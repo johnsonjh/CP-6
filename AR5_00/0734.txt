@@ -1,0 +1,863 @@
+VERSION E05
+
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:1    
+        1        1        /*M* FTR$KEYIN tape keyin receiver */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* THI=1,PLM=3,MCL=10 */
+        8        8
+        9        9        FTR$KEYIN: PROC(KEYIN);
+       10       10
+       11       11        /*F*  NAME: FTR$KEYIN
+       12       12              PURPOSE: Receiver for tape keyins.
+       13       13              DESCRIPTION: If received keyin is expected, indicate in DDT
+       14       14                 what operator's response was.  If not, tell operator which
+       15       15                 keyin (if any) is expected.
+       16       16         ***/
+       17       17
+       18       18
+       19       19         /***
+       20       20          *** INCLUDE files:
+       21       21          ***/
+       22       22
+       23       23        %INCLUDE FR$RAT;
+       24       76           %FR$RAT;
+       25      116        %INCLUDE FR_SUBS;
+       26      184        %MACRO FT$DDTBD(BASED=BASED);
+       27      185        %INCLUDE FT$DDT;
+       28      246        %MEND;
+       29      247           %FT$DDTBD(BASED="BASED(DDDT$)");
+       30      309        %INCLUDE FT_SUBS;
+       31      389        %INCLUDE NI_DATA_R;
+       32      826           %NI$DCT (NAME=DCT,STCLASS=BASED);
+       33      874        %INCLUDE OC_SUBS_C;
+       34     1605        %INCLUDE SS_SCHED_C;
+       35     1838
+       36     1839         /***
+       37     1840          *** External routines:
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:2    
+       38     1841          ***/
+       39     1842
+       40     1843    1   DCL OCZ$DEV_DCT ENTRY(3) ALTRET;        /* Convert DEVNM to DCTX              */
+       41     1844    1   DCL OCZ$SID_UN ENTRY(4) ALTRET;         /* Convert SYSID to UN                */
+       42     1845    1   DCL OCI$MK_WR ENTRY(7);                 /* Tell operator                      */
+       43     1846    1   DCL SC_FTRBADDDT ENTRY CONV(2,0);       /* Screech due to bad DDT             */
+       44     1847    1   DCL SC_FTRBADSYSID ENTRY CONV(2,0);     /* Screech due to bad sysid           */
+       45     1848    1   DCL SSR$RUE ENTRY(4);                   /* Report wake up                     */
+       46     1849
+       47     1850         /***
+       48     1851          *** Parameters:
+       49     1852          ***/
+       50     1853
+       51     1854    1   DCL 1 KEYIN,                            /* Keyin packet                       */
+       52     1855    1         2 KIN UBIN HALF UNAL,             /* Keyin number                       */
+       53     1856    1         2 CADDR BIT(18) UNAL,             /* Originating console's address      */
+       54     1857    1         2 SYSID UBIN HALF UNAL,           /* Sysid (0)                          */
+       55     1858    1         2 SN CHAR(6) UNAL,                /* Serial number (blanks)             */
+       56     1859    1         2 DEVNM CHAR(8) UNAL;             /* Device name                        */
+       57     1860
+       58     1861         /***
+       59     1862          *** AUTO data:
+       60     1863          ***/
+       61     1864
+       62     1865    1   DCL DCTX UBIN WORD ALIGNED AUTO;
+       63     1866    1   DCL DDDT$ PTR ALIGNED AUTO;             /* Pointer to DDT entry               */
+       64     1867    1   DCL KEYIN_RCVD SBIN WORD ALIGNED AUTO;  /* Code of keyin received             */
+       65     1868    1   DCL OK SBIN WORD ALIGNED AUTO;          /* Not CANT                           */
+       66     1869    1   DCL 1 MSGS ALIGNED AUTO,
+       67     1870    1         2 MG1 UBIN BYTE UNAL;
+       68     1871    1   DCL RAT$ PTR ALIGNED AUTO;              /* Pointer to RAT entry               */
+       69     1872    1   DCL USER_NBR UBIN WORD ALIGNED AUTO;    /* User number for sysid with drive   */
+       70     1873    1   DCL USER_NBR_BYTE UBIN BYTE ALIGNED AUTO; /* To pass user number              */
+       71     1874
+       72     1875         /***
+       73     1876          *** CONSTANT:
+       74     1877          ***/
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:3    
+       75     1878
+       76     1879        /*S*     SCREECH_CODE: FTR-S$BADSYSID-8
+       77     1880                 TYPE: Screech.
+       78     1881                 MESSAGE: RAT table contains bad sysid.
+       79     1882                 DESCRIPTION: A keyin for a device for which the RAT contains
+       80     1883                              an invalid sysid was received.
+       81     1884         ***/
+       82     1885
+       83     1886        /*S*     SCREECH_CODE: FTR-S$BADDDT-8
+       84     1887                 TYPE: Screech.
+       85     1888                 MESSAGE: DDt table contains bad information.
+       86     1889                 DESCRIPTION: An expected keyin was received but there
+       87     1890                              is no tape mounted and open.
+       88     1891         ***/
+       89     1892
+       90     1893        /********************/
+       91     1894
+       92     1895         /***
+       93     1896          *** Convert device name to DCTX.
+       94     1897          ***/
+       95     1898
+       96     1899    1      CALL OCZ$DEV_DCT(KEYIN.DEVNM,DCTX,KEYIN.CADDR) ALTRET(JUSTRET);
+       97     1900
+       98     1901         /***
+       99     1902          *** Make sure it's a tape.
+      100     1903          ***/
+      101     1904
+      102     1905    1      RAT$ = N$DCT$(DCTX)->DCT.RAT$;
+      103     1906    1      IF RAT$->FR$RAT.RCOD ~= FR_MT
+      104     1907    2       THEN DO;                            /* Isn't a tape                       */
+      105     1908    2         CALL OCI$MK_WR(KEYIN.CADDR,BADMT_MSG#,1,'004'O,FRKE_NTP,DCTX);
+      106     1909    2         RETURN;
+      107     1910    2         END;
+      108     1911
+      109     1912         /***
+      110     1913          *** Determine what to do from keyin.
+      111     1914          ***/
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:4    
+      112     1915
+      113     1916    2      DO CASE(KEYIN.KIN);
+      114     1917    2       CASE(KEY_RING#);                    /* RING                               */
+      115     1918    2         OK = 1;
+      116     1919    2         KEYIN_RCVD = FT_RINGSOL#;
+      117     1920    2       CASE(KEY_CANTRING#);                /* CANT RING                          */
+      118     1921    2         OK = 0;
+      119     1922    2         KEYIN_RCVD = FT_RINGSOL#;
+      120     1923    2       CASE(KEY_OVER#);                    /* OVER                               */
+      121     1924    2         OK = 1;
+      122     1925    2         KEYIN_RCVD = FT_OVERSOL#;
+      123     1926    2       CASE(KEY_CANTOVER#);                /* CANT OVER                          */
+      124     1927    2         OK = 0;
+      125     1928    2         KEYIN_RCVD = FT_OVERSOL#;
+      126     1929    2       CASE(ELSE);
+      127     1930    2         KEYIN_RCVD = FT_NOWAYSOL#;
+      128     1931    2         OK = 1;
+      129     1932    2       END;
+      130     1933
+      131     1934    1      DDDT$ = N$DCT$(DCTX)->DCT.DDT$;
+      132     1935    1      IF FT$DDT.SOLICIT = KEYIN_RCVD
+      133     1936    2       THEN DO;                            /* Received expected keyin            */
+      134     1937    3         DO CASE(OK);
+      135     1938    3          CASE(0);                         /* CANT                               */
+      136     1939    3            FT$DDT.SOLICIT = FT_NOWAYSOL#;
+      137     1940    3          CASE(1);                         /* OK                                 */
+      138     1941    3            FT$DDT.SOLICIT = 0;
+      139     1942    3          END;
+      140     1943    2         IF NOT ( RAT$->FR$RAT.FLG.OPN AND RAT$->FR$RAT.FLG.RUP )
+      141     1944    2          THEN CALL SC_FTRBADDDT;        /*S* SCREECH_CODE: FTR-S$BADDDT */
+      142     1945    2         KEYIN.SYSID = RAT$->FR$RAT.RES.SISID; /* Get sysid to wake up user      */
+      143     1946    2         CALL OCZ$SID_UN(KEYIN.SYSID,USER_NBR) ALTRET(BADSYSID);
+      144     1947    2         USER_NBR_BYTE = USER_NBR;
+      145     1948    2         CALL SSR$RUE(%SS_WU,USER_NBR_BYTE); /* Wake user up                     */
+      146     1949    2         RETURN;
+      147     1950    2         END;
+      148     1951
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:5    
+      149     1952         /***
+      150     1953          *** Didn't receive expected keyin.  Tell operator what we're
+      151     1954          *** waiting for.
+      152     1955          ***/
+      153     1956
+      154     1957    2      DO CASE(FT$DDT.SOLICIT);
+      155     1958    2       CASE(FT_OVERSOL#);
+      156     1959    2         MSGS.MG1 = FT_WAITOVER#;
+      157     1960    2       CASE(FT_RINGSOL#);
+      158     1961    2         MSGS.MG1 = FT_WAITRING#;
+      159     1962    2       CASE(ELSE);
+      160     1963    2         MSGS.MG1 = FT_WAITNONE#;          /* Waiting for nothing                */
+      161     1964    2       END;
+      162     1965
+      163     1966    1      CALL OCI$MK_WR(KEYIN.CADDR,UNSOLKEY_MSG#,1,'001'O,MSGS,DCTX);
+      164     1967
+      165     1968    1   JUSTRET: ;
+      166     1969    2      DO WHILE('0'B);
+      167     1970    2   BADSYSID: ;
+      168     1971    2         CALL SC_FTRBADSYSID;        /*S* SCREECH_CODE: FTR-S$BADSYSID */
+      169     1972    2         END;
+      170     1973    1      RETURN;
+      171     1974
+      172     1975    1   END FTR$KEYIN;
+
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:6    
+--  Include file information  --
+
+   SS_SCHED_C.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   FT_SUBS.:E05TOU  is referenced.
+   FT$DDT.:E05TOU  is referenced.
+   FR_SUBS.:E05TOU  is referenced.
+   FR$RAT.:E05TOU  is referenced.
+      No diagnostics issued in procedure FTR$KEYIN.
+
+   Procedure FTR$KEYIN requires 162 words for executable code.
+   Procedure FTR$KEYIN requires 18 words of local(AUTO) storage.
+
+    No errors detected in file FTR$KEYIN.:E05TSI    .
+
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:7    
+
+ Object Unit name= FTR$KEYIN                                  File name= FTR$KEYIN.:E05TOU
+ UTS= JUL 29 '97 18:01:24.48 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   162    242  FTR$KEYIN
+    1  RoData even  none    14     16  FTR$KEYIN
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  FTR$KEYIN
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       3 OCZ$DEV_DCT
+         yes           Std       7 OCI$MK_WR
+ yes     yes           Std       4 OCZ$SID_UN
+         yes           Std       4 SSR$RUE
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:8    
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_FTRBADDDT                          SC_FTRBADSYSID                        N$DCT$$
+     N$FQ$                                 NI$FQ$                                NI$IBUF$
+     NI$RP$                                B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ASLENTSID                             ISSID
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:9    
+
+
+        1        1        /*M* FTR$KEYIN tape keyin receiver */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* THI=1,PLM=3,MCL=10 */
+        8        8
+        9        9        FTR$KEYIN: PROC(KEYIN);
+
+      9  0 000000   000000 700200 xent  FTR$KEYIN    TSX0  ! X66_AUTO_1
+         0 000001   000022 000001                    ZERO    18,1
+
+       10       10
+       11       11        /*F*  NAME: FTR$KEYIN
+       12       12              PURPOSE: Receiver for tape keyins.
+       13       13              DESCRIPTION: If received keyin is expected, indicate in DDT
+       14       14                 what operator's response was.  If not, tell operator which
+       15       15                 keyin (if any) is expected.
+       16       16         ***/
+       17       17
+       18       18
+       19       19         /***
+       20       20          *** INCLUDE files:
+       21       21          ***/
+       22       22
+       23       23        %INCLUDE FR$RAT;
+       24       76           %FR$RAT;
+       25      116        %INCLUDE FR_SUBS;
+       26      184        %MACRO FT$DDTBD(BASED=BASED);
+       27      185        %INCLUDE FT$DDT;
+       28      246        %MEND;
+       29      247           %FT$DDTBD(BASED="BASED(DDDT$)");
+       30      309        %INCLUDE FT_SUBS;
+       31      389        %INCLUDE NI_DATA_R;
+       32      826           %NI$DCT (NAME=DCT,STCLASS=BASED);
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:10   
+       33      874        %INCLUDE OC_SUBS_C;
+       34     1605        %INCLUDE SS_SCHED_C;
+       35     1838
+       36     1839         /***
+       37     1840          *** External routines:
+       38     1841          ***/
+       39     1842
+       40     1843    1   DCL OCZ$DEV_DCT ENTRY(3) ALTRET;        /* Convert DEVNM to DCTX              */
+       41     1844    1   DCL OCZ$SID_UN ENTRY(4) ALTRET;         /* Convert SYSID to UN                */
+       42     1845    1   DCL OCI$MK_WR ENTRY(7);                 /* Tell operator                      */
+       43     1846    1   DCL SC_FTRBADDDT ENTRY CONV(2,0);       /* Screech due to bad DDT             */
+       44     1847    1   DCL SC_FTRBADSYSID ENTRY CONV(2,0);     /* Screech due to bad sysid           */
+       45     1848    1   DCL SSR$RUE ENTRY(4);                   /* Report wake up                     */
+       46     1849
+       47     1850         /***
+       48     1851          *** Parameters:
+       49     1852          ***/
+       50     1853
+       51     1854    1   DCL 1 KEYIN,                            /* Keyin packet                       */
+       52     1855    1         2 KIN UBIN HALF UNAL,             /* Keyin number                       */
+       53     1856    1         2 CADDR BIT(18) UNAL,             /* Originating console's address      */
+       54     1857    1         2 SYSID UBIN HALF UNAL,           /* Sysid (0)                          */
+       55     1858    1         2 SN CHAR(6) UNAL,                /* Serial number (blanks)             */
+       56     1859    1         2 DEVNM CHAR(8) UNAL;             /* Device name                        */
+       57     1860
+       58     1861         /***
+       59     1862          *** AUTO data:
+       60     1863          ***/
+       61     1864
+       62     1865    1   DCL DCTX UBIN WORD ALIGNED AUTO;
+       63     1866    1   DCL DDDT$ PTR ALIGNED AUTO;             /* Pointer to DDT entry               */
+       64     1867    1   DCL KEYIN_RCVD SBIN WORD ALIGNED AUTO;  /* Code of keyin received             */
+       65     1868    1   DCL OK SBIN WORD ALIGNED AUTO;          /* Not CANT                           */
+       66     1869    1   DCL 1 MSGS ALIGNED AUTO,
+       67     1870    1         2 MG1 UBIN BYTE UNAL;
+       68     1871    1   DCL RAT$ PTR ALIGNED AUTO;              /* Pointer to RAT entry               */
+       69     1872    1   DCL USER_NBR UBIN WORD ALIGNED AUTO;    /* User number for sysid with drive   */
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:11   
+       70     1873    1   DCL USER_NBR_BYTE UBIN BYTE ALIGNED AUTO; /* To pass user number              */
+       71     1874
+       72     1875         /***
+       73     1876          *** CONSTANT:
+       74     1877          ***/
+       75     1878
+       76     1879        /*S*     SCREECH_CODE: FTR-S$BADSYSID-8
+       77     1880                 TYPE: Screech.
+       78     1881                 MESSAGE: RAT table contains bad sysid.
+       79     1882                 DESCRIPTION: A keyin for a device for which the RAT contains
+       80     1883                              an invalid sysid was received.
+       81     1884         ***/
+       82     1885
+       83     1886        /*S*     SCREECH_CODE: FTR-S$BADDDT-8
+       84     1887                 TYPE: Screech.
+       85     1888                 MESSAGE: DDt table contains bad information.
+       86     1889                 DESCRIPTION: An expected keyin was received but there
+       87     1890                              is no tape mounted and open.
+       88     1891         ***/
+       89     1892
+       90     1893        /********************/
+       91     1894
+       92     1895         /***
+       93     1896          *** Convert device name to DCTX.
+       94     1897          ***/
+       95     1898
+       96     1899    1      CALL OCZ$DEV_DCT(KEYIN.DEVNM,DCTX,KEYIN.CADDR) ALTRET(JUSTRET);
+
+   1899  0 000002   200003 236100                    LDQ     @KEYIN,,AUTO
+         0 000003   400000 036007                    ADLQ    -131072,DL
+         0 000004   200016 756100                    STQ     USER_NBR_BYTE+3,,AUTO
+         0 000005   200004 630500                    EPPR0   DCTX,,AUTO
+         0 000006   200015 450500                    STP0    USER_NBR_BYTE+2,,AUTO
+         0 000007   200003 236100                    LDQ     @KEYIN,,AUTO
+         0 000010   000003 036003                    ADLQ    3,DU
+         0 000011   200014 756100                    STQ     USER_NBR_BYTE+1,,AUTO
+         0 000012   200014 630500                    EPPR0   USER_NBR_BYTE+1,,AUTO
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:12   
+         0 000013   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000014   000000 701000 xent               TSX1    OCZ$DEV_DCT
+         0 000015   000236 702000 0                  TSX2    JUSTRET
+
+       97     1900
+       98     1901         /***
+       99     1902          *** Make sure it's a tape.
+      100     1903          ***/
+      101     1904
+      102     1905    1      RAT$ = N$DCT$(DCTX)->DCT.RAT$;
+
+   1905  0 000016   000000 470400 xsym               LDP0    N$DCT$$
+         0 000017   200004 720100                    LXL0    DCTX,,AUTO
+         0 000020   000000 471510                    LDP1    0,X0,PR0
+         0 000021   100005 236100                    LDQ     5,,PR1
+         0 000022   200011 756100                    STQ     RAT$,,AUTO
+
+      103     1906    1      IF RAT$->FR$RAT.RCOD ~= FR_MT
+
+   1906  0 000023   200011 473500                    LDP3    RAT$,,AUTO
+         0 000024   300003 236100                    LDQ     3,,PR3
+         0 000025   000740 376003                    ANQ     480,DU
+         0 000026   000040 116003                    CMPQ    32,DU
+         0 000027   000050 600000 0                  TZE     s:1916
+
+      104     1907    2       THEN DO;                            /* Isn't a tape                       */
+
+      105     1908    2         CALL OCI$MK_WR(KEYIN.CADDR,BADMT_MSG#,1,'004'O,FRKE_NTP,DCTX);
+
+   1908  0 000030   200004 634500                    EPPR4   DCTX,,AUTO
+         0 000031   200021 454500                    STP4    USER_NBR_BYTE+6,,AUTO
+         0 000032   000002 236000 1                  LDQ     2
+         0 000033   200020 756100                    STQ     USER_NBR_BYTE+5,,AUTO
+         0 000034   000004 237000 1                  LDAQ    4
+         0 000035   200016 757100                    STAQ    USER_NBR_BYTE+3,,AUTO
+         0 000036   000006 236000 1                  LDQ     6
+         0 000037   200015 756100                    STQ     USER_NBR_BYTE+2,,AUTO
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:13   
+         0 000040   200003 236100                    LDQ     @KEYIN,,AUTO
+         0 000041   400000 036007                    ADLQ    -131072,DL
+         0 000042   200014 756100                    STQ     USER_NBR_BYTE+1,,AUTO
+         0 000043   200014 630500                    EPPR0   USER_NBR_BYTE+1,,AUTO
+         0 000044   000024 631400 xsym               EPPR1   B_VECTNIL+20
+         0 000045   000000 701000 xent               TSX1    OCI$MK_WR
+         0 000046   000000 011000                    NOP     0
+
+      106     1909    2         RETURN;
+
+   1909  0 000047   000000 702200 xent               TSX2  ! X66_ARET
+
+      107     1910    2         END;
+      108     1911
+      109     1912         /***
+      110     1913          *** Determine what to do from keyin.
+      111     1914          ***/
+      112     1915
+      113     1916    2      DO CASE(KEYIN.KIN);
+
+   1916  0 000050   200003 474500                    LDP4    @KEYIN,,AUTO
+         0 000051   000100 100500                    MLR     fill='000'O
+         0 000052   400000 000002                    ADSC9   0,,PR4                   cn=0,n=2
+         0 000053   200014 000004                    ADSC9   USER_NBR_BYTE+1,,AUTO    cn=0,n=4
+         0 000054   200014 221100                    LDX1    USER_NBR_BYTE+1,,AUTO
+         0 000055   000005 101003                    CMPX1   5,DU
+         0 000056   000060 602011 0                  TNC     s:1916+8,X1
+         0 000057   000106 710000 0                  TRA     s:1930
+         0 000060   000106 710000 0                  TRA     s:1930
+         0 000061   000065 710000 0                  TRA     s:1918
+         0 000062   000072 710000 0                  TRA     s:1921
+         0 000063   000076 710000 0                  TRA     s:1924
+         0 000064   000102 710000 0                  TRA     s:1927
+
+      114     1917    2       CASE(KEY_RING#);                    /* RING                               */
+
+      115     1918    2         OK = 1;
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:14   
+
+   1918  0 000065   000001 235007                    LDA     1,DL
+         0 000066   200007 755100                    STA     OK,,AUTO
+
+      116     1919    2         KEYIN_RCVD = FT_RINGSOL#;
+
+   1919  0 000067   000002 236007                    LDQ     2,DL
+         0 000070   200006 756100                    STQ     KEYIN_RCVD,,AUTO
+         0 000071   000112 710000 0                  TRA     s:1934
+
+      117     1920    2       CASE(KEY_CANTRING#);                /* CANT RING                          */
+
+      118     1921    2         OK = 0;
+
+   1921  0 000072   200007 450100                    STZ     OK,,AUTO
+
+      119     1922    2         KEYIN_RCVD = FT_RINGSOL#;
+
+   1922  0 000073   000002 235007                    LDA     2,DL
+         0 000074   200006 755100                    STA     KEYIN_RCVD,,AUTO
+         0 000075   000112 710000 0                  TRA     s:1934
+
+      120     1923    2       CASE(KEY_OVER#);                    /* OVER                               */
+
+      121     1924    2         OK = 1;
+
+   1924  0 000076   000001 235007                    LDA     1,DL
+         0 000077   200007 755100                    STA     OK,,AUTO
+
+      122     1925    2         KEYIN_RCVD = FT_OVERSOL#;
+
+   1925  0 000100   200006 755100                    STA     KEYIN_RCVD,,AUTO
+         0 000101   000112 710000 0                  TRA     s:1934
+
+      123     1926    2       CASE(KEY_CANTOVER#);                /* CANT OVER                          */
+
+      124     1927    2         OK = 0;
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:15   
+
+   1927  0 000102   200007 450100                    STZ     OK,,AUTO
+
+      125     1928    2         KEYIN_RCVD = FT_OVERSOL#;
+
+   1928  0 000103   000001 235007                    LDA     1,DL
+         0 000104   200006 755100                    STA     KEYIN_RCVD,,AUTO
+         0 000105   000112 710000 0                  TRA     s:1934
+
+      126     1929    2       CASE(ELSE);
+
+      127     1930    2         KEYIN_RCVD = FT_NOWAYSOL#;
+
+   1930  0 000106   000003 235007                    LDA     3,DL
+         0 000107   200006 755100                    STA     KEYIN_RCVD,,AUTO
+
+      128     1931    2         OK = 1;
+
+   1931  0 000110   000001 236007                    LDQ     1,DL
+         0 000111   200007 756100                    STQ     OK,,AUTO
+
+      129     1932    2       END;
+
+      130     1933
+      131     1934    1      DDDT$ = N$DCT$(DCTX)->DCT.DDT$;
+
+   1934  0 000112   000000 471510                    LDP1    0,X0,PR0
+         0 000113   100004 236100                    LDQ     4,,PR1
+         0 000114   200005 756100                    STQ     DDDT$,,AUTO
+
+      132     1935    1      IF FT$DDT.SOLICIT = KEYIN_RCVD
+
+   1935  0 000115   200005 475500                    LDP5    DDDT$,,AUTO
+         0 000116   500006 236100                    LDQ     6,,PR5
+         0 000117   000007 376007                    ANQ     7,DL
+         0 000120   200006 116100                    CMPQ    KEYIN_RCVD,,AUTO
+         0 000121   000200 601000 0                  TNZ     s:1957
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:16   
+
+      133     1936    2       THEN DO;                            /* Received expected keyin            */
+
+      134     1937    3         DO CASE(OK);
+
+   1937  0 000122   200007 235100                    LDA     OK,,AUTO
+         0 000123   000002 115007                    CMPA    2,DL
+         0 000124   000126 602005 0                  TNC     s:1937+4,AL
+         0 000125   000137 710000 0                  TRA     s:1943
+         0 000126   000130 710000 0                  TRA     s:1939
+         0 000127   000135 710000 0                  TRA     s:1941
+
+      135     1938    3          CASE(0);                         /* CANT                               */
+
+      136     1939    3            FT$DDT.SOLICIT = FT_NOWAYSOL#;
+
+   1939  0 000130   500006 236100                    LDQ     6,,PR5
+         0 000131   000007 376000 1                  ANQ     7
+         0 000132   000003 276007                    ORQ     3,DL
+         0 000133   500006 756100                    STQ     6,,PR5
+         0 000134   000137 710000 0                  TRA     s:1943
+
+      137     1940    3          CASE(1);                         /* OK                                 */
+
+      138     1941    3            FT$DDT.SOLICIT = 0;
+
+   1941  0 000135   000007 236000 1                  LDQ     7
+         0 000136   500006 356100                    ANSQ    6,,PR5
+
+      139     1942    3          END;
+
+      140     1943    2         IF NOT ( RAT$->FR$RAT.FLG.OPN AND RAT$->FR$RAT.FLG.RUP )
+
+   1943  0 000137   300010 236100                    LDQ     8,,PR3
+         0 000140   000020 316007                    CANQ    16,DL
+         0 000141   000144 600000 0                  TZE     s:1944
+         0 000142   000004 316007                    CANQ    4,DL
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:17   
+         0 000143   000146 601000 0                  TNZ     s:1945
+
+      141     1944    2          THEN CALL SC_FTRBADDDT;        /*S* SCREECH_CODE: FTR-S$BADDDT */
+
+   1944  0 000144   000000 713400 xsym               CLIMB   SC_FTRBADDDT
+         0 000145   000000 600000 xsid               climb   nvectors=         0
+
+      142     1945    2         KEYIN.SYSID = RAT$->FR$RAT.RES.SISID; /* Get sysid to wake up user      */
+
+   1945  0 000146   200011 470500                    LDP0    RAT$,,AUTO
+         0 000147   200003 471500                    LDP1    @KEYIN,,AUTO
+         0 000150   000100 100500                    MLR     fill='000'O
+         0 000151   000001 000002                    ADSC9   1,,PR0                   cn=0,n=2
+         0 000152   100001 000002                    ADSC9   1,,PR1                   cn=0,n=2
+
+      143     1946    2         CALL OCZ$SID_UN(KEYIN.SYSID,USER_NBR) ALTRET(BADSYSID);
+
+   1946  0 000153   200012 633500                    EPPR3   USER_NBR,,AUTO
+         0 000154   200015 453500                    STP3    USER_NBR_BYTE+2,,AUTO
+         0 000155   200003 236100                    LDQ     @KEYIN,,AUTO
+         0 000156   000001 036003                    ADLQ    1,DU
+         0 000157   200014 756100                    STQ     USER_NBR_BYTE+1,,AUTO
+         0 000160   200014 630500                    EPPR0   USER_NBR_BYTE+1,,AUTO
+         0 000161   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000162   000000 701000 xent               TSX1    OCZ$SID_UN
+         0 000163   000237 702000 0                  TSX2    BADSYSID
+
+      144     1947    2         USER_NBR_BYTE = USER_NBR;
+
+   1947  0 000164   200012 235100                    LDA     USER_NBR,,AUTO
+         0 000165   000033 735000                    ALS     27
+         0 000166   200013 755100                    STA     USER_NBR_BYTE,,AUTO
+
+      145     1948    2         CALL SSR$RUE(%SS_WU,USER_NBR_BYTE); /* Wake user up                     */
+
+   1948  0 000167   200013 630500                    EPPR0   USER_NBR_BYTE,,AUTO
+         0 000170   200015 450500                    STP0    USER_NBR_BYTE+2,,AUTO
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:18   
+         0 000171   000011 236000 1                  LDQ     9
+         0 000172   200014 756100                    STQ     USER_NBR_BYTE+1,,AUTO
+         0 000173   200014 630500                    EPPR0   USER_NBR_BYTE+1,,AUTO
+         0 000174   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000175   000000 701000 xent               TSX1    SSR$RUE
+         0 000176   000000 011000                    NOP     0
+
+      146     1949    2         RETURN;
+
+   1949  0 000177   000000 702200 xent               TSX2  ! X66_ARET
+
+      147     1950    2         END;
+      148     1951
+      149     1952         /***
+      150     1953          *** Didn't receive expected keyin.  Tell operator what we're
+      151     1954          *** waiting for.
+      152     1955          ***/
+      153     1956
+      154     1957    2      DO CASE(FT$DDT.SOLICIT);
+
+   1957  0 000200   500006 722100                    LXL2    6,,PR5
+         0 000201   000007 362003                    ANX2    7,DU
+         0 000202   000003 102003                    CMPX2   3,DU
+         0 000203   000205 602012 0                  TNC     s:1957+5,X2
+         0 000204   000216 710000 0                  TRA     s:1963
+         0 000205   000216 710000 0                  TRA     s:1963
+         0 000206   000210 710000 0                  TRA     s:1959
+         0 000207   000213 710000 0                  TRA     s:1961
+
+      155     1958    2       CASE(FT_OVERSOL#);
+
+      156     1959    2         MSGS.MG1 = FT_WAITOVER#;
+
+   1959  0 000210   002000 236003                    LDQ     1024,DU
+         0 000211   200010 756100                    STQ     MSGS,,AUTO
+         0 000212   000217 710000 0                  TRA     s:1966
+
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:19   
+      157     1960    2       CASE(FT_RINGSOL#);
+
+      158     1961    2         MSGS.MG1 = FT_WAITRING#;
+
+   1961  0 000213   001000 236003                    LDQ     512,DU
+         0 000214   200010 756100                    STQ     MSGS,,AUTO
+         0 000215   000217 710000 0                  TRA     s:1966
+
+      159     1962    2       CASE(ELSE);
+
+      160     1963    2         MSGS.MG1 = FT_WAITNONE#;          /* Waiting for nothing                */
+
+   1963  0 000216   200010 450100                    STZ     MSGS,,AUTO
+
+      161     1964    2       END;
+
+      162     1965
+      163     1966    1      CALL OCI$MK_WR(KEYIN.CADDR,UNSOLKEY_MSG#,1,'001'O,MSGS,DCTX);
+
+   1966  0 000217   200004 631500                    EPPR1   DCTX,,AUTO
+         0 000220   200021 451500                    STP1    USER_NBR_BYTE+6,,AUTO
+         0 000221   200010 636500                    EPPR6   MSGS,,AUTO
+         0 000222   200020 456500                    STP6    USER_NBR_BYTE+5,,AUTO
+         0 000223   000014 237000 1                  LDAQ    12
+         0 000224   200016 757100                    STAQ    USER_NBR_BYTE+3,,AUTO
+         0 000225   000013 236000 1                  LDQ     11
+         0 000226   200015 756100                    STQ     USER_NBR_BYTE+2,,AUTO
+         0 000227   200003 236100                    LDQ     @KEYIN,,AUTO
+         0 000230   400000 036007                    ADLQ    -131072,DL
+         0 000231   200014 756100                    STQ     USER_NBR_BYTE+1,,AUTO
+         0 000232   200014 630500                    EPPR0   USER_NBR_BYTE+1,,AUTO
+         0 000233   000024 631400 xsym               EPPR1   B_VECTNIL+20
+         0 000234   000000 701000 xent               TSX1    OCI$MK_WR
+         0 000235   000000 011000                    NOP     0
+
+   1966  0 000236                       JUSTRET      null
+      164     1967
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:20   
+      165     1968    1   JUSTRET: ;
+      166     1969    2      DO WHILE('0'B);
+
+   1969  0 000236   000241 710000 0                  TRA     s:1973
+
+   1966  0 000237                       BADSYSID     null
+      167     1970    2   BADSYSID: ;
+      168     1971    2         CALL SC_FTRBADSYSID;        /*S* SCREECH_CODE: FTR-S$BADSYSID */
+
+   1971  0 000237   000000 713400 xsym               CLIMB   SC_FTRBADSYSID
+         0 000240   000000 600000 xsid               climb   nvectors=         0
+
+      169     1972    2         END;
+
+      170     1973    1      RETURN;
+
+   1973  0 000241   000000 702200 xent               TSX2  ! X66_ARET
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 000035   004000 000000   000011 006000   000000 000000    ................
+   1     004   000003 006000   000001 006000   000000 006000   777777 777770    ................
+   1     010   000000 000027   000010 006000   000000 000376   000012 006000    ................
+   1     014   000003 006000   000033 006000                                    ........
+      171     1974
+      172     1975    1   END FTR$KEYIN;
+
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:21   
+--  Include file information  --
+
+   SS_SCHED_C.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   FT_SUBS.:E05TOU  is referenced.
+   FT$DDT.:E05TOU  is referenced.
+   FR_SUBS.:E05TOU  is referenced.
+   FR$RAT.:E05TOU  is referenced.
+      No diagnostics issued in procedure FTR$KEYIN.
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:22   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @KEYIN                     4-0-0/w UBIN        r     1 DCTX
+     5-0-0/w PTR         r     1 DDDT$                     *0-0-0/c STRC(180)   r     1 KEYIN
+     6-0-0/w SBIN        r     1 KEYIN_RCVD                10-0-0/w STRC(9)     r     1 MSGS
+     7-0-0/w SBIN        r     1 OK                        11-0-0/w PTR         r     1 RAT$
+    12-0-0/w UBIN        r     1 USER_NBR                  13-0-0/w UBIN(9)     r     1 USER_NBR_BYTE
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 N$DCT$$                    0-0-0/w PTR         r     1 N$FQ$
+     0-0-0/w PTR         r     1 NI$FQ$                     0-0-0/w PTR         r     1 NI$IBUF$
+     0-0-0/w PTR         r     1 NI$RP$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(1332)  r     1 DCT                        0-0-0/w STRC(324)   r     1 FR$RAT
+     0-0-0/w STRC(288)   r     1 FT$DDT                     0-0-0/w PTR         r     1 N$DCT$(0:0)
+
+
+   Procedure FTR$KEYIN requires 162 words for executable code.
+   Procedure FTR$KEYIN requires 18 words of local(AUTO) storage.
+
+    No errors detected in file FTR$KEYIN.:E05TSI    .
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:23   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:24   
+          MINI XREF LISTING
+
+BADSYSID
+      1966**LABEL    1946--CALLALT
+DCT.DDT$
+       836**DCL      1934>>ASSIGN
+DCT.DP
+       855**DCL       862--REDEF     865--REDEF     866--REDEF     868--REDEF     868--REDEF     869--REDEF
+       870--REDEF     870--REDEF
+DCT.MPC.IOCHANX
+       863**DCL       863--REDEF
+DCT.RAT$
+       836**DCL      1905>>ASSIGN
+DCTX
+      1865**DCL      1899<>CALL     1905>>ASSIGN   1908<>CALL     1934>>ASSIGN   1966<>CALL
+DDDT$
+      1866**DCL       255--IMP-PTR  1934<<ASSIGN   1935>>IF       1939>>ASSIGN   1941>>ASSIGN   1957>>DOCASE
+FR$RAT.FLG.OPN
+       110**DCL      1943>>IF
+FR$RAT.FLG.RUP
+       112**DCL      1943>>IF
+FR$RAT.RCOD
+        91**DCL      1906>>IF
+FR$RAT.RES.SISID
+        81**DCL      1945>>ASSIGN
+FT$DDT.SOLICIT
+       291**DCL      1935>>IF       1939<<ASSIGN   1941<<ASSIGN   1957>>DOCASE
+JUSTRET
+      1966**LABEL    1899--CALLALT
+KEYIN
+      1854**DCL         9--PROC
+KEYIN.CADDR
+      1856**DCL      1899<>CALL     1908<>CALL     1966<>CALL
+KEYIN.DEVNM
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:25   
+      1859**DCL      1899<>CALL
+KEYIN.KIN
+      1855**DCL      1916>>DOCASE
+KEYIN.SYSID
+      1857**DCL      1945<<ASSIGN   1946<>CALL
+KEYIN_RCVD
+      1867**DCL      1919<<ASSIGN   1922<<ASSIGN   1925<<ASSIGN   1928<<ASSIGN   1930<<ASSIGN   1935>>IF
+MSGS
+      1869**DCL      1966<>CALL
+MSGS.MG1
+      1870**DCL      1959<<ASSIGN   1961<<ASSIGN   1963<<ASSIGN
+N$DCT$
+       821**DCL      1905>>ASSIGN   1934>>ASSIGN
+N$DCT$$
+       687**DCL       821--IMP-PTR  1905>>ASSIGN   1934>>ASSIGN
+N$FQ$
+       687**DCL       822--IMP-PTR
+N$REQ_INIT.BUFADDR
+       706**DCL       707--REDEF     707--REDEF
+N$REQ_INIT.DLA.DRELADDR
+       698**DCL       698--REDEF
+N$REQ_INIT.DVE.EOMCHAR
+       735**DCL       736--REDEF
+N$REQ_INIT.EAINFO
+       729**DCL       729--REDEF
+N$REQ_INIT.EAINFOX
+       729**DCL       730--REDEF
+N$REQ_INIT.EVNTINFO
+       730**DCL       730--REDEF
+N$REQ_INIT.STATUS
+       711**DCL       717--REDEF
+NI$FQ$
+       747**DCL       823--IMP-PTR
+NI$IBUF$
+       747**DCL       823--IMP-PTR
+NI$IMXMBX_INIT.PAGED_BASE
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:26   
+       757**DCL       758--REDEF     758--REDEF
+NI$IMXMBX_INIT.SIZE
+       759**DCL       759--REDEF
+NI$REQ_INIT.DCW
+       781**DCL       784--REDEF
+NI$REQ_INIT.DCW.TALLY
+       782**DCL       782--REDEF
+NI$REQ_INIT.IDCW.EXTA
+       784**DCL       784--REDEF
+NI$REQ_INIT.PCW
+       786**DCL       790--REDEF
+NI$REQ_INIT.SEEK
+       791**DCL       792--REDEF     793--REDEF
+NI$RP$
+       795**DCL       825--IMP-PTR
+NI_MBX_INIT.DCW.CONTROL.AE
+       817**DCL       817--REDEF
+NI_MBX_INIT.LPW.CONTROL.AE
+       813**DCL       813--REDEF
+OCI$MK_WR
+      1845**DCL-ENT  1908--CALL     1966--CALL
+OCZ$DEV_DCT
+      1843**DCL-ENT  1899--CALL
+OCZ$SID_UN
+      1844**DCL-ENT  1946--CALL
+OK
+      1868**DCL      1918<<ASSIGN   1921<<ASSIGN   1924<<ASSIGN   1927<<ASSIGN   1931<<ASSIGN   1937>>DOCASE
+RAT$
+      1871**DCL      1905<<ASSIGN   1906>>IF       1943>>IF       1943>>IF       1945>>ASSIGN
+SC_FTRBADDDT
+      1846**DCL-ENT  1944--CALL
+SC_FTRBADSYSID
+      1847**DCL-ENT  1971--CALL
+SSR$RUE
+      1848**DCL-ENT  1948--CALL
+USER_NBR
+PL6.E3A0      #001=FTR$KEYIN File=FTR$KEYIN.:E05TSI                              TUE 07/29/97 18:01 Page:27   
+      1872**DCL      1946<>CALL     1947>>ASSIGN
+USER_NBR_BYTE
+      1873**DCL      1947<<ASSIGN   1948<>CALL

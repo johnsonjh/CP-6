@@ -1,0 +1,601 @@
+/*M* ASP - processor to "authorize special privileges" */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+ 
+ASP:    PROC MAIN;
+ 
+ 
+/*                          ASP
+       This is the technical documentation for ASP (Authorization
+       of Special Privileges).
+ 
+       All input is read through M$SI, and all output is through
+       M$LO.  After the password is verified, XUR$GETCMD is used
+       to parse the list of privileges.  And, possibly the processor
+       name is read in.  Exit control is turned on, and the specified
+       privileges are turned on.  Then, after any kind of exit, the
+       routine MYEXIT turns off the privileges, updates the tracker
+       file, then finally turns off exit control, and exits.
+ 
+       NOTE:  The tracker file name is in VLPs in the routine MYEXIT.
+              The tracker file is an EDIT keyed file.  If it doesn't
+              exist, then ASP will create it.  The first record in
+              the file must be a dummy record.  If ASP creates it,
+              then it will write a blank record as the first record.
+              The list of restricted processors is in this routine
+              in the array RESTRICTED_PROC_TABLE.
+ 
+ 
+                          ASP Data
+ 
+       READSI - is used to read in commands.
+       READ_HLP - is used to read :HLP.:SYS in order to verify the
+          user's password.  The record is read though M$HLP.
+       FPT_XCON - is used to set exit control to the routine MYEXIT.
+       FPT_PRIV - is used to turn on the JIT privilege in order to
+          modify the user's privileges in the JIT.
+       PRIV_FMR - is used to turn on FMR privilege in order to read
+          :HLP.:SYS.
+       PASSWORD, PRIVILEGE, PROCESSOR - These are the text for the
+          various questions that are asked of the user.
+       PRIV_TABLE - This is a table of the various privileges that the
+          user may get.
+       PPRIV_TABLE - This is a table of the various processor privileges
+          that the user may get.
+       PROCESSOR_TABLE - This is a table parallel to PPRIV_TABLE.  If
+          the user specifies a PPRIV, this table tells which processor
+          to link to.
+       RESTRICTED_PROC_TABLE - This is the table of the restricted
+          processors that the user may NOT specify.
+                                                                              */
+       %EJECT;
+       %INCLUDE CP_6;
+       %INCLUDE B$JIT;
+       %INCLUDE XU_MACRO_C;
+       %INCLUDE KL_SUPER_C;
+       %INCLUDE ASP_C1;
+/* */
+       %FPT_PROMPT(FPTN=FPT_PROMPT);
+       %FPT_READ(FPTN=READSI,BUF=BUFFER,DCB=M$SI);
+       %FPT_READ(FPTN=READ_HLP,BUF=KL_DREC,DCB=M$HLP,KEY=KEY_HLP,
+          KEYS=YES);
+       %FPT_OPEN(FPTN=OPEN_HLP,ACCT=SYS,SHARE=ALL,NAME=HLP,ASN=FILE,
+          DCB=M$HLP);
+       %FPT_CLOSE(FPTN=CLOSE_HLP,DCB=M$HLP);
+       %FPT_XCON(FPTN=FPT_XCON,UENTRY=MYEXIT);
+       %FPT_TIME(FPTN=FPT_TIME,DATE=DATE,TIME=TIME,DEST=EXT);
+       %FPT_LINK(FPTN=FPT_LINK, CP_CMD=LINK_CMD, TEXTC=YES);
+       %FPT_ERRMSG(FPTN=FPT_ERRMSG,CODE=CODE,OUTDCB1=M$LO,
+          BUF=ERRBUF);
+       %FPT_PRIV(FPTN=FPT_PRIV,PRIV=%PR_JIT#,STCLASS=STATIC SYMDEF);
+       %FPT_PRIV(FPTN=PRIV_FMR,PRIV=%PR_FMREAD#,STCLASS=STATIC SYMDEF);
+       %FPT_XCON(FPTN=FPT_XCON2,UENTRY=MYEXIT2);
+       %FPT_XCON(FPTN=NO_XCON);
+       %FPT_TRMCTL(FPTN=DO_ECHO,DCB=M$UC,TRMCTL=ECHO_ON);
+       %FPT_TRMCTL(FPTN=DONT_ECHO,DCB=M$UC,TRMCTL=ECHO_OFF);
+/* */
+       %F$DCB;
+       %VLP_NAME(FPTN=HLP,NAME=':HLP');
+       %VLP_ACCT(FPTN=SYS, ACCT=':SYS');
+       %VLP_NAME(FPTN=ERRMSG,NAME=':ERRMSG');
+       %KL_DREC (LAST=",");
+       %KL_FEBLK (LVL=2,STCLASS=STATIC,RCNT=31);
+       %XUR_INIT;
+       %P$PCB(NAME=P$PCB,STCLASS="BASED(PCB$)");
+       %PARSE$OUT(NAME=OUT,STCLASS=BASED);
+       %VLP_TRMCTL(FPTN=ECHO_ON,DISPINPUT=YES);
+       %VLP_TRMCTL(FPTN=ECHO_OFF,DISPINPUT=NO);
+       %B$TCB;
+       %B$ALT;
+/* */
+       DCL M$SI DCB;
+       DCL M$LO DCB;
+       DCL M$HLP DCB;
+/* */
+       DCL ASZ$SCRAMBLE ENTRY(1);
+       DCL MYEXIT ENTRY ASYNC;
+       DCL MYEXIT2 ENTRY ASYNC;
+       DCL XUR$INIT ENTRY(3) ALTRET;
+       DCL XUR$GETCMD ENTRY(6) ALTRET;
+/* */
+       DCL B$JIT$ PTR SYMREF;
+       DCL B$TCB$ PTR SYMREF;
+       DCL M$SI$ PTR;
+       DCL OUT$ PTR;
+       DCL PCB$ PTR;
+/* */
+       DCL PASSWORD CHAR(9) CONSTANT INIT('Password?');
+       DCL PRIVILEGE CHAR(30) CONSTANT INIT(
+                 'What Privilege[s] do you need?');
+       DCL PROCESSOR CHAR(15) CONSTANT INIT('What Processor?');
+       DCL WHY CHAR(17) CONSTANT INIT('For what purpose?');
+       DCL PRIV_TABLE(0:22) BIT(36) STATIC INIT(
+                 %PR_SPCLMM#,
+                 %PR_EXMM#,
+                 %PR_MAXMEM#,
+                 %PR_MSYS#,
+                 %PR_JIT#,
+                 %PR_TND#,
+                 %PR_PM#,
+                 %PR_EXPM#,
+                 %PR_IOQ#,
+                 %PR_IOQW#,
+                 %PR_CFEP#,
+                 %PR_MFEP#,
+                 %PR_SYSLOG#,
+                 %PR_ASAVE#,
+                 %PR_SYSCON#,
+                 %PR_DISPJOB#,
+                 %PR_FMEFT#,
+                 %PR_FMBLK#,
+                 %PR_FMSEC#,
+                 %PR_FMDIAG#,
+                 %PR_FMREAD#,
+                 %PR_GPP#);
+       DCL PPRIV_TABLE(0:14) BIT(36) CONSTANT INIT(
+                 %PPR_CNTRLD#,
+                 %PPR_CNTRLC#,
+                 %PPR_EFT#,
+                 %PPR_EL#,
+                 %PPR_LABEL#,
+                 %PPR_PIGD#,
+                 %PPR_PIGC#,
+                 %PPR_SPIDERD#,
+                 %PPR_SPIDERC#,
+                 %PPR_NETCON#,
+                 %PPR_VOLINIT#,
+                 %PPR_REPLAY#,
+                 %PPR_RATES#,
+                 '0'B,
+                 %PPR_SYSCON#);
+       DCL 1 PROCESSOR_TABLE(0:14) CONSTANT,
+            2 SIZE UBIN(9) UNAL INIT(
+                    7, 7, 3, 4, 5, 3, 3, 6, 6, 6, 7, 6, 5, 1, 6),
+            2 TEXT CHAR(30) UNAL INIT(
+                    'CONTROL',
+                    'CONTROL',
+                    'EFT',
+                    'ELAN',
+                    'LABEL',
+                    'PIG',
+                    'PIG',
+                    'SPIDER',
+                    'SPIDER',
+                    'NETCON',
+                    'VOLINIT',
+                    'REPLAY',
+                    'RATES',
+                    ' ',
+                    'SYSCON');
+/* */
+       DCL BUFFER CHAR(256) STATIC;
+       DCL ERRBUF CHAR(256) STATIC;
+       DCL CODE BIT(36) STATIC;
+       DCL BLK$ PTR;
+       DCL PASS CHAR(8);
+       DCL PRIVS BIT(36) STATIC;
+       DCL PPRIVS BIT(36) STATIC;
+       DCL PRIV_LIST SBIN SYMREF;
+       DCL ERR SBIN;
+       DCL PRIV BIT(36);
+       DCL I SBIN;
+       DCL J SBIN;
+       DCL 1 KEY_HLP STATIC,
+             2 SIZE UBIN(9) UNAL,
+             2 TEXT CHAR(20) UNAL;
+       DCL SIZE SBIN;
+       DCL OUTREC CHAR(332) STATIC SYMDEF;
+       DCL DATE CHAR(10) STATIC;
+       DCL TIME CHAR(11) STATIC;
+       DCL 1 LINK_CMD STATIC,
+            2 SIZE UBIN(9) CALIGNED INIT(0),
+            2 TEXT CHAR(255) INIT(' ');
+/* */
+       DCL BLOCK CHAR(256) BASED;
+/* */
+       DCL SAVE_JOB BIT(36) STATIC SYMDEF;
+       DCL SAVE_PPRIV BIT(36) STATIC SYMDEF;
+/* */
+/*           LIST OF RESTRICTED PROCESSORS            */
+/* */
+       %EQU NUM_RESTRICTED_PROC=0;      /* ZERO BASED NUMBERING               */
+       DCL RESTRICTED_PROC_TABLE(0:%NUM_RESTRICTED_PROC) CHAR(30)
+          CONSTANT INIT(
+          'SUPER');
+       %EJECT;
+/*                      CODE
+ 
+       1).  Turn off echo, and read in the user's password.
+       2).  Insert the password, left justified, and blank filled
+            into PASS.  Then scramble the password.
+       3).  Get the user's account and user name.  Create a key from
+            these.  Find the size of the key, and set the key size.
+       4).  Turn on exit control, and FMR privilege, so we can read
+            :HLP.:SYS.
+       5).  Open the file, read the record we need, and then close
+            the file, turn off FMR and exit control.
+       6).  Now compare the password.  If it doesn't match, then
+            write out a message, and exit.
+       7).  Initialize for parsing, and set the prompt for the next
+            question.
+       8).  Set the processor name to blanks, and the privileges to
+            0.
+       9).  Keep looping until we have successfully parsed a list of
+            privileges.
+            A).  Get a list of privileges.  If we get a normal return
+                 then the parse was successful.
+            B).  Loop through the list for the number of items that
+                 we have.
+            C).  If we have more than one item, then we have to get
+                 our pointer from the correct sublock.  Otherwise,
+                 the pointer will be the top pointer.
+            D).  If we got a privilege, then get the right bit out
+                 of the privilege table, and "or" it into the privilege
+                 word.
+            E).  If we got a PPRIV, then check the processor name.
+                 If we already have one then report an error.  It only
+                 makes sense to specify one PPRIV.  Otherwise, get the
+                 bit for the PPRIV out of the PPRIV table, and get the
+                 corresponding processor name out of a parallel table.
+            F).  If we got a parse error, then get the high character
+                 out of the Parse Control Block (plus 30 to get past
+                 the prompt) put out a pointer to the error.  Then
+                 give the user an elaborate and detailed description
+                 of exactly what went wrong with the parse.
+       10). If we havn't already gotten a processor name because of
+            a PPRIV being specified, then get it now.
+            A).  Set the prompt for the next question.
+            B).  Keep looping until we get a good processor name.
+                 I).  Read in the processor name.
+                 II). Loop through a restricted processor table.  If
+                      the processor that the user specified is in the
+                      table, then report an error and try again.
+       11). Get the reason the person wants to use ASP.  The reason
+            must contain at least 5 non-blank characters.
+       12). Get the time stamp, and put all of the necessary information
+            in the tracker record.  (account name, user name, date
+            and time, processor, and privilege list)
+       13). Turn on exit control, and the JIT privilege.  Save the
+            user's current privileges, and set those that he requested.
+       14). Link to the processor that the user requested.
+       15). When we get back, exit.
+                                                                              */
+       %EJECT;
+       M$SI$=DCBADDR(DCBNUM(M$SI));
+       FPT_PROMPT.PROMPT_=VECTOR(PASSWORD);
+       CALL M$PROMPT(FPT_PROMPT) ALTRET(CROAK);
+       CALL M$STRMCTL(DONT_ECHO) ALTRET(CROAK);
+       CALL M$READ(READSI) ALTRET(CROAK);
+       CALL M$STRMCTL(DO_ECHO) ALTRET(CROAK);
+/* */
+       SIZE=M$SI$->F$DCB.ARS#;
+       CALL INSERT(PASS,0,8,SUBSTR(BUFFER,0,SIZE));
+       CALL ASZ$SCRAMBLE(PASS);
+       CALL INSERT(KEY_HLP.TEXT,0,20,B$JIT$->B$JIT.ACCN,
+          B$JIT$->B$JIT.UNAME);
+       I=19;
+       DO WHILE(SUBSTR(KEY_HLP.TEXT,I,1) = ' ');
+          I=I-1;
+       END;  /* WHILE */
+       READ_HLP.KEY_.BOUND=I+1;
+       KEY_HLP.SIZE=I+1;
+       CALL M$XCON(FPT_XCON2) ALTRET(CROAK);
+       CALL M$SPRIV(PRIV_FMR) ALTRET(CROAK);
+/* */
+       CALL M$OPEN(OPEN_HLP) ALTRET(CROAK);
+       CALL M$READ(READ_HLP) ALTRET(CROAK);
+       CALL M$CLOSE(CLOSE_HLP) ALTRET(CROAK);
+       CALL M$RPRIV(PRIV_FMR) ALTRET(CROAK);
+       CALL M$XCON(NO_XCON) ALTRET(CROAK);
+/* */
+       IF KL_DREC.PASSWORD ~= PASS THEN
+          DO;   /* BAD PASSWORD */
+          CALL WRITE('Bad password',12);
+          CALL M$EXIT;
+          END;  /* BAD PASSWORD */
+/* */
+       CALL XUR$INIT(XUR_INIT,PCB$);
+/* */
+       FPT_PROMPT.PROMPT_=VECTOR(PRIVILEGE);
+       CALL M$PROMPT(FPT_PROMPT) ALTRET(CROAK);
+/* */
+       LINK_CMD.TEXT=' ';
+       PRIVS='0'B;
+       PPRIVS='0'B;
+       DO UNTIL (ERR = 0);
+REPARSE:  ERR=0;
+          CALL XUR$GETCMD(PRIV_LIST,BLK$) ALTRET(PARSERR);
+          DO I=0 TO BLK$->OUT.NSUBLKS-1;
+             IF BLK$->OUT.NSUBLKS > 1 THEN
+                OUT$=BLK$->OUT.SUBLK$(I);
+             ELSE
+                OUT$=BLK$;
+             IF OUT$->OUT.CODE = %PRIV THEN
+                DO;   /* PRIVS */
+                PRIV=PRIV_TABLE(OUT$->OUT.SUBLK$(0)->OUT.CODE);
+                PRIVS=PRIVS|PRIV;
+                END;  /* PRIVS */
+             ELSE
+                DO;   /* PPRIVS */
+                IF LINK_CMD.TEXT ~= ' ' THEN
+                   DO;   /* ERROR */
+                   CALL WRITE('You may only specify one PPRIV.',31);
+                   ERR=1;
+                   GOTO REPARSE;
+                   END;  /* ERROR */
+                J=OUT$->OUT.SUBLK$(0)->OUT.CODE;
+                PPRIVS=PPRIV_TABLE(J);
+                LINK_CMD.TEXT=PROCESSOR_TABLE.TEXT(J);
+                LINK_CMD.SIZE=PROCESSOR_TABLE.SIZE(J);
+                END;  /* PPRIVS */
+          END;  /* DO I */
+/* */
+          DO WHILE ('0'B);
+PARSERR:     BUFFER=' ';
+             J=PCB$->P$PCB.HI_CHAR+30;
+             CALL INSERT(BUFFER,J,1,'^');
+             CALL WRITE(BUFFER,J+1);
+             CALL WRITE('Syntax error',12);
+             ERR=1;
+          END;  /* WHILE */
+          END;  /* WHILE */
+/* */
+       IF LINK_CMD.TEXT = ' ' THEN
+          DO;   /* GET PROCESSOR */
+          FPT_PROMPT.PROMPT_=VECTOR(PROCESSOR);
+          CALL M$PROMPT(FPT_PROMPT) ALTRET(CROAK);
+          DO UNTIL (ERR = 0);
+             ERR=0;
+             BUFFER=' ';
+             CALL M$READ(READSI) ALTRET(CROAK);
+             LINK_CMD.TEXT=BUFFER;
+             LINK_CMD.SIZE=M$SI$->F$DCB.ARS#;
+             DO I=0 TO %NUM_RESTRICTED_PROC;
+                IF LINK_CMD.TEXT = RESTRICTED_PROC_TABLE(I) THEN
+                   DO;   /* CANT GET THERE FROM HERE */
+                   CALL WRITE('You are not allowed to access that processor.'
+                      ,45);
+                   ERR=1;
+                   END;  /* CANT GET THERE FROM HERE */
+             END;  /* DO I */
+          END;  /* DO UNTIL */
+          END;  /* GET PROCESSOR */
+/* */
+      FPT_PROMPT.PROMPT_=VECTOR(WHY);
+      CALL M$PROMPT(FPT_PROMPT) ALTRET(CROAK);
+      I=0;
+/* */
+      DO WHILE (I = 0);
+         BUFFER=' ';
+         CALL M$READ(READSI) ALTRET(CROAK);
+         DO J=0 TO 255;
+            IF SUBSTR(BUFFER,J,1) ~= ' ' THEN
+               I=I+1;
+         END;  /* DO J */
+         IF I < 5 THEN
+            DO;   /* ANSWER NOT GOOD ENOUGH */
+            CALL WRITE('Please give a longer answer.',28);
+            I=0;
+            END;  /* ANSWER NOT GOOD ENOUGH */
+       END;  /* WHILE */
+       I=M$SI$->F$DCB.ARS#;
+/* */
+       CALL M$TIME(FPT_TIME) ALTRET(CROAK);
+       CALL INSERT(OUTREC,0,33,B$JIT$->B$JIT.ACCN,',',
+          B$JIT$->B$JIT.UNAME,' ',DATE,' ');
+       I=14+LINK_CMD.SIZE+P$PCB.NCHARS;
+       CALL INSERT(OUTREC,33,I,TIME,' ',
+          SUBSTR(LINK_CMD.TEXT,0,LINK_CMD.SIZE),' ',
+          SUBSTR(P$PCB.TEXT$->BLOCK,0,P$PCB.NCHARS),' ');
+       I=33+I;
+       CALL INSERT(OUTREC,I,332-I,
+          SUBSTR(BUFFER,0,M$SI$->F$DCB.ARS#));
+/* */
+       DO INHIBIT;
+          CALL M$XCON(FPT_XCON) ALTRET(CROAK);
+          CALL M$SPRIV(FPT_PRIV) ALTRET(CROAK);
+          SAVE_JOB=B$JIT$->B$JIT.PRIV.JOB;
+          SAVE_PPRIV=B$JIT$->B$JIT.PPRIV;
+          B$JIT$->B$JIT.PRIV.JOB=SAVE_JOB|PRIVS;
+          B$JIT$->B$JIT.PPRIV=SAVE_PPRIV|PPRIVS;
+       END;  /* INHIBIT */
+/* */
+       CALL INSERT(LINK_CMD.TEXT, LINK_CMD.SIZE, LINK_CMD.SIZE+5,
+          '.:SYS');
+       LINK_CMD.SIZE=LINK_CMD.SIZE+5;
+       CALL M$LINK(FPT_LINK) ALTRET(ERR);
+/* */
+       CALL M$EXIT;
+/* */
+ERR:   CODE=B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+       CALL M$ERRMSG(FPT_ERRMSG);
+       CALL M$EXIT;
+/* */
+CROAK: CALL M$MERC;
+       CALL M$EXIT;
+       %EJECT;
+/*               WRITE
+ 
+       This routine is a general output routine.  It takes specified
+       text of a specified size and writes it out through M$LO.
+                                                                              */
+       %EJECT;
+WRITE: PROC(TEXT,SIZE);
+       %FPT_WRITE(FPTN=WRITELO,DCB=M$LO,BUF=BUF);
+       DCL BUF CHAR(132) STATIC;
+       DCL SIZE SBIN;
+       DCL TEXT CHAR(SIZE);
+/* */
+       BUF=TEXT;
+       WRITELO.BUF_.BOUND=SIZE-1;
+       CALL M$WRITE(WRITELO) ALTRET(CROAK);
+       RETURN;
+/* */
+CROAK: CALL M$MERC;
+       CALL M$EXIT;
+       END WRITE;
+       END ASP;
+       %EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*                      MYEXIT
+ 
+       After the user has gotten his privileges, this is the routine
+       that we go to after any kind of exit.  It insures that the
+       privileges will be turned off, and the tracker file will be
+       updated.
+ 
+       The only new data of any importance are the VLPs SUPPORT and
+       TRACKER which contain the account and name of the tracker
+       file for ASP.
+ 
+       A).  If we have already been through this routine before, then
+            do a trap return to return to were ever we were.
+       B).  Turn on the flag that says that we have been here before.
+            And restore the privilege flags to whatever they were
+            before.
+       C).  Remove the JIT privilege.
+       D).  Get the size of the output record.
+       E).  Open and enqueue the tracker file.  Find out the number of
+            the last edit key in the tracker file.
+       F).  Increment the key, then write out the tracker record as
+            the last record in the file.
+       G).  Dequeue and close the file.
+       H).  Turn off exit control, and exit for the final time.
+       I).  If the file doesn't exist, then give ourselves FMSEC
+            privilege, create the file, and write out the first
+            record, which will just be a blank.  Then go back and
+            try again.
+                                                                              */
+       %EJECT;
+MYEXIT: PROC ASYNC;
+       %INCLUDE CP_6;
+       %INCLUDE B$JIT;
+       %INCLUDE B_ERRORS_C;
+/* */
+       %FPT_XCON(FPTN=FPT_XCON);
+       %FPT_OPEN(FPTN=OPEN_TRKR,ACCT=SUPPORT,DCB=M$TRKR,
+          NAME=TRACKER,FUN=UPDATE,SHARE=ALL,ASN=FILE);
+       %FPT_CLOSE(FPTN=CLOSE_TRKR,DCB=M$TRKR,DISP=SAVE);
+       %FPT_WRITE(FPTN=WRITE_TRKR,BUF=OUTREC,DCB=M$TRKR,
+          KEY=KEYBUF);
+       %FPT_PFIL(FPTN=FPT_PFIL,DCB=M$TRKR);
+       %FPT_PRECORD(FPTN=FPT_PRECORD,KEYS=NO,KEYR=YES,KEY=KEYBUF,
+          N=-1,DCB=M$TRKR);
+       %FPT_ENQ(FPTN=FPT_ENQ,DCB=M$TRKR,RNAME=ASP,SHARE=NONE,
+          WAIT=YES,WAIT_TIME=-1);
+       %FPT_DEQ(FPTN=FPT_DEQ,DCB=M$TRKR,RNAME=ASP);
+       %FPT_PRIV(FPTN=FPT_PRIV,STCLASS=SYMREF);
+       %FPT_PRIV(FPTN=PRIV_FMS,PRIV=%PR_FMSEC#);
+       %FPT_OPEN(FPTN=OPEN_CREATE,ACCT=SUPPORT,DCB=M$TRKR,
+          NAME=TRACKER,FUN=CREATE,ASN=FILE,ORG=KEYED);
+       %FPT_WRITE(FPTN=FIRST_WRITE,BUF=BLANKS,DCB=M$TRKR,
+          KEY=FIRST_KEY);
+/* */
+       %VLP_ACCT(FPTN=SUPPORT,ACCT='SUPPORT');
+       %VLP_NAME(FPTN=TRACKER,NAME=':ASP_TRACKER');
+       %VLP_NAME(FPTN=ASP,NAME='ASP');
+       %B$TCB;
+       %B$ALT;
+/* */
+       DCL M$TRKR DCB;
+/* */
+       DCL BLANKS CHAR(1) CONSTANT INIT(' ');
+       DCL 1 FIRST_KEY CONSTANT,
+            2 SIZE UBIN(9) UNAL INIT(3),
+            2 KEY UBIN(27) UNAL INIT(1000);
+       DCL OUTREC CHAR(332) SYMREF;
+       DCL DUMMY CHAR(332) STATIC;
+       DCL BEEN_HERE SBIN STATIC INIT(0);
+       DCL SAVE_JOB BIT(36) SYMREF;
+       DCL KEYBUF SBIN STATIC;
+       DCL SAVE_PPRIV BIT(36) SYMREF;
+       DCL B$JIT$ PTR SYMREF;
+       DCL B$TCB$ PTR SYMREF;
+       DCL I SBIN;
+/* */
+       IF BEEN_HERE = 1 THEN
+          CALL M$TRTN;
+/* */
+       DO INHIBIT;
+          BEEN_HERE=1;
+          B$JIT$->B$JIT.PRIV.JOB=SAVE_JOB;
+          B$JIT$->B$JIT.PPRIV=SAVE_PPRIV;
+       END;  /* INHIBIT */
+/* */
+       CALL M$RPRIV(FPT_PRIV) ALTRET(CROAK);
+/* */
+       I=331;
+       DO WHILE (SUBSTR(OUTREC,I,1) = ' ');
+          I=I-1;
+       END;  /* WHILE */
+       WRITE_TRKR.BUF_.BOUND=I;
+OPN_AGN: CALL M$OPEN(OPEN_TRKR) ALTRET(CREATE);
+       CALL M$ENQ(FPT_ENQ) ALTRET(CROAK);
+       CALL M$PFIL(FPT_PFIL) ALTRET(CROAK);
+       CALL M$PRECORD(FPT_PRECORD) ALTRET(CROAK);
+       KEYBUF=KEYBUF+1000;
+       CALL M$WRITE(WRITE_TRKR) ALTRET(CROAK);
+       CALL M$DEQ(FPT_DEQ) ALTRET(CROAK);
+       CALL M$CLOSE(CLOSE_TRKR) ALTRET(CROAK);
+/* */
+       CALL M$XCON(FPT_XCON);
+       CALL M$EXIT;
+/* */
+CROAK: CALL M$MERC;
+       CALL M$XCON(FPT_XCON);
+       CALL M$EXIT;
+CREATE: IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE = %E$NOFILE THEN
+          DO;   /* CREATE THE FILE */
+          CALL M$SPRIV(PRIV_FMS) ALTRET(CROAK);
+          CALL M$OPEN(OPEN_CREATE) ALTRET(CROAK);
+          CALL M$WRITE(FIRST_WRITE) ALTRET(CROAK);
+          CALL M$CLOSE(CLOSE_TRKR) ALTRET(CROAK);
+          CALL M$RPRIV(PRIV_FMS) ALTRET(CROAK);
+          GOTO OPN_AGN;
+          END;  /* CREATE THE FILE */
+       ELSE
+          GOTO CROAK;
+       END MYEXIT;
+       %EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*                          MYEXIT2
+ 
+       This routine is used to temporarily maintain exit control
+       while we have turned on FMR privilege to read :HLP.:SYS.
+       All we do is check to see if we have been here before, and
+       if we haven't turn off FMR privilege, and exit.
+                                                                              */
+       %EJECT;
+MYEXIT2:  PROC ASYNC;
+       %INCLUDE CP_6;
+/* */
+       %FPT_XCON(FPTN=NO_XCON);
+       %FPT_PRIV(FPTN=PRIV_FMR,STCLASS=SYMREF);
+/* */
+       DCL BEEN_HERE SBIN STATIC INIT(0);
+/* */
+       IF BEEN_HERE = 1 THEN
+          CALL M$TRTN;
+/* */
+       BEEN_HERE=1;
+       CALL M$RPRIV(PRIV_FMR) ALTRET(CROAK);
+       CALL M$XCON(NO_XCON) ALTRET(CROAK);
+       CALL M$EXIT;
+/* */
+CROAK: CALL M$MERC;
+       CALL M$XCON(NO_XCON);
+       CALL M$EXIT;
+       END MYEXIT2;

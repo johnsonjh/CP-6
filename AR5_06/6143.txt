@@ -1,0 +1,461 @@
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+SWANHND: PROC MAIN ;
+ 
+/* EQUates */
+ 
+%EQU TRUE = '1'B ;
+%EQU FALSE = '0'B ;
+%EQU NPOSSCHNS = 10 ;
+ 
+/* INCLUDE Files */
+ 
+%INCLUDE LCP_6 ;
+%INCLUDE GH_HARDWARE_M ;
+%INCLUDE GH_IOFNC_E ;
+ 
+/* Entries */
+ 
+DCL GHH$IO ENTRY (1) ALTRET ;
+DCL GHH$IO_IN ENTRY (1) ALTRET ;
+DCL GHH$IOLD ENTRY (1) ALTRET ;
+DCL GHH$RSC ENTRY ;
+DCL GHH$WAITIO ENTRY ALTRET ;
+ 
+/* FPTs */
+ 
+%FPT_OPEN ( FPTN = OPEN_COMPATH, DCB = M$HOST, RES = 'HO' ) ;
+%FPT_READ ( FPTN = RD_HOST, DCB = M$HOST, BUF = CHN, WAIT = YES ) ;
+%FPT_WRITE ( FPTN = WR_HOST, DCB = M$HOST, BUF = OBUF, RRR = YES ) ;
+%FPT_GDS ( FPTN = GET_IO, NEXT = BIG, IOBUF = YES, PAGES = 64, FREE = YES,
+           RESULTS = VLP_SEGMENT ) ;
+%FPT_FDS ( FPTN = REL_IO, PAGES = 64, RESULTS = VLP_SEGMENT ) ;
+%FPT_SPRIV ( AUTH = YES, PRIV = PRIVS ) ;
+%FPT_WAIT ( FPTN = WAIT3, UNITS = SEC3 ) ;
+ 
+/* VLPs */
+ 
+%VLP_PRIV ( FPTN = PRIVS, MSYS = ON ) ;
+%VLP_SEGMENT ;
+ 
+/* DCBs */
+ 
+DCL M$HOST DCB ;
+ 
+/* I/O Structures */
+ 
+%GH_IO ( FPTN = INP_DVCID, FNC = %GH#IO_INPDVCID ) ;
+ 
+/* Load Firmware I/O Structures */
+ 
+%GH_IO ( FPTN = INIT_SWAN, FNC = %GH#IO_OTPCTR, LCTDAT = "%BITBIN('80'X)" ) ;
+%GH_IO ( FPTN = OTP_TSKWD, FNC = %GH#IO_OTPTSK, LCTDAT = "%BITBIN('80'X)" ) ;
+%GH_IO ( FPTN = INP_STS1, FNC = %GH#IO_INPSTT1 ) ;
+%GH_IO ( FPTN = INP_STS2, FNC = %GH#IO_INPSTT2 ) ;
+%GH_IOLD ( FPTN = LOAD_FW, FNC = %GH#IO_IOLD, BUFSIZE = 32768 ) ;
+ 
+/* Dump SILO I/O Structures */
+ 
+%GH_IO ( FPTN = OTP_LAFMODE, FNC = %GH#IO_OTPTSK, LCTDAT = "%BITBIN('20'X)",
+                          LCTADR = "%BITBIN('09'X)" ) ;
+%GH_IO ( FPTN = OTP_BCKUP, FNC = %GH#IO_OTPTSK, LCTDAT = "%BITBIN('20'X)" ) ;
+%GH_IO ( FPTN = OTP_PRNT, FNC = %GH#IO_OTPTSK, LCTDAT = "%BITBIN('20'X)",
+                          LCTADR = "%BITBIN('06'X)" ) ;
+%GH_IO ( FPTN = INP_RNG, FNC = %GH#IO_INPRNG ) ;
+%GH_IOLD ( FPTN = GET_PRNTLN, FNC = %GH#IO_IOLD, BUFSIZE = 256 ) ;
+ 
+/* Constants */
+ 
+DCL SEC3 UBIN CONSTANT INIT ( 3 ) ;
+DCL CHN(0:9) BIT(16) CONSTANT INIT (
+        '0080'X, '00C0'X, '0140'X, '0180'X, '01C0'X,
+        '0240'X, '0280'X, '02C0'X, '0340'X, '0380'X ) ;
+DCL 1 CHN_(0:9) REDEF CHN ,
+      2 CHN UBIN(10) UNAL ,
+      2 * BIT(6) UNAL ;
+ 
+/* Static Variables */
+ 
+DCL ASCHEX CHAR(4) STATIC ALIGNED ;
+DCL ASCHEX_(0:3) REDEF ASCHEX CHAR(1) ;
+DCL ARS SBIN STATIC ;
+ 
+/* I/O Buffers */
+ 
+DCL CMDBUF CHAR(80) STATIC CALIGNED ;
+DCL OBUF CHAR(80) STATIC ALIGNED ;
+DCL FBUF CHAR(256) STATIC ALIGNED ;
+ 
+/* Pointers */
+ 
+DCL M$HOST$ PTR ;
+DCL FW$ CPTR ;
+DCL DMP$ PTR STATIC SYMDEF ;
+DCL WRT$ PTR ;
+DCL TPTR$ PTR ;
+ 
+/* Based Structures */
+ 
+%M$DCB ( STCLASS = BASED, DCBN = F$DCB ) ;
+DCL IOBUF CHAR(256) BASED ( FW$ ) ;
+DCL 1 DMPBUF BASED ( DMP$ ) ALIGNED ,
+      2 CTL ALIGNED ,
+        3 SILOEMPTY BIT(1) UNAL ,
+        3 PRNTDONE BIT(1) UNAL ,
+        3 * BIT(14) UNAL ,
+      2 TXT CHAR(510) ALIGNED ;
+DCL 1 WRBUF BASED ( WRT$ ) ALIGNED ,
+      2 CTL ALIGNED ,
+        3 SILOEMPTY BIT(1) UNAL ,
+        3 PRNTDONE BIT(1) UNAL ,
+        3 * BIT(14) UNAL ,
+      2 TXT CHAR(510) ALIGNED ;
+DCL WRBUF_ CHAR(512) BASED ( WRT$ ) ALIGNED ;
+ 
+/* AUTO Variables */
+ 
+DCL I UBIN ;
+DCL EXITFLG BIT(1) UNAL ;
+ 
+/* SWANHND MainLine Code */
+ 
+        M$HOST$ = DCBADDR ( DCBNUM ( M$HOST ) ) ;
+ 
+/* Open a comm path to the HOST program */
+ 
+        CALL M$OPEN ( OPEN_COMPATH ) WHENALTRETURN DO ;
+           CALL M$EXIT ;
+           END ;
+ 
+/* Get to RING 1 */
+ 
+        CALL GETRING1 WHENALTRETURN DO ;
+           CALL M$EXIT ;
+           END ;
+ 
+/* Get the SWAN's channel # */
+ 
+        CALL CHKDVCID WHENALTRETURN DO ;
+           CALL M$EXIT ;
+           END ;
+ 
+/* Get the commands from the HOST */
+ 
+        EXITFLG = %FALSE ;
+        DO WHILE EXITFLG = %FALSE ;
+           RD_HOST.BUF_ = VECTOR ( CMDBUF ) ;
+           CALL M$READ ( RD_HOST ) WHENALTRETURN DO ;
+              CALL M$EXIT ;
+              END ;
+           DO SELECT ( SUBSTR ( CMDBUF, 0, 1 ) ) ;
+              SELECT ( 'L' ) ;    /* LOAD SWAN FIRMWARE */
+                 CALL LOADFW ;
+              SELECT ( 'C' ) ;    /* DISABLE CACHE */
+                 CALL DSBCACHE ;
+              SELECT ( 'D' ) ;    /* DUMP SWAN */
+                 CALL DUMPSWAN ;
+              SELECT ( 'Q' ) ;    /* QUIT */
+                 EXITFLG = %TRUE ;
+              SELECT ( ELSE ) ;
+                 OBUF = '1Command Error.' ;
+                 CALL SNDMSG ;
+              END ;
+           END ;
+ 
+        RETURN ;
+ 
+/* END SWANHND */
+ 
+GETRING1: PROC ALTRET ;
+ 
+/* GETRING1 Code */
+ 
+        CALL M$SPRIV ( FPT_SPRIV ) WHENALTRETURN DO ;
+           OBUF = '2Couldn''t get MSYS priv.' ;
+SNDERR:
+           CALL SNDMSG ;
+           ALTRETURN ;
+           END ;
+        CALL M$SYS WHENALTRETURN DO ;
+           OBUF = '2M$SYS ALTRETURNed.' ;
+           GOTO SNDERR ;
+           END ;
+ 
+        OBUF = '0FPRG now in RING 1.' ;
+        CALL SNDMSG ;
+ 
+        RETURN ;
+ 
+END GETRING1 ;
+ 
+CHKDVCID: PROC ALTRET ;
+ 
+/* CHKDVCID Code */
+ 
+        I = 0 ;
+        DO WHILE I <= %NPOSSCHNS ;
+           INP_DVCID.CAS.CHN = CHN_.CHN(I) ;
+           CALL GHH$IO_IN ( INP_DVCID ) WHENRETURN DO ;
+              IF INP_DVCID.STATUS = '2810'X THEN DO ;
+                 INIT_SWAN.CAS.CHN = INP_DVCID.CAS.CHN ;
+                 LOAD_FW.CHN = INP_DVCID.CAS.CHN ;
+                 OTP_TSKWD.CAS.CHN = INP_DVCID.CAS.CHN ;
+                 INP_STS1.CAS.CHN = INP_DVCID.CAS.CHN ;
+                 INP_STS2.CAS.CHN = INP_DVCID.CAS.CHN ;
+                 OTP_LAFMODE.CAS.CHN = INP_DVCID.CAS.CHN ;
+                 OTP_BCKUP.CAS.CHN = INP_DVCID.CAS.CHN ;
+                 OTP_PRNT.CAS.CHN = INP_DVCID.CAS.CHN ;
+                 INP_RNG.CAS.CHN = INP_DVCID.CAS.CHN ;
+                 GET_PRNTLN.CHN = INP_DVCID.CAS.CHN ;
+                 OBUF = '0SWAN Located.' ;
+                 CALL SNDMSG ;
+                 RETURN ;
+                 END ;
+              END ;
+           I = I + 1 ;
+           END ;
+ 
+        OBUF = '1No SWAN was found in this FEP.' ;
+        CALL SNDMSG ;
+ 
+        ALTRETURN ;
+ 
+END CHKDVCID ;
+ 
+LOADFW: PROC ;
+ 
+/* AUTO Variables */
+ 
+DCL EOF BIT(1) UNAL ;
+DCL FSIZE UBIN ;
+ 
+ 
+/* LOADFW Code */
+ 
+        VLP_SEGMENT.BASE$ = ADDR ( NIL ) ;
+        GET_IO.V.PAGES = 64 ;
+        CALL M$GDS ( GET_IO ) WHENALTRETURN DO ;
+           OBUF = '1Couldn''t get I/O memory.' ;
+           GOTO SNDERR ;
+           END ;
+        OBUF = '0Got I/O memory.' ;
+        CALL SNDMSG ;
+        FW$ = VLP_SEGMENT.BASE$ ;
+        EOF = %FALSE ;
+        FSIZE = 0 ;
+        RD_HOST.BUF_ = VECTOR ( FBUF ) ;
+        DO WHILE EOF = %FALSE ;
+           CALL M$READ ( RD_HOST ) WHENALTRETURN DO ;
+              CALL M$EXIT ;
+              END ;
+           IF M$HOST$->F$DCB.ARS = 6 AND
+              SUBSTR ( FBUF, 0, 6 ) = 'EOFCJE' THEN
+              EOF = %TRUE ;
+           ELSE DO ;
+              FSIZE = FSIZE + M$HOST$->F$DCB.ARS ;
+           IF FSIZE > 32768 THEN DO ;
+              OBUF = '1Firmware size > 32768 bytes.  Max is 32768.' ;
+              GOTO SNDERR ;
+              END ;
+              SUBSTR ( IOBUF, 0, M$HOST$->F$DCB.ARS ) =
+                 SUBSTR ( FBUF, 0, M$HOST$->F$DCB.ARS ) ;
+              FW$ = PINCRC ( FW$, M$HOST$->F$DCB.ARS ) ;
+              END ;
+           OBUF = '0ACK' ;
+           CALL SNDMSG ;
+           END ;
+        LOAD_FW.BUFSIZE = FSIZE ;
+        LOAD_FW.BUF$ = VLP_SEGMENT.BASE$ ;
+        CALL GHH$IO ( INIT_SWAN ) WHENALTRETURN DO ;
+           OBUF = '1Error while initializing SWAN.' ;
+           GOTO SNDERR ;
+           END ;
+        CALL M$WAIT ( WAIT3 ) ;
+        CALL GHH$IOLD ( LOAD_FW ) WHENALTRETURN DO ;
+           OBUF = '1Error while loading SWAN firmware.' ;
+           GOTO SNDERR ;
+           END ;
+        CALL GHH$IO ( OTP_TSKWD ) WHENALTRETURN DO ;
+           OBUF = '1Error while sending task word.' ;
+           GOTO SNDERR ;
+           END ;
+        CALL M$WAIT ( WAIT3 ) ;
+        CALL GHH$IO_IN ( INP_STS1 ) WHENALTRETURN DO ;
+           OBUF = '1Error while getting status 1.' ;
+           GOTO SNDERR ;
+           END ;
+        IF INP_STS1.STATUS ~= '8800'X THEN DO ;
+           CALL HEXASC ( INP_STS1.STATUS ) ;
+           CALL CONCAT ( OBUF, '1Status 1 error = ', ASCHEX ) ;
+           GOTO SNDERR ;
+           END ;
+        CALL GHH$IO_IN ( INP_STS2 ) WHENALTRETURN DO ;
+           OBUF = '1Error while getting status 2. ' ;
+           GOTO SNDERR ;
+           END ;
+        IF ( ( INP_STS2.STATUS & 'FF00'X ) ~= '0000'X ) THEN DO ;
+           CALL HEXASC ( INP_STS2.STATUS ) ;
+           CALL CONCAT ( OBUF, '1Status 2 error = ', ASCHEX ) ;
+           GOTO SNDERR ;
+           END ;
+ 
+        OBUF = '0SWAN firmware successfully loaded.' ;
+ 
+SNDERR:
+        REL_IO.V.PAGES = 64 ;
+        CALL M$FDS ( REL_IO ) WHENALTRETURN DO ;
+           OBUF = '2Error releasing I/O memory' ;
+           END ;
+        CALL SNDMSG ;
+ 
+        RETURN ;
+ 
+END LOADFW ;
+ 
+DSBCACHE: PROC ;
+ 
+        CALL GHH$RSC ;
+ 
+        OBUF = '0Cache disabled' ;
+        CALL SNDMSG ;
+ 
+        RETURN ;
+ 
+END DSBCACHE ;
+ 
+DUMPSWAN: PROC ;
+ 
+/* AUTO Variables */
+ 
+DCL EODUMP BIT(1) UNAL ;
+DCL I UBIN ;
+DCL J UBIN ;
+ 
+/* DUMPSWAN Code */
+ 
+        VLP_SEGMENT.BASE$ = ADDR ( NIL ) ;
+        GET_IO.V.PAGES = 5 ;
+        CALL M$GDS ( GET_IO ) WHENALTRETURN DO ;
+           OBUF = '1Couldn''t get I/O memory.' ;
+           GOTO SNDERR ;
+           END ;
+        DMP$ = VLP_SEGMENT.BASE$ ;
+        WRT$ = PINCRW ( DMP$, SIZEW ( DMPBUF ) ) ;
+ 
+        CALL GHH$IO ( OTP_LAFMODE ) WHENALTRETURN DO ;
+           OBUF = '1Error setting LAF mode.' ;
+           GOTO SNDERR ;
+           END ;
+ 
+/* Get the first print line */
+ 
+        DMPBUF.CTL = '0'B ;
+        WRBUF.CTL = '0'B ;
+        GET_PRNTLN.BUF$ = VLP_SEGMENT.BASE$ ;
+        CALL GHH$IOLD ( GET_PRNTLN ) WHENALTRETURN DO ;
+IOLDERR:
+           OBUF = '1Error during IOLD.' ;
+           GOTO SNDERR ;
+           END ;
+ 
+/* Backup to beginning of SILO */
+ 
+        CALL GHH$IO ( OTP_BCKUP ) WHENALTRETURN DO ;
+           OBUF = '1Error during BACKUP command to SWAN.' ;
+           GOTO SNDERR ;
+           END ;
+ 
+        EODUMP = %FALSE ;
+        DO WHILE EODUMP = %FALSE ;
+           CALL GHH$WAITIO WHENALTRETURN DO ;
+              OBUF = '1SWAN dump timed out.' ;
+              GOTO SNDERR ;
+              END ;
+           CALL GHH$IO_IN ( INP_RNG ) WHENALTRETURN DO ;
+              OBUF = '1Error while getting RANGE from SWAN.' ;
+              GOTO SNDERR ;
+              END ;
+           ARS = ( 255 - BITBIN ( INP_RNG.STATUS ) ) * 2 ;
+ 
+/* Swap I/O buffer ptrs */
+ 
+           TPTR$ = DMP$ ;
+           DMP$ = WRT$ ;
+           WRT$ = TPTR$ ;
+ 
+           IF DMPBUF.CTL.SILOEMPTY THEN
+              EODUMP = %TRUE ;
+           ELSE DO ;
+ 
+/* Get the next print line */
+ 
+              DMPBUF.CTL = '0'B ;
+              GET_PRNTLN.BUF$ = DMP$ ;
+              CALL GHH$IOLD ( GET_PRNTLN ) ALTRET ( IOLDERR ) ;
+              CALL GHH$IO ( OTP_PRNT ) WHENALTRETURN DO ;
+                 OBUF = '1Error during print I/O.' ;
+                 GOTO SNDERR ;
+                 END ;
+              END ;
+ 
+/* Write line to HOST */
+ 
+           IF ARS > 0 THEN DO ;
+              SUBSTR ( WRBUF_, 1, 1 ) = '0' ;
+              WR_HOST.BUF_ = VECTOR ( SUBSTR ( WRBUF_, 1, ARS + 1 ) ) ;
+              CALL M$WRITE ( WR_HOST ) WHENALTRETURN DO ;
+                 CALL M$EXIT ;
+                 END ;
+              END ;
+           END ;
+ 
+        FBUF = '0EOFCJE' ;
+        WR_HOST.BUF_ = VECTOR ( SUBSTR ( FBUF, 0, 7 ) ) ;
+ 
+SNDERR:
+        REL_IO.V.PAGES = 5 ;
+        CALL M$FDS ( REL_IO ) WHENALTRETURN DO ;
+           OBUF = '2Error releasing I/O memory' ;
+           WR_HOST.BUF_ = VECTOR ( OBUF ) ;
+           CALL SNDMSG ;
+           CALL M$EXIT ;
+           END ;
+ 
+        CALL SNDMSG ;
+        WR_HOST.BUF_ = VECTOR ( OBUF ) ;
+ 
+        RETURN ;
+ 
+END DUMPSWAN ;
+ 
+HEXASC: PROC ( HEXVAL ) ;
+ 
+DCL HEXVAL UBIN ;
+DCL HEX_(0:3) REDEF HEXVAL UBIN(4) UNAL ;
+DCL I UBIN ;
+ 
+        DO I = 0 TO 3 ;
+           IF HEX_(I) < 10 THEN
+              ASCHEX_(I) = BINASC ( HEX_(I) + 48 ) ;
+           ELSE
+              ASCHEX_(I) = BINASC ( HEX_(I) + 55 ) ;
+           END ;
+ 
+        RETURN ;
+ 
+END HEXASC ;
+ 
+SNDMSG: PROC ;
+ 
+        CALL M$WRITE ( WR_HOST ) WHENALTRETURN DO ;
+           CALL M$EXIT ;
+           END ;
+ 
+        RETURN ;
+ 
+END SNDMSG ;
+ 
+END SWANHND ;

@@ -1,0 +1,2386 @@
+VERSION A06
+
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:1    
+        1        1        /*M*  Z8DD$DOCUMENT -- Phase 2 storage allocation and flow analysis overview. */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*P*
+        8        8               NAME:  Z8FD$DOCUMENT
+        9        9            PURPOSE:  Explains the calculation of storage offsets and flow analysis.
+       10       10        */
+       11       11        /*F*
+       12       12               NAME:  PURPOSE
+       13       13             AUTHOR:  GK Myers
+       14       14          REFERENCE:  Design note 1 and design note 23
+       15       15
+       16       16                      Phase 2 storage allocation calculates the actual storage
+       17       17                      location of all data items set up by Phase 1.  Storage locations
+       18       18                      inside a structure are determined by adding the offset of the
+       19       19                      item within the structure to the offset of the 01 data item.
+       20       20                      Storage allocation also handles the creation of ESC (escape)
+       21       21                      and ARGP (argument pointer) triads in the ETT.
+       22       22
+       23       23                      Phase 2 also handles flow analysis.  The ILS and ILL tables
+       24       24                      are looked thru to achieve various optimizations.
+       25       25                      These include:
+       26       26
+       27       27                           (1)  Label reference resolution
+       28       28                           (2)  Elimination of dead code
+       29       29                           (3)  Transform small PERFORMs to in-line
+       30       30                           (4)  Transform out of line iterative PERFORMs
+       31       31                                to in-line
+       32       32                           (5)  Transform if loops to do loops
+       33       33                           (6)  Phase 3 optimizer support
+       34       34                           (7)  Eliminate unnecessary assignments
+       35       35                           (8)  Collapse chains of GOTOs to single GOTOs
+       36       36                           (9)  Independent segment management
+       37       37        */
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:2    
+       38       38        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:3    
+       39       39        /*F*
+       40       40               NAME:  METHOD
+       41       41             AUTHOR:  GK Myers (06/10/81)
+       42       42
+       43       43                      The code for these modules is in PL-6.  The master module
+       44       44                      (Z8F2$PHASE2) is called by the executive after Phase 1 has
+       45       45                      been completed.  The master module then calls the procedures
+       46       46                      to calculate storage allocation and to perform flow analysis.
+       47       47
+       48       48                      The modules and their relationships are described in the
+       49       49                      following diagram:
+       50       50
+       51       51
+       52       52        Z9AP$BRING_IN_PHASE
+       53       53        -------------------
+       54       54                 !
+       55       55                 !
+       56       56                 !
+       57       57                 V
+       58       58        *****************      ****************************
+       59       59        !               !----->!                          !
+       60       60        !               !      !  Z8FB$PHASE2_PREPASS     !          -----------
+       61       61        !               !      !                          !          !         !
+       62       62        !               !      !                          !          !         !
+       63       63        !               !      ****************************          V         !
+       64       64        !               !      ****************************      *********************
+       65       65        !               !----->!                          !----->!                   !
+       66       66        !               !      !  Z8FA$STORAGE_ALLOCATOR  !      !  Z8FC$SA_UPDATE   !
+       67       67        !               !      !                          !      !    (Recursive)    !
+       68       68        !               !      !                          !      !                   !
+       69       69        !               !      ****************************      *********************
+       70       70        !               !      ****************************
+       71       71        !               !----->!                          !
+       72       72        !               !      !   Z8FL$LABEL_REFERENCE   !
+       73       73        !               !      !                          !
+       74       74        !  Z8F2$PHASE2  !      !                          !
+       75       75        !               !      ****************************
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:4    
+       76       76        !               !      ****************************
+       77       77        !               !----->!                          !
+       78       78        !               !      !   Z8FJ$SEGMENT_SUBS      !
+       79       79        !               !      !                          !
+       80       80        !  Z8F2$PHASE2  !      !                          !
+       81       81        !               !      ****************************
+       82       82        !               !
+       83       83        !               !      ****************************      *********************
+       84       84        !               !----->!                          !----->!Z8FS$SRCH_IF_DO_LBL!
+       85       85        !               !      !    Z8FF$FLOW_ANALYSIS    !      *********************
+       86       86        !               !      !                          !      *********************
+       87       87        !               !      !                          !----->!Z8FP$PFORM_CHECKING!
+       88       88        !               !      ****************************      *********************
+       89       89        !               !      ****************************
+       90       90        !               !----->!                          !
+       91       91        !               !      !   Z8FO$LOCAL_OPTIMIZER   !
+       92       92        !               !      !                          !
+       93       93        *****************      ****************************
+       94       94
+       95       95        %EJECT ;
+       96       96
+       97       97        Z9AP$BRING_IN_PHASE     Executive procedure that calls Phase 2 to be executed.
+       98       98
+       99       99        Z8F2$PHASE2             Phase 2 root.  Calls Z8FA$STORAGE_ALLOCATOR and
+      100      100                                Z8FF$FLOW_ANALYSIS.
+      101      101
+      102      102        Z8FB$PHASE2_PREPASS     Does necessary preprocessing to set up linkages
+      103      103                                needed by Phase 2.
+      104      104
+      105      105        Z8FA$STORAGE_ALLOCATOR  Calculates the storage locations for all 01's and
+      106      106                                77's.  If it is a structure, Z8FC$SA_UPDATE is
+      107      107                                called.  This procedure also creates the escape and
+      108      108                                ARGP triads. But it does not need to calculate
+      109      109                                storage addresses for anything in the LINKAGE SECTION.
+      110      110
+      111      111        Z8FC$SA_UPDATE          Calculates the storage location of all elements
+      112      112                                within a structure.  It starts with the 02's then
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:5    
+      113      113                                does the 03's, etc.
+      114      114
+      115      115        Z8FL$LABEL_REFERENCE    Performs label reference resolution on all ALTERS,
+      116      116                                GOS, and PERFORMS.
+      117      117
+      118      118        Z8FJ$SEGMENT_SUBS       Handle switching among independent segments. Reset
+      119      119                                all ALTERed GOTO pointers in any independent segment
+      120      120                                on entry into it.
+      121      121
+      122      122        Z8FF$FLOW_ANALYSIS      Performs all the flow analysis on the program
+      123      123                                flow by stepping thru the ILS.
+      124      124
+      125      125        Z8FS$SRCH_IF_DO_LBL     Resets the DO and DEFLB linked lists if
+      126      126                                needed.  This is called when a PFORM code group
+      127      127                                is transferred in line from above.
+      128      128
+      129      129        Z8FP$PFORM_CHECKING     All PERFORM statements are checked to see if they
+      130      130                                should be COBOL 74 or optimized PERFORMS.
+      131      131        Z8FO$LOCAL_OPTIMIZER    Makes various local optimizations such as supplying
+      132      132                                alignment information for MOVEs and some conversions.
+      133      133        */
+      134      134        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:6    
+      135      135        /*F*
+      136      136               NAME:  FORMAT_OF_INPUT
+      137      137            CHAPTER:  Overview
+      138      138             AUTHOR:  GK Myers (06/08/81)
+      139      139
+      140      140                      The information needed for storage allocation and flow analysis
+      141      141                      is stored in six tables.  When Phase 1 allocates a data item, it
+      142      142                      creates an entry in the symbol table, qualifier links table, and
+      143      143                      if the item is dimensioned a LTS entry.  When Phase 1 breaks
+      144      144                      up a statement, ETT, ILL, and ILS entries are created.
+      145      145                      A brief description of the six tables follows.
+      146      146
+      147      147                         ETT  - Expression Triad Table.  This table represents an
+      148      148                                encoded version of all expressions encountered in the
+      149      149                                procedure division - arithmetic, character, relational,
+      150      150                                etc.  This table is accessed by the programs in a
+      151      151                                random manner via pointers present in ILL, and other ETT
+      152      152                                items.  These items constitute the body of the trees.
+      153      153
+      154      154                         ILL  - Internal Language List.  This table represents an
+      155      155                                encoded version of the COBOL Procedure Division
+      156      156                                statements.  This table is accessed sequentially by the
+      157      157                                ILS table. These nodes are the root nodes of each tree.
+      158      158
+      159      159                         ILS  - Internal Language Supplement.  This table gives the
+      160      160                                order in which the program will be processed.
+      161      161                                Each ILS entry points to a ILL entry.  It is accessed
+      162      162                                sequentially and can also be accessed by ILL
+      163      163                                pointers or by ST pointers when the item is a label.
+      164      164
+      165      165                         LTS  - Long Term Supplement.  This table gives information
+      166      166                                for array entries, edited entries, items with lengths
+      167      167                                greater than the ST.ADSC.N field, and a controller
+      168      168                                entry if needed.  This table is accessed via pointers
+      169      169                                in the ST.
+      170      170
+      171      171                         QLT  - Qualifier Links Table.  This table contains bits
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:7    
+      172      172                                giving further information about a symbol table
+      173      173                                item and also details the entry's father,
+      174      174                                brother, and son if one exists.  The table is accessed
+      175      175                                sequentially or by pointers in the ST.
+      176      176
+      177      177                          ST  - Symbol Table.  This table is comprised of items
+      178      178                                representing encoded versions of data names, file
+      179      179                                names, labels, etc.  The information concerning
+      180      180                                the items location, type, and length is contained
+      181      181                                here.  This table is accessed sequentially or by
+      182      182                                pointers in the QLT.
+      183      183        */
+      184      184
+      185      185        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:8    
+      186      186        /*F*
+      187      187               NAME:  FORMAT_OF_INPUT
+      188      188            CHAPTER:  ETT table
+      189      189
+      190      190                      ETT items are described below.
+      191      191
+      192      192                           ETT.ID      identification code
+      193      193                           ETT.T       Used by the generator to detail the triad's
+      194      194                                       location, i.e. 'Q register contained'.
+      195      195                           ETT.COUNT   Used by the generator to indicate how many
+      196      196                                       times the triad is referenced.
+      197      197                           ETT.LOP     Always a pointer,  usually to ETT items but
+      198      198                                       may point to ST items.
+      199      199                           ETT.ROP     Right operand like LOP.  Base triads are linked
+      200      200                                       together by this pointer and after escape triads
+      201      201                                       are created this points to the escape triad.
+      202      202                           ETT.ROPCON  Right operand constant, for escape triads this
+      203      203                                       details the data block the variable is in.
+      204      204
+      205      205                           The other ETT variables are not used by Phase 2.
+      206      206
+      207      207
+      208      208                ETT
+      209      209                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      210      210               I-----------------I-----------------I-----------------I-----------------I
+      211      211              0!ID                                 !@!T        !COUNT                  !
+      212      212               I-----------------I-----------------I-----------------I-----------------I
+      213      213              1!LOP                                                                    !
+      214      214               I-----------------I-----------------I-----------------I-----------------I
+      215      215              2!ROP                                                                    !
+      216      216               I-----------------I-----------------I-----------------I-----------------I
+      217      217              2!ROPCON                                                                 !
+      218      218               I-----------------I-----------------I-----------------I-----------------I
+      219      219              2!ESCINF                                                                 !
+      220      220               I-----------------I-----------------I-----------------I-----------------I
+      221      221              3!ARG#                               !BLK#                               !
+      222      222               I-----------------I-----------------I-----------------I-----------------I
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:9    
+      223      223              2!VALUE                              !TYPE                               !
+      224      224               I-----------------I-----------------I-----------------I-----------------I
+      225      225              3!ADDO                                                                   !
+      226      226               I-----------------I-----------------I-----------------I-----------------I
+      227      227              3!EVALP$                                                                 !
+      228      228               I-----------------I-----------------I-----------------I-----------------I
+      229      229              4!SSOP_SIZ                                                               !
+      230      230               I-----------------I-----------------I-----------------I-----------------I
+      231      231              4!SC                                 !NI                                 !
+      232      232               I-----------------I-----------------I-----------------I-----------------I
+      233      233        */
+      234      234        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:10   
+      235      235        /*F*
+      236      236               NAME:  FORMAT_OF_INPUT
+      237      237            CHAPTER:  ILL table
+      238      238
+      239      239
+      240      240                      ILL items can be of different formats as different statement
+      241      241                      types are broken down.  It is the head pointer of a tree with
+      242      242                      pointers to subtrees of ETT items.  It is described below.
+      243      243
+      244      244                      (1)  Most ILL items are as below.
+      245      245
+      246      246                           ILL.ID    identification code
+      247      247                           ILL.CODE  Optional field that indicates special attributes
+      248      248                                     of operands ie. LOP, ROP.
+      249      249                           ILL.LOP   Left operand, always a pointer usually pointing
+      250      250                                     to ETT tree but may point to ST.
+      251      251                           ILL.ROP   Right operand like LOP.
+      252      252                           ILL.LBL   Pointer to next label (ILS entry) in label chain.
+      253      253                           ILL.TO    Optional field that points to the receiving data
+      254      254                                     item in moves (not used in Phase 2).
+      255      255
+      256      256
+      257      257                ILL
+      258      258                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      259      259               I-----------------I-----------------I-----------------I-----------------I
+      260      260              0!ID                                 !CODE                               !
+      261      261               I-----------------I-----------------I-----------------I-----------------I
+      262      262              1!LOP                                                                    !
+      263      263               I-----------------I-----------------I-----------------I-----------------I
+      264      264              2!ROP                                                                    !
+      265      265               I-----------------I-----------------I-----------------I-----------------I
+      266      266              2!LBL                                                                    !
+      267      267               I-----------------I-----------------I-----------------I-----------------I
+      268      268              3!TO_                                                                    !
+      269      269               I-----------------I-----------------I-----------------I-----------------I
+      270      270
+      271      271
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:11   
+      272      272                      (2)  Before each statement which usually consists of one ILL entry,
+      273      273                           there is a LINOI item detailing the line number and type of
+      274      274                           the statement.  A description is below.
+      275      275
+      276      276                           LINOI.ID         identification code
+      277      277                           LINOI.PREV_LINE  previous line number
+      278      278                           LINOI.COLUMN_NO  column position
+      279      279                           LINOI.LINE_NO    current line number
+      280      280                           LINOI.TYPE       statement type
+      281      281
+      282      282
+      283      283                LINOI
+      284      284                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      285      285               I-----------------I-----------------I-----------------I-----------------I
+      286      286              0!ID                                 !PREV_LINE                          !
+      287      287               I-----------------I-----------------I-----------------I-----------------I
+      288      288              1!COLUMN_NO                          !LINE_NO                            !
+      289      289               I-----------------I-----------------I-----------------I-----------------I
+      290      290              2!TYPE                               !*                                  !
+      291      291               I-----------------I-----------------I-----------------I-----------------I
+      292      292
+      293      293
+      294      294                      (3)  Do loops have their own ILL entry because of the number of
+      295      295                           differences between them and a standard ILL entry.  It is
+      296      296                           described below.
+      297      297
+      298      298                           DO_N.ID            identification code
+      299      299                           DO_N.B.TEST_AFTER  bit to determine if loop is tested after
+      300      300                           DO_N.ITE           pointer to end of loop
+      301      301                           DO_N.ITB           pointer to beginning of loop
+      302      302                           DO_N.GLIST         for SEARCH optimization
+      303      303                           DO_N.ITP           pointer to prior DO or DOEND entry
+      304      304                           DO_N.ITO           pointer to outside loop entry if any
+      305      305                           DO_N.LEVEL         nesting level of do loop
+      306      306                           DO_N.XLAB          pointer to last referenced label
+      307      307                           DO_N.UNTIL$        pointer to comparison triad
+      308      308                           DO_N.TIMES$        pointer to expression determining
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:12   
+      309      309                                              number of times loop is done
+      310      310                           DO_N.VARYING$      pointer to variable to be varied
+      311      311                           DO_N.FROM$         pointer to starting value of variable
+      312      312                                              being varied
+      313      313                           DO_N.BY$           pointer to increment value of variable
+      314      314
+      315      315
+      316      316                DO_N
+      317      317                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      318      318               I-----------------I-----------------I-----------------I-----------------I
+      319      319              0!ID                                 !. . . . . . . . . . . . . . . . . .!W
+      320      320               I-----------------I-----------------I-----------------I-----------------I
+      321      321              0!. . . . . . . . . . . . . . . . . .!@!* B.TEST_AFTER                   !
+      322      322               I-----------------I-----------------I-----------------I-----------------I
+      323      323              1!ITE                                                                    !
+      324      324               I-----------------I-----------------I-----------------I-----------------I
+      325      325              1!ITB                                                                    !
+      326      326               I-----------------I-----------------I-----------------I-----------------I
+      327      327              2!GLIST                                                                  !
+      328      328               I-----------------I-----------------I-----------------I-----------------I
+      329      329              3!ITP                                                                    !
+      330      330               I-----------------I-----------------I-----------------I-----------------I
+      331      331              4!ITO                                                                    !
+      332      332               I-----------------I-----------------I-----------------I-----------------I
+      333      333              5!LEVEL                              !*                                  !
+      334      334               I-----------------I-----------------I-----------------I-----------------I
+      335      335              6!XLAB                                                                   !
+      336      336               I-----------------I-----------------I-----------------I-----------------I
+      337      337              7!UNTIL$                                                                 !
+      338      338               I-----------------I-----------------I-----------------I-----------------I
+      339      339              7!TIMES$                                                                 !
+      340      340               I-----------------I-----------------I-----------------I-----------------I
+      341      341             10!VARYING$                                                               !
+      342      342               I-----------------I-----------------I-----------------I-----------------I
+      343      343             11!FROM$                                                                  !
+      344      344               I-----------------I-----------------I-----------------I-----------------I
+      345      345             12!BY$                                                                    !
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:13   
+      346      346               I-----------------I-----------------I-----------------I-----------------I
+      347      347        */
+      348      348        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:14   
+      349      349        /*F*
+      350      350               NAME:  FORMAT_OF_INPUT
+      351      351            CHAPTER:  ILS table
+      352      352
+      353      353                      ILS entries will all be as below.
+      354      354
+      355      355                           ILS.ID     identification code
+      356      356                           ILS.SEQNO  sequence number for program operation
+      357      357                           ILS.CDEF   common redefinition bit
+      358      358                           ILS.RDEF   redefinition sequence number
+      359      359                           ILS.NEXT   pointer to next ILS entry
+      360      360                           ILS.ILL$   pointer to ILL entry
+      361      361                           ILS.DNAME  pointer to dataname being redefined
+      362      362                           ILS.DEF    pointer to list of datanames being redefined
+      363      363
+      364      364
+      365      365                ILS
+      366      366                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      367      367               I-----------------I-----------------I-----------------I-----------------I
+      368      368              0!ID                                 !SEQNO                              !
+      369      369               I-----------------I-----------------I-----------------I-----------------I
+      370      370              1!@!* B.CDEF                         !. . . . . . . . . . . . . . . . . .!B
+      371      371               I-----------------I-----------------I-----------------I-----------------I
+      372      372              1!. . . . . . . . . . . . . . . . . .!RDEF                               !
+      373      373               I-----------------I-----------------I-----------------I-----------------I
+      374      374              2!NEXT                                                                   !
+      375      375               I-----------------I-----------------I-----------------I-----------------I
+      376      376              3!ILL$                                                                   !
+      377      377               I-----------------I-----------------I-----------------I-----------------I
+      378      378              4!DNAME                                                                  !
+      379      379               I-----------------I-----------------I-----------------I-----------------I
+      380      380              4!DEF                                                                    !
+      381      381               I-----------------I-----------------I-----------------I-----------------I
+      382      382        */
+      383      383        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:15   
+      384      384        /*F*
+      385      385               NAME:  FORMAT_OF_INPUT
+      386      386            CHAPTER:  LTS_table
+      387      387
+      388      388                      Whenever an item has an occurs clause or if it is an
+      389      389                      edited item, Phase 1 will set up an LTS entry.  The type
+      390      390                      of entry is dependent on which clause is used.  If more
+      391      391                      than one clause is used an LTSS item is created which
+      392      392                      holds pointers to the various LTS entries.  Another entry
+      393      393                      is set up if the variable's size is greater than 4095 as its
+      394      394                      size can't be stored in the symbol table.  The only two
+      395      395                      entries we're concerned with are the LONG and LTSS entries.
+      396      396
+      397      397                      (3) The long entry consists of
+      398      398
+      399      399                          LONG.ID            identification code
+      400      400                          LONG.LENGTH        length of item
+      401      401
+      402      402                LONG
+      403      403                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      404      404               I-----------------I-----------------I-----------------I-----------------I
+      405      405              0!ID                                 !*                                  !
+      406      406               I-----------------I-----------------I-----------------I-----------------I
+      407      407              1!LENGTH                                                                 !
+      408      408               I-----------------I-----------------I-----------------I-----------------I
+      409      409
+      410      410                      (4) LTSS entry to manage multiple Lts entries.
+      411      411
+      412      412                          LTSS.ID            identification code
+      413      413                          LTSS.DIMS$         pointer to dimensioned entry
+      414      414                          LTSS.NEL$          pointer to edited entry
+      415      415                          LTSS.LONG$         pointer to long entry
+      416      416
+      417      417                LTSS
+      418      418                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      419      419               I-----------------I-----------------I-----------------I-----------------I
+      420      420              0!ID                                 !*                                  !
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:16   
+      421      421               I-----------------I-----------------I-----------------I-----------------I
+      422      422              1!DIMS$                                                                  !
+      423      423               I-----------------I-----------------I-----------------I-----------------I
+      424      424              2!NEL$                                                                   !
+      425      425               I-----------------I-----------------I-----------------I-----------------I
+      426      426              3!LONG$                                                                  !
+      427      427               I-----------------I-----------------I-----------------I-----------------I
+      428      428        */
+      429      429        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:17   
+      430      430        /*F*
+      431      431               NAME:  FORMAT_OF_INPUT
+      432      432            CHAPTER:  QLT table
+      433      433
+      434      434                      A qualifier item is set up for every array, scalar, or label
+      435      435                      item in the symbol table.
+      436      436
+      437      437                          QLT.FATHER        pointer to father or nill
+      438      438                          QLT.BROTHER       pointer to brother or nill
+      439      439                          QLT.SON           pointer to son or nill
+      440      440                          QLT.ST$           pointer to ST entry
+      441      441
+      442      442                        Attribute bits:
+      443      443
+      444      444                          QLT.B.OCCURS      item has an occurs clause
+      445      445                          QLT.B.SYNC        item has synchronized clause
+      446      446                          QLT.B.DIGIT       COMP-4 or (COMP-8 when not synchronized)
+      447      447
+      448      448                QLT
+      449      449                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      450      450               I-----------------I-----------------I-----------------I-----------------I
+      451      451              0!ID                                 !. . . . . . . . . . . . . . . . . .!W
+      452      452               I-----------------I-----------------I-----------------I-----------------I
+      453      453              0!. . . . . . . . . . . . . . . . . .!O!S!D!*                            !
+      454      454               I-----------------I-----------------I-----------------I-----------------I
+      455      455              1!FATHER                                                                 !
+      456      456               I-----------------I-----------------I-----------------I-----------------I
+      457      457              2!BROTHER                                                                !
+      458      458               I-----------------I-----------------I-----------------I-----------------I
+      459      459              3!SON                                                                    !
+      460      460               I-----------------I-----------------I-----------------I-----------------I
+      461      461              4!ST$                                                                    !
+      462      462               I-----------------I-----------------I-----------------I-----------------I
+      463      463              5!DNT$                                                                   !
+      464      464               I-----------------I-----------------I-----------------I-----------------I
+      465      465        */
+      466      466        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:18   
+      467      467        /*F*
+      468      468               NAME:  FORMAT_OF_INPUT
+      469      469            CHAPTER:  ST
+      470      470
+      471      471                      A symbol table item is set up for every block, label, array,
+      472      472                      constant, or scalar item.  Some of the items in this
+      473      473                      table are redefined for generator usage.
+      474      474
+      475      475                          ST.ID             identification code
+      476      476                          ST.R              relocation: 1 for labels, 3 for variables
+      477      477                          ST.COUNT          block number
+      478      478                          ST.SA             storage address
+      479      479                          ST.TYPE           data type ie. COMP-6, COMP-7, etc.
+      480      480                          ST.LINE_NO        line number of declaration
+      481      481
+      482      482                      A descriptor field is set up with information depending on the
+      483      483                      item being numeric (NDSC), alphabetic (ADSC), or bit (BDSC).
+      484      484
+      485      485                        Alpha Descriptor
+      486      486                          ST.ADSC.CN        byte position within word
+      487      487                          ST.ADSC.N         length of item in bytes (if > 4095 then
+      488      488                                            stored in LONG.LENGTH in LTS table)
+      489      489
+      490      490                        Bit Descriptor
+      491      491
+      492      492                          ST.BDSC.C         character position in word
+      493      493                          ST.BDSC.B         bit within byte
+      494      494                          ST.BDSC.N         length in bits
+      495      495
+      496      496                        Numeric Descriptor
+      497      497
+      498      498                          ST.NDSC.CN        digit position within word
+      499      499                          ST.NDSC.TN        '0'B = 9 bit, '1'B = 4 bit
+      500      500                          ST.NDSC.S         signed number, '11'b = no sign
+      501      501                          ST.NDSC.SF        scale factor
+      502      502                          ST.NDSC.N         length in digits is st.ndsc.tn, else bytes
+      503      503
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:19   
+      504      504                        Attribute bits
+      505      505
+      506      506                          ST.B.REFERENCED   item is referenced
+      507      507                          ST.B.DEFINED      item is defined
+      508      508                          ST.B.COMPILER_CREATED Item is one created by compiler
+      509      509                          ST.B.GOTO_LABEL   Item is destination of a GO TO or ALTER
+      510      510                          ST.B.DUPLICATE    defined more than once
+      511      511                          ST.B.ONE_REF      item is referenced only once
+      512      512                          ST.B.GREATER_256K size greater than 256K
+      513      513                          ST.B.LONG_CONSTANT
+      514      514                          ST.B.ELEMENTARY   item has no sons
+      515      515                          ST.B.INIT_PROC    start label of init proc
+      516      516                          ST.B.LENGTH_4096  item's length is stored in LONG.LENGTH
+      517      517                          ST.B.COMP6_NONOP  item can't be optimized into COMP-6
+      518      518                          ST.B.PHASE_2      label has been read by Phase 2
+      519      519                          ST.B.FALL_THRU    label may be reached by falling thru
+      520      520                          ST.B.PFORM_START  start label of optimized PERFORM
+      521      521                          ST.B.PFORM_END    end label of optimized PERFORM
+      522      522                          ST.B.PFORM_NESTED A PERFORM exists in this PERFORM's range
+      523      523                          ST.B.ALTER_CHECK  Label of paragraph that can be ALTERed
+      524      524                          ST.B.COBOL_74_PFORM start label of COBOL-74-style PERFORM
+      525      525                          ST.B.PFORM_74_END end label of COBOL-74-style PERFORM
+      526      526                          ST.B.GO_VECTOR_START label at start of table of GOTOs
+      527      527                          ST.B.INTERIOR_PFORM_LBL label inside a PERFORM code group
+      528      528                          ST.B.BACKWARD_PFORM start label of PERFORM after end label
+      529      529                          ST.B.ALLOCATED
+      530      530                          ST.B.ON_SIZE_ERROR
+      531      531                          ST.B.GO_ALTERED   GO affected by ALTER
+      532      532                          ST.B.USE_BASE_POINTER
+      533      533                          ST.B.USE_GLOBAL   start label of GLOBAL USE
+      534      534                          ST.B.USE_ALREADY_FLAGGED level check already issued
+      535      535                          ST.B.USE_PROC     start label of USE proc
+      536      536                          ST.B.EXIT_PROG_LABEL used if EXIT PROG in USE proc
+      537      537                          ST.B.PFORM_END_LBL
+      538      538
+      539      539                        Pointers
+      540      540
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:20   
+      541      541                          ST.NEXT           pointer to next entry if duplicate
+      542      542                          ST.LTS$           pointer to LTS entry
+      543      543                          ST.ILS$           pointer to ILS entry
+      544      544                          ST.DNT$           pointer to DNT entry
+      545      545                          ST.QLT$           pointer to QLT
+      546      546
+      547      547              ST                            WALIGNED
+      548      548              0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      549      549             I-----------------I-----------------I-----------------I-----------------I
+      550      550            0!ID                                 !R                !COUNT            !W
+      551      551             I-----------------I-----------------I-----------------I-----------------I
+      552      552            1!SA                                 !. . . . . . . . . . . . . . . . . .!
+      553      553             I-----------------I-----------------I-----------------I-----------------I
+      554      554            1!SA_BIT                             !DESCL                              !
+      555      555             I-----------------I-----------------I-----------------I-----------------I
+      556      556              LVL2=BDSC
+      557      557            1!. . . . . . . . . . . . . . . . . .!C  !B      !N                      !B
+      558      558             I-----------------I-----------------I-----------------I-----------------I
+      559      559              LVL2=BDSC        LVL3=LEN
+      560      560            1!. . . . . . . . . . . . . . . . . . . . . . . .!*              !REG    !B
+      561      561             I-----------------I-----------------I-----------------I-----------------I
+      562      562              LVL2=ADSC
+      563      563            1!. . . . . . . . . . . . . . . . . .!CN !M!TA !M!N                      !B
+      564      564             I-----------------I-----------------I-----------------I-----------------I
+      565      565              LVL2=ADSC        LVL3=LEN
+      566      566            1!. . . . . . . . . . . . . . . . . . . . . . . .!*              !REG    !B
+      567      567             I-----------------I-----------------I-----------------I-----------------I
+      568      568              LVL2=NDSC
+      569      569            1!. . . . . . . . . . . . . . . . . .!CN   !T!S  !SF         !N          !B
+      570      570             I-----------------I-----------------I-----------------I-----------------I
+      571      571            2!TYPE or SIZE                       !LINE_NO                            !
+      572      572             I-----------------I-----------------I-----------------I-----------------I
+      573      573              LVL2=REF         LVL3=MF
+      574      574            2!. . . . . . . . . . . . . . . . . .!A!R!I!TAG    !. . . . . . . . . . .!B
+      575      575             I-----------------I-----------------I-----------------I-----------------I
+      576      576              LVL2=REF
+      577      577            2!. . . . . . . . . . . . . . . . . . . . . . . . .!ARF  !C!*            !
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:21   
+      578      578             I-----------------I-----------------I-----------------I-----------------I
+      579      579            3!ATTR                                                                   !
+      580      580             I-----------------I-----------------I-----------------I-----------------I
+      581      581              LVL2=B
+      582      582            3!R!D!C!G!D!O!P!F!I!P!P!P!A!C!P!G!E!I!D!B!A!O!G!U!U!U!U!E!P!*            !B
+      583      583             I-----------------I-----------------I-----------------I-----------------I
+      584      584
+      585      585              0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      586      586             I-----------------I-----------------I-----------------I-----------------I
+      587      587            4!NEXT                                                                   !
+      588      588             I-----------------I-----------------I-----------------I-----------------I
+      589      589            5!LTS$ or POINTER$ or ILS$                                                !
+      590      590             I-----------------I-----------------I-----------------I-----------------I
+      591      591            6!DNT$                                                                   !
+      592      592             I-----------------I-----------------I-----------------I-----------------I
+      593      593            6!CONSTI                                                                 !
+      594      594             I-----------------I-----------------I-----------------I-----------------I
+      595      595            6!LAST                                                                   !
+      596      596             I-----------------I-----------------I-----------------I-----------------I
+      597      597            7!QLT$                                                                   !
+      598      598             I-----------------I-----------------I-----------------I-----------------I
+      599      599            7!ST_PTR                                                                 !
+      600      600             I-----------------I-----------------I-----------------I-----------------I
+      601      601            7!ASS_TRIAD                                                              !
+      602      602             I-----------------I-----------------I-----------------I-----------------I
+      603      603            7!SEGMENT$                                                               !
+      604      604             I-----------------I-----------------I-----------------I-----------------I
+      605      605            7!SECTION$                                                               !
+      606      606             I-----------------I-----------------I-----------------I-----------------I
+      607      607           10!FDP                                !BDP                                !
+      608      608             I-----------------I-----------------I-----------------I-----------------I
+      609      609           10!PREV_ILS$                                                              !
+      610      610             I-----------------I-----------------I-----------------I-----------------I
+      611      611           11!PROC$                                                                  !
+      612      612             I-----------------I-----------------I-----------------I-----------------I
+      613      613           11!REF_TRIAD                                                              !
+      614      614             I-----------------I-----------------I-----------------I-----------------I
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:22   
+      615      615           12!LINK                                                                   !
+      616      616             I-----------------I-----------------I-----------------I-----------------I
+      617      617         */
+      618      618        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:23   
+      619      619        /*F*
+      620      620               NAME:  PROGRAM_DESCRIPTIONS
+      621      621            CHAPTER:  Z8F2$PHASE2
+      622      622
+      623      623                      This procedure is the control procedure for storage allocation
+      624      624                      and flow analysis.  It simply calls Z8FB$PHASE2_PREPASS,
+      625      625                      Z8FA$STORAGE_ALLOCATOR, Z8FL$LABEL_REFERENCE,
+      626      626                      Z8FF$FLOW_ANALYSIS, and Z8FO$LOCAL_OPTIMIZER.
+      627      627        */
+      628      628        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:24   
+      629      629        /*F*
+      630      630               NAME:  PROGRAM_DESCRIPTIONS
+      631      631            CHAPTER:  Z8FA$STORAGE_ALLOCATOR
+      632      632
+      633      633                      This procedure allocates storage for 01's and 77's.  It calls
+      634      634                      Z8FC$SA_UPDATE to calculate the locations of interior members
+      635      635                      of a structure.  After storage allocation is completed then
+      636      636                      escape and ARGP triads are created by this procedure.  A pseudo
+      637      637                      program is below to show the flow of the procedure.
+      638      638
+      639      639
+      640      640                           Get pointer to top of QLT
+      641      641                           Do while Qlt pointer points to a 01 or 77
+      642      642                             If item is referenced and defined and not in LINKAGE
+      643      643                             SECTION then
+      644      644                               Align storage counters
+      645      645                               Get size of variable and increment storage counts
+      646      646                               Check storage counts against data limit
+      647      647                               If item is a structure then
+      648      648                                 Call Z8FC$SA_UPDATE
+      649      649                             Get next 01 or 77 data item
+      650      650                           End
+      651      651                           Create escape and ARGP triads
+      652      652
+      653      653
+      654      654                      The pointer to the top of the Qlt is determined and this is used
+      655      655                      for the loop.  The pointer will point to the first 01 or 77
+      656      656                      data item and the loop then steps thru the QLT performing
+      657      657                      storage allocation on all the 01's and 77's.
+      658      658
+      659      659                      The storage allocation is done only for items that are
+      660      660                      referenced and defined.  The storage counts are double
+      661      661                      word aligned if needed otherwise it is left at a word
+      662      662                      boundary.  This is done to be compatible with COBOL-74
+      663      663                      and so code generation can generate more optimal code.
+      664      664                      However, for the LINKAGE SECTION all storage allocation has
+      665      665                      already been done by Phase 1.
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:25   
+      666      666
+      667      667                      The item's size is then extracted from the ST or LONG.LENGTH
+      668      668                      and added to the storage counts to get the next
+      669      669                      available location for the next data item.
+      670      670
+      671      671                      The next available location is checked against the data
+      672      672                      storage limit (256K) to make sure that all of the data will fit.
+      673      673                      If it goes over the limit an error message is produced and
+      674      674                      the counters are reset to zero, except if MSDATA then allocation
+      675      675                      switches to another data section.
+      676      676
+      677      677                      This procedure only calculates storage locations for 01's
+      678      678                      and 77's so if a 01 item is a structure then Z8FC$SA_UPDATE
+      679      679                      is called.  This then calculates all the interior member's
+      680      680                      location.
+      681      681
+      682      682                      After all of the storage locations have been assigned, the escape
+      683      683                      triads are created.  These are used by the generator to pick out
+      684      684                      the data from a 16K block of storage.  Every item that is
+      685      685                      referenced or defined will have a base item in the ETT that will
+      686      686                      point to a ST entry.  This procedure looks at each base item and
+      687      687                      determines what 16K block of memory it is in.  The escape triad
+      688      688                      is created if needed and the pointer to the escape is assigned
+      689      689                      to the BASE's right operand. For items in the LINKAGE SECTION,
+      690      690                      ARGP triads are created instead of escape triads.
+      691      691        */
+      692      692        %EJECT;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:26   
+      693      693        /*F*
+      694      694               NAME:  PROGRAM_DESCRIPTIONS
+      695      695            CHAPTER:  Z8FB$PHASE2_PREPASS
+      696      696
+      697      697                      This does needed preprocessing for Phase 2: linking DO and VAL
+      698      698                      items, setting PREV_ILS$ for labels as well as the FALL_THRU
+      699      699                      bit, and setting up the list of entries and the branch list
+      700      700                      that Z8FL$LABEL_REFERENCE walks.
+      701      701        */
+      702      702        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:27   
+      703      703        /*F*
+      704      704               NAME:  PROGRAM_DESCRIPTIONS
+      705      705            CHAPTER:  Z8FC$SA_UPDATE
+      706      706
+      707      707                      This procedure is used to go thru all of the data entries in
+      708      708                      a structure to compute their actual locationn.  It is
+      709      709                      recursive and starts with the 02's and then does the 03's,
+      710      710                      etc.  The program flow is shown below.
+      711      711
+      712      712
+      713      713                           If item type is not %TYA then issue error message.
+      714      714                           Get structure's son
+      715      715                           Do while another son exists
+      716      716                             Assign son's storage location
+      717      717                             If son is nonelementary then
+      718      718                               Call Z8FC$SA_UPDATE
+      719      719                             Get son's brother
+      720      720                           End
+      721      721
+      722      722
+      723      723                      The procedure receives a parameter which is the head
+      724      724                      of a structure.  The procedure loops thru all the sons
+      725      725                      starting with the first son of the item.  It calculates
+      726      726                      sons storage address by adding the son's offset within
+      727      727                      the 01 structure to the 01's storage address.
+      728      728                      If the son is nonelementary then it calls Z8FC$SA_UPDATE
+      729      729                      passing itself as the head of the structure.  The son's
+      730      730                      brother is then extracted and sent to the top of the loop.
+      731      731        */
+      732      732        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:28   
+      733      733        /*F*
+      734      734               NAME:  PROGRAM_DESCRIPTIONS
+      735      735            CHAPTER:  Z8FF$FLOW_ANALYSIS
+      736      736
+      737      737                      This procedure looks at the ILS and ILL tables looking for
+      738      738                      optimizations.  It also relinks the ILS in reverse order
+      739      739                      and puts a sequence number in each ILS entry for Phase 3.
+      740      740                      A program flow description is below.
+      741      741
+      742      742
+      743      743                      Initialization
+      744      744                      Loop thru ILS
+      745      745                        Do case on type of ILL entry
+      746      746                          Optimize ILS & ILL if possible
+      747      747                        End
+      748      748                      End
+      749      749                      Loop thru ILS
+      750      750                        Reverse ILS pointers to point to previous item
+      751      751                        Remove dead code
+      752      752                        Assign sequence numbers
+      753      753                        Assign forward definition point
+      754      754                      End
+      755      755
+      756      756
+      757      757                      The initialization phase of the program mainly deals with
+      758      758                      preparing for the loop thru the ILS.  The pointer used for
+      759      759                      the loop is assigned the pointer of the top element of the ILS.
+      760      760                      The pointer to the current section name and paragraph name
+      761      761                      are initialized to nill.  The variables used for do items
+      762      762                      (outer do loop pointer, nesting level) are also initialized.
+      763      763
+      764      764                      The ILS is looped thru so that the ILL items may be looked at.
+      765      765                      The ILL can be accessed thru the ILS which is linked
+      766      766                      sequentially.  When the loop is entered for each ILS item,
+      767      767                      the ILL pointer is set and pointers are set to the next
+      768      768                      LINOI entry and to the next non-LINOI item.  A case statement is
+      769      769                      then used to perform optimizations on the different
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:29   
+      770      770                      ILL types.  The different optimizations are discussed below.
+      771      771
+      772      772
+      773      773                      GO item    -- The left operand of the GO item points to the
+      774      774                                    ST entry for the label.  No optimizations are
+      775      775                                    performed on conditional GOTOs but unconditional
+      776      776                                    GOTOs may be optimized.
+      777      777
+      778      778                                    If there is an unconditional GOTO that is not
+      779      779                                    followed by a referenced label then some dead code
+      780      780                                    exists.  This code is linked around by the ILS and
+      781      781                                    a warning is printed at the start of the unreachable
+      782      782                                    code and an end marker is placed to show the
+      783      783                                    start of reachable code.
+      784      784
+      785      785                      DEFLB item -- The defined label is not optimized but some
+      786      786                                    pointers need to be set.  The pointers to the
+      787      787                                    most recently seen referenced label and the one to
+      788      788                                    the current section name may have to be reassigned.
+      789      789
+      790      790                      DOEND item -- Again no optimizations are done but the DO_N.ITP is
+      791      791                                    set to the previous DO entry.  The nesting level
+      792      792                                    counter is reassigned as well as the pointer to the
+      793      793                                    outer do entry.
+      794      794
+      795      795                      PFORM item -- There are two types of optimizations that may be
+      796      796                                    done on on the PFORM.
+      797      797
+      798      798                                    The best optimization is to move the perform code
+      799      799                                    group in line by reassigning the sequencing links of
+      800      800                                    the ILS.  This can only be done however if the
+      801      801                                    beginning and ending labels of the perform group
+      802      802                                    are only referenced once and there are no referenced
+      803      803                                    labels in between them.
+      804      804
+      805      805                                    The other optimization is to copy the ILS entries
+      806      806                                    of the perform code group and move the copy in
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:30   
+      807      807                                    line using the sequence links.  This can be done no
+      808      808                                    matter how many times the labels are referenced but
+      809      809                                    it is optimal only if there's a small number of
+      810      810                                    statements in the code group.
+      811      811
+      812      812
+      813      813                      This procedure has a second loop thru the ILS which assigns the
+      814      814                      sequence numbers of items and rereverses the ILS sequencing links.
+      815      815                      These are needed for Phase 3.  It also has a case statement which
+      816      816                      assigns the forward definition points.
+      817      817        */
+      818      818        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:31   
+      819      819        /*F*
+      820      820               NAME:  PROGRAM_DESCRIPTIONS
+      821      821            CHAPTER:  Z8FJ$SEGMENT_SUBS
+      822      822
+      823      823                      This procedure steps through the BRANCH sublist, when
+      824      824                      a %SCOPE ILL item is found, it generates the subroutines
+      825      825                      which will refresh the alter switches in the independent
+      826      826                      segments on the top of the procedure divisions, when a
+      827      827                      %DEFLB ILL item is found and the label id is %SECTION,
+      828      828                      or, a %GO ILL item is found, the program flow will be
+      829      829                      checked and if it is flowing into a different independent
+      830      830                      segment then the run time subroutine call will be
+      831      831                      generated to refresh the alter switches in that independent
+      832      832                      segment.
+      833      833
+      834      834        */
+      835      835        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:32   
+      836      836        /*F*
+      837      837               NAME:  PROGRAM_DESCRIPTIONS
+      838      838
+      839      839            CHAPTER:  Z8FL$LABEL_REFERENCE
+      840      840
+      841      841                      This internal procedure checks and assigns left or right
+      842      842                      operands of the ILL to point to the correct label entries
+      843      843                      in the ST.  A program flow overview is below.
+      844      844
+      845      845
+      846      846                      If operand points to ST entry of type PARA or SECTION then
+      847      847                        if item has a duplicate entry then
+      848      848                          Print out duplicate error message
+      849      849                      Else
+      850      850                        Reassign pointer to point to ST not DNT entry
+      851      851                        If ST entry's ID is not PARA or SECTION then
+      852      852                          Print error that no label by this name exists
+      853      853                        Else
+      854      854                          If only one entry by that label name then
+      855      855                            Assign St pointer to ILL operand
+      856      856                          Else
+      857      857                            If ILL entry is not located in a section name then
+      858      858                              Print out duplicate error message
+      859      859                            Else
+      860      860                              Look at ST label entries of this name to
+      861      861                                find one in current section
+      862      862                              If no ST entry of this type then
+      863      863                                Print out duplicate error message
+      864      864                              Else
+      865      865                                If duplicate entries of this name in section then
+      866      866                                  Print out duplicate error message
+      867      867                                Else
+      868      868                                  Assign pointer, correct label reference
+      869      869
+      870      870
+      871      871                      This procedure basically looks at a tree and decides which
+      872      872                      category the reference belongs to.  A label is referenced
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:33   
+      873      873                      correctly under any of the following conditions.
+      874      874
+      875      875                      1)  Operand points to ST entry where that entry is of
+      876      876                          type Para or SECTION.
+      877      877
+      878      878                      2)  There is only one label by this name in the program.
+      879      879
+      880      880                      3)  There is only one label by this name in the current
+      881      881                          section.
+      882      882
+      883      883
+      884      884                      A duplicate error message is printed for any of the
+      885      885                      following conditions
+      886      886
+      887      887                      1)  Though item is qualified i.e. GOTO A OF X,
+      888      888                          There are two labels A in X.
+      889      889
+      890      890                      2)  ILL entry is not under a section and there are two
+      891      891                          or more labels of the same name in the program.
+      892      892
+      893      893                      3)  Two or more labels of the same name in the program
+      894      894                          but none of them are in the current section.
+      895      895
+      896      896                      4)  Two or more labels of same name within the current
+      897      897                          section.
+      898      898
+      899      899
+      900      900                      An error message is printed stating that there is no label
+      901      901                      by this name if the ST entry is not of type PARA or SECTION.
+      902      902        */
+      903      903        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:34   
+      904      904        /*F*
+      905      905               NAME:  PROGRAM_DESCRIPTIONS
+      906      906            CHAPTER:  Z8FS$SRCH_IF_DO_LBL
+      907      907
+      908      908                      This procedure is called when a PFORM is to be transferred
+      909      909                      in-line and that PFORM code group has already been processed
+      910      910                      by flow analysis.  A program flow description is below.
+      911      911
+      912      912                      Search code group for DOs.
+      913      913                      Find the last ref'd label and relink label chain
+      914      914                      If there is a DO then relink and reset DO_N.XLAB
+      915      915
+      916      916                      The last referenced label
+      917      917                      before the code group is found for the DO items.
+      918      918
+      919      919                      The DO items are relinked if there are any present.  The
+      920      920                      DO_N.XLAB pointer is reset for any DO items after the code group
+      921      921                      that point to the ending label of the code group.
+      922      922        */
+      923      923        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:35   
+      924      924        /*F*
+      925      925               NAME:  PROGRAM_DESCRIPTIONS
+      926      926            CHAPTER:  Z8FP$PFORM_CHECKING
+      927      927
+      928      928                      This procedure is called at the end of the optimization loop
+      929      929                      in Z8FF if there are any PFORMs in the program.  Design note 27
+      930      930                      defines the criteria for either creating a COBOL 74 PFORM or
+      931      931                      an OPTIMIZED PFORM.  All of the labels involved are marked and
+      932      932                      then a check is made to see which type of PFORM is created.
+      933      933
+      934      934        %EJECT ;
+      935      935                                      EXAMPLE
+      936      936                                      *******
+      937      937
+      938      938          USER PROGRAM           COBOL 74 PERFORM          OPTIMIZED PERFORM
+      939      939          ------------           ----------------          -----------------
+      940      940
+      941      941          PERFORM A.             ALTER POINTER TO RETURN.   GO_SUB A-BEGIN.
+      942      942                                 GO TO A.
+      943      943                               RETURN_LOC:
+      944      944                                 ALTER POINTER TO A-END.
+      945      945                                 PRESET POINTER TO A-END.
+      946      946
+      947      947
+      948      948
+      949      949          A.                   A.                       A.
+      950      950                                                  ALTER X7 TO A-END.
+      951      951                                              A-BEGIN.
+      952      952                                                  Safestore X7 to temp if need to.
+      953      953
+      954      954                                                  Restore X7 if need to.
+      955      955                                                  GO TO 0,X7.
+      956      956                                 GO TO POINTER.
+      957      957                               A-END.                   A-END.
+      958      958
+      959      959        */
+      960      960        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:36   
+      961      961        /*F*
+      962      962               NAME:  PROGRAM DESCRIPTIONS
+      963      963            CHAPTER:  Z8FO$LOCAL_OPTIMIZER
+      964      964
+      965      965                      This procedure is called after storage allocation to make such
+      966      966                      optimizations as it can. That includes marking alphanumeric
+      967      967                      moves to indicate what byte alignments are involved, converting
+      968      968                      them to optimized moves if possible, and supplying alignment
+      969      969                      information for certain conversions, such as COMP-6 to COMP-7.
+      970      970                      DO3s for the SEARCH statement are analyzed to see which
+      971      971                      ESC and ARGP triads need to be forced to be global
+      972      972                      between DO3 and DOEND.
+      973      973        */
+      974      974        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:37   
+      975      975        Z8FD$DOCUMENT: PROC NOAUTO ;
+      976      976
+      977      977        %SET LISTINC = '1'B ;
+      978      978
+      979      979        %SET PHASE = 2 ;
+      980      980
+      981      981        %INCLUDE Z8F_O2COM ;
+        1+     982        /*M* Z8F_O2COM -- Phase 2 Common Variables */
+        2+     983        /*T***********************************************************/
+        3+     984        /*T*                                                         */
+        4+     985        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5+     986        /*T*                                                         */
+        6+     987        /*T***********************************************************/
+        7+     988
+        8+     989        /*B*
+        9+     990            NEXT_AVAILABLE$ -- Used as pointer to storage location counter for the
+       10+     991                               last data block to be referenced.
+       11+     992        */
+       12+     993
+       13+     994    1   DCL 1 O2COM      ALIGNED EXT,
+       14+     995    1         2 POPS_SA    SBIN WORD,   /* SA field of "01" or "FD" */
+       15+     996    1         2 PFORM_LIST$  PTR , /* Ptr used for PFORM linked list      */
+       16+     997    1         2 LAST_LBL$   PTR , /* Ptr to ILS for last referenced label */
+       17+     998    1         2 SECTION$    PTR   /* Ptr to ST entry for SECTION name */
+       18+     999    1                       INIT(ADDR(NIL)), /* Not in any section yet */
+       19+    1000    1         2 LINE_NO$    PTR , /* Ptr to ILS item above LINOI item for line numbers */
+       20+    1001    1         2 SEGMENT_NO     UBIN ,
+       21+    1002    1         2 NEXT_AVAILABLE$ PTR INIT(ADDR(NIL)),
+       22+    1003    1         2 DO_LEVEL       SBIN WORD INIT(0), /* Running DO level */
+       23+    1004    1         2 DO_BEGIN       PTR INIT(ADDR(NIL)), /* Current Mother DO */
+       24+    1005    1         2 CALL_ID        BIT (1) ALIGNED INIT ('0'B),
+       25+    1006    1         2 WORK_STOR_BLKNUM UBIN INIT (1),
+       26+    1007    1         2 LAST       PTR ;
+       27+    1008
+       28+    1009        /*V*
+       29+    1010            NEXT_ILS -- Find the next entry in the ILS chain, in order of
+       30+    1011                        ILS.NEXT linkages.
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:38   
+       31+    1012        */
+       32+    1013
+       33+    1014        %MACRO NEXT_ILS (POINTER = ILS$) ;
+       34+    1015               DO ; /* Next ILS entry in the ILS chain */
+       35+    1016                 POINTER = POINTER->ILS.NEXT ;
+       36+    1017               END ;
+       37+    1018        %MEND ;
+       38+    1019
+       39+    1020        /*V*
+       40+    1021            NEXT_NON_LINOI -- Find the next entry in the ILS chain for which an ILL
+       41+    1022                              entry exists and for which that entry is not a LINOI.
+       42+    1023        */
+       43+    1024
+       44+    1025        %MACRO NEXT_NON_LINOI (POINTER = ILS$) ;
+       45+    1026               DO UNTIL (POINTER->ILS.ILL$ ~= ADDR (NIL) AND
+       46+    1027                         POINTER->ILS.ILL$->ILL.ID ~= %LINOI) ;
+       47+    1028        %NEXT_ILS (POINTER = POINTER) ;
+       48+    1029               END ;
+       49+    1030        %MEND ;
+       50+    1031
+       51+    1032        /*V*
+       52+    1033            NEXT_NON_SUPPORT -- Find the next entry in the ILS chain for which an ILL
+       53+    1034                                entry exists and for which it is not LINOI, PREOFF,
+       54+    1035                                PRESET, or PTR_SET.
+       55+    1036        */
+       56+    1037
+       57+    1038        %MACRO NEXT_NON_SUPPORT (POINTER = ILS$) ;
+       58+    1039               DO UNTIL (POINTER->ILS.ILL$ ~= ADDR (NIL) AND
+       59+    1040                         POINTER->ILS.ILL$->ILL.ID ~= %PTR_SET AND
+       60+    1041                         POINTER->ILS.ILL$->ILL.ID ~= %PRESET AND
+       61+    1042                         POINTER->ILS.ILL$->ILL.ID ~= %P_A_PRESET AND
+       62+    1043                         POINTER->ILS.ILL$->ILL.ID ~= %P_P_PRESET AND
+       63+    1044                         POINTER->ILS.ILL$->ILL.ID ~= %PREOFF AND
+       64+    1045                         POINTER->ILS.ILL$->ILL.ID ~= %LINOI) ;
+       65+    1046        %NEXT_ILS (POINTER = POINTER) ;
+       66+    1047               END ;
+       67+    1048        %MEND ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:39   
+       68+    1049
+       69+    1050        /*V*
+       70+    1051            FIND_LINE_NO - Using the ILS item passed in search the ILS until an
+       71+    1052                           item is found with a LINOI below it.  This item is then
+       72+    1053                           used by the procedure to call an error message.
+       73+    1054        */
+       74+    1055
+       75+    1056        %MACRO FIND_LINE_NO (@START_ITEM$=ILS$) ;
+       76+    1057               DO ;
+       77+    1058                 O2COM.LINE_NO$ = @START_ITEM$ ;
+       78+    1059
+       79+    1060                 DO WHILE O2COM.LINE_NO$->ILS.ILL$->ILL.ID ~= %LINOI ;
+       80+    1061
+       81+    1062                   DO UNTIL O2COM.LINE_NO$->ILS.ILL$ ~= ADDR(NIL) ;
+       82+    1063                     %NEXT_ILS (POINTER=O2COM.LINE_NO$) ;
+       83+    1064                   END ;
+       84+    1065
+       85+    1066                 END ;
+       86+    1067
+       87+    1068                 COMCOM.CURRENT.LINE = O2COM.LINE_NO$->ILS.ILL$->LINOI.PREV_LINE ;
+       88+    1069                 COMCOM.CURRENT.COLUMN = O2COM.LINE_NO$->ILS.ILL$->LINOI.PREV_COL ;
+       89+    1070               END ;
+       90+    1071        %MEND ;
+       91+    1072
+       92+    1073        %MACRO INCREMENT_STORAGE_CNT (@ITEM$=POINTER$) ;
+       93+    1074               DO ;
+       94+    1075                 @ITEM$->ST.SA = COMCOM.BLOCK$->BLOCK.SIZE ;
+       95+    1076                 COMCOM.BLOCK$->BLOCK.SIZE = COMCOM.BLOCK$->BLOCK.SIZE + 1 ;
+       96+    1077
+       97+    1078        /*N*
+       98+    1079        ESC_CHECK - Need to check ESC to make sure that storage allocation does
+       99+    1080                    does not cross a ESC triad.
+      100+    1081        */
+      101+    1082
+      102+    1083               END ;
+      103+    1084        %MEND ;
+      104+    1085
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:40   
+      105+    1086        %IF PHASE = 2;
+      106+    1087            %EQU BYTES_PER_WORD = 4 ;
+      107+    1088            %EQU DIGITS_PER_BYTE = 2 ;
+      108+    1089        %ENDIF;
+      109+    1090        %EJECT;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:41   
+      982     1091        %INCLUDE Z8F_ALIGN ;
+        1+    1092        /*M* Z8F_ALIGN -- Codes for alignment on various boundaries */
+        2+    1093        /*T***********************************************************/
+        3+    1094        /*T*                                                         */
+        4+    1095        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5+    1096        /*T*                                                         */
+        6+    1097        /*T***********************************************************/
+        7+    1098        %MACRO ALIGNMENT_LENGTH;
+        8+    1099
+        9+    1100             2 ALIGNMENT SBIN WORD,
+       10+    1101             2 LENGTH    SBIN WORD;
+       11+    1102
+       12+    1103        %MEND;
+       13+    1104
+       14+    1105
+       15+    1106             %EQU ALIGNMENT_WORD      = 0;
+       16+    1107             %EQU ALIGNMENT_DOUBLE    = 1;
+       17+    1108             %EQU ALIGNMENT_HALF      = 2;
+       18+    1109             %EQU ALIGNMENT_BYTE1     = 3;
+       19+    1110             %EQU ALIGNMENT_BYTE3     = 4;
+       20+    1111             %EQU ALIGNMENT_UNKNOWN   = 5;
+       21+    1112
+       22+    1113        %EJECT;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:42   
+      983     1114    1   RETURN ;
+      984     1115    1   END ;
+
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:43   
+--  Include file information  --
+
+   Z8F_ALIGN.:Z8A6TOU  is referenced.
+   Z8F_O2COM.:Z8A6TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure Z8FD$DOCUMENT.
+
+   Procedure Z8FD$DOCUMENT requires 3 words for executable code.
+   Procedure Z8FD$DOCUMENT is declared NOAUTO and requires 2 words of local(STATIC) storage.
+
+    No errors detected in file Z8FD.:Z8A6TSI    .
+
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:44   
+
+ Object Unit name= Z8FD$DOCUMENT                              File name= Z8FD.:Z8A6TOU
+ UTS= AUG 09 '97 13:05:24.56 SAT                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Data  even  none     2      2  Z8FD$DOCUMENT
+    1  LblCom even  none    12     14  O2COM
+    2   Proc  even  none     3      3  Z8FD$DOCUMENT
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes            yes      Std        0  Z8FD$DOCUMENT
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     NULLSID
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:45   
+
+
+        1        1        /*M*  Z8DD$DOCUMENT -- Phase 2 storage allocation and flow analysis overview. */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*P*
+        8        8               NAME:  Z8FD$DOCUMENT
+        9        9            PURPOSE:  Explains the calculation of storage offsets and flow analysis.
+       10       10        */
+       11       11        /*F*
+       12       12               NAME:  PURPOSE
+       13       13             AUTHOR:  GK Myers
+       14       14          REFERENCE:  Design note 1 and design note 23
+       15       15
+       16       16                      Phase 2 storage allocation calculates the actual storage
+       17       17                      location of all data items set up by Phase 1.  Storage locations
+       18       18                      inside a structure are determined by adding the offset of the
+       19       19                      item within the structure to the offset of the 01 data item.
+       20       20                      Storage allocation also handles the creation of ESC (escape)
+       21       21                      and ARGP (argument pointer) triads in the ETT.
+       22       22
+       23       23                      Phase 2 also handles flow analysis.  The ILS and ILL tables
+       24       24                      are looked thru to achieve various optimizations.
+       25       25                      These include:
+       26       26
+       27       27                           (1)  Label reference resolution
+       28       28                           (2)  Elimination of dead code
+       29       29                           (3)  Transform small PERFORMs to in-line
+       30       30                           (4)  Transform out of line iterative PERFORMs
+       31       31                                to in-line
+       32       32                           (5)  Transform if loops to do loops
+       33       33                           (6)  Phase 3 optimizer support
+       34       34                           (7)  Eliminate unnecessary assignments
+       35       35                           (8)  Collapse chains of GOTOs to single GOTOs
+       36       36                           (9)  Independent segment management
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:46   
+       37       37        */
+       38       38        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:47   
+       39       39        /*F*
+       40       40               NAME:  METHOD
+       41       41             AUTHOR:  GK Myers (06/10/81)
+       42       42
+       43       43                      The code for these modules is in PL-6.  The master module
+       44       44                      (Z8F2$PHASE2) is called by the executive after Phase 1 has
+       45       45                      been completed.  The master module then calls the procedures
+       46       46                      to calculate storage allocation and to perform flow analysis.
+       47       47
+       48       48                      The modules and their relationships are described in the
+       49       49                      following diagram:
+       50       50
+       51       51
+       52       52        Z9AP$BRING_IN_PHASE
+       53       53        -------------------
+       54       54                 !
+       55       55                 !
+       56       56                 !
+       57       57                 V
+       58       58        *****************      ****************************
+       59       59        !               !----->!                          !
+       60       60        !               !      !  Z8FB$PHASE2_PREPASS     !          -----------
+       61       61        !               !      !                          !          !         !
+       62       62        !               !      !                          !          !         !
+       63       63        !               !      ****************************          V         !
+       64       64        !               !      ****************************      *********************
+       65       65        !               !----->!                          !----->!                   !
+       66       66        !               !      !  Z8FA$STORAGE_ALLOCATOR  !      !  Z8FC$SA_UPDATE   !
+       67       67        !               !      !                          !      !    (Recursive)    !
+       68       68        !               !      !                          !      !                   !
+       69       69        !               !      ****************************      *********************
+       70       70        !               !      ****************************
+       71       71        !               !----->!                          !
+       72       72        !               !      !   Z8FL$LABEL_REFERENCE   !
+       73       73        !               !      !                          !
+       74       74        !  Z8F2$PHASE2  !      !                          !
+       75       75        !               !      ****************************
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:48   
+       76       76        !               !      ****************************
+       77       77        !               !----->!                          !
+       78       78        !               !      !   Z8FJ$SEGMENT_SUBS      !
+       79       79        !               !      !                          !
+       80       80        !  Z8F2$PHASE2  !      !                          !
+       81       81        !               !      ****************************
+       82       82        !               !
+       83       83        !               !      ****************************      *********************
+       84       84        !               !----->!                          !----->!Z8FS$SRCH_IF_DO_LBL!
+       85       85        !               !      !    Z8FF$FLOW_ANALYSIS    !      *********************
+       86       86        !               !      !                          !      *********************
+       87       87        !               !      !                          !----->!Z8FP$PFORM_CHECKING!
+       88       88        !               !      ****************************      *********************
+       89       89        !               !      ****************************
+       90       90        !               !----->!                          !
+       91       91        !               !      !   Z8FO$LOCAL_OPTIMIZER   !
+       92       92        !               !      !                          !
+       93       93        *****************      ****************************
+       94       94
+       95       95        %EJECT ;
+       96       96
+       97       97        Z9AP$BRING_IN_PHASE     Executive procedure that calls Phase 2 to be executed.
+       98       98
+       99       99        Z8F2$PHASE2             Phase 2 root.  Calls Z8FA$STORAGE_ALLOCATOR and
+      100      100                                Z8FF$FLOW_ANALYSIS.
+      101      101
+      102      102        Z8FB$PHASE2_PREPASS     Does necessary preprocessing to set up linkages
+      103      103                                needed by Phase 2.
+      104      104
+      105      105        Z8FA$STORAGE_ALLOCATOR  Calculates the storage locations for all 01's and
+      106      106                                77's.  If it is a structure, Z8FC$SA_UPDATE is
+      107      107                                called.  This procedure also creates the escape and
+      108      108                                ARGP triads. But it does not need to calculate
+      109      109                                storage addresses for anything in the LINKAGE SECTION.
+      110      110
+      111      111        Z8FC$SA_UPDATE          Calculates the storage location of all elements
+      112      112                                within a structure.  It starts with the 02's then
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:49   
+      113      113                                does the 03's, etc.
+      114      114
+      115      115        Z8FL$LABEL_REFERENCE    Performs label reference resolution on all ALTERS,
+      116      116                                GOS, and PERFORMS.
+      117      117
+      118      118        Z8FJ$SEGMENT_SUBS       Handle switching among independent segments. Reset
+      119      119                                all ALTERed GOTO pointers in any independent segment
+      120      120                                on entry into it.
+      121      121
+      122      122        Z8FF$FLOW_ANALYSIS      Performs all the flow analysis on the program
+      123      123                                flow by stepping thru the ILS.
+      124      124
+      125      125        Z8FS$SRCH_IF_DO_LBL     Resets the DO and DEFLB linked lists if
+      126      126                                needed.  This is called when a PFORM code group
+      127      127                                is transferred in line from above.
+      128      128
+      129      129        Z8FP$PFORM_CHECKING     All PERFORM statements are checked to see if they
+      130      130                                should be COBOL 74 or optimized PERFORMS.
+      131      131        Z8FO$LOCAL_OPTIMIZER    Makes various local optimizations such as supplying
+      132      132                                alignment information for MOVEs and some conversions.
+      133      133        */
+      134      134        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:50   
+      135      135        /*F*
+      136      136               NAME:  FORMAT_OF_INPUT
+      137      137            CHAPTER:  Overview
+      138      138             AUTHOR:  GK Myers (06/08/81)
+      139      139
+      140      140                      The information needed for storage allocation and flow analysis
+      141      141                      is stored in six tables.  When Phase 1 allocates a data item, it
+      142      142                      creates an entry in the symbol table, qualifier links table, and
+      143      143                      if the item is dimensioned a LTS entry.  When Phase 1 breaks
+      144      144                      up a statement, ETT, ILL, and ILS entries are created.
+      145      145                      A brief description of the six tables follows.
+      146      146
+      147      147                         ETT  - Expression Triad Table.  This table represents an
+      148      148                                encoded version of all expressions encountered in the
+      149      149                                procedure division - arithmetic, character, relational,
+      150      150                                etc.  This table is accessed by the programs in a
+      151      151                                random manner via pointers present in ILL, and other ETT
+      152      152                                items.  These items constitute the body of the trees.
+      153      153
+      154      154                         ILL  - Internal Language List.  This table represents an
+      155      155                                encoded version of the COBOL Procedure Division
+      156      156                                statements.  This table is accessed sequentially by the
+      157      157                                ILS table. These nodes are the root nodes of each tree.
+      158      158
+      159      159                         ILS  - Internal Language Supplement.  This table gives the
+      160      160                                order in which the program will be processed.
+      161      161                                Each ILS entry points to a ILL entry.  It is accessed
+      162      162                                sequentially and can also be accessed by ILL
+      163      163                                pointers or by ST pointers when the item is a label.
+      164      164
+      165      165                         LTS  - Long Term Supplement.  This table gives information
+      166      166                                for array entries, edited entries, items with lengths
+      167      167                                greater than the ST.ADSC.N field, and a controller
+      168      168                                entry if needed.  This table is accessed via pointers
+      169      169                                in the ST.
+      170      170
+      171      171                         QLT  - Qualifier Links Table.  This table contains bits
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:51   
+      172      172                                giving further information about a symbol table
+      173      173                                item and also details the entry's father,
+      174      174                                brother, and son if one exists.  The table is accessed
+      175      175                                sequentially or by pointers in the ST.
+      176      176
+      177      177                          ST  - Symbol Table.  This table is comprised of items
+      178      178                                representing encoded versions of data names, file
+      179      179                                names, labels, etc.  The information concerning
+      180      180                                the items location, type, and length is contained
+      181      181                                here.  This table is accessed sequentially or by
+      182      182                                pointers in the QLT.
+      183      183        */
+      184      184
+      185      185        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:52   
+      186      186        /*F*
+      187      187               NAME:  FORMAT_OF_INPUT
+      188      188            CHAPTER:  ETT table
+      189      189
+      190      190                      ETT items are described below.
+      191      191
+      192      192                           ETT.ID      identification code
+      193      193                           ETT.T       Used by the generator to detail the triad's
+      194      194                                       location, i.e. 'Q register contained'.
+      195      195                           ETT.COUNT   Used by the generator to indicate how many
+      196      196                                       times the triad is referenced.
+      197      197                           ETT.LOP     Always a pointer,  usually to ETT items but
+      198      198                                       may point to ST items.
+      199      199                           ETT.ROP     Right operand like LOP.  Base triads are linked
+      200      200                                       together by this pointer and after escape triads
+      201      201                                       are created this points to the escape triad.
+      202      202                           ETT.ROPCON  Right operand constant, for escape triads this
+      203      203                                       details the data block the variable is in.
+      204      204
+      205      205                           The other ETT variables are not used by Phase 2.
+      206      206
+      207      207
+      208      208                ETT
+      209      209                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      210      210               I-----------------I-----------------I-----------------I-----------------I
+      211      211              0!ID                                 !@!T        !COUNT                  !
+      212      212               I-----------------I-----------------I-----------------I-----------------I
+      213      213              1!LOP                                                                    !
+      214      214               I-----------------I-----------------I-----------------I-----------------I
+      215      215              2!ROP                                                                    !
+      216      216               I-----------------I-----------------I-----------------I-----------------I
+      217      217              2!ROPCON                                                                 !
+      218      218               I-----------------I-----------------I-----------------I-----------------I
+      219      219              2!ESCINF                                                                 !
+      220      220               I-----------------I-----------------I-----------------I-----------------I
+      221      221              3!ARG#                               !BLK#                               !
+      222      222               I-----------------I-----------------I-----------------I-----------------I
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:53   
+      223      223              2!VALUE                              !TYPE                               !
+      224      224               I-----------------I-----------------I-----------------I-----------------I
+      225      225              3!ADDO                                                                   !
+      226      226               I-----------------I-----------------I-----------------I-----------------I
+      227      227              3!EVALP$                                                                 !
+      228      228               I-----------------I-----------------I-----------------I-----------------I
+      229      229              4!SSOP_SIZ                                                               !
+      230      230               I-----------------I-----------------I-----------------I-----------------I
+      231      231              4!SC                                 !NI                                 !
+      232      232               I-----------------I-----------------I-----------------I-----------------I
+      233      233        */
+      234      234        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:54   
+      235      235        /*F*
+      236      236               NAME:  FORMAT_OF_INPUT
+      237      237            CHAPTER:  ILL table
+      238      238
+      239      239
+      240      240                      ILL items can be of different formats as different statement
+      241      241                      types are broken down.  It is the head pointer of a tree with
+      242      242                      pointers to subtrees of ETT items.  It is described below.
+      243      243
+      244      244                      (1)  Most ILL items are as below.
+      245      245
+      246      246                           ILL.ID    identification code
+      247      247                           ILL.CODE  Optional field that indicates special attributes
+      248      248                                     of operands ie. LOP, ROP.
+      249      249                           ILL.LOP   Left operand, always a pointer usually pointing
+      250      250                                     to ETT tree but may point to ST.
+      251      251                           ILL.ROP   Right operand like LOP.
+      252      252                           ILL.LBL   Pointer to next label (ILS entry) in label chain.
+      253      253                           ILL.TO    Optional field that points to the receiving data
+      254      254                                     item in moves (not used in Phase 2).
+      255      255
+      256      256
+      257      257                ILL
+      258      258                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      259      259               I-----------------I-----------------I-----------------I-----------------I
+      260      260              0!ID                                 !CODE                               !
+      261      261               I-----------------I-----------------I-----------------I-----------------I
+      262      262              1!LOP                                                                    !
+      263      263               I-----------------I-----------------I-----------------I-----------------I
+      264      264              2!ROP                                                                    !
+      265      265               I-----------------I-----------------I-----------------I-----------------I
+      266      266              2!LBL                                                                    !
+      267      267               I-----------------I-----------------I-----------------I-----------------I
+      268      268              3!TO_                                                                    !
+      269      269               I-----------------I-----------------I-----------------I-----------------I
+      270      270
+      271      271
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:55   
+      272      272                      (2)  Before each statement which usually consists of one ILL entry,
+      273      273                           there is a LINOI item detailing the line number and type of
+      274      274                           the statement.  A description is below.
+      275      275
+      276      276                           LINOI.ID         identification code
+      277      277                           LINOI.PREV_LINE  previous line number
+      278      278                           LINOI.COLUMN_NO  column position
+      279      279                           LINOI.LINE_NO    current line number
+      280      280                           LINOI.TYPE       statement type
+      281      281
+      282      282
+      283      283                LINOI
+      284      284                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      285      285               I-----------------I-----------------I-----------------I-----------------I
+      286      286              0!ID                                 !PREV_LINE                          !
+      287      287               I-----------------I-----------------I-----------------I-----------------I
+      288      288              1!COLUMN_NO                          !LINE_NO                            !
+      289      289               I-----------------I-----------------I-----------------I-----------------I
+      290      290              2!TYPE                               !*                                  !
+      291      291               I-----------------I-----------------I-----------------I-----------------I
+      292      292
+      293      293
+      294      294                      (3)  Do loops have their own ILL entry because of the number of
+      295      295                           differences between them and a standard ILL entry.  It is
+      296      296                           described below.
+      297      297
+      298      298                           DO_N.ID            identification code
+      299      299                           DO_N.B.TEST_AFTER  bit to determine if loop is tested after
+      300      300                           DO_N.ITE           pointer to end of loop
+      301      301                           DO_N.ITB           pointer to beginning of loop
+      302      302                           DO_N.GLIST         for SEARCH optimization
+      303      303                           DO_N.ITP           pointer to prior DO or DOEND entry
+      304      304                           DO_N.ITO           pointer to outside loop entry if any
+      305      305                           DO_N.LEVEL         nesting level of do loop
+      306      306                           DO_N.XLAB          pointer to last referenced label
+      307      307                           DO_N.UNTIL$        pointer to comparison triad
+      308      308                           DO_N.TIMES$        pointer to expression determining
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:56   
+      309      309                                              number of times loop is done
+      310      310                           DO_N.VARYING$      pointer to variable to be varied
+      311      311                           DO_N.FROM$         pointer to starting value of variable
+      312      312                                              being varied
+      313      313                           DO_N.BY$           pointer to increment value of variable
+      314      314
+      315      315
+      316      316                DO_N
+      317      317                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      318      318               I-----------------I-----------------I-----------------I-----------------I
+      319      319              0!ID                                 !. . . . . . . . . . . . . . . . . .!W
+      320      320               I-----------------I-----------------I-----------------I-----------------I
+      321      321              0!. . . . . . . . . . . . . . . . . .!@!* B.TEST_AFTER                   !
+      322      322               I-----------------I-----------------I-----------------I-----------------I
+      323      323              1!ITE                                                                    !
+      324      324               I-----------------I-----------------I-----------------I-----------------I
+      325      325              1!ITB                                                                    !
+      326      326               I-----------------I-----------------I-----------------I-----------------I
+      327      327              2!GLIST                                                                  !
+      328      328               I-----------------I-----------------I-----------------I-----------------I
+      329      329              3!ITP                                                                    !
+      330      330               I-----------------I-----------------I-----------------I-----------------I
+      331      331              4!ITO                                                                    !
+      332      332               I-----------------I-----------------I-----------------I-----------------I
+      333      333              5!LEVEL                              !*                                  !
+      334      334               I-----------------I-----------------I-----------------I-----------------I
+      335      335              6!XLAB                                                                   !
+      336      336               I-----------------I-----------------I-----------------I-----------------I
+      337      337              7!UNTIL$                                                                 !
+      338      338               I-----------------I-----------------I-----------------I-----------------I
+      339      339              7!TIMES$                                                                 !
+      340      340               I-----------------I-----------------I-----------------I-----------------I
+      341      341             10!VARYING$                                                               !
+      342      342               I-----------------I-----------------I-----------------I-----------------I
+      343      343             11!FROM$                                                                  !
+      344      344               I-----------------I-----------------I-----------------I-----------------I
+      345      345             12!BY$                                                                    !
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:57   
+      346      346               I-----------------I-----------------I-----------------I-----------------I
+      347      347        */
+      348      348        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:58   
+      349      349        /*F*
+      350      350               NAME:  FORMAT_OF_INPUT
+      351      351            CHAPTER:  ILS table
+      352      352
+      353      353                      ILS entries will all be as below.
+      354      354
+      355      355                           ILS.ID     identification code
+      356      356                           ILS.SEQNO  sequence number for program operation
+      357      357                           ILS.CDEF   common redefinition bit
+      358      358                           ILS.RDEF   redefinition sequence number
+      359      359                           ILS.NEXT   pointer to next ILS entry
+      360      360                           ILS.ILL$   pointer to ILL entry
+      361      361                           ILS.DNAME  pointer to dataname being redefined
+      362      362                           ILS.DEF    pointer to list of datanames being redefined
+      363      363
+      364      364
+      365      365                ILS
+      366      366                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      367      367               I-----------------I-----------------I-----------------I-----------------I
+      368      368              0!ID                                 !SEQNO                              !
+      369      369               I-----------------I-----------------I-----------------I-----------------I
+      370      370              1!@!* B.CDEF                         !. . . . . . . . . . . . . . . . . .!B
+      371      371               I-----------------I-----------------I-----------------I-----------------I
+      372      372              1!. . . . . . . . . . . . . . . . . .!RDEF                               !
+      373      373               I-----------------I-----------------I-----------------I-----------------I
+      374      374              2!NEXT                                                                   !
+      375      375               I-----------------I-----------------I-----------------I-----------------I
+      376      376              3!ILL$                                                                   !
+      377      377               I-----------------I-----------------I-----------------I-----------------I
+      378      378              4!DNAME                                                                  !
+      379      379               I-----------------I-----------------I-----------------I-----------------I
+      380      380              4!DEF                                                                    !
+      381      381               I-----------------I-----------------I-----------------I-----------------I
+      382      382        */
+      383      383        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:59   
+      384      384        /*F*
+      385      385               NAME:  FORMAT_OF_INPUT
+      386      386            CHAPTER:  LTS_table
+      387      387
+      388      388                      Whenever an item has an occurs clause or if it is an
+      389      389                      edited item, Phase 1 will set up an LTS entry.  The type
+      390      390                      of entry is dependent on which clause is used.  If more
+      391      391                      than one clause is used an LTSS item is created which
+      392      392                      holds pointers to the various LTS entries.  Another entry
+      393      393                      is set up if the variable's size is greater than 4095 as its
+      394      394                      size can't be stored in the symbol table.  The only two
+      395      395                      entries we're concerned with are the LONG and LTSS entries.
+      396      396
+      397      397                      (3) The long entry consists of
+      398      398
+      399      399                          LONG.ID            identification code
+      400      400                          LONG.LENGTH        length of item
+      401      401
+      402      402                LONG
+      403      403                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      404      404               I-----------------I-----------------I-----------------I-----------------I
+      405      405              0!ID                                 !*                                  !
+      406      406               I-----------------I-----------------I-----------------I-----------------I
+      407      407              1!LENGTH                                                                 !
+      408      408               I-----------------I-----------------I-----------------I-----------------I
+      409      409
+      410      410                      (4) LTSS entry to manage multiple Lts entries.
+      411      411
+      412      412                          LTSS.ID            identification code
+      413      413                          LTSS.DIMS$         pointer to dimensioned entry
+      414      414                          LTSS.NEL$          pointer to edited entry
+      415      415                          LTSS.LONG$         pointer to long entry
+      416      416
+      417      417                LTSS
+      418      418                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      419      419               I-----------------I-----------------I-----------------I-----------------I
+      420      420              0!ID                                 !*                                  !
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:60   
+      421      421               I-----------------I-----------------I-----------------I-----------------I
+      422      422              1!DIMS$                                                                  !
+      423      423               I-----------------I-----------------I-----------------I-----------------I
+      424      424              2!NEL$                                                                   !
+      425      425               I-----------------I-----------------I-----------------I-----------------I
+      426      426              3!LONG$                                                                  !
+      427      427               I-----------------I-----------------I-----------------I-----------------I
+      428      428        */
+      429      429        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:61   
+      430      430        /*F*
+      431      431               NAME:  FORMAT_OF_INPUT
+      432      432            CHAPTER:  QLT table
+      433      433
+      434      434                      A qualifier item is set up for every array, scalar, or label
+      435      435                      item in the symbol table.
+      436      436
+      437      437                          QLT.FATHER        pointer to father or nill
+      438      438                          QLT.BROTHER       pointer to brother or nill
+      439      439                          QLT.SON           pointer to son or nill
+      440      440                          QLT.ST$           pointer to ST entry
+      441      441
+      442      442                        Attribute bits:
+      443      443
+      444      444                          QLT.B.OCCURS      item has an occurs clause
+      445      445                          QLT.B.SYNC        item has synchronized clause
+      446      446                          QLT.B.DIGIT       COMP-4 or (COMP-8 when not synchronized)
+      447      447
+      448      448                QLT
+      449      449                0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      450      450               I-----------------I-----------------I-----------------I-----------------I
+      451      451              0!ID                                 !. . . . . . . . . . . . . . . . . .!W
+      452      452               I-----------------I-----------------I-----------------I-----------------I
+      453      453              0!. . . . . . . . . . . . . . . . . .!O!S!D!*                            !
+      454      454               I-----------------I-----------------I-----------------I-----------------I
+      455      455              1!FATHER                                                                 !
+      456      456               I-----------------I-----------------I-----------------I-----------------I
+      457      457              2!BROTHER                                                                !
+      458      458               I-----------------I-----------------I-----------------I-----------------I
+      459      459              3!SON                                                                    !
+      460      460               I-----------------I-----------------I-----------------I-----------------I
+      461      461              4!ST$                                                                    !
+      462      462               I-----------------I-----------------I-----------------I-----------------I
+      463      463              5!DNT$                                                                   !
+      464      464               I-----------------I-----------------I-----------------I-----------------I
+      465      465        */
+      466      466        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:62   
+      467      467        /*F*
+      468      468               NAME:  FORMAT_OF_INPUT
+      469      469            CHAPTER:  ST
+      470      470
+      471      471                      A symbol table item is set up for every block, label, array,
+      472      472                      constant, or scalar item.  Some of the items in this
+      473      473                      table are redefined for generator usage.
+      474      474
+      475      475                          ST.ID             identification code
+      476      476                          ST.R              relocation: 1 for labels, 3 for variables
+      477      477                          ST.COUNT          block number
+      478      478                          ST.SA             storage address
+      479      479                          ST.TYPE           data type ie. COMP-6, COMP-7, etc.
+      480      480                          ST.LINE_NO        line number of declaration
+      481      481
+      482      482                      A descriptor field is set up with information depending on the
+      483      483                      item being numeric (NDSC), alphabetic (ADSC), or bit (BDSC).
+      484      484
+      485      485                        Alpha Descriptor
+      486      486                          ST.ADSC.CN        byte position within word
+      487      487                          ST.ADSC.N         length of item in bytes (if > 4095 then
+      488      488                                            stored in LONG.LENGTH in LTS table)
+      489      489
+      490      490                        Bit Descriptor
+      491      491
+      492      492                          ST.BDSC.C         character position in word
+      493      493                          ST.BDSC.B         bit within byte
+      494      494                          ST.BDSC.N         length in bits
+      495      495
+      496      496                        Numeric Descriptor
+      497      497
+      498      498                          ST.NDSC.CN        digit position within word
+      499      499                          ST.NDSC.TN        '0'B = 9 bit, '1'B = 4 bit
+      500      500                          ST.NDSC.S         signed number, '11'b = no sign
+      501      501                          ST.NDSC.SF        scale factor
+      502      502                          ST.NDSC.N         length in digits is st.ndsc.tn, else bytes
+      503      503
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:63   
+      504      504                        Attribute bits
+      505      505
+      506      506                          ST.B.REFERENCED   item is referenced
+      507      507                          ST.B.DEFINED      item is defined
+      508      508                          ST.B.COMPILER_CREATED Item is one created by compiler
+      509      509                          ST.B.GOTO_LABEL   Item is destination of a GO TO or ALTER
+      510      510                          ST.B.DUPLICATE    defined more than once
+      511      511                          ST.B.ONE_REF      item is referenced only once
+      512      512                          ST.B.GREATER_256K size greater than 256K
+      513      513                          ST.B.LONG_CONSTANT
+      514      514                          ST.B.ELEMENTARY   item has no sons
+      515      515                          ST.B.INIT_PROC    start label of init proc
+      516      516                          ST.B.LENGTH_4096  item's length is stored in LONG.LENGTH
+      517      517                          ST.B.COMP6_NONOP  item can't be optimized into COMP-6
+      518      518                          ST.B.PHASE_2      label has been read by Phase 2
+      519      519                          ST.B.FALL_THRU    label may be reached by falling thru
+      520      520                          ST.B.PFORM_START  start label of optimized PERFORM
+      521      521                          ST.B.PFORM_END    end label of optimized PERFORM
+      522      522                          ST.B.PFORM_NESTED A PERFORM exists in this PERFORM's range
+      523      523                          ST.B.ALTER_CHECK  Label of paragraph that can be ALTERed
+      524      524                          ST.B.COBOL_74_PFORM start label of COBOL-74-style PERFORM
+      525      525                          ST.B.PFORM_74_END end label of COBOL-74-style PERFORM
+      526      526                          ST.B.GO_VECTOR_START label at start of table of GOTOs
+      527      527                          ST.B.INTERIOR_PFORM_LBL label inside a PERFORM code group
+      528      528                          ST.B.BACKWARD_PFORM start label of PERFORM after end label
+      529      529                          ST.B.ALLOCATED
+      530      530                          ST.B.ON_SIZE_ERROR
+      531      531                          ST.B.GO_ALTERED   GO affected by ALTER
+      532      532                          ST.B.USE_BASE_POINTER
+      533      533                          ST.B.USE_GLOBAL   start label of GLOBAL USE
+      534      534                          ST.B.USE_ALREADY_FLAGGED level check already issued
+      535      535                          ST.B.USE_PROC     start label of USE proc
+      536      536                          ST.B.EXIT_PROG_LABEL used if EXIT PROG in USE proc
+      537      537                          ST.B.PFORM_END_LBL
+      538      538
+      539      539                        Pointers
+      540      540
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:64   
+      541      541                          ST.NEXT           pointer to next entry if duplicate
+      542      542                          ST.LTS$           pointer to LTS entry
+      543      543                          ST.ILS$           pointer to ILS entry
+      544      544                          ST.DNT$           pointer to DNT entry
+      545      545                          ST.QLT$           pointer to QLT
+      546      546
+      547      547              ST                            WALIGNED
+      548      548              0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      549      549             I-----------------I-----------------I-----------------I-----------------I
+      550      550            0!ID                                 !R                !COUNT            !W
+      551      551             I-----------------I-----------------I-----------------I-----------------I
+      552      552            1!SA                                 !. . . . . . . . . . . . . . . . . .!
+      553      553             I-----------------I-----------------I-----------------I-----------------I
+      554      554            1!SA_BIT                             !DESCL                              !
+      555      555             I-----------------I-----------------I-----------------I-----------------I
+      556      556              LVL2=BDSC
+      557      557            1!. . . . . . . . . . . . . . . . . .!C  !B      !N                      !B
+      558      558             I-----------------I-----------------I-----------------I-----------------I
+      559      559              LVL2=BDSC        LVL3=LEN
+      560      560            1!. . . . . . . . . . . . . . . . . . . . . . . .!*              !REG    !B
+      561      561             I-----------------I-----------------I-----------------I-----------------I
+      562      562              LVL2=ADSC
+      563      563            1!. . . . . . . . . . . . . . . . . .!CN !M!TA !M!N                      !B
+      564      564             I-----------------I-----------------I-----------------I-----------------I
+      565      565              LVL2=ADSC        LVL3=LEN
+      566      566            1!. . . . . . . . . . . . . . . . . . . . . . . .!*              !REG    !B
+      567      567             I-----------------I-----------------I-----------------I-----------------I
+      568      568              LVL2=NDSC
+      569      569            1!. . . . . . . . . . . . . . . . . .!CN   !T!S  !SF         !N          !B
+      570      570             I-----------------I-----------------I-----------------I-----------------I
+      571      571            2!TYPE or SIZE                       !LINE_NO                            !
+      572      572             I-----------------I-----------------I-----------------I-----------------I
+      573      573              LVL2=REF         LVL3=MF
+      574      574            2!. . . . . . . . . . . . . . . . . .!A!R!I!TAG    !. . . . . . . . . . .!B
+      575      575             I-----------------I-----------------I-----------------I-----------------I
+      576      576              LVL2=REF
+      577      577            2!. . . . . . . . . . . . . . . . . . . . . . . . .!ARF  !C!*            !
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:65   
+      578      578             I-----------------I-----------------I-----------------I-----------------I
+      579      579            3!ATTR                                                                   !
+      580      580             I-----------------I-----------------I-----------------I-----------------I
+      581      581              LVL2=B
+      582      582            3!R!D!C!G!D!O!P!F!I!P!P!P!A!C!P!G!E!I!D!B!A!O!G!U!U!U!U!E!P!*            !B
+      583      583             I-----------------I-----------------I-----------------I-----------------I
+      584      584
+      585      585              0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8
+      586      586             I-----------------I-----------------I-----------------I-----------------I
+      587      587            4!NEXT                                                                   !
+      588      588             I-----------------I-----------------I-----------------I-----------------I
+      589      589            5!LTS$ or POINTER$ or ILS$                                                !
+      590      590             I-----------------I-----------------I-----------------I-----------------I
+      591      591            6!DNT$                                                                   !
+      592      592             I-----------------I-----------------I-----------------I-----------------I
+      593      593            6!CONSTI                                                                 !
+      594      594             I-----------------I-----------------I-----------------I-----------------I
+      595      595            6!LAST                                                                   !
+      596      596             I-----------------I-----------------I-----------------I-----------------I
+      597      597            7!QLT$                                                                   !
+      598      598             I-----------------I-----------------I-----------------I-----------------I
+      599      599            7!ST_PTR                                                                 !
+      600      600             I-----------------I-----------------I-----------------I-----------------I
+      601      601            7!ASS_TRIAD                                                              !
+      602      602             I-----------------I-----------------I-----------------I-----------------I
+      603      603            7!SEGMENT$                                                               !
+      604      604             I-----------------I-----------------I-----------------I-----------------I
+      605      605            7!SECTION$                                                               !
+      606      606             I-----------------I-----------------I-----------------I-----------------I
+      607      607           10!FDP                                !BDP                                !
+      608      608             I-----------------I-----------------I-----------------I-----------------I
+      609      609           10!PREV_ILS$                                                              !
+      610      610             I-----------------I-----------------I-----------------I-----------------I
+      611      611           11!PROC$                                                                  !
+      612      612             I-----------------I-----------------I-----------------I-----------------I
+      613      613           11!REF_TRIAD                                                              !
+      614      614             I-----------------I-----------------I-----------------I-----------------I
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:66   
+      615      615           12!LINK                                                                   !
+      616      616             I-----------------I-----------------I-----------------I-----------------I
+      617      617         */
+      618      618        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:67   
+      619      619        /*F*
+      620      620               NAME:  PROGRAM_DESCRIPTIONS
+      621      621            CHAPTER:  Z8F2$PHASE2
+      622      622
+      623      623                      This procedure is the control procedure for storage allocation
+      624      624                      and flow analysis.  It simply calls Z8FB$PHASE2_PREPASS,
+      625      625                      Z8FA$STORAGE_ALLOCATOR, Z8FL$LABEL_REFERENCE,
+      626      626                      Z8FF$FLOW_ANALYSIS, and Z8FO$LOCAL_OPTIMIZER.
+      627      627        */
+      628      628        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:68   
+      629      629        /*F*
+      630      630               NAME:  PROGRAM_DESCRIPTIONS
+      631      631            CHAPTER:  Z8FA$STORAGE_ALLOCATOR
+      632      632
+      633      633                      This procedure allocates storage for 01's and 77's.  It calls
+      634      634                      Z8FC$SA_UPDATE to calculate the locations of interior members
+      635      635                      of a structure.  After storage allocation is completed then
+      636      636                      escape and ARGP triads are created by this procedure.  A pseudo
+      637      637                      program is below to show the flow of the procedure.
+      638      638
+      639      639
+      640      640                           Get pointer to top of QLT
+      641      641                           Do while Qlt pointer points to a 01 or 77
+      642      642                             If item is referenced and defined and not in LINKAGE
+      643      643                             SECTION then
+      644      644                               Align storage counters
+      645      645                               Get size of variable and increment storage counts
+      646      646                               Check storage counts against data limit
+      647      647                               If item is a structure then
+      648      648                                 Call Z8FC$SA_UPDATE
+      649      649                             Get next 01 or 77 data item
+      650      650                           End
+      651      651                           Create escape and ARGP triads
+      652      652
+      653      653
+      654      654                      The pointer to the top of the Qlt is determined and this is used
+      655      655                      for the loop.  The pointer will point to the first 01 or 77
+      656      656                      data item and the loop then steps thru the QLT performing
+      657      657                      storage allocation on all the 01's and 77's.
+      658      658
+      659      659                      The storage allocation is done only for items that are
+      660      660                      referenced and defined.  The storage counts are double
+      661      661                      word aligned if needed otherwise it is left at a word
+      662      662                      boundary.  This is done to be compatible with COBOL-74
+      663      663                      and so code generation can generate more optimal code.
+      664      664                      However, for the LINKAGE SECTION all storage allocation has
+      665      665                      already been done by Phase 1.
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:69   
+      666      666
+      667      667                      The item's size is then extracted from the ST or LONG.LENGTH
+      668      668                      and added to the storage counts to get the next
+      669      669                      available location for the next data item.
+      670      670
+      671      671                      The next available location is checked against the data
+      672      672                      storage limit (256K) to make sure that all of the data will fit.
+      673      673                      If it goes over the limit an error message is produced and
+      674      674                      the counters are reset to zero, except if MSDATA then allocation
+      675      675                      switches to another data section.
+      676      676
+      677      677                      This procedure only calculates storage locations for 01's
+      678      678                      and 77's so if a 01 item is a structure then Z8FC$SA_UPDATE
+      679      679                      is called.  This then calculates all the interior member's
+      680      680                      location.
+      681      681
+      682      682                      After all of the storage locations have been assigned, the escape
+      683      683                      triads are created.  These are used by the generator to pick out
+      684      684                      the data from a 16K block of storage.  Every item that is
+      685      685                      referenced or defined will have a base item in the ETT that will
+      686      686                      point to a ST entry.  This procedure looks at each base item and
+      687      687                      determines what 16K block of memory it is in.  The escape triad
+      688      688                      is created if needed and the pointer to the escape is assigned
+      689      689                      to the BASE's right operand. For items in the LINKAGE SECTION,
+      690      690                      ARGP triads are created instead of escape triads.
+      691      691        */
+      692      692        %EJECT;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:70   
+      693      693        /*F*
+      694      694               NAME:  PROGRAM_DESCRIPTIONS
+      695      695            CHAPTER:  Z8FB$PHASE2_PREPASS
+      696      696
+      697      697                      This does needed preprocessing for Phase 2: linking DO and VAL
+      698      698                      items, setting PREV_ILS$ for labels as well as the FALL_THRU
+      699      699                      bit, and setting up the list of entries and the branch list
+      700      700                      that Z8FL$LABEL_REFERENCE walks.
+      701      701        */
+      702      702        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:71   
+      703      703        /*F*
+      704      704               NAME:  PROGRAM_DESCRIPTIONS
+      705      705            CHAPTER:  Z8FC$SA_UPDATE
+      706      706
+      707      707                      This procedure is used to go thru all of the data entries in
+      708      708                      a structure to compute their actual locationn.  It is
+      709      709                      recursive and starts with the 02's and then does the 03's,
+      710      710                      etc.  The program flow is shown below.
+      711      711
+      712      712
+      713      713                           If item type is not %TYA then issue error message.
+      714      714                           Get structure's son
+      715      715                           Do while another son exists
+      716      716                             Assign son's storage location
+      717      717                             If son is nonelementary then
+      718      718                               Call Z8FC$SA_UPDATE
+      719      719                             Get son's brother
+      720      720                           End
+      721      721
+      722      722
+      723      723                      The procedure receives a parameter which is the head
+      724      724                      of a structure.  The procedure loops thru all the sons
+      725      725                      starting with the first son of the item.  It calculates
+      726      726                      sons storage address by adding the son's offset within
+      727      727                      the 01 structure to the 01's storage address.
+      728      728                      If the son is nonelementary then it calls Z8FC$SA_UPDATE
+      729      729                      passing itself as the head of the structure.  The son's
+      730      730                      brother is then extracted and sent to the top of the loop.
+      731      731        */
+      732      732        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:72   
+      733      733        /*F*
+      734      734               NAME:  PROGRAM_DESCRIPTIONS
+      735      735            CHAPTER:  Z8FF$FLOW_ANALYSIS
+      736      736
+      737      737                      This procedure looks at the ILS and ILL tables looking for
+      738      738                      optimizations.  It also relinks the ILS in reverse order
+      739      739                      and puts a sequence number in each ILS entry for Phase 3.
+      740      740                      A program flow description is below.
+      741      741
+      742      742
+      743      743                      Initialization
+      744      744                      Loop thru ILS
+      745      745                        Do case on type of ILL entry
+      746      746                          Optimize ILS & ILL if possible
+      747      747                        End
+      748      748                      End
+      749      749                      Loop thru ILS
+      750      750                        Reverse ILS pointers to point to previous item
+      751      751                        Remove dead code
+      752      752                        Assign sequence numbers
+      753      753                        Assign forward definition point
+      754      754                      End
+      755      755
+      756      756
+      757      757                      The initialization phase of the program mainly deals with
+      758      758                      preparing for the loop thru the ILS.  The pointer used for
+      759      759                      the loop is assigned the pointer of the top element of the ILS.
+      760      760                      The pointer to the current section name and paragraph name
+      761      761                      are initialized to nill.  The variables used for do items
+      762      762                      (outer do loop pointer, nesting level) are also initialized.
+      763      763
+      764      764                      The ILS is looped thru so that the ILL items may be looked at.
+      765      765                      The ILL can be accessed thru the ILS which is linked
+      766      766                      sequentially.  When the loop is entered for each ILS item,
+      767      767                      the ILL pointer is set and pointers are set to the next
+      768      768                      LINOI entry and to the next non-LINOI item.  A case statement is
+      769      769                      then used to perform optimizations on the different
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:73   
+      770      770                      ILL types.  The different optimizations are discussed below.
+      771      771
+      772      772
+      773      773                      GO item    -- The left operand of the GO item points to the
+      774      774                                    ST entry for the label.  No optimizations are
+      775      775                                    performed on conditional GOTOs but unconditional
+      776      776                                    GOTOs may be optimized.
+      777      777
+      778      778                                    If there is an unconditional GOTO that is not
+      779      779                                    followed by a referenced label then some dead code
+      780      780                                    exists.  This code is linked around by the ILS and
+      781      781                                    a warning is printed at the start of the unreachable
+      782      782                                    code and an end marker is placed to show the
+      783      783                                    start of reachable code.
+      784      784
+      785      785                      DEFLB item -- The defined label is not optimized but some
+      786      786                                    pointers need to be set.  The pointers to the
+      787      787                                    most recently seen referenced label and the one to
+      788      788                                    the current section name may have to be reassigned.
+      789      789
+      790      790                      DOEND item -- Again no optimizations are done but the DO_N.ITP is
+      791      791                                    set to the previous DO entry.  The nesting level
+      792      792                                    counter is reassigned as well as the pointer to the
+      793      793                                    outer do entry.
+      794      794
+      795      795                      PFORM item -- There are two types of optimizations that may be
+      796      796                                    done on on the PFORM.
+      797      797
+      798      798                                    The best optimization is to move the perform code
+      799      799                                    group in line by reassigning the sequencing links of
+      800      800                                    the ILS.  This can only be done however if the
+      801      801                                    beginning and ending labels of the perform group
+      802      802                                    are only referenced once and there are no referenced
+      803      803                                    labels in between them.
+      804      804
+      805      805                                    The other optimization is to copy the ILS entries
+      806      806                                    of the perform code group and move the copy in
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:74   
+      807      807                                    line using the sequence links.  This can be done no
+      808      808                                    matter how many times the labels are referenced but
+      809      809                                    it is optimal only if there's a small number of
+      810      810                                    statements in the code group.
+      811      811
+      812      812
+      813      813                      This procedure has a second loop thru the ILS which assigns the
+      814      814                      sequence numbers of items and rereverses the ILS sequencing links.
+      815      815                      These are needed for Phase 3.  It also has a case statement which
+      816      816                      assigns the forward definition points.
+      817      817        */
+      818      818        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:75   
+      819      819        /*F*
+      820      820               NAME:  PROGRAM_DESCRIPTIONS
+      821      821            CHAPTER:  Z8FJ$SEGMENT_SUBS
+      822      822
+      823      823                      This procedure steps through the BRANCH sublist, when
+      824      824                      a %SCOPE ILL item is found, it generates the subroutines
+      825      825                      which will refresh the alter switches in the independent
+      826      826                      segments on the top of the procedure divisions, when a
+      827      827                      %DEFLB ILL item is found and the label id is %SECTION,
+      828      828                      or, a %GO ILL item is found, the program flow will be
+      829      829                      checked and if it is flowing into a different independent
+      830      830                      segment then the run time subroutine call will be
+      831      831                      generated to refresh the alter switches in that independent
+      832      832                      segment.
+      833      833
+      834      834        */
+      835      835        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:76   
+      836      836        /*F*
+      837      837               NAME:  PROGRAM_DESCRIPTIONS
+      838      838
+      839      839            CHAPTER:  Z8FL$LABEL_REFERENCE
+      840      840
+      841      841                      This internal procedure checks and assigns left or right
+      842      842                      operands of the ILL to point to the correct label entries
+      843      843                      in the ST.  A program flow overview is below.
+      844      844
+      845      845
+      846      846                      If operand points to ST entry of type PARA or SECTION then
+      847      847                        if item has a duplicate entry then
+      848      848                          Print out duplicate error message
+      849      849                      Else
+      850      850                        Reassign pointer to point to ST not DNT entry
+      851      851                        If ST entry's ID is not PARA or SECTION then
+      852      852                          Print error that no label by this name exists
+      853      853                        Else
+      854      854                          If only one entry by that label name then
+      855      855                            Assign St pointer to ILL operand
+      856      856                          Else
+      857      857                            If ILL entry is not located in a section name then
+      858      858                              Print out duplicate error message
+      859      859                            Else
+      860      860                              Look at ST label entries of this name to
+      861      861                                find one in current section
+      862      862                              If no ST entry of this type then
+      863      863                                Print out duplicate error message
+      864      864                              Else
+      865      865                                If duplicate entries of this name in section then
+      866      866                                  Print out duplicate error message
+      867      867                                Else
+      868      868                                  Assign pointer, correct label reference
+      869      869
+      870      870
+      871      871                      This procedure basically looks at a tree and decides which
+      872      872                      category the reference belongs to.  A label is referenced
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:77   
+      873      873                      correctly under any of the following conditions.
+      874      874
+      875      875                      1)  Operand points to ST entry where that entry is of
+      876      876                          type Para or SECTION.
+      877      877
+      878      878                      2)  There is only one label by this name in the program.
+      879      879
+      880      880                      3)  There is only one label by this name in the current
+      881      881                          section.
+      882      882
+      883      883
+      884      884                      A duplicate error message is printed for any of the
+      885      885                      following conditions
+      886      886
+      887      887                      1)  Though item is qualified i.e. GOTO A OF X,
+      888      888                          There are two labels A in X.
+      889      889
+      890      890                      2)  ILL entry is not under a section and there are two
+      891      891                          or more labels of the same name in the program.
+      892      892
+      893      893                      3)  Two or more labels of the same name in the program
+      894      894                          but none of them are in the current section.
+      895      895
+      896      896                      4)  Two or more labels of same name within the current
+      897      897                          section.
+      898      898
+      899      899
+      900      900                      An error message is printed stating that there is no label
+      901      901                      by this name if the ST entry is not of type PARA or SECTION.
+      902      902        */
+      903      903        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:78   
+      904      904        /*F*
+      905      905               NAME:  PROGRAM_DESCRIPTIONS
+      906      906            CHAPTER:  Z8FS$SRCH_IF_DO_LBL
+      907      907
+      908      908                      This procedure is called when a PFORM is to be transferred
+      909      909                      in-line and that PFORM code group has already been processed
+      910      910                      by flow analysis.  A program flow description is below.
+      911      911
+      912      912                      Search code group for DOs.
+      913      913                      Find the last ref'd label and relink label chain
+      914      914                      If there is a DO then relink and reset DO_N.XLAB
+      915      915
+      916      916                      The last referenced label
+      917      917                      before the code group is found for the DO items.
+      918      918
+      919      919                      The DO items are relinked if there are any present.  The
+      920      920                      DO_N.XLAB pointer is reset for any DO items after the code group
+      921      921                      that point to the ending label of the code group.
+      922      922        */
+      923      923        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:79   
+      924      924        /*F*
+      925      925               NAME:  PROGRAM_DESCRIPTIONS
+      926      926            CHAPTER:  Z8FP$PFORM_CHECKING
+      927      927
+      928      928                      This procedure is called at the end of the optimization loop
+      929      929                      in Z8FF if there are any PFORMs in the program.  Design note 27
+      930      930                      defines the criteria for either creating a COBOL 74 PFORM or
+      931      931                      an OPTIMIZED PFORM.  All of the labels involved are marked and
+      932      932                      then a check is made to see which type of PFORM is created.
+      933      933
+      934      934        %EJECT ;
+      935      935                                      EXAMPLE
+      936      936                                      *******
+      937      937
+      938      938          USER PROGRAM           COBOL 74 PERFORM          OPTIMIZED PERFORM
+      939      939          ------------           ----------------          -----------------
+      940      940
+      941      941          PERFORM A.             ALTER POINTER TO RETURN.   GO_SUB A-BEGIN.
+      942      942                                 GO TO A.
+      943      943                               RETURN_LOC:
+      944      944                                 ALTER POINTER TO A-END.
+      945      945                                 PRESET POINTER TO A-END.
+      946      946
+      947      947
+      948      948
+      949      949          A.                   A.                       A.
+      950      950                                                  ALTER X7 TO A-END.
+      951      951                                              A-BEGIN.
+      952      952                                                  Safestore X7 to temp if need to.
+      953      953
+      954      954                                                  Restore X7 if need to.
+      955      955                                                  GO TO 0,X7.
+      956      956                                 GO TO POINTER.
+      957      957                               A-END.                   A-END.
+      958      958
+      959      959        */
+      960      960        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:80   
+      961      961        /*F*
+      962      962               NAME:  PROGRAM DESCRIPTIONS
+      963      963            CHAPTER:  Z8FO$LOCAL_OPTIMIZER
+      964      964
+      965      965                      This procedure is called after storage allocation to make such
+      966      966                      optimizations as it can. That includes marking alphanumeric
+      967      967                      moves to indicate what byte alignments are involved, converting
+      968      968                      them to optimized moves if possible, and supplying alignment
+      969      969                      information for certain conversions, such as COMP-6 to COMP-7.
+      970      970                      DO3s for the SEARCH statement are analyzed to see which
+      971      971                      ESC and ARGP triads need to be forced to be global
+      972      972                      between DO3 and DOEND.
+      973      973        */
+      974      974        %EJECT ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:81   
+      975      975        Z8FD$DOCUMENT: PROC NOAUTO ;
+
+    975  2 000000   000000 741200 0     Z8FD$DOCUME* STX1  ! 0
+
+      976      976
+      977      977        %SET LISTINC = '1'B ;
+      978      978
+      979      979        %SET PHASE = 2 ;
+      980      980
+      981      981        %INCLUDE Z8F_O2COM ;
+        1+     982        /*M* Z8F_O2COM -- Phase 2 Common Variables */
+        2+     983        /*T***********************************************************/
+        3+     984        /*T*                                                         */
+        4+     985        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5+     986        /*T*                                                         */
+        6+     987        /*T***********************************************************/
+        7+     988
+        8+     989        /*B*
+        9+     990            NEXT_AVAILABLE$ -- Used as pointer to storage location counter for the
+       10+     991                               last data block to be referenced.
+       11+     992        */
+       12+     993
+       13+     994    1   DCL 1 O2COM      ALIGNED EXT,
+       14+     995    1         2 POPS_SA    SBIN WORD,   /* SA field of "01" or "FD" */
+       15+     996    1         2 PFORM_LIST$  PTR , /* Ptr used for PFORM linked list      */
+       16+     997    1         2 LAST_LBL$   PTR , /* Ptr to ILS for last referenced label */
+       17+     998    1         2 SECTION$    PTR   /* Ptr to ST entry for SECTION name */
+       18+     999    1                       INIT(ADDR(NIL)), /* Not in any section yet */
+       19+    1000    1         2 LINE_NO$    PTR , /* Ptr to ILS item above LINOI item for line numbers */
+       20+    1001    1         2 SEGMENT_NO     UBIN ,
+       21+    1002    1         2 NEXT_AVAILABLE$ PTR INIT(ADDR(NIL)),
+       22+    1003    1         2 DO_LEVEL       SBIN WORD INIT(0), /* Running DO level */
+       23+    1004    1         2 DO_BEGIN       PTR INIT(ADDR(NIL)), /* Current Mother DO */
+       24+    1005    1         2 CALL_ID        BIT (1) ALIGNED INIT ('0'B),
+       25+    1006    1         2 WORK_STOR_BLKNUM UBIN INIT (1),
+       26+    1007    1         2 LAST       PTR ;
+       27+    1008
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:82   
+       28+    1009        /*V*
+       29+    1010            NEXT_ILS -- Find the next entry in the ILS chain, in order of
+       30+    1011                        ILS.NEXT linkages.
+       31+    1012        */
+       32+    1013
+       33+    1014        %MACRO NEXT_ILS (POINTER = ILS$) ;
+       34+    1015               DO ; /* Next ILS entry in the ILS chain */
+       35+    1016                 POINTER = POINTER->ILS.NEXT ;
+       36+    1017               END ;
+       37+    1018        %MEND ;
+       38+    1019
+       39+    1020        /*V*
+       40+    1021            NEXT_NON_LINOI -- Find the next entry in the ILS chain for which an ILL
+       41+    1022                              entry exists and for which that entry is not a LINOI.
+       42+    1023        */
+       43+    1024
+       44+    1025        %MACRO NEXT_NON_LINOI (POINTER = ILS$) ;
+       45+    1026               DO UNTIL (POINTER->ILS.ILL$ ~= ADDR (NIL) AND
+       46+    1027                         POINTER->ILS.ILL$->ILL.ID ~= %LINOI) ;
+       47+    1028        %NEXT_ILS (POINTER = POINTER) ;
+       48+    1029               END ;
+       49+    1030        %MEND ;
+       50+    1031
+       51+    1032        /*V*
+       52+    1033            NEXT_NON_SUPPORT -- Find the next entry in the ILS chain for which an ILL
+       53+    1034                                entry exists and for which it is not LINOI, PREOFF,
+       54+    1035                                PRESET, or PTR_SET.
+       55+    1036        */
+       56+    1037
+       57+    1038        %MACRO NEXT_NON_SUPPORT (POINTER = ILS$) ;
+       58+    1039               DO UNTIL (POINTER->ILS.ILL$ ~= ADDR (NIL) AND
+       59+    1040                         POINTER->ILS.ILL$->ILL.ID ~= %PTR_SET AND
+       60+    1041                         POINTER->ILS.ILL$->ILL.ID ~= %PRESET AND
+       61+    1042                         POINTER->ILS.ILL$->ILL.ID ~= %P_A_PRESET AND
+       62+    1043                         POINTER->ILS.ILL$->ILL.ID ~= %P_P_PRESET AND
+       63+    1044                         POINTER->ILS.ILL$->ILL.ID ~= %PREOFF AND
+       64+    1045                         POINTER->ILS.ILL$->ILL.ID ~= %LINOI) ;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:83   
+       65+    1046        %NEXT_ILS (POINTER = POINTER) ;
+       66+    1047               END ;
+       67+    1048        %MEND ;
+       68+    1049
+       69+    1050        /*V*
+       70+    1051            FIND_LINE_NO - Using the ILS item passed in search the ILS until an
+       71+    1052                           item is found with a LINOI below it.  This item is then
+       72+    1053                           used by the procedure to call an error message.
+       73+    1054        */
+       74+    1055
+       75+    1056        %MACRO FIND_LINE_NO (@START_ITEM$=ILS$) ;
+       76+    1057               DO ;
+       77+    1058                 O2COM.LINE_NO$ = @START_ITEM$ ;
+       78+    1059
+       79+    1060                 DO WHILE O2COM.LINE_NO$->ILS.ILL$->ILL.ID ~= %LINOI ;
+       80+    1061
+       81+    1062                   DO UNTIL O2COM.LINE_NO$->ILS.ILL$ ~= ADDR(NIL) ;
+       82+    1063                     %NEXT_ILS (POINTER=O2COM.LINE_NO$) ;
+       83+    1064                   END ;
+       84+    1065
+       85+    1066                 END ;
+       86+    1067
+       87+    1068                 COMCOM.CURRENT.LINE = O2COM.LINE_NO$->ILS.ILL$->LINOI.PREV_LINE ;
+       88+    1069                 COMCOM.CURRENT.COLUMN = O2COM.LINE_NO$->ILS.ILL$->LINOI.PREV_COL ;
+       89+    1070               END ;
+       90+    1071        %MEND ;
+       91+    1072
+       92+    1073        %MACRO INCREMENT_STORAGE_CNT (@ITEM$=POINTER$) ;
+       93+    1074               DO ;
+       94+    1075                 @ITEM$->ST.SA = COMCOM.BLOCK$->BLOCK.SIZE ;
+       95+    1076                 COMCOM.BLOCK$->BLOCK.SIZE = COMCOM.BLOCK$->BLOCK.SIZE + 1 ;
+       96+    1077
+       97+    1078        /*N*
+       98+    1079        ESC_CHECK - Need to check ESC to make sure that storage allocation does
+       99+    1080                    does not cross a ESC triad.
+      100+    1081        */
+      101+    1082
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:84   
+      102+    1083               END ;
+      103+    1084        %MEND ;
+      104+    1085
+      105+    1086        %IF PHASE = 2;
+      106+    1087            %EQU BYTES_PER_WORD = 4 ;
+      107+    1088            %EQU DIGITS_PER_BYTE = 2 ;
+      108+    1089        %ENDIF;
+      109+    1090        %EJECT;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:85   
+      982     1091        %INCLUDE Z8F_ALIGN ;
+        1+    1092        /*M* Z8F_ALIGN -- Codes for alignment on various boundaries */
+        2+    1093        /*T***********************************************************/
+        3+    1094        /*T*                                                         */
+        4+    1095        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5+    1096        /*T*                                                         */
+        6+    1097        /*T***********************************************************/
+        7+    1098        %MACRO ALIGNMENT_LENGTH;
+        8+    1099
+        9+    1100             2 ALIGNMENT SBIN WORD,
+       10+    1101             2 LENGTH    SBIN WORD;
+       11+    1102
+       12+    1103        %MEND;
+       13+    1104
+       14+    1105
+       15+    1106             %EQU ALIGNMENT_WORD      = 0;
+       16+    1107             %EQU ALIGNMENT_DOUBLE    = 1;
+       17+    1108             %EQU ALIGNMENT_HALF      = 2;
+       18+    1109             %EQU ALIGNMENT_BYTE1     = 3;
+       19+    1110             %EQU ALIGNMENT_BYTE3     = 4;
+       20+    1111             %EQU ALIGNMENT_UNKNOWN   = 5;
+       21+    1112
+       22+    1113        %EJECT;
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:86   
+      983     1114    1   RETURN ;
+
+   1114  2 000001   000000 221200 0                  LDX1  ! 0
+         2 000002   000001 702211                    TSX2  ! 1,X1
+      984     1115    1   END ;
+
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:87   
+--  Include file information  --
+
+   Z8F_ALIGN.:Z8A6TOU  is referenced.
+   Z8F_O2COM.:Z8A6TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure Z8FD$DOCUMENT.
+PL6.E3A0      #001=Z8FD$DOCUMENT File=Z8FD.:Z8A6TSI                              SAT 08/09/97 13:05 Page:88   
+
+ **** Variables and constants ****
+
+  ****  Section 001 LblCom O2COM
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(432)         1 O2COM
+
+
+   Procedure Z8FD$DOCUMENT requires 3 words for executable code.
+   Procedure Z8FD$DOCUMENT is declared NOAUTO and requires 2 words of local(STATIC) storage.
+
+    No errors detected in file Z8FD.:Z8A6TSI    .

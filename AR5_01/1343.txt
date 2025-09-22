@@ -1,0 +1,3298 @@
+VERSION E05
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:1    
+        1        1        /*M* KVS$BFR VDH BUFFER SERVICE ROUTINES
+                 1             */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*     NSO,PLM=3,SQB=Y,AND=Y,ENI=0,SDI=3,MCL=10,CSI=0,ECI=0,IND=0,IAD=3 */
+        8        8
+        9        9        KVS$BFR: PROC(AV$) ALTRET;
+       10       10        /*P* NAME: KVS$BFR
+       11       11             PURPOSE: VDH buffer manipulation routines.
+       12       12             DESCRIPTION:
+       13       13                   Acquire or release buffers for VDH or for the vdh user.
+       14       14                   The buffers may be shared (VDH or user)
+       15       15                   or unshared. For shared buffers, these routines
+       16       16                   keep track of usage counts and chains. For all buffers, they
+       17       17                   track current buffer utilizations, and check against allowable
+       18       18                   limits.
+       19       19                   The routines perform the KV$VDH_GETBFR or KV$VDH_RLSBFR functions. */
+       20       20
+       21       21        %INCLUDE KH_MACRO_C;
+       22      764        %INCLUDE KL_CONTROL_C;
+       23     1144        %INCLUDE KL_AFCN_C;
+       24     1245        %INCLUDE KL_MACRO_C;
+       25     4597        %INCLUDE K_ID_E;
+       26     4647        %K#ENTID_E;
+       27     4666        %K#LYRID_E;
+       28     4673
+       29     4674 S      %INCLUDE KV$GLB;                        /* VDH Global structures              */
+       30     4675 S      %INCLUDE KV$GLBCTX;                     /* VDH Global context                 */
+       31     4676 S      %INCLUDE KV$INT;                        /* VDH internal structures            */
+       32     4677 S      %INCLUDE KV$USR;                        /* VDH to VDH-user request structures */
+       33     4678 S      %INCLUDE KV$VDH;                        /* VDH-user to VDH request structures */
+       34     4679 S      %INCLUDE KV_GLBCNS_E;                   /* Virtual device handler constants   */
+       35     4680 S      %INCLUDE KV_PRMID_E;                    /* Parameter ID definitions           */
+       36     4681        %INCLUDE KV_SCODE_C;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:2    
+       37     4702        %INCLUDE LCP_6;
+       38     4893        %VLP_SCODE (FPTN=KVS_NOMMR,FCG=KV,MID=S,ERR#=%S$KV_NOMMR,STCLASS=CONSTANT);
+       39     4954        %VLP_SCODE (FPTN=KVS_SHRCHN,FCG=KV,MID=S,ERR#=%S$KV_SHRCHN,STCLASS=CONSTANT);
+       40     5015
+       41     5016        %KH$CTLTBL (FPTN=KH_CTLTBL, STCLASS="BASED(KH_CTLTBL$)");
+       42     5228    1   DCL KH_CTLTBL$ PTR SYMREF;
+       43     5229        %EQU KH_INHLVL=CHARTEXT(CONCAT('KH_CTLTBL.PARM.PTR$(',BINCHAR(KL_HNDLRPARM_INTLVL),
+              5229            ')->Y$WRD'));
+       44     5230        %KV$PTR;                                /*  Pointers, status                  */
+       45     5273        %KV$SHRBFR(NAM = 'MUD', STCLASS = "BASED(BFR$)");
+              5273            /* Shared buffer header template */
+       46     5305        %KV$SSN;                                /*  Session                           */
+       47     5384        %KV$STR;                                /*  Stream                            */
+       48     5471        %KV$STT (STCLASS = "BASED(Y@STT$)");    /*  Stats                             */
+       49     5865        %KV$STT (NAME=Y$STT, STCLASS="BASED(Y@STT$)"); /*  Stats                      */
+       50     6259        %EQU KV_STT=CHARTEXT('Y$STT');
+       51     6260        %KV$USRPRM;                             /*  USER PARAMETERS                   */
+       52     6311        %KV$VDI;                                /*  VDI (VDH < ->VDH user interface)  */
+       53     6382        %KV_BFRRLSDSP_E;
+       54     6388        %KV_STRTYP_E;
+       55     6426        %KV#VD_ORG_E;
+       56     6434
+       57     6435    1   DCL Y$WRD UBIN BASED ALIGNED;
+       58     6436    1   DCL Y$PTR$ PTR BASED;
+       59     6437
+       60     6438    1   DCL KVB$GETSYS ENTRY(2) ALTRET;
+       61     6439    1   DCL KVB$GET2NSYS ENTRY(2) ALTRET;
+       62     6440    1   DCL KVB$RLSSYS ENTRY(2) ALTRET;
+       63     6441    1   DCL KVB$RLS2NSYS ENTRY(2) ALTRET;
+       64     6442    1   DCL KHI$DISABLE ENTRY(1);
+       65     6443    1   DCL KHI$ENABLE ENTRY;
+       66     6444    1   DCL KHD$SCREECH ENTRY(1);
+       67     6445
+       68     6446        %KV$SHRBFR(NAME = KV_ACTCHRTBLNRM, STCLASS = CONSTANT SYMDEF, LAST = ",", LNK =
+              6446            KV_ACTCHR1);
+       69     6478    1          2 *(0:7) BIT(32) INIT(
+       70     6479    1    '082C002F'X, '0'B*3, '082C002F'X, '0'B*3);
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:3    
+       71     6480        %KV$SHRBFR(NAME = KV_ACTCHR1, STCLASS = CONSTANT, LAST = ",", LNK = KV_ACTCHR2);
+       72     6512    1          2 *(0:7) BIT(32) INIT(
+       73     6513    1    '0824020F'X, '0'B*3, '0824020F'X, '0'B*3);
+       74     6514        %KV$SHRBFR(NAME = KV_ACTCHR2, STCLASS = CONSTANT, LAST = ",");
+       75     6546    1          2 *(0:7) BIT(32) INIT(
+       76     6547    1    '086C002F'X, '00010004'X, '00000016'X, '00000014'X,
+       77     6548    1    '086C002F'X, '00010004'X, '00000016'X, '00000014'X);
+       78     6549        %KV$SHRBFR(NAME = KV_SHRBFR, STCLASS = CONSTANT SYMDEF);
+       79     6581        %KV$SHRBFR(NAME = KV_SHRBFR_ENTSRD, STCLASS = CONSTANT SYMDEF);
+       80     6613        %KV$SHRBFR(NAME = KV_SHRBFR_TAB, STCLASS = CONSTANT SYMDEF, LAST = ",");
+       81     6645    1          2 *(0:7) BIT(32) INIT('0'B*0);
+       82     6646        %KV$LINLST(NAME = KV_LINLST, STCLASS = CONSTANT SYMDEF);
+       83     6673        %KV$MRD(NAME = KV_MRD, STCLASS = CONSTANT SYMDEF);
+       84     6720        %KV$MVD(NAME = KV_MVD, STCLASS = CONSTANT SYMDEF);
+       85     6764        %KV$SHRBFR_PRM(NAME = KV_SHRBFR_PRM1, STCLASS = CONSTANT SYMDEF, NAM = '',
+       86     6765         VFC = '70'X, TXT = '!',
+       87     6766         LNK = KV_SHRBFR_PRM2);
+       88     6813        %KV$SHRBFR_PRM(NAME = KV_SHRBFR_PRM2, STCLASS = CONSTANT SYMDEF, NAM = '',
+       89     6814         VFC = '40'X, TXT = '*',
+       90     6815         LNK = KV_SHRBFR_PRM3);
+       91     6862        %KV$SHRBFR_PRM(NAME = KV_SHRBFR_PRM3, STCLASS = CONSTANT SYMDEF, NAM = '',
+       92     6863         VFC = '40'X, TXT = '?');
+       93     6910        %KV$PTR(NAME = KV_PTR, STCLASS = CONSTANT SYMDEF);
+       94     6953        %KV$SRD(NAME = KV_SRD, STCLASS = CONSTANT SYMDEF);
+       95     7228        %KV$SSN(NAME = KV_SSN, STCLASS = CONSTANT SYMDEF);
+       96     7307        %KV$STR (NAME=KV_STR, STCLASS=CONSTANT SYMDEF, ACTCHRTBL=KV_ACTCHRTBLNRM);
+       97     7394        %KV$TYPAHDBFR(NAME = KV_TYPAHDBFR, STCLASS = CONSTANT SYMDEF);
+       98     7419        %KV$X364(NAME = KV_X364, STCLASS = SYMREF READONLY);
+       99     7453        %KV$VDI(NAME = KV_VDI, STCLASS = CONSTANT SYMDEF);
+      100     7524
+      101     7525        %SET KV$STRCTR_INDEX = 0;
+      102     7526
+      103     7527    1   DCL 1 KV_STRCTR ALIGNED STATIC SYMDEF,
+      104     7528
+      105     7529        %KV$STRCTR(NAME = ACTCHR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_ACTCHR,
+      106     7530        SHRBFR = YES, SHRBFRHED = KV_ACTCHRTBLNRM, LAST = ",");
+      107     7564
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:4    
+      108     7565        %KV$STRCTR(NAME = DCB_, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_DCB, LAST =
+              7565            ",");
+      109     7599
+      110     7600        %KV$STRCTR(NAME = DCBHDN, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_DCBHDN,
+      111     7601        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      112     7635
+      113     7636        %KV$STRCTR(NAME = ERR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_ERR, LAST =
+              7636            ",");
+      114     7670
+      115     7671        %KV$STRCTR(NAME = FLD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_FLD, LAST =
+              7671            ",");
+      116     7705
+      117     7706        %KV$STRCTR(NAME = FLDLST, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_FLDLST,
+      118     7707        PWR2=YES, LAST=",");
+      119     7741
+      120     7742        %KV$STRCTR(NAME = INPTAB, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_INPTAB,
+      121     7743        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, CHKSIZ=YES, LAST=",");
+      122     7777
+      123     7778        %KV$STRCTR(NAME = LIN, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_LIN, LAST =
+              7778            ",");
+      124     7812
+      125     7813        %KV$STRCTR(NAME = LINLST, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_LINLST,
+      126     7814        INTDAT = KV_LINLST, LAST = ",");
+      127     7848
+      128     7849        %KV$STRCTR(NAME = MRD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_MRD,
+      129     7850        BYTSIZ = "SIZEC(KV_MRD)", INTDAT = KV_MRD, LAST = ",");
+      130     7884
+      131     7885        %KV$STRCTR(NAME = MSG, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_MSG,
+      132     7886        PWR2 = YES, LAST = ",");
+      133     7920
+      134     7921        %KV$STRCTR(NAME = MVD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_MVD,
+      135     7922        BYTSIZ = "SIZEC(KV_MVD)", INTDAT = KV_MVD, LAST = ",");
+      136     7956
+      137     7957        %KV$STRCTR(NAME = OTPTAB, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_OTPTAB,
+      138     7958        DUMMY = YES, BYTSIZ = %KV_STRTYP_INPTAB, LAST = ",");
+      139     7992
+      140     7993        %KV$STRCTR(NAME = PAG, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_PAG,
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:5    
+      141     7994        LAST = ",");
+      142     8028
+      143     8029        %KV$STRCTR(NAME = PRM, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_PRM,
+      144     8030        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_PRM1, CHKSIZ=YES, LAST=",");
+      145     8064
+      146     8065        %KV$STRCTR(NAME = PTR_, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_PTR,
+      147     8066        BYTSIZ = "SIZEC(KV_PTR)", INTDAT = KV_PTR, LAST = ",");
+      148     8100
+      149     8101        %KV$STRCTR(NAME = REDBFR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_REDBFR,
+      150     8102        PWR2 = YES, LAST = ",");
+      151     8136
+      152     8137        %KV$STRCTR(NAME = SRD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_SRD,
+      153     8138        BYTSIZ = "SIZEC(KV_SRD)", INTDAT = KV_SRD, LAST = ",");
+      154     8172
+      155     8173        %KV$STRCTR(NAME = SSN, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_SSN,
+      156     8174        BYTSIZ = "SIZEC(KV_SSN)", INTDAT = KV_SSN, LAST = ",");
+      157     8208
+      158     8209        %KV$STRCTR(NAME = SSNHDN, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_SSNHDN,
+      159     8210        DUMMY = YES, BYTSIZ = %KV_STRTYP_DCBHDN, LAST = ",");
+      160     8244
+      161     8245        %KV$STRCTR(NAME = SSTINPFNCTBL, LVL = 2, STCLASS = STATIC, STRTYP =
+              8245            %KV_STRTYP_SSTINPFNCTBL,
+      162     8246        SHRBFR = YES, LAST = ",");
+      163     8280
+      164     8281        %KV$STRCTR(NAME = STR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_STR,
+      165     8282        BYTSIZ = "SIZEC(KV_STR)", INTDAT = KV_STR, LAST = ",");
+      166     8316
+      167     8317        %KV$STRCTR(NAME = TRMTAB, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_TRMTAB,
+      168     8318        DUMMY = YES, BYTSIZ = %KV_STRTYP_INPTAB, LAST = ",");
+      169     8352
+      170     8353        %KV$STRCTR(NAME = TRNTBL, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_TRNTBL,
+      171     8354        SHRBFR = YES, LAST = ",");
+      172     8388
+      173     8389        %KV$STRCTR(NAME = TYPAHDBFR, LVL = 2, STCLASS = STATIC, STRTYP =
+              8389            %KV_STRTYP_TYPAHDBFR,
+      174     8390        PWR2 = YES, BYTSIZ = "%(KV_TYPAHDBFR_CHRX_HI+1)", INTDAT = KV_TYPAHDBFR, LAST = ",")
+              8390            ;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:6    
+      175     8424
+      176     8425        %KV$STRCTR(NAME=USRINPFNCTBL, LVL=2, STCLASS=STATIC, STRTYP=%KV_STRTYP_USRINPFNCTBL,
+      177     8426        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      178     8460
+      179     8461        %KV$STRCTR(NAME = USRBFR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_USRBFR,
+      180     8462        LAST = ",");
+      181     8496
+      182     8497        %KV$STRCTR(NAME=USRSHRBFR, LVL=2, STCLASS=STATIC, STRTYP=%KV_STRTYP_USRSHRBFR,
+      183     8498        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, CHKSIZ=YES, LAST=",");
+      184     8532
+      185     8533        %KV$STRCTR(NAME = VDI, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_VDI,
+      186     8534        BYTSIZ = "SIZEC(KV_VDI)", INTDAT = KV_VDI, LAST = ",");
+      187     8568
+      188     8569        %KV$STRCTR(NAME = VFU, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_VFU,
+      189     8570        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      190     8604
+      191     8605        %KV$STRCTR(NAME = ERD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_ERD,
+      192     8606        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      193     8640
+      194     8641        %KV$STRCTR(NAME = ENTSRD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_ENTSRD,
+      195     8642        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      196     8676
+      197     8677        %KV$STRCTR(NAME = TRCBFR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_TRCBFR,
+      198     8678        LAST = ",");
+      199     8712
+      200     8713        %KV$STRCTR(NAME = X364, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_X364,
+      201     8714        BYTSIZ = "SIZEC(KV_X364)", INTDAT = KV_X364, LAST = ",");
+      202     8748
+      203     8749        %KV$STRCTR (NAME=RCR, LVL=2, STCLASS=STATIC, STRTYP=%KV_STRTYP_RCR,
+      204     8750        PWR2=YES, LAST=",");
+      205     8784
+      206     8785        %KV$STRCTR (NAME=RCRLST, LVL=2, STCLASS=STATIC, STRTYP=%KV_STRTYP_RCRLST,
+      207     8786        LAST=";");
+      208     8820
+      209     8821        %KV$STRCTR;
+      210     8855
+      211     8856        /* Local AUTO variables                                                       */
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:7    
+      212     8857
+      213     8858        /* pointer to the structure control entry for this structure type             */
+      214     8859
+      215     8860    1   DCL STRCTR$ PTR;
+      216     8861        %EQU KV_STRCTR = CHARTEXT('STRCTR$->KV$STRCTR');
+      217     8862
+      218     8863        /* number of bytes of initial data                                            */
+      219     8864
+      220     8865    1   DCL INTDATSIZ UBIN;
+      221     8866        /*N* PL6 BUG!! */
+      222     8867    1   DCL 1 INTDAT REDEF INTDATSIZ,
+      223     8868    1          2 * BIT(8), 2 SIZ UBIN(8) UNAL;
+      224     8869
+      225     8870        /* byte size of new buffer aquired (total size including any header)          */
+      226     8871
+      227     8872    1   DCL BFRBYTSIZ UBIN;
+      228     8873
+      229     8874        /* interrupt level KVS$GETBFR was called at                                   */
+      230     8875
+      231     8876    1   DCL LVL UBIN;
+      232     8877
+      233     8878        /* working pointer to the buffer we are alocating or looking at.              */
+      234     8879
+      235     8880    1   DCL BFR$ PTR;
+      236     8881
+      237     8882        /* pointer to initialization data                                             */
+      238     8883
+      239     8884    1   DCL DAT$ CPTR;
+      240     8885
+      241     8886
+      242     8887        /* Pointer to KV$STT */
+      243     8888
+      244     8889    1   DCL Y@STT$ PTR AUTO;
+      245     8890        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:8    
+      246     8891        /* Argument structures                                                        */
+      247     8892
+      248     8893    1   DCL AV$ CHAR(INTDATSIZ);
+      249     8894        %KV$VDH_GETBFR(NAME = VDH_GETBFR, STCLASS = REDEF AV$);
+      250     8959        %KV$VDH_RLSBFR(NAME = VDH_RLSBFR, STCLASS = REDEF AV$);
+      251     8995    1   DCL 1 KV_B BASED(BFR$) ALIGNED,         /* Parameter for KVB$RLSBFR           */
+      252     8996    1          2 SIZ UBIN;
+      253     8997    1   DCL CHARS CHAR(256) BASED;
+      254     8998
+      255     8999        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:9    
+      256     9000    1   KVS$GETBFR: ENTRY(AV$) ALTRET;
+      257     9001        /*P* NAME: KVS$GETBFR
+      258     9002             PURPOSE:
+      259     9003               To acquire a buffer for the VDH or for the vdh user.                    */
+      260     9004        /*D* NAME: KVS$GETBFR
+      261     9005             DESCRIPTION:
+      262     9006                   Acquire a buffer for the VDH or for the vdh user.
+      263     9007                   This buffer may be a shared buffer (VDH or user)
+      264     9008                   or it may be an unshared buffer. For shared buffers, this routine
+      265     9009                   keeps track of usage counts and chains. For all buffers, this routine
+      266     9010                   tracks current buffer utilizations, and checks against allowable
+      267     9011                   limits.  REG the user if we can't get memory.
+      268     9012             INPUT:
+      269     9013                   The argument to this routine is the KV$VDH_GETBFR structure.       */
+      270     9014
+      271     9015    2      IF VDH_GETBFR.STT$ ~= ADDR(NIL) THEN DO;
+      272     9016        /*
+      273     9017        The caller is passing in the address of the KV$STT structure.
+      274     9018        Use it instead of the one we'd normally find.
+      275     9019        We're probably in early connect or late disconnect.
+      276     9020        */
+      277     9021    2         Y@STT$ = VDH_GETBFR.STT$;
+      278     9022    2      END; ELSE DO;                        /* ELSE IF VDH_GETBFR.STT$ ~= NIL     */
+      279     9023        /*
+      280     9024        There is no caller-supplied KV$STT address.
+      281     9025        */
+      282     9026    2         Y@STT$ = %KV_USRPRM.STT$;
+      283     9027    2      END; /* END ELSE IF VDH_GETBFR.STT$ ~= NIL */
+      284     9028
+      285     9029    1      VDH_GETBFR.ERR = '0'B;
+      286     9030
+      287     9031        /* since parts of this code are kind of sensitive, we will go to
+      288     9032           a higher level to avoid hurting anyones feelings (the VDH inhibit
+      289     9033           level, if we are not already there)                                        */
+      290     9034
+      291     9035    1      LVL = %KH_INHLVL;
+      292     9036    1      CALL KHI$DISABLE(LVL);
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:10   
+      293     9037
+      294     9038        /* develop a pointer to the buffer control structure for this buffer
+      295     9039           type                                                                       */
+      296     9040
+      297     9041    1      STRCTR$ = PINCRW(ADDR(KV_STRCTR), SIZEW(KV$STRCTR)*(VDH_GETBFR.STRTYP-1));
+      298     9042    2      IF %KV_STRCTR.DUMMY THEN DO;
+      299     9043    2         VDH_GETBFR.STRTYP = %KV_STRCTR.BYTSIZ;
+      300     9044    2         STRCTR$ = PINCRW(ADDR(KV_STRCTR), SIZEW(KV$STRCTR)*(%KV_STRCTR.BYTSIZ-1));
+      301     9045    2      END;
+      302     9046
+      303     9047        /* the purpose of the label below is to allow us to reg the user if we
+      304     9048           cant get memory later in the routine. we pick up from this point
+      305     9049           and recalculate so as to avoid getting messed up by anything that
+      306     9050           may have changed while we were gone                                        */
+      307     9051
+      308     9052    1   NOMEM:;
+      309     9053
+      310     9054    1      BFRBYTSIZ = %KV_STRCTR.BYTSIZ;
+      311     9055    1      INTDATSIZ = VDH_GETBFR.DAT_.BYTSIZ;
+      312     9056
+      313     9057        /* see if we should handle this as a shared buffer or a normal buffer         */
+      314     9058
+      315     9059    2      IF NOT %KV_STRCTR.SHRBFR THEN DO;
+      316     9060
+      317     9061        /* non-shared buffer                                                       */
+      318     9062
+      319     9063    2         VDH_GETBFR.BFR$ = ADDR(NIL);
+      320     9064    2         IF BFRBYTSIZ<VDH_GETBFR.BYTSIZ AND (%KV_STRCTR.CHKSIZ OR BFRBYTSIZ=0)
+      321     9065    2         THEN BFRBYTSIZ = VDH_GETBFR.BYTSIZ;
+      322     9066    2         IF BFRBYTSIZ=0 THEN BFRBYTSIZ = INTDATSIZ;
+      323     9067    2      END; ELSE DO;
+      324     9068
+      325     9069        /* its a shared buffer.                                                    */
+      326     9070
+      327     9071    3         IF VDH_GETBFR.SHRBFR.SRC OR VDH_GETBFR.SHRBFR.GET THEN DO;
+      328     9072
+      329     9073        /* this is a shared buffer operation, and is a
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:11   
+      330     9074        search or get. the user isn't passing a buffer
+      331     9075        address, so we want to null the pointer passed.
+      332     9076        we null it here just to ensure it is returned
+      333     9077        as a null in case anything goes wrong.                                     */
+      334     9078
+      335     9079    3            VDH_GETBFR.BFR$ = ADDR(NIL);
+      336     9080    3         END /* IF */;
+      337     9081        /* Load up the buffer size needed */
+      338     9082    2         BFRBYTSIZ = INTDATSIZ + SIZEC(KV_SHRBFR);
+      339     9083
+      340     9084        /* see if we need to search the chain                                      */
+      341     9085
+      342     9086    3         IF VDH_GETBFR.SHRBFR.SRC THEN DO;
+      343     9087
+      344     9088    3            BFR$ = %KV_STRCTR.SHRBFRHED$;
+      345     9089    4            IF BFR$=ADDR(NIL) THEN DO;
+      346     9090    4               CALL Y$GETSHRBFRHED$_ADR;
+      347     9091    4               IF BFR$~=ADDR(NIL) THEN BFR$ = KV$SHRBFR.LNK$;
+      348     9092    4            END;
+      349     9093
+      350     9094        /* search the chain                                                        */
+      351     9095
+      352     9096    4            DO WHILE(BFR$ ~= ADDR(NIL));
+      353     9097
+      354     9098    4               IF (KV$SHRBFR.BYTSIZ=BFRBYTSIZ
+      355     9099    4                 OR KV$SHRBFR.BYTSIZ>BFRBYTSIZ AND NOT %KV_STRCTR.CHKSIZ)
+      356     9100    4                 AND KV$SHRBFR.USRCNT~=0
+      357     9101
+      358     9102        /* the buffer size matches and the user count looks good. lets do a complete
+      359     9103        byte by byte check                                                         */
+      360     9104
+      361     9105    4                 AND SUBSTR(KV$SHRBFR.NAM, 0, INTDATSIZ) = SUBSTR
+      362     9106    4                 (VDH_GETBFR.DAT_.ADR$->CHARS, VDH_GETBFR.DAT_.BYTX, INTDATSIZ)
+      363     9107    5               THEN DO;
+      364     9108
+      365     9109    5                  VDH_GETBFR.BFR$ = BFR$;
+      366     9110        /* Increment user count if not in constant */
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:12   
+      367     9111    5                  IF KV$SHRBFR.USRCNT ~= %KV_SHRBFR_CNSUSRCNT
+      368     9112    5                  THEN KV$SHRBFR.USRCNT = KV$SHRBFR.USRCNT+1;
+      369     9113    5                  GOTO ENABLE_RETURN;
+      370     9114    5               END /* IF */;
+      371     9115
+      372     9116    4               BFR$ = KV$SHRBFR.LNK$;
+      373     9117    4            END /* LOOP */;
+      374     9118    4            IF NOT VDH_GETBFR.SHRBFR.GET THEN DO;
+      375     9119        /* Search only, altreturn if not found. */
+      376     9120    4               VDH_GETBFR.ERR.NOT_FND = '1'B;
+      377     9121    4               GOTO ENABLE_RETURN;
+      378     9122    4            END /* IF */;
+      379     9123
+      380     9124    3         END /* IF */;
+      381     9125    2         IF BFRBYTSIZ<VDH_GETBFR.BYTSIZ
+      382     9126        /* Get the larger of the required size and the requested one,
+      383     9127           so that even shared buffers can be expanded. */
+      384     9128    2         THEN BFRBYTSIZ = VDH_GETBFR.BYTSIZ;
+      385     9129    2      END /* IF */;
+      386     9130
+      387     9131        /* if this is a 'get' operation of a shared buffer not on the chain,
+      388     9132        or this is a 'get' operation of a non-shared buffer, do the getting
+      389     9133        while the getting is good.                                                 */
+      390     9134
+      391     9135    2      IF NOT %KV_STRCTR.SHRBFR OR VDH_GETBFR.SHRBFR.GET THEN DO;
+      392     9136
+      393     9137        /* bytes to wrds                                                           */
+      394     9138
+      395     9139    2         BFRBYTSIZ = (BFRBYTSIZ+1)/2;
+      396     9140
+      397     9141        /* acquire the memory                                                      */
+      398     9142
+      399     9143    3         IF %KV_STRCTR.PWR2 THEN DO;
+      400     9144
+      401     9145    3            CALL KVB$GET2NSYS(BFRBYTSIZ, VDH_GETBFR.BFR$) ALTRET(NOGET);
+      402     9146    3         END; ELSE DO;
+      403     9147
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:13   
+      404     9148    3            CALL KVB$GETSYS(BFRBYTSIZ, VDH_GETBFR.BFR$)
+      405     9149    4            WHENRETURN DO;
+      406     9150
+      407     9151        /* If we're to return actual size, pluck it out of the buffer. */
+      408     9152
+      409     9153    4               IF %KV_STRCTR.BYTSIZ=0 AND NOT %KV_STRCTR.SHRBFR
+      410     9154    4               THEN BFRBYTSIZ = VDH_GETBFR.BFR$->KV_B.SIZ;
+      411     9155    4            END;                           /* WHENRETURN                         */
+      412     9156    4            WHENALTRETURN DO;
+      413     9157    4   NOGET:      ;
+      414     9158        /*N* FOR NOW, WE WILL SCREECH IF WE CANT GET MEMORY. EVENTUALLY, WE        */
+      415     9159        /*N* WILL REG THE USER (IF WE CAN). UPON RETURNING FROM THE REG, WE        */
+      416     9160        /*N* WILL EXIT THE CURRENT GROUP AND END UP RETRYING THE ENTIRE            */
+      417     9161        /*N* OPERATION. NOTE THIS WHOLE THING IS IN A BIG LOOP. IF THE             */
+      418     9162        /*N* USER CAN'T BE REGED, WE WILL JUST SET THE NO_MEM BIT IN THE           */
+      419     9163        /*N* ARGUMENT STRUCTURE AND RETURN.                                        */
+      420     9164
+      421     9165    4               IF VDH_GETBFR.SCRNO_MMR OR VDH_GETBFR.BFR$ ~= ADDR(NIL)
+      422     9166    4               THEN CALL KHD$SCREECH (KVS_NOMMR);
+      423     9167        /*S*  SCREECH_CODE: KVS-S$KV_NOMMR
+      424     9168              MESSAGE: VDH ran out of memory.
+      425     9169        */
+      426     9170
+      427     9171        /* for now we set the err.no_mmr bit here. when we reg we should
+      428     9172        set the nomem flag which is checked later on in
+      429     9173        this loop                                                                     */
+      430     9174
+      431     9175    4               VDH_GETBFR.ERR.NO_MMR = '1'B;
+      432     9176    4               GOTO ENABLE_RETURN;
+      433     9177
+      434     9178    4            END /* WHENALTRETURN */;
+      435     9179
+      436     9180        /*N*  %KH$TRC (FCG = 'KVS', EVENT = %KV_TRC_BFRGET, IF = DEFAULT);               */
+      437     9181
+      438     9182    3         END /* IF */;
+      439     9183
+      440     9184        /* stash away what we actually got                                         */
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:14   
+      441     9185    2         BFRBYTSIZ = BFRBYTSIZ*2;
+      442     9186    2         VDH_GETBFR.BYTSIZ = BFRBYTSIZ;
+      443     9187
+      444     9188        /* keep track of buffer utilizations                                       */
+      445     9189    2         %KV_STT.BYTUTL(VDH_GETBFR.STRTYP) = BFRBYTSIZ+%KV_STT.BYTUTL(VDH_GETBFR.STRTYP
+              9189                  );
+      446     9190    2         %KV_STT.BFRGETCNT(VDH_GETBFR.STRTYP) = %KV_STT.BFRGETCNT(VDH_GETBFR.STRTYP) +1
+              9190                  ;
+      447     9191    2         %KV_STT.BFRCNT(VDH_GETBFR.STRTYP) = %KV_STT.BFRCNT(VDH_GETBFR.STRTYP) +1;
+      448     9192
+      449     9193        /* do any requested inits                                                  */
+      450     9194
+      451     9195        /* see if any initializing data was specified on the call                  */
+      452     9196
+      453     9197    3         IF (VDH_GETBFR.DAT_.ADR$ ~= ADDR(NIL)) THEN DO;
+      454     9198    3            DAT$ = PINCRC(VDH_GETBFR.DAT_.ADR$, VDH_GETBFR.DAT_.BYTX);
+      455     9199
+      456     9200        /* otherwise, see if there is any default initializing data                */
+      457     9201    3         END; ELSE IF %KV_STRCTR.INTDAT$ ~= ADDR(NIL) THEN DO;
+      458     9202    3            DAT$ = %KV_STRCTR.INTDAT$;
+      459     9203    3            INTDATSIZ = %KV_STRCTR.BYTSIZ;
+      460     9204
+      461     9205        /* otherwise, there is no initializing data                                */
+      462     9206    3         END; ELSE DO;
+      463     9207    3            DAT$ = ADDR(NIL);
+      464     9208    3         END /* IF */;
+      465     9209
+      466     9210        /* if there is data to init with, move it in                               */
+      467     9211
+      468     9212    3         IF (DAT$ ~= ADDR(NIL)) THEN DO;
+      469     9213
+      470     9214        /* move data in after the header, if this is a shared buffer               */
+      471     9215    3            BFR$ = VDH_GETBFR.BFR$;
+      472     9216    4            IF %KV_STRCTR.SHRBFR THEN DO;
+      473     9217    4               BFR$ = PINCRW(BFR$, SIZEW(KV_SHRBFR));
+      474     9218    4            END;
+      475     9219
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:15   
+      476     9220        /* move in the initial size                                                */
+      477     9221
+      478     9222    3            SUBSTR(BFR$->CHARS, 0, INTDATSIZ) = SUBSTR(DAT$->CHARS, 0, INTDATSIZ);
+      479     9223        /* Fix up the buffer size - it should reflect the data size. */
+      480     9224
+      481     9225    3            BFRBYTSIZ = INTDATSIZ+SIZEC(KV_SHRBFR);
+      482     9226    3         END /* IF */;
+      483     9227
+      484     9228        /* see if we have to place the structure type into byte 0                  */
+      485     9229
+      486     9230    3         IF %KV_STRCTR.INTSTRTYP THEN DO;
+      487     9231    3            SUBSTR(VDH_GETBFR.BFR$->KV$SHRBFR.NAM, 0, 1) = BINASC(VDH_GETBFR.STRTYP);
+      488     9232    3         END /* IF */;
+      489     9233    2      END /* IF */;
+      490     9234
+      491     9235        /* if this was a 'get and add' operation and the buffer was not found,
+      492     9236           or this is just an 'add' operation, lets find the end of the buffer
+      493     9237           chain. note the buffer we are working with must be shared                  */
+      494     9238
+      495     9239    2      IF %KV_STRCTR.SHRBFR THEN DO;
+      496     9240    2         IF VDH_GETBFR.SHRBFR.GET OR VDH_GETBFR.SHRBFR.ADD
+      497     9241    3           AND VDH_GETBFR.BFR$ ~= ADDR(NIL) THEN DO;
+      498     9242    3            BFR$ = VDH_GETBFR.BFR$;
+      499     9243        /* init the shared buffer header                                                 */
+      500     9244
+      501     9245    3            KV$SHRBFR.LNK$ = ADDR(NIL);
+      502     9246    3            KV$SHRBFR.USRCNT = 0;
+      503     9247    4            IF VDH_GETBFR.SHRBFR.GET THEN DO;
+      504     9248    4               KV$SHRBFR.BYTSIZ = BFRBYTSIZ;
+      505     9249    4            END /* IF */;
+      506     9250
+      507     9251    4            IF VDH_GETBFR.SHRBFR.ADD THEN DO;
+      508     9252
+      509     9253        /* if this is a 'get and add' operation, init the user count                     */
+      510     9254
+      511     9255    4               KV$SHRBFR.USRCNT = 1;
+      512     9256    4               BFR$ = ADDR(%KV_STRCTR.SHRBFRHED$);
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:16   
+      513     9257    4               IF KV$SHRBFR.LNK$=ADDR(NIL)
+      514     9258    4               THEN CALL Y$GETSHRBFRHED$_ADR;
+      515     9259
+      516     9260        %IF '0'B;                               /* IF LINK_AT_TAIL                    */
+      523     9267        %ELSE;
+      524     9268    4               VDH_GETBFR.BFR$->KV$SHRBFR.LNK$ = KV$SHRBFR.LNK$;
+      525     9269        %ENDIF;
+      526     9270        /* end of chain                                                                  */
+      527     9271
+      528     9272    4               KV$SHRBFR.LNK$ = VDH_GETBFR.BFR$;
+      529     9273    4            END /* IF */;
+      530     9274    3         END /* IF */;
+      531     9275    2      END /* IF */;
+      532     9276
+      533     9277        /* if we were called from below the VDH inhibit level, we should
+      534     9278           do an enable to the level we were called at                                */
+      535     9279
+      536     9280        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:17   
+      537     9281    1   ENABLE_RETURN:;
+      538     9282    2      IF (LVL > %KH_INHLVL) THEN DO;
+      539     9283    2         CALL KHI$ENABLE;
+      540     9284    2      END /* IF */;
+      541     9285
+      542     9286        /* ALTRETURN if error occurred */
+      543     9287    1      IF VDH_GETBFR.ERR THEN ALTRETURN;
+      544     9288
+      545     9289    1      RETURN;
+      546     9290        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:18   
+      547     9291        /*F* NAME: KVS$RLSBFR
+      548     9292             PURPOSE: This routine releases a buffer for VDH or the
+      549     9293           VDH user. the buffer may be shared or unshared. the argument
+      550     9294           to KVS$RLSBFR is the KV$VDH_RLSBFR structure                               */
+      551     9295
+      552     9296    1   KVS$RLSBFR: ENTRY(AV$) ALTRET;
+      553     9297
+      554     9298        /* if this address is null, we did a quickie!                                 */
+      555     9299
+      556     9300    1      IF VDH_RLSBFR.BFR$=ADDR(NIL) THEN RETURN;
+      557     9301    1      BFR$ = VDH_RLSBFR.BFR$;
+      558     9302        /* if we were called from below the VDH inhibit level, go to that
+      559     9303           level to prevent being interrupted at an inoportune time.                  */
+      560     9304
+      561     9305    2      IF VDH_GETBFR.STT$ ~= ADDR(NIL) THEN DO;
+      562     9306        /*
+      563     9307        The caller is passing in the address of the KV$STT structure.
+      564     9308        Use it instead of the one we'd normally find.
+      565     9309        We're probably in early connect or late disconnect.
+      566     9310        */
+      567     9311    2         Y@STT$ = VDH_GETBFR.STT$;
+      568     9312    2      END; ELSE DO;                        /* ELSE IF VDH_GETBFR.STT$ ~= NIL     */
+      569     9313        /*
+      570     9314        There is no caller-supplied KV$STT address.
+      571     9315        */
+      572     9316    2         Y@STT$ = %KV_USRPRM.STT$;
+      573     9317    2      END; /* END ELSE IF VDH_GETBFR.STT$ ~= NIL */
+      574     9318
+      575     9319    1      LVL = %KH_INHLVL;
+      576     9320    1      CALL KHI$DISABLE(LVL);
+      577     9321
+      578     9322        /* develop a ptr to the buffer control structure for this buffer type         */
+      579     9323
+      580     9324    1      STRCTR$ = PINCRW(ADDR(KV_STRCTR), SIZEW(KV$STRCTR)*(VDH_RLSBFR.STRTYP-1));
+      581     9325    2      IF %KV_STRCTR.DUMMY THEN DO;
+      582     9326    2         VDH_GETBFR.STRTYP = %KV_STRCTR.BYTSIZ;
+      583     9327    2         STRCTR$ = PINCRW(ADDR(KV_STRCTR), SIZEW(KV$STRCTR)*(%KV_STRCTR.BYTSIZ-1));
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:19   
+      584     9328    2      END;
+      585     9329
+      586     9330        /* determine how large a buffer to release                                    */
+      587     9331
+      588     9332    2      IF %KV_STRCTR.SHRBFR THEN DO;
+      589     9333
+      590     9334        /* this is a shared buffer                                                    */
+      591     9335
+      592     9336        /* if its usage count is > 1, just decr
+      593     9337           the usage count and don't worry about anything else.                       */
+      594     9338
+      595     9339    3         IF VDH_RLSBFR.SHRBFRSRC AND KV$SHRBFR.USRCNT > 1 THEN DO;
+      596     9340
+      597     9341        /* we can just decrement the usage count                                      */
+      598     9342    3            IF KV$SHRBFR.USRCNT ~= %KV_SHRBFR_CNSUSRCNT
+      599     9343    3            THEN KV$SHRBFR.USRCNT = KV$SHRBFR.USRCNT-1;
+      600     9344    3            GOTO ENABLE_RETURN;
+      601     9345    3         END /* IF */;
+      602     9346
+      603     9347        /* if this buffer is shared, run the chain and find it                        */
+      604     9348
+      605     9349    3         IF VDH_RLSBFR.SHRBFRSRC THEN DO;
+      606     9350
+      607     9351    3            BFR$ = ADDR(%KV_STRCTR.SHRBFRHED$);
+      608     9352    3            IF KV$SHRBFR.LNK$=ADDR(NIL)
+      609     9353    3            THEN CALL Y$GETSHRBFRHED$_ADR;
+      610     9354
+      611     9355        /* search the chain                                                           */
+      612     9356
+      613     9357    4            DO WHILE KV$SHRBFR.LNK$ ~= VDH_RLSBFR.BFR$;
+      614     9358    5               IF KV$SHRBFR.LNK$ = ADDR(NIL) THEN DO;
+      615     9359        /*S* SCREECH_CODE: KVS-S$KV_SHRCHN
+      616     9360             MESSAGE: Shared buffer release not found in its chain.
+      617     9361        */
+      618     9362    5                  CALL KHD$SCREECH (KVS_SHRCHN);
+      619     9363    5               END /* IF */;
+      620     9364    4               BFR$ = KV$SHRBFR.LNK$;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:20   
+      621     9365    4            END /* LOOP */;
+      622     9366    3            KV$SHRBFR.LNK$ = VDH_RLSBFR.BFR$->KV$SHRBFR.LNK$;
+      623     9367    3            BFR$ = VDH_RLSBFR.BFR$;
+      624     9368
+      625     9369    3         END /* IF */;
+      626     9370    2         BFRBYTSIZ = KV$SHRBFR.BYTSIZ+MOD(KV$SHRBFR.BYTSIZ,2);
+      627     9371
+      628     9372        /* otherwise, the byte size of the structure is in the argument
+      629     9373           structure (variable) or the buffer control structure (fixed)               */
+      630     9374
+      631     9375    2      END; ELSE IF (VDH_RLSBFR.BYTSIZ ~= 0) THEN DO;
+      632     9376    2         BFRBYTSIZ = VDH_RLSBFR.BYTSIZ+MOD(VDH_RLSBFR.BYTSIZ,2);
+      633     9377    2      END; ELSE DO;
+      634     9378    2         BFRBYTSIZ = %KV_STRCTR.BYTSIZ;
+      635     9379    2      END /* IF */;
+      636     9380
+      637     9381        /* stuff the stats                                                      */
+      638     9382
+      639     9383    1      %KV_STT.BYTUTL(VDH_RLSBFR.STRTYP) = %KV_STT.BYTUTL(VDH_RLSBFR.STRTYP)-BFRBYTSIZ;
+      640     9384    1      %KV_STT.BFRCNT(VDH_RLSBFR.STRTYP) = %KV_STT.BFRCNT(VDH_RLSBFR.STRTYP)-1;
+      641     9385
+      642     9386        /* convert from bytes to words                                                */
+      643     9387
+      644     9388    1      KV_B.SIZ = (BFRBYTSIZ+1)/2;
+      645     9389        /* do the actual release                                                      */
+      646     9390
+      647     9391    2      IF %KV_STRCTR.PWR2 THEN DO;
+      648     9392    2         CALL KVB$RLS2NSYS(KV_B.SIZ) ;
+      649     9393    2      END; ELSE DO;
+      650     9394    2         CALL KVB$RLSSYS(KV_B.SIZ) ;
+      651     9395    2      END /* IF */;
+      652     9396
+      653     9397        /*N*     %KH$TRC (FCG = 'KVS', EVENT = %KV_TRC_BFRRLS, IF = DEFAULT);
+              9397        */
+      654     9398        /* if we were called from below the vhd inhibit level, do an enable to
+      655     9399           get to the level we were called at                                         */
+      656     9400
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:21   
+      657     9401    1      IF LVL>%KH_INHLVL THEN CALL KHI$ENABLE;
+      658     9402    1      RETURN;
+      659     9403        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:22   
+      660     9404    1   Y$GETSHRBFRHED$_ADR: PROC;
+      661     9405        /*
+      662     9406        Get the shared buffer head pointer address.
+      663     9407        */
+      664     9408    3      DO SELECT VDH_GETBFR.STRTYP;
+      665     9409    3         SELECT %KV_STRTYP_SSTINPFNCTBL,%KV_STRTYP_USRINPFNCTBL;
+      666     9410        /*
+      667     9411        Get the input function table head pointer address.
+      668     9412        */
+      669     9413    3         BFR$ = %KV_USRPRM.INPFNCTBLHEDPTR$;
+      670     9414    3         SELECT %KV_STRTYP_TRNTBL;
+      671     9415        /*
+      672     9416        Get the translate table head pointer address.
+      673     9417        */
+      674     9418    3         BFR$ = %KV_USRPRM.TRNTBLHEDPTR$;
+      675     9419    3         SELECT ELSE;
+      676     9420        /*
+      677     9421        Not a special case.  The head pointer is in KV$STRCTR.
+      678     9422        */
+      679     9423    3      BFR$ = ADDR(%KV_STRCTR.SHRBFRHED$);
+      680     9424    3      END; /* END DO SELECT %KV_STRCTR.STRTYP */
+      681     9425    2   END Y$GETSHRBFRHED$_ADR;                /* END PROC                           */
+      682     9426    1   END /* SUBROUTINE */;
+      683     9427        %EOD;
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:23   
+--  Include file information  --
+
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   KV_SCODE_C.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   KL_CONTROL_C.:E05TOU  is referenced.
+   KH_MACRO_C.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  was found in the system file and is referenced.
+   KV_GLBCNS_E.:E05TOU  was found in the system file and is referenced.
+   KV$VDO.:E05TOU  was found in the system file and is never referenced.
+   KV$VDH.:E05TOU  was found in the system file and is referenced.
+   KV$USR.:E05TOU  was found in the system file and is referenced.
+   KV$SND.:E05TOU  was found in the system file and is never referenced.
+   KV$INT.:E05TOU  was found in the system file and is referenced.
+   KV$GLBCTX.:E05TOU  was found in the system file and is referenced.
+   KV$GLB.:E05TOU  was found in the system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure KVS$BFR.
+
+   Procedure KVS$BFR requires 955 words for executable code.
+   Procedure KVS$BFR requires 24 words of local(AUTO) storage.
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:24   
+
+ Object Unit name= KVS$BFR                                    File name= KVS$BFR.:E05TOU
+ UTS= JUL 30 '97 02:14:03.32 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0  RoData even  UTS    373    175  KVS$BFR
+    1   Data  even  none   144     90  KVS$BFR
+    2   Proc  even  none   955    3BB  KVS$BFR
+    3  RoData even  none     4      4  KVS$BFR
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes    yes     yes      Std        1  KVS$BFR
+     2      7          yes     yes      Std        1  KVS$GETBFR
+     2    262          yes     yes      Std        1  KVS$RLSBFR
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:25   
+
+  ****  Data defs  ****
+
+ Sect HexLoc  Name                           Sect HexLoc  Name
+    0      6  KV_ACTCHRTBLNRM                    0     42  KV_SHRBFR
+    0     46  KV_SHRBFR_ENTSRD                   0     4A  KV_SHRBFR_TAB
+    0     5E  KV_LINLST                          0     66  KV_MRD
+    0     86  KV_MVD                             0     A6  KV_SHRBFR_PRM1
+    0     AB  KV_SHRBFR_PRM2                     0     B0  KV_SHRBFR_PRM3
+    0     B5  KV_PTR                             0     D3  KV_SRD
+    0     F2  KV_SSN                             0    132  KV_STR
+    0    152  KV_TYPAHDBFR                       0    155  KV_VDI
+    1      0  KV_STRCTR
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 KHI$DISABLE
+ yes     yes           Std       2 KVB$GET2NSYS
+ yes     yes           Std       2 KVB$RLS2NSYS
+ yes     yes           Std       2 KVB$GETSYS
+         yes           Std       0 KHI$ENABLE
+         yes           Std       1 KHD$SCREECH
+ yes     yes           Std       2 KVB$RLSSYS
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6C_ACM
+                       nStd      0 X6A_AALT
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KH_CTLTBL$                            KV$PTR$                          r    KV_X364
+r    G$ROS$
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:26   
+
+
+        1        1        /*M* KVS$BFR VDH BUFFER SERVICE ROUTINES
+                 1             */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*     NSO,PLM=3,SQB=Y,AND=Y,ENI=0,SDI=3,MCL=10,CSI=0,ECI=0,IND=0,IAD=3 */
+        8        8
+        9        9        KVS$BFR: PROC(AV$) ALTRET;
+
+      9   2 000000  D380 0000 0000  xent KVS$BFR         LNJ,B5   X6A_AUTO_1
+          2 000003       0018 0001                       DC       24,1
+          2 000005  0F81 0006                            B        s:9015,PREL
+
+       10       10        /*P* NAME: KVS$BFR
+       11       11             PURPOSE: VDH buffer manipulation routines.
+       12       12             DESCRIPTION:
+       13       13                   Acquire or release buffers for VDH or for the vdh user.
+       14       14                   The buffers may be shared (VDH or user)
+       15       15                   or unshared. For shared buffers, these routines
+       16       16                   keep track of usage counts and chains. For all buffers, they
+       17       17                   track current buffer utilizations, and check against allowable
+       18       18                   limits.
+       19       19                   The routines perform the KV$VDH_GETBFR or KV$VDH_RLSBFR functions. */
+       20       20
+       21       21        %INCLUDE KH_MACRO_C;
+       22      764        %INCLUDE KL_CONTROL_C;
+       23     1144        %INCLUDE KL_AFCN_C;
+       24     1245        %INCLUDE KL_MACRO_C;
+       25     4597        %INCLUDE K_ID_E;
+       26     4647        %K#ENTID_E;
+       27     4666        %K#LYRID_E;
+       28     4673
+       29     4674 S      %INCLUDE KV$GLB;                        /* VDH Global structures              */
+       30     4675 S      %INCLUDE KV$GLBCTX;                     /* VDH Global context                 */
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:27   
+       31     4676 S      %INCLUDE KV$INT;                        /* VDH internal structures            */
+       32     4677 S      %INCLUDE KV$USR;                        /* VDH to VDH-user request structures */
+       33     4678 S      %INCLUDE KV$VDH;                        /* VDH-user to VDH request structures */
+       34     4679 S      %INCLUDE KV_GLBCNS_E;                   /* Virtual device handler constants   */
+       35     4680 S      %INCLUDE KV_PRMID_E;                    /* Parameter ID definitions           */
+       36     4681        %INCLUDE KV_SCODE_C;
+       37     4702        %INCLUDE LCP_6;
+       38     4893        %VLP_SCODE (FPTN=KVS_NOMMR,FCG=KV,MID=S,ERR#=%S$KV_NOMMR,STCLASS=CONSTANT);
+       39     4954        %VLP_SCODE (FPTN=KVS_SHRCHN,FCG=KV,MID=S,ERR#=%S$KV_SHRCHN,STCLASS=CONSTANT);
+       40     5015
+       41     5016        %KH$CTLTBL (FPTN=KH_CTLTBL, STCLASS="BASED(KH_CTLTBL$)");
+       42     5228    1   DCL KH_CTLTBL$ PTR SYMREF;
+       43     5229        %EQU KH_INHLVL=CHARTEXT(CONCAT('KH_CTLTBL.PARM.PTR$(',BINCHAR(KL_HNDLRPARM_INTLVL),
+              5229            ')->Y$WRD'));
+       44     5230        %KV$PTR;                                /*  Pointers, status                  */
+       45     5273        %KV$SHRBFR(NAM = 'MUD', STCLASS = "BASED(BFR$)");
+              5273            /* Shared buffer header template */
+       46     5305        %KV$SSN;                                /*  Session                           */
+       47     5384        %KV$STR;                                /*  Stream                            */
+       48     5471        %KV$STT (STCLASS = "BASED(Y@STT$)");    /*  Stats                             */
+       49     5865        %KV$STT (NAME=Y$STT, STCLASS="BASED(Y@STT$)"); /*  Stats                      */
+       50     6259        %EQU KV_STT=CHARTEXT('Y$STT');
+       51     6260        %KV$USRPRM;                             /*  USER PARAMETERS                   */
+       52     6311        %KV$VDI;                                /*  VDI (VDH < ->VDH user interface)  */
+       53     6382        %KV_BFRRLSDSP_E;
+       54     6388        %KV_STRTYP_E;
+       55     6426        %KV#VD_ORG_E;
+       56     6434
+       57     6435    1   DCL Y$WRD UBIN BASED ALIGNED;
+       58     6436    1   DCL Y$PTR$ PTR BASED;
+       59     6437
+       60     6438    1   DCL KVB$GETSYS ENTRY(2) ALTRET;
+       61     6439    1   DCL KVB$GET2NSYS ENTRY(2) ALTRET;
+       62     6440    1   DCL KVB$RLSSYS ENTRY(2) ALTRET;
+       63     6441    1   DCL KVB$RLS2NSYS ENTRY(2) ALTRET;
+       64     6442    1   DCL KHI$DISABLE ENTRY(1);
+       65     6443    1   DCL KHI$ENABLE ENTRY;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:28   
+       66     6444    1   DCL KHD$SCREECH ENTRY(1);
+       67     6445
+       68     6446        %KV$SHRBFR(NAME = KV_ACTCHRTBLNRM, STCLASS = CONSTANT SYMDEF, LAST = ",", LNK =
+              6446            KV_ACTCHR1);
+       69     6478    1          2 *(0:7) BIT(32) INIT(
+       70     6479    1    '082C002F'X, '0'B*3, '082C002F'X, '0'B*3);
+       71     6480        %KV$SHRBFR(NAME = KV_ACTCHR1, STCLASS = CONSTANT, LAST = ",", LNK = KV_ACTCHR2);
+       72     6512    1          2 *(0:7) BIT(32) INIT(
+       73     6513    1    '0824020F'X, '0'B*3, '0824020F'X, '0'B*3);
+       74     6514        %KV$SHRBFR(NAME = KV_ACTCHR2, STCLASS = CONSTANT, LAST = ",");
+       75     6546    1          2 *(0:7) BIT(32) INIT(
+       76     6547    1    '086C002F'X, '00010004'X, '00000016'X, '00000014'X,
+       77     6548    1    '086C002F'X, '00010004'X, '00000016'X, '00000014'X);
+       78     6549        %KV$SHRBFR(NAME = KV_SHRBFR, STCLASS = CONSTANT SYMDEF);
+       79     6581        %KV$SHRBFR(NAME = KV_SHRBFR_ENTSRD, STCLASS = CONSTANT SYMDEF);
+       80     6613        %KV$SHRBFR(NAME = KV_SHRBFR_TAB, STCLASS = CONSTANT SYMDEF, LAST = ",");
+       81     6645    1          2 *(0:7) BIT(32) INIT('0'B*0);
+       82     6646        %KV$LINLST(NAME = KV_LINLST, STCLASS = CONSTANT SYMDEF);
+       83     6673        %KV$MRD(NAME = KV_MRD, STCLASS = CONSTANT SYMDEF);
+       84     6720        %KV$MVD(NAME = KV_MVD, STCLASS = CONSTANT SYMDEF);
+       85     6764        %KV$SHRBFR_PRM(NAME = KV_SHRBFR_PRM1, STCLASS = CONSTANT SYMDEF, NAM = '',
+       86     6765         VFC = '70'X, TXT = '!',
+       87     6766         LNK = KV_SHRBFR_PRM2);
+       88     6813        %KV$SHRBFR_PRM(NAME = KV_SHRBFR_PRM2, STCLASS = CONSTANT SYMDEF, NAM = '',
+       89     6814         VFC = '40'X, TXT = '*',
+       90     6815         LNK = KV_SHRBFR_PRM3);
+       91     6862        %KV$SHRBFR_PRM(NAME = KV_SHRBFR_PRM3, STCLASS = CONSTANT SYMDEF, NAM = '',
+       92     6863         VFC = '40'X, TXT = '?');
+       93     6910        %KV$PTR(NAME = KV_PTR, STCLASS = CONSTANT SYMDEF);
+       94     6953        %KV$SRD(NAME = KV_SRD, STCLASS = CONSTANT SYMDEF);
+       95     7228        %KV$SSN(NAME = KV_SSN, STCLASS = CONSTANT SYMDEF);
+       96     7307        %KV$STR (NAME=KV_STR, STCLASS=CONSTANT SYMDEF, ACTCHRTBL=KV_ACTCHRTBLNRM);
+       97     7394        %KV$TYPAHDBFR(NAME = KV_TYPAHDBFR, STCLASS = CONSTANT SYMDEF);
+       98     7419        %KV$X364(NAME = KV_X364, STCLASS = SYMREF READONLY);
+       99     7453        %KV$VDI(NAME = KV_VDI, STCLASS = CONSTANT SYMDEF);
+      100     7524
+      101     7525        %SET KV$STRCTR_INDEX = 0;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:29   
+      102     7526
+      103     7527    1   DCL 1 KV_STRCTR ALIGNED STATIC SYMDEF,
+      104     7528
+      105     7529        %KV$STRCTR(NAME = ACTCHR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_ACTCHR,
+      106     7530        SHRBFR = YES, SHRBFRHED = KV_ACTCHRTBLNRM, LAST = ",");
+      107     7564
+      108     7565        %KV$STRCTR(NAME = DCB_, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_DCB, LAST =
+              7565            ",");
+      109     7599
+      110     7600        %KV$STRCTR(NAME = DCBHDN, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_DCBHDN,
+      111     7601        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      112     7635
+      113     7636        %KV$STRCTR(NAME = ERR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_ERR, LAST =
+              7636            ",");
+      114     7670
+      115     7671        %KV$STRCTR(NAME = FLD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_FLD, LAST =
+              7671            ",");
+      116     7705
+      117     7706        %KV$STRCTR(NAME = FLDLST, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_FLDLST,
+      118     7707        PWR2=YES, LAST=",");
+      119     7741
+      120     7742        %KV$STRCTR(NAME = INPTAB, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_INPTAB,
+      121     7743        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, CHKSIZ=YES, LAST=",");
+      122     7777
+      123     7778        %KV$STRCTR(NAME = LIN, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_LIN, LAST =
+              7778            ",");
+      124     7812
+      125     7813        %KV$STRCTR(NAME = LINLST, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_LINLST,
+      126     7814        INTDAT = KV_LINLST, LAST = ",");
+      127     7848
+      128     7849        %KV$STRCTR(NAME = MRD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_MRD,
+      129     7850        BYTSIZ = "SIZEC(KV_MRD)", INTDAT = KV_MRD, LAST = ",");
+      130     7884
+      131     7885        %KV$STRCTR(NAME = MSG, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_MSG,
+      132     7886        PWR2 = YES, LAST = ",");
+      133     7920
+      134     7921        %KV$STRCTR(NAME = MVD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_MVD,
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:30   
+      135     7922        BYTSIZ = "SIZEC(KV_MVD)", INTDAT = KV_MVD, LAST = ",");
+      136     7956
+      137     7957        %KV$STRCTR(NAME = OTPTAB, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_OTPTAB,
+      138     7958        DUMMY = YES, BYTSIZ = %KV_STRTYP_INPTAB, LAST = ",");
+      139     7992
+      140     7993        %KV$STRCTR(NAME = PAG, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_PAG,
+      141     7994        LAST = ",");
+      142     8028
+      143     8029        %KV$STRCTR(NAME = PRM, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_PRM,
+      144     8030        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_PRM1, CHKSIZ=YES, LAST=",");
+      145     8064
+      146     8065        %KV$STRCTR(NAME = PTR_, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_PTR,
+      147     8066        BYTSIZ = "SIZEC(KV_PTR)", INTDAT = KV_PTR, LAST = ",");
+      148     8100
+      149     8101        %KV$STRCTR(NAME = REDBFR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_REDBFR,
+      150     8102        PWR2 = YES, LAST = ",");
+      151     8136
+      152     8137        %KV$STRCTR(NAME = SRD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_SRD,
+      153     8138        BYTSIZ = "SIZEC(KV_SRD)", INTDAT = KV_SRD, LAST = ",");
+      154     8172
+      155     8173        %KV$STRCTR(NAME = SSN, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_SSN,
+      156     8174        BYTSIZ = "SIZEC(KV_SSN)", INTDAT = KV_SSN, LAST = ",");
+      157     8208
+      158     8209        %KV$STRCTR(NAME = SSNHDN, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_SSNHDN,
+      159     8210        DUMMY = YES, BYTSIZ = %KV_STRTYP_DCBHDN, LAST = ",");
+      160     8244
+      161     8245        %KV$STRCTR(NAME = SSTINPFNCTBL, LVL = 2, STCLASS = STATIC, STRTYP =
+              8245            %KV_STRTYP_SSTINPFNCTBL,
+      162     8246        SHRBFR = YES, LAST = ",");
+      163     8280
+      164     8281        %KV$STRCTR(NAME = STR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_STR,
+      165     8282        BYTSIZ = "SIZEC(KV_STR)", INTDAT = KV_STR, LAST = ",");
+      166     8316
+      167     8317        %KV$STRCTR(NAME = TRMTAB, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_TRMTAB,
+      168     8318        DUMMY = YES, BYTSIZ = %KV_STRTYP_INPTAB, LAST = ",");
+      169     8352
+      170     8353        %KV$STRCTR(NAME = TRNTBL, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_TRNTBL,
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:31   
+      171     8354        SHRBFR = YES, LAST = ",");
+      172     8388
+      173     8389        %KV$STRCTR(NAME = TYPAHDBFR, LVL = 2, STCLASS = STATIC, STRTYP =
+              8389            %KV_STRTYP_TYPAHDBFR,
+      174     8390       PWR2 = YES, BYTSIZ = "%(KV_TYPAHDBFR_CHRX_HI+1)", INTDAT = KV_TYPAHDBFR, LAST = ",")
+              8390            ;
+      175     8424
+      176     8425       %KV$STRCTR(NAME=USRINPFNCTBL, LVL=2, STCLASS=STATIC, STRTYP=%KV_STRTYP_USRINPFNCTBL,
+      177     8426        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      178     8460
+      179     8461        %KV$STRCTR(NAME = USRBFR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_USRBFR,
+      180     8462        LAST = ",");
+      181     8496
+      182     8497        %KV$STRCTR(NAME=USRSHRBFR, LVL=2, STCLASS=STATIC, STRTYP=%KV_STRTYP_USRSHRBFR,
+      183     8498        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, CHKSIZ=YES, LAST=",");
+      184     8532
+      185     8533        %KV$STRCTR(NAME = VDI, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_VDI,
+      186     8534        BYTSIZ = "SIZEC(KV_VDI)", INTDAT = KV_VDI, LAST = ",");
+      187     8568
+      188     8569        %KV$STRCTR(NAME = VFU, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_VFU,
+      189     8570        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      190     8604
+      191     8605        %KV$STRCTR(NAME = ERD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_ERD,
+      192     8606        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      193     8640
+      194     8641        %KV$STRCTR(NAME = ENTSRD, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_ENTSRD,
+      195     8642        SHRBFR=YES, SHRBFRHED=KV_SHRBFR_TAB, LAST=",");
+      196     8676
+      197     8677        %KV$STRCTR(NAME = TRCBFR, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_TRCBFR,
+      198     8678        LAST = ",");
+      199     8712
+      200     8713        %KV$STRCTR(NAME = X364, LVL = 2, STCLASS = STATIC, STRTYP = %KV_STRTYP_X364,
+      201     8714        BYTSIZ = "SIZEC(KV_X364)", INTDAT = KV_X364, LAST = ",");
+      202     8748
+      203     8749        %KV$STRCTR (NAME=RCR, LVL=2, STCLASS=STATIC, STRTYP=%KV_STRTYP_RCR,
+      204     8750        PWR2=YES, LAST=",");
+      205     8784
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:32   
+      206     8785        %KV$STRCTR (NAME=RCRLST, LVL=2, STCLASS=STATIC, STRTYP=%KV_STRTYP_RCRLST,
+      207     8786        LAST=";");
+      208     8820
+      209     8821        %KV$STRCTR;
+      210     8855
+      211     8856        /* Local AUTO variables                                                       */
+      212     8857
+      213     8858        /* pointer to the structure control entry for this structure type             */
+      214     8859
+      215     8860    1   DCL STRCTR$ PTR;
+      216     8861        %EQU KV_STRCTR = CHARTEXT('STRCTR$->KV$STRCTR');
+      217     8862
+      218     8863        /* number of bytes of initial data                                            */
+      219     8864
+      220     8865    1   DCL INTDATSIZ UBIN;
+      221     8866        /*N* PL6 BUG!! */
+      222     8867    1   DCL 1 INTDAT REDEF INTDATSIZ,
+      223     8868    1          2 * BIT(8), 2 SIZ UBIN(8) UNAL;
+      224     8869
+      225     8870        /* byte size of new buffer aquired (total size including any header)          */
+      226     8871
+      227     8872    1   DCL BFRBYTSIZ UBIN;
+      228     8873
+      229     8874        /* interrupt level KVS$GETBFR was called at                                   */
+      230     8875
+      231     8876    1   DCL LVL UBIN;
+      232     8877
+      233     8878        /* working pointer to the buffer we are alocating or looking at.              */
+      234     8879
+      235     8880    1   DCL BFR$ PTR;
+      236     8881
+      237     8882        /* pointer to initialization data                                             */
+      238     8883
+      239     8884    1   DCL DAT$ CPTR;
+      240     8885
+      241     8886
+      242     8887        /* Pointer to KV$STT */
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:33   
+      243     8888
+      244     8889    1   DCL Y@STT$ PTR AUTO;
+      245     8890        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:34   
+      246     8891        /* Argument structures                                                        */
+      247     8892
+      248     8893    1   DCL AV$ CHAR(INTDATSIZ);
+      249     8894        %KV$VDH_GETBFR(NAME = VDH_GETBFR, STCLASS = REDEF AV$);
+      250     8959        %KV$VDH_RLSBFR(NAME = VDH_RLSBFR, STCLASS = REDEF AV$);
+      251     8995    1   DCL 1 KV_B BASED(BFR$) ALIGNED,         /* Parameter for KVB$RLSBFR           */
+      252     8996    1          2 SIZ UBIN;
+      253     8997    1   DCL CHARS CHAR(256) BASED;
+      254     8998
+      255     8999        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:35   
+      256     9000    1   KVS$GETBFR: ENTRY(AV$) ALTRET;
+
+   9000   2 000007  D380 0000 0000  xent KVS$GETBFR      LNJ,B5   X6A_AUTO_1
+          2 00000A       0018 0001                       DC       24,1
+
+      257     9001        /*P* NAME: KVS$GETBFR
+      258     9002             PURPOSE:
+      259     9003               To acquire a buffer for the VDH or for the vdh user.                    */
+      260     9004        /*D* NAME: KVS$GETBFR
+      261     9005             DESCRIPTION:
+      262     9006                   Acquire a buffer for the VDH or for the vdh user.
+      263     9007                   This buffer may be a shared buffer (VDH or user)
+      264     9008                   or it may be an unshared buffer. For shared buffers, this routine
+      265     9009                   keeps track of usage counts and chains. For all buffers, this routine
+      266     9010                   tracks current buffer utilizations, and checks against allowable
+      267     9011                   limits.  REG the user if we can't get memory.
+      268     9012             INPUT:
+      269     9013                   The argument to this routine is the KV$VDH_GETBFR structure.       */
+      270     9014
+      271     9015    2      IF VDH_GETBFR.STT$ ~= ADDR(NIL) THEN DO;
+
+   9015   2 00000C  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 00000E  8DC6 0004                            CMN      4,B6
+          2 000010  0901 0007                            BE       s:9026,PREL
+
+      272     9016        /*
+      273     9017        The caller is passing in the address of the KV$STT structure.
+      274     9018        Use it instead of the one we'd normally find.
+      275     9019        We're probably in early connect or late disconnect.
+      276     9020        */
+      277     9021    2         Y@STT$ = VDH_GETBFR.STT$;
+
+   9021   2 000012  DCC6 0004                            LDB,B5   4,B6
+          2 000014  DFC7 000F                            STB,B5   Y@STT$,AUTO
+
+      278     9022    2      END; ELSE DO;                        /* ELSE IF VDH_GETBFR.STT$ ~= NIL     */
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:36   
+   9022   2 000016  0F81 000B                            B        s:9029,PREL
+
+      279     9023        /*
+      280     9024        There is no caller-supplied KV$STT address.
+      281     9025        */
+      282     9026    2         Y@STT$ = %KV_USRPRM.STT$;
+
+   9026   2 000018  DC80 0000 0000  xsym                 LDB,B5   KV$PTR$
+          2 00001B  CC85                                 LDB,B4   ,B5
+          2 00001C  BCC4 0008                            LDB,B3   8,B4
+          2 00001E  ACC3 0033                            LDB,B2   51,B3
+          2 000020  AFC7 000F                            STB,B2   Y@STT$,AUTO
+
+      283     9027    2      END; /* END ELSE IF VDH_GETBFR.STT$ ~= NIL */
+
+      284     9028
+      285     9029    1      VDH_GETBFR.ERR = '0'B;
+
+   9029   2 000022  8846 0006                            LBF,'001E'X       6,B6
+   9029   2 000024       001E
+
+      286     9030
+      287     9031        /* since parts of this code are kind of sensitive, we will go to
+      288     9032           a higher level to avoid hurting anyones feelings (the VDH inhibit
+      289     9033           level, if we are not already there)                                        */
+      290     9034
+      291     9035    1      LVL = %KH_INHLVL;
+
+   9035   2 000025  DC80 0000 0000  xsym                 LDB,B5   KH_CTLTBL$
+          2 000028  CCC5 0002                            LDB,B4   2,B5
+          2 00002A  E804                                 LDR,R6   ,B4
+          2 00002B  EF47 000A                            STR,R6   LVL,AUTO
+
+      292     9036    1      CALL KHI$DISABLE(LVL);
+
+   9036   2 00002D  CBC7 000A                            LAB,B4   LVL,AUTO
+          2 00002F  CFC7 0014                            STB,B4   Y@STT$+5,AUTO
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:37   
+          2 000031  BBC7 0014                            LAB,B3   Y@STT$+5,AUTO
+          2 000033  CBF0 0100                            LAB,B4   256,IMO
+          2 000035  E380 0000 0000  xent                 LNJ,B6   KHI$DISABLE
+          2 000038       0001                            DC       s:9041,PREL
+
+      293     9037
+      294     9038        /* develop a pointer to the buffer control structure for this buffer
+      295     9039           type                                                                       */
+      296     9040
+      297     9041    1      STRCTR$ = PINCRW(ADDR(KV_STRCTR), SIZEW(KV$STRCTR)*(VDH_GETBFR.STRTYP-1));
+
+   9041   2 000039  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 00003B  B2C6 0006                            LLH,R3   6,B6
+          2 00003D  3002                                 SOL,R3   2
+          2 00003E  DBB0 000F FFFC  01                   LAB,B5   KV_STRCTR-4,R3
+          2 000041  DFC7 0006                            STB,B5   STRCTR$,AUTO
+
+      298     9042    2      IF %KV_STRCTR.DUMMY THEN DO;
+
+   9042   2 000043  82C5 0003                            LB,'1000'X        3,B5
+   9042   2 000045       1000
+          2 000046  0581 0018                            BBF      s:9045,PREL
+
+      299     9043    2         VDH_GETBFR.STRTYP = %KV_STRCTR.BYTSIZ;
+
+   9043   2 000048  E805                                 LDR,R6   ,B5
+          2 000049  E7C6 0006                            STH,R6   6,B6
+
+      300     9044    2         STRCTR$ = PINCRW(ADDR(KV_STRCTR), SIZEW(KV$STRCTR)*(%KV_STRCTR.BYTSIZ-1));
+
+   9044   2 00004B  B805                                 LDR,R3   ,B5
+          2 00004C  CB80 0000 0000  01                   LAB,B4   KV_STRCTR
+          2 00004F  CFC7 0014                            STB,B4   Y@STT$+5,AUTO
+          2 000051  8CC7 0014                            LDI      Y@STT$+5,AUTO
+          2 000053  8D47 0016                            SDI      Y@STT$+7,AUTO
+          2 000055  F853                                 LDR,R7   R3
+          2 000056  6C00                                 LDV,R6   0
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:38   
+          2 000057  7082                                 DOL,R7   2
+          2 000058  8447 0016                            AID      Y@STT$+7,AUTO
+          2 00005A  8470 FFFF FFFC                       AID      -4,IMO
+          2 00005D  8D47 0006                            SDI      STRCTR$,AUTO
+
+      301     9045    2      END;
+
+   9042   2                              NOMEM           null
+      302     9046
+      303     9047        /* the purpose of the label below is to allow us to reg the user if we
+      304     9048           cant get memory later in the routine. we pick up from this point
+      305     9049           and recalculate so as to avoid getting messed up by anything that
+      306     9050           may have changed while we were gone                                        */
+      307     9051
+      308     9052    1   NOMEM:;
+      309     9053
+      310     9054    1      BFRBYTSIZ = %KV_STRCTR.BYTSIZ;
+
+   9054   2 00005F  DCC7 0006            NOMEM           LDB,B5   STRCTR$,AUTO
+          2 000061  E805                                 LDR,R6   ,B5
+          2 000062  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      311     9055    1      INTDATSIZ = VDH_GETBFR.DAT_.BYTSIZ;
+
+   9055   2 000064  D846 000A                            LDR,R5   10,B6
+          2 000066  DF47 0008                            STR,R5   INTDATSIZ,AUTO
+
+      312     9056
+      313     9057        /* see if we should handle this as a shared buffer or a normal buffer         */
+      314     9058
+      315     9059    2      IF NOT %KV_STRCTR.SHRBFR THEN DO;
+
+   9059   2 000068  89C5 0003                            CMZ      3,B5
+          2 00006A  0801 001E                            BAL      s:9071,PREL
+
+      316     9060
+      317     9061        /* non-shared buffer                                                       */
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:39   
+      318     9062
+      319     9063    2         VDH_GETBFR.BFR$ = ADDR(NIL);
+
+   9063   2 00006C  CB80 0000 0000                       LAB,B4   0
+          2 00006F  CFC6 0001                            STB,B4   1,B6
+
+      320     9064    2         IF BFRBYTSIZ<VDH_GETBFR.BYTSIZ AND (%KV_STRCTR.CHKSIZ OR BFRBYTSIZ=0)
+
+   9064   2 000071  E847 0009                            LDR,R6   BFRBYTSIZ,AUTO
+          2 000073  E946 0003                            CMR,R6   3,B6
+          2 000075  0281 000C                            BGE      s:9066,PREL
+          2 000077  82C5 0003                            LB,'0800'X        3,B5
+          2 000079       0800
+          2 00007A  0501 0003                            BBT      s:9065,PREL
+          2 00007C  6981 0005                            BNEZ,R6  s:9066,PREL
+
+      321     9065    2         THEN BFRBYTSIZ = VDH_GETBFR.BYTSIZ;
+
+   9065   2 00007E  E846 0003                            LDR,R6   3,B6
+          2 000080  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      322     9066    2         IF BFRBYTSIZ=0 THEN BFRBYTSIZ = INTDATSIZ;
+
+   9066   2 000082  6981 008D                            BNEZ,R6  s:9135,PREL
+
+   9066   2 000084  E855                                 LDR,R6   R5
+          2 000085  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      323     9067    2      END; ELSE DO;
+
+   9067   2 000087  0F81 0088                            B        s:9135,PREL
+
+      324     9068
+      325     9069        /* its a shared buffer.                                                    */
+      326     9070
+      327     9071    3         IF VDH_GETBFR.SHRBFR.SRC OR VDH_GETBFR.SHRBFR.GET THEN DO;
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:40   
+   9071   2 000089  82C6 0006                            LB,'0080'X        6,B6
+   9071   2 00008B       0080
+          2 00008C  0501 0006                            BBT      s:9079,PREL
+          2 00008E  82C6 0006                            LB,'0040'X        6,B6
+          2 000090       0040
+          2 000091  0581 0006                            BBF      s:9082,PREL
+
+      328     9072
+      329     9073        /* this is a shared buffer operation, and is a
+      330     9074        search or get. the user isn't passing a buffer
+      331     9075        address, so we want to null the pointer passed.
+      332     9076        we null it here just to ensure it is returned
+      333     9077        as a null in case anything goes wrong.                                     */
+      334     9078
+      335     9079    3            VDH_GETBFR.BFR$ = ADDR(NIL);
+
+   9079   2 000093  CB80 0000 0000                       LAB,B4   0
+          2 000096  CFC6 0001                            STB,B4   1,B6
+
+      336     9080    3         END /* IF */;
+
+      337     9081        /* Load up the buffer size needed */
+      338     9082    2         BFRBYTSIZ = INTDATSIZ + SIZEC(KV_SHRBFR);
+
+   9082   2 000098  5E08                                 ADV,R5   8
+          2 000099  DF47 0009                            STR,R5   BFRBYTSIZ,AUTO
+
+      339     9083
+      340     9084        /* see if we need to search the chain                                      */
+      341     9085
+      342     9086    3         IF VDH_GETBFR.SHRBFR.SRC THEN DO;
+
+   9086   2 00009B  82C6 0006                            LB,'0080'X        6,B6
+   9086   2 00009D       0080
+          2 00009E  0581 0067                            BBF      s:9125,PREL
+
+      343     9087
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:41   
+      344     9088    3            BFR$ = %KV_STRCTR.SHRBFRHED$;
+
+   9088   2 0000A0  CCC5 0001                            LDB,B4   1,B5
+          2 0000A2  CFC7 000B                            STB,B4   BFR$,AUTO
+
+      345     9089    4            IF BFR$=ADDR(NIL) THEN DO;
+
+   9089   2 0000A4  8DC7 000B                            CMN      BFR$,AUTO
+          2 0000A6  0981 000D                            BNE      s:9096,PREL
+
+      346     9090    4               CALL Y$GETSHRBFRHED$_ADR;
+
+   9090   2 0000A8  E3C0 02DA                            LNJ,B6   s:0,PREL
+          2 0000AA       0001                            DC       s:9091,PREL
+
+      347     9091    4               IF BFR$~=ADDR(NIL) THEN BFR$ = KV$SHRBFR.LNK$;
+
+   9091   2 0000AB  8DC7 000B                            CMN      BFR$,AUTO
+          2 0000AD  0901 0006                            BE       s:9096,PREL
+
+   9091   2 0000AF  ECC7 000B                            LDB,B6   BFR$,AUTO
+          2 0000B1  DC86                                 LDB,B5   ,B6
+          2 0000B2  DFC7 000B                            STB,B5   BFR$,AUTO
+
+      348     9092    4            END;
+
+      349     9093
+      350     9094        /* search the chain                                                        */
+      351     9095
+      352     9096    4            DO WHILE(BFR$ ~= ADDR(NIL));
+
+   9096   2 0000B4  0F81 0041                            B        s:9117,PREL
+
+      353     9097
+      354     9098    4               IF (KV$SHRBFR.BYTSIZ=BFRBYTSIZ
+
+   9098   2 0000B6  ECC7 000B                            LDB,B6   BFR$,AUTO
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:42   
+          2 0000B8  E846 0002                            LDR,R6   2,B6
+          2 0000BA  E947 0009                            CMR,R6   BFRBYTSIZ,AUTO
+          2 0000BC  0901 000A                            BE       s:9098+17,PREL
+          2 0000BE  0381 0032                            BLE      s:9116,PREL
+          2 0000C0  DCC7 0006                            LDB,B5   STRCTR$,AUTO
+          2 0000C2  82C5 0003                            LB,'0800'X        3,B5
+          2 0000C4       0800
+          2 0000C5  0501 002B                            BBT      s:9116,PREL
+          2 0000C7  D846 0003                            LDR,R5   3,B6
+          2 0000C9  5901 0027                            BEZ,R5   s:9116,PREL
+          2 0000CB  DCC7 0004                            LDB,B5   @AV$,AUTO
+          2 0000CD  CCC5 0007                            LDB,B4   7,B5
+          2 0000CF  C845 0009                            LDR,R4   9,B5
+          2 0000D1  CF47 0014                            STR,R4   Y@STT$+5,AUTO
+          2 0000D3  CFC7 0015                            STB,B4   Y@STT$+6,AUTO
+          2 0000D5  AB86                                 LAB,B2   ,B6
+          2 0000D6  2C08                                 LDV,R2   8
+          2 0000D7  E847 0008                            LDR,R6   INTDATSIZ,AUTO
+          2 0000D9  BB84                                 LAB,B3   ,B4
+          2 0000DA  B854                                 LDR,R3   R4
+          2 0000DB  F856                                 LDR,R7   R6
+          2 0000DC  D380 0000 0000  xent                 LNJ,B5   X6C_ACM
+          2 0000DF  5301 0011                            CBNE     s:9116,PREL
+
+      355     9099    4                 OR KV$SHRBFR.BYTSIZ>BFRBYTSIZ AND NOT %KV_STRCTR.CHKSIZ)
+      356     9100    4                 AND KV$SHRBFR.USRCNT~=0
+      357     9101
+      358     9102        /* the buffer size matches and the user count looks good. lets do a complete
+      359     9103        byte by byte check                                                         */
+      360     9104
+      361     9105    4                 AND SUBSTR(KV$SHRBFR.NAM, 0, INTDATSIZ) = SUBSTR
+      362     9106    4                 (VDH_GETBFR.DAT_.ADR$->CHARS, VDH_GETBFR.DAT_.BYTX, INTDATSIZ)
+      363     9107    5               THEN DO;
+
+      364     9108
+      365     9109    5                  VDH_GETBFR.BFR$ = BFR$;
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:43   
+   9109   2 0000E1  ECC7 000B                            LDB,B6   BFR$,AUTO
+          2 0000E3  DCC7 0004                            LDB,B5   @AV$,AUTO
+          2 0000E5  EFC5 0001                            STB,B6   1,B5
+
+      366     9110        /* Increment user count if not in constant */
+      367     9111    5                  IF KV$SHRBFR.USRCNT ~= %KV_SHRBFR_CNSUSRCNT
+
+   9111   2 0000E7  E846 0003                            LDR,R6   3,B6
+          2 0000E9  E970 7FFF                            CMR,R6   32767,IMO
+          2 0000EB  0901 0003                            BE       s:9113,PREL
+
+      368     9112    5                  THEN KV$SHRBFR.USRCNT = KV$SHRBFR.USRCNT+1;
+
+   9112   2 0000ED  8AC6 0003                            INC      3,B6
+
+      369     9113    5                  GOTO ENABLE_RETURN;
+
+   9113   2 0000EF  0F81 0155                            B        s:9275,PREL
+
+      370     9114    5               END /* IF */;
+      371     9115
+      372     9116    4               BFR$ = KV$SHRBFR.LNK$;
+
+   9116   2 0000F1  ECC7 000B                            LDB,B6   BFR$,AUTO
+          2 0000F3  DC86                                 LDB,B5   ,B6
+          2 0000F4  DFC7 000B                            STB,B5   BFR$,AUTO
+
+      373     9117    4            END /* LOOP */;
+
+   9117   2 0000F6  8DC7 000B                            CMN      BFR$,AUTO
+          2 0000F8  0981 FFBD                            BNE      s:9098,PREL
+
+      374     9118    4            IF NOT VDH_GETBFR.SHRBFR.GET THEN DO;
+
+   9118   2 0000FA  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 0000FC  82C6 0006                            LB,'0040'X        6,B6
+          2 0000FE       0040
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:44   
+          2 0000FF  0501 0006                            BBT      s:9125,PREL
+
+      375     9119        /* Search only, altreturn if not found. */
+      376     9120    4               VDH_GETBFR.ERR.NOT_FND = '1'B;
+
+   9120   2 000101  8946 0006                            LBT,'0004'X       6,B6
+   9120   2 000103       0004
+
+      377     9121    4               GOTO ENABLE_RETURN;
+
+   9121   2 000104  0F81 0140                            B        s:9275,PREL
+
+      378     9122    4            END /* IF */;
+      379     9123
+      380     9124    3         END /* IF */;
+      381     9125    2         IF BFRBYTSIZ<VDH_GETBFR.BYTSIZ
+
+   9125   2 000106  E847 0009                            LDR,R6   BFRBYTSIZ,AUTO
+          2 000108  E946 0003                            CMR,R6   3,B6
+          2 00010A  0281 0005                            BGE      s:9135,PREL
+
+      382     9126        /* Get the larger of the required size and the requested one,
+      383     9127           so that even shared buffers can be expanded. */
+      384     9128    2         THEN BFRBYTSIZ = VDH_GETBFR.BYTSIZ;
+
+   9128   2 00010C  E846 0003                            LDR,R6   3,B6
+          2 00010E  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      385     9129    2      END /* IF */;
+
+      386     9130
+      387     9131        /* if this is a 'get' operation of a shared buffer not on the chain,
+      388     9132        or this is a 'get' operation of a non-shared buffer, do the getting
+      389     9133        while the getting is good.                                                 */
+      390     9134
+      391     9135    2      IF NOT %KV_STRCTR.SHRBFR OR VDH_GETBFR.SHRBFR.GET THEN DO;
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:45   
+   9135   2 000110  DCC7 0006                            LDB,B5   STRCTR$,AUTO
+          2 000112  89C5 0003                            CMZ      3,B5
+          2 000114  0881 0006                            BAGE     s:9139,PREL
+          2 000116  82C6 0006                            LB,'0040'X        6,B6
+          2 000118       0040
+          2 000119  0581 00E9                            BBF      s:9239,PREL
+
+      392     9136
+      393     9137        /* bytes to wrds                                                           */
+      394     9138
+      395     9139    2         BFRBYTSIZ = (BFRBYTSIZ+1)/2;
+
+   9139   2 00011B  6E01                                 ADV,R6   1
+          2 00011C  6041                                 SOR,R6   1
+          2 00011D  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      396     9140
+      397     9141        /* acquire the memory                                                      */
+      398     9142
+      399     9143    3         IF %KV_STRCTR.PWR2 THEN DO;
+
+   9143   2 00011F  82C5 0003                            LB,'4000'X        3,B5
+   9143   2 000121       4000
+          2 000122  0581 0013                            BBF      s:9148,PREL
+
+      400     9144
+      401     9145    3            CALL KVB$GET2NSYS(BFRBYTSIZ, VDH_GETBFR.BFR$) ALTRET(NOGET);
+
+   9145   2 000124  CBC6 0001                            LAB,B4   1,B6
+          2 000126  CFC7 0016                            STB,B4   Y@STT$+7,AUTO
+          2 000128  BBC7 0009                            LAB,B3   BFRBYTSIZ,AUTO
+          2 00012A  BFC7 0014                            STB,B3   Y@STT$+5,AUTO
+          2 00012C  BBC7 0014                            LAB,B3   Y@STT$+5,AUTO
+          2 00012E  CBF0 0200                            LAB,B4   512,IMO
+          2 000130  E380 0000 0000  xent                 LNJ,B6   KVB$GET2NSYS
+          2 000133       0025                            DC       s:9156,PREL
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:46   
+      402     9146    3         END; ELSE DO;
+
+   9146   2 000134  0F81 003E                            B        s:9185,PREL
+
+      403     9147
+      404     9148    3            CALL KVB$GETSYS(BFRBYTSIZ, VDH_GETBFR.BFR$)
+
+   9148   2 000136  CBC6 0001                            LAB,B4   1,B6
+          2 000138  CFC7 0016                            STB,B4   Y@STT$+7,AUTO
+          2 00013A  BBC7 0009                            LAB,B3   BFRBYTSIZ,AUTO
+          2 00013C  BFC7 0014                            STB,B3   Y@STT$+5,AUTO
+          2 00013E  BBC7 0014                            LAB,B3   Y@STT$+5,AUTO
+          2 000140  CBF0 0200                            LAB,B4   512,IMO
+          2 000142  E380 0000 0000  xent                 LNJ,B6   KVB$GETSYS
+          2 000145       0013                            DC       s:9156,PREL
+
+      405     9149    4            WHENRETURN DO;
+
+      406     9150
+      407     9151        /* If we're to return actual size, pluck it out of the buffer. */
+      408     9152
+      409     9153    4               IF %KV_STRCTR.BYTSIZ=0 AND NOT %KV_STRCTR.SHRBFR
+
+   9153   2 000146  ECC7 0006                            LDB,B6   STRCTR$,AUTO
+          2 000148  E806                                 LDR,R6   ,B6
+          2 000149  6981 000C                            BNEZ,R6  s:9155,PREL
+          2 00014B  89C6 0003                            CMZ      3,B6
+          2 00014D  0801 0008                            BAL      s:9155,PREL
+
+      410     9154    4               THEN BFRBYTSIZ = VDH_GETBFR.BFR$->KV_B.SIZ;
+
+   9154   2 00014F  DCC7 0004                            LDB,B5   @AV$,AUTO
+          2 000151  CCC5 0001                            LDB,B4   1,B5
+          2 000153  D804                                 LDR,R5   ,B4
+          2 000154  DF47 0009                            STR,R5   BFRBYTSIZ,AUTO
+
+      411     9155    4            END;                           /* WHENRETURN                         */
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:47   
+
+   9155   2 000156  0F81 001C                            B        s:9185,PREL
+
+      412     9156    4            WHENALTRETURN DO;
+
+   9154   2                              NOGET           null
+      413     9157    4   NOGET:      ;
+      414     9158        /*N* FOR NOW, WE WILL SCREECH IF WE CANT GET MEMORY. EVENTUALLY, WE        */
+      415     9159        /*N* WILL REG THE USER (IF WE CAN). UPON RETURNING FROM THE REG, WE        */
+      416     9160        /*N* WILL EXIT THE CURRENT GROUP AND END UP RETRYING THE ENTIRE            */
+      417     9161        /*N* OPERATION. NOTE THIS WHOLE THING IS IN A BIG LOOP. IF THE             */
+      418     9162        /*N* USER CAN'T BE REGED, WE WILL JUST SET THE NO_MEM BIT IN THE           */
+      419     9163        /*N* ARGUMENT STRUCTURE AND RETURN.                                        */
+      420     9164
+      421     9165    4               IF VDH_GETBFR.SCRNO_MMR OR VDH_GETBFR.BFR$ ~= ADDR(NIL)
+
+   9165   2 000158  ECC7 0004            NOGET           LDB,B6   @AV$,AUTO
+          2 00015A  82C6 0006                            LB,'0001'X        6,B6
+          2 00015C       0001
+          2 00015D  0501 0005                            BBT      s:9166,PREL
+          2 00015F  8DC6 0001                            CMN      1,B6
+          2 000161  0901 000A                            BE       s:9175,PREL
+
+      422     9166    4               THEN CALL KHD$SCREECH (KVS_NOMMR);
+
+   9166   2 000163  BB80 0000 0000  03                   LAB,B3   0
+          2 000166  CBF0 0100                            LAB,B4   256,IMO
+          2 000168  E380 0000 0000  xent                 LNJ,B6   KHD$SCREECH
+          2 00016B       0001                            DC       s:9175,PREL
+
+      423     9167        /*S*  SCREECH_CODE: KVS-S$KV_NOMMR
+      424     9168              MESSAGE: VDH ran out of memory.
+      425     9169        */
+      426     9170
+      427     9171        /* for now we set the err.no_mmr bit here. when we reg we should
+      428     9172        set the nomem flag which is checked later on in
+      429     9173        this loop                                                                     */
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:48   
+      430     9174
+      431     9175    4               VDH_GETBFR.ERR.NO_MMR = '1'B;
+
+   9175   2 00016C  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 00016E  8946 0006                            LBT,'0008'X       6,B6
+          2 000170       0008
+
+      432     9176    4               GOTO ENABLE_RETURN;
+
+   9176   2 000171  0F81 00D3                            B        s:9275,PREL
+
+      433     9177
+      434     9178    4            END /* WHENALTRETURN */;
+      435     9179
+      436     9180        /*N*  %KH$TRC (FCG = 'KVS', EVENT = %KV_TRC_BFRGET, IF = DEFAULT);               */
+      437     9181
+      438     9182    3         END /* IF */;
+
+      439     9183
+      440     9184        /* stash away what we actually got                                         */
+      441     9185    2         BFRBYTSIZ = BFRBYTSIZ*2;
+
+   9185   2 000173  E847 0009                            LDR,R6   BFRBYTSIZ,AUTO
+          2 000175  6001                                 SOL,R6   1
+          2 000176  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      442     9186    2         VDH_GETBFR.BYTSIZ = BFRBYTSIZ;
+
+   9186   2 000178  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 00017A  EF46 0003                            STR,R6   3,B6
+
+      443     9187
+      444     9188        /* keep track of buffer utilizations                                       */
+      445     9189    2        %KV_STT.BYTUTL(VDH_GETBFR.STRTYP) = BFRBYTSIZ+%KV_STT.BYTUTL(VDH_GETBFR.STRTYP
+              9189                  );
+
+   9189   2 00017C  B2C6 0006                            LLH,R3   6,B6
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:49   
+          2 00017E  DCC7 000F                            LDB,B5   Y@STT$,AUTO
+          2 000180  BF47 0014                            STR,R3   Y@STT$+5,AUTO
+          2 000182  3E6D                                 ADV,R3   109
+          2 000183  F847 0009                            LDR,R7   BFRBYTSIZ,AUTO
+          2 000185  6C00                                 LDV,R6   0
+          2 000186  8435                                 AID      ,B5,R3
+          2 000187  B847 0014                            LDR,R3   Y@STT$+5,AUTO
+          2 000189  3E6D                                 ADV,R3   109
+          2 00018A  8D35                                 SDI      ,B5,R3
+
+      446     9190    2        %KV_STT.BFRGETCNT(VDH_GETBFR.STRTYP) = %KV_STT.BFRGETCNT(VDH_GETBFR.STRTYP) +1
+              9190                  ;
+
+   9190   2 00018B  A2C6 0006                            LLH,R2   6,B6
+          2 00018D  CBC5 0124                            LAB,B4   292,B5
+          2 00018F  BBC5 0124                            LAB,B3   292,B5
+          2 000191  8CA4                                 LDI      ,B4,R2
+          2 000192  8470 0000 0001                       AID      1,IMO
+          2 000195  8D23                                 SDI      ,B3,R2
+
+      447     9191    2         %KV_STT.BFRCNT(VDH_GETBFR.STRTYP) = %KV_STT.BFRCNT(VDH_GETBFR.STRTYP) +1;
+
+   9191   2 000196  A2C6 0006                            LLH,R2   6,B6
+          2 000198  CBC5 016E                            LAB,B4   366,B5
+          2 00019A  BBC5 016E                            LAB,B3   366,B5
+          2 00019C  8CA4                                 LDI      ,B4,R2
+          2 00019D  8470 0000 0001                       AID      1,IMO
+          2 0001A0  8D23                                 SDI      ,B3,R2
+
+      448     9192
+      449     9193        /* do any requested inits                                                  */
+      450     9194
+      451     9195        /* see if any initializing data was specified on the call                  */
+      452     9196
+      453     9197    3         IF (VDH_GETBFR.DAT_.ADR$ ~= ADDR(NIL)) THEN DO;
+
+   9197   2 0001A1  8DC6 0007                            CMN      7,B6
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:50   
+          2 0001A3  0901 0015                            BE       s:9201+2,PREL
+
+      454     9198    3            DAT$ = PINCRC(VDH_GETBFR.DAT_.ADR$, VDH_GETBFR.DAT_.BYTX);
+
+   9198   2 0001A5  A846 0009                            LDR,R2   9,B6
+          2 0001A7  CCC6 0007                            LDB,B4   7,B6
+          2 0001A9  CFC7 0014                            STB,B4   Y@STT$+5,AUTO
+          2 0001AB  8CC7 0014                            LDI      Y@STT$+5,AUTO
+          2 0001AD  7031                                 DCL,R7   1
+          2 0001AE  8D47 0016                            SDI      Y@STT$+7,AUTO
+          2 0001B0  E852                                 LDR,R6   R2
+          2 0001B1  70F0                                 DAR,R7   16
+          2 0001B2  8447 0016                            AID      Y@STT$+7,AUTO
+          2 0001B4  7071                                 DCR,R7   1
+          2 0001B5  8D47 000D                            SDI      DAT$,AUTO
+
+      455     9199
+      456     9200        /* otherwise, see if there is any default initializing data                */
+      457     9201    3         END; ELSE IF %KV_STRCTR.INTDAT$ ~= ADDR(NIL) THEN DO;
+
+   9201   2 0001B7  0F81 0015                            B        s:9212,PREL
+
+   9201   2 0001B9  CCC7 0006                            LDB,B4   STRCTR$,AUTO
+          2 0001BB  8DC4 0001                            CMN      1,B4
+          2 0001BD  0901 000A                            BE       s:9207,PREL
+
+      458     9202    3            DAT$ = %KV_STRCTR.INTDAT$;
+
+   9202   2 0001BF  BCC4 0001                            LDB,B3   1,B4
+          2 0001C1  BFC7 000D                            STB,B3   DAT$,AUTO
+
+      459     9203    3            INTDATSIZ = %KV_STRCTR.BYTSIZ;
+
+   9203   2 0001C3  E804                                 LDR,R6   ,B4
+          2 0001C4  EF47 0008                            STR,R6   INTDATSIZ,AUTO
+
+      460     9204
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:51   
+      461     9205        /* otherwise, there is no initializing data                                */
+      462     9206    3         END; ELSE DO;
+
+   9206   2 0001C6  0F81 0006                            B        s:9212,PREL
+
+      463     9207    3            DAT$ = ADDR(NIL);
+
+   9207   2 0001C8  BB80 0000 0000                       LAB,B3   0
+          2 0001CB  BFC7 000D                            STB,B3   DAT$,AUTO
+
+      464     9208    3         END /* IF */;
+
+      465     9209
+      466     9210        /* if there is data to init with, move it in                               */
+      467     9211
+      468     9212    3         IF (DAT$ ~= ADDR(NIL)) THEN DO;
+
+   9212   2 0001CD  8DC7 000D                            CMN      DAT$,AUTO
+          2 0001CF  0901 0026                            BE       s:9230,PREL
+
+      469     9213
+      470     9214        /* move data in after the header, if this is a shared buffer               */
+      471     9215    3            BFR$ = VDH_GETBFR.BFR$;
+
+   9215   2 0001D1  CCC6 0001                            LDB,B4   1,B6
+          2 0001D3  CFC7 000B                            STB,B4   BFR$,AUTO
+
+      472     9216    4            IF %KV_STRCTR.SHRBFR THEN DO;
+
+   9216   2 0001D5  BCC7 0006                            LDB,B3   STRCTR$,AUTO
+          2 0001D7  89C3 0003                            CMZ      3,B3
+          2 0001D9  0881 0005                            BAGE     s:9222,PREL
+
+      473     9217    4               BFR$ = PINCRW(BFR$, SIZEW(KV_SHRBFR));
+
+   9217   2 0001DB  ABC4 0004                            LAB,B2   4,B4
+          2 0001DD  AFC7 000B                            STB,B2   BFR$,AUTO
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:52   
+
+      474     9218    4            END;
+
+      475     9219
+      476     9220        /* move in the initial size                                                */
+      477     9221
+      478     9222    3            SUBSTR(BFR$->CHARS, 0, INTDATSIZ) = SUBSTR(DAT$->CHARS, 0, INTDATSIZ);
+
+   9222   2 0001DF  8CC7 000D                            LDI      DAT$,AUTO
+          2 0001E1  B856                                 LDR,R3   R6
+          2 0001E2  E570 7FFF                            AND,R6   32767,IMO
+          2 0001E4  8D47 0014                            SDI      Y@STT$+5,AUTO
+          2 0001E6  CCC7 0014                            LDB,B4   Y@STT$+5,AUTO
+          2 0001E8  304F                                 SOR,R3   15
+          2 0001E9  AB84                                 LAB,B2   ,B4
+          2 0001EA  A853                                 LDR,R2   R3
+          2 0001EB  E847 0008                            LDR,R6   INTDATSIZ,AUTO
+          2 0001ED  BCC7 000B                            LDB,B3   BFR$,AUTO
+          2 0001EF  3C00                                 LDV,R3   0
+          2 0001F0  0008                                 MMM
+
+      479     9223        /* Fix up the buffer size - it should reflect the data size. */
+      480     9224
+      481     9225    3            BFRBYTSIZ = INTDATSIZ+SIZEC(KV_SHRBFR);
+
+   9225   2 0001F1  E847 0008                            LDR,R6   INTDATSIZ,AUTO
+          2 0001F3  6E08                                 ADV,R6   8
+          2 0001F4  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      482     9226    3         END /* IF */;
+
+      483     9227
+      484     9228        /* see if we have to place the structure type into byte 0                  */
+      485     9229
+      486     9230    3         IF %KV_STRCTR.INTSTRTYP THEN DO;
+
+   9230   2 0001F6  DCC7 0006                            LDB,B5   STRCTR$,AUTO
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:53   
+          2 0001F8  82C5 0003                            LB,'2000'X        3,B5
+          2 0001FA       2000
+          2 0001FB  0581 0007                            BBF      s:9239,PREL
+
+      487     9231    3            SUBSTR(VDH_GETBFR.BFR$->KV$SHRBFR.NAM, 0, 1) = BINASC(VDH_GETBFR.STRTYP);
+
+   9231   2 0001FD  CCC6 0001                            LDB,B4   1,B6
+          2 0001FF  E0C6 0006                            LDH,R6   6,B6
+          2 000201  E7C4 0004                            STH,R6   4,B4
+
+      488     9232    3         END /* IF */;
+
+      489     9233    2      END /* IF */;
+
+      490     9234
+      491     9235        /* if this was a 'get and add' operation and the buffer was not found,
+      492     9236           or this is just an 'add' operation, lets find the end of the buffer
+      493     9237           chain. note the buffer we are working with must be shared                  */
+      494     9238
+      495     9239    2      IF %KV_STRCTR.SHRBFR THEN DO;
+
+   9239   2 000203  89C5 0003                            CMZ      3,B5
+          2 000205  0881 003F                            BAGE     s:9275,PREL
+
+      496     9240    2         IF VDH_GETBFR.SHRBFR.GET OR VDH_GETBFR.SHRBFR.ADD
+
+   9240   2 000207  82C6 0006                            LB,'0040'X        6,B6
+   9240   2 000209       0040
+          2 00020A  0501 000A                            BBT      s:9242,PREL
+          2 00020C  82C6 0006                            LB,'0020'X        6,B6
+          2 00020E       0020
+          2 00020F  0581 0035                            BBF      s:9275,PREL
+          2 000211  8DC6 0001                            CMN      1,B6
+          2 000213  0901 0031                            BE       s:9275,PREL
+
+      497     9241    3           AND VDH_GETBFR.BFR$ ~= ADDR(NIL) THEN DO;
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:54   
+      498     9242    3            BFR$ = VDH_GETBFR.BFR$;
+
+   9242   2 000215  CCC6 0001                            LDB,B4   1,B6
+          2 000217  CFC7 000B                            STB,B4   BFR$,AUTO
+
+      499     9243        /* init the shared buffer header                                                 */
+      500     9244
+      501     9245    3            KV$SHRBFR.LNK$ = ADDR(NIL);
+
+   9245   2 000219  BB80 0000 0000                       LAB,B3   0
+          2 00021C  BF84                                 STB,B3   ,B4
+
+      502     9246    3            KV$SHRBFR.USRCNT = 0;
+
+   9246   2 00021D  8744 0003                            CL       3,B4
+
+      503     9247    4            IF VDH_GETBFR.SHRBFR.GET THEN DO;
+
+   9247   2 00021F  82C6 0006                            LB,'0040'X        6,B6
+   9247   2 000221       0040
+          2 000222  0581 0005                            BBF      s:9251,PREL
+
+      504     9248    4               KV$SHRBFR.BYTSIZ = BFRBYTSIZ;
+
+   9248   2 000224  E847 0009                            LDR,R6   BFRBYTSIZ,AUTO
+          2 000226  EF44 0002                            STR,R6   2,B4
+
+      505     9249    4            END /* IF */;
+
+      506     9250
+      507     9251    4            IF VDH_GETBFR.SHRBFR.ADD THEN DO;
+
+   9251   2 000228  82C6 0006                            LB,'0020'X        6,B6
+   9251   2 00022A       0020
+          2 00022B  0581 0019                            BBF      s:9275,PREL
+
+      508     9252
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:55   
+      509     9253        /* if this is a 'get and add' operation, init the user count                     */
+      510     9254
+      511     9255    4               KV$SHRBFR.USRCNT = 1;
+
+   9255   2 00022D  6C01                                 LDV,R6   1
+          2 00022E  EF44 0003                            STR,R6   3,B4
+
+      512     9256    4               BFR$ = ADDR(%KV_STRCTR.SHRBFRHED$);
+
+   9256   2 000230  ABC5 0001                            LAB,B2   1,B5
+          2 000232  AFC7 000B                            STB,B2   BFR$,AUTO
+
+      513     9257    4               IF KV$SHRBFR.LNK$=ADDR(NIL)
+
+   9257   2 000234  8D82                                 CMN      ,B2
+          2 000235  0981 0004                            BNE      s:9268,PREL
+
+      514     9258    4               THEN CALL Y$GETSHRBFRHED$_ADR;
+
+   9258   2 000237  E3C0 014B                            LNJ,B6   s:0,PREL
+          2 000239       0001                            DC       s:9268,PREL
+
+      515     9259
+      516     9260        %IF '0'B;                               /* IF LINK_AT_TAIL                    */
+      523     9267        %ELSE;
+      524     9268    4               VDH_GETBFR.BFR$->KV$SHRBFR.LNK$ = KV$SHRBFR.LNK$;
+
+   9268   2 00023A  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 00023C  DCC6 0001                            LDB,B5   1,B6
+          2 00023E  CCC7 000B                            LDB,B4   BFR$,AUTO
+          2 000240  BC84                                 LDB,B3   ,B4
+          2 000241  BF85                                 STB,B3   ,B5
+
+      525     9269        %ENDIF;
+      526     9270        /* end of chain                                                                  */
+      527     9271
+      528     9272    4               KV$SHRBFR.LNK$ = VDH_GETBFR.BFR$;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:56   
+
+   9272   2 000242  DCC6 0001                            LDB,B5   1,B6
+          2 000244  DF84                                 STB,B5   ,B4
+
+      529     9273    4            END /* IF */;
+
+      530     9274    3         END /* IF */;
+
+      531     9275    2      END /* IF */;
+
+   9257   2                              ENABLE_RETURN   null
+      532     9276
+      533     9277        /* if we were called from below the VDH inhibit level, we should
+      534     9278           do an enable to the level we were called at                                */
+      535     9279
+      536     9280        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:57   
+      537     9281    1   ENABLE_RETURN:;
+      538     9282    2      IF (LVL > %KH_INHLVL) THEN DO;
+
+   9282   2 000245  EC80 0000 0000  xsym ENABLE_RETURN   LDB,B6   KH_CTLTBL$
+          2 000248  DCC6 0002                            LDB,B5   2,B6
+          2 00024A  E847 000A                            LDR,R6   LVL,AUTO
+          2 00024C  E905                                 CMR,R6   ,B5
+          2 00024D  0381 0007                            BLE      s:9287,PREL
+
+      539     9283    2         CALL KHI$ENABLE;
+
+   9283   2 00024F  CBF0 0000                            LAB,B4   0,IMO
+          2 000251  E380 0000 0000  xent                 LNJ,B6   KHI$ENABLE
+          2 000254       0001                            DC       s:9287,PREL
+
+      540     9284    2      END /* IF */;
+
+      541     9285
+      542     9286        /* ALTRETURN if error occurred */
+      543     9287    1      IF VDH_GETBFR.ERR THEN ALTRETURN;
+
+   9287   2 000255  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 000257  82C6 0006                            LB,'001E'X        6,B6
+          2 000259       001E
+          2 00025A  0581 0004                            BBF      s:9289,PREL
+
+   9287   2 00025C  C380 0000 0000  xent                 LNJ,B4   X6A_AALT
+
+      544     9288
+      545     9289    1      RETURN;
+
+   9289   2 00025F  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      546     9290        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:58   
+      547     9291        /*F* NAME: KVS$RLSBFR
+      548     9292             PURPOSE: This routine releases a buffer for VDH or the
+      549     9293           VDH user. the buffer may be shared or unshared. the argument
+      550     9294           to KVS$RLSBFR is the KV$VDH_RLSBFR structure                               */
+      551     9295
+      552     9296    1   KVS$RLSBFR: ENTRY(AV$) ALTRET;
+
+   9296   2 000262  D380 0000 0000  xent KVS$RLSBFR      LNJ,B5   X6A_AUTO_1
+          2 000265       0018 0001                       DC       24,1
+
+      553     9297
+      554     9298        /* if this address is null, we did a quickie!                                 */
+      555     9299
+      556     9300    1      IF VDH_RLSBFR.BFR$=ADDR(NIL) THEN RETURN;
+
+   9300   2 000267  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 000269  8DC6 0001                            CMN      1,B6
+          2 00026B  0981 0004                            BNE      s:9301,PREL
+
+   9300   2 00026D  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      557     9301    1      BFR$ = VDH_RLSBFR.BFR$;
+
+   9301   2 000270  DCC6 0001                            LDB,B5   1,B6
+          2 000272  DFC7 000B                            STB,B5   BFR$,AUTO
+
+      558     9302        /* if we were called from below the VDH inhibit level, go to that
+      559     9303           level to prevent being interrupted at an inoportune time.                  */
+      560     9304
+      561     9305    2      IF VDH_GETBFR.STT$ ~= ADDR(NIL) THEN DO;
+
+   9305   2 000274  8DC6 0004                            CMN      4,B6
+          2 000276  0901 0007                            BE       s:9316,PREL
+
+      562     9306        /*
+      563     9307        The caller is passing in the address of the KV$STT structure.
+      564     9308        Use it instead of the one we'd normally find.
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:59   
+      565     9309        We're probably in early connect or late disconnect.
+      566     9310        */
+      567     9311    2         Y@STT$ = VDH_GETBFR.STT$;
+
+   9311   2 000278  CCC6 0004                            LDB,B4   4,B6
+          2 00027A  CFC7 000F                            STB,B4   Y@STT$,AUTO
+
+      568     9312    2      END; ELSE DO;                        /* ELSE IF VDH_GETBFR.STT$ ~= NIL     */
+
+   9312   2 00027C  0F81 000B                            B        s:9319,PREL
+
+      569     9313        /*
+      570     9314        There is no caller-supplied KV$STT address.
+      571     9315        */
+      572     9316    2         Y@STT$ = %KV_USRPRM.STT$;
+
+   9316   2 00027E  CC80 0000 0000  xsym                 LDB,B4   KV$PTR$
+          2 000281  BC84                                 LDB,B3   ,B4
+          2 000282  ACC3 0008                            LDB,B2   8,B3
+          2 000284  9CC2 0033                            LDB,B1   51,B2
+          2 000286  9FC7 000F                            STB,B1   Y@STT$,AUTO
+
+      573     9317    2      END; /* END ELSE IF VDH_GETBFR.STT$ ~= NIL */
+
+      574     9318
+      575     9319    1      LVL = %KH_INHLVL;
+
+   9319   2 000288  CC80 0000 0000  xsym                 LDB,B4   KH_CTLTBL$
+          2 00028B  BCC4 0002                            LDB,B3   2,B4
+          2 00028D  E803                                 LDR,R6   ,B3
+          2 00028E  EF47 000A                            STR,R6   LVL,AUTO
+
+      576     9320    1      CALL KHI$DISABLE(LVL);
+
+   9320   2 000290  BBC7 000A                            LAB,B3   LVL,AUTO
+          2 000292  BFC7 0014                            STB,B3   Y@STT$+5,AUTO
+          2 000294  BBC7 0014                            LAB,B3   Y@STT$+5,AUTO
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:60   
+          2 000296  CBF0 0100                            LAB,B4   256,IMO
+          2 000298  E380 0000 0000  xent                 LNJ,B6   KHI$DISABLE
+          2 00029B       0001                            DC       s:9324,PREL
+
+      577     9321
+      578     9322        /* develop a ptr to the buffer control structure for this buffer type         */
+      579     9323
+      580     9324    1      STRCTR$ = PINCRW(ADDR(KV_STRCTR), SIZEW(KV$STRCTR)*(VDH_RLSBFR.STRTYP-1));
+
+   9324   2 00029C  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 00029E  B2C6 0006                            LLH,R3   6,B6
+          2 0002A0  3002                                 SOL,R3   2
+          2 0002A1  DBB0 000F FFFC  01                   LAB,B5   KV_STRCTR-4,R3
+          2 0002A4  DFC7 0006                            STB,B5   STRCTR$,AUTO
+
+      581     9325    2      IF %KV_STRCTR.DUMMY THEN DO;
+
+   9325   2 0002A6  82C5 0003                            LB,'1000'X        3,B5
+   9325   2 0002A8       1000
+          2 0002A9  0581 0018                            BBF      s:9332,PREL
+
+      582     9326    2         VDH_GETBFR.STRTYP = %KV_STRCTR.BYTSIZ;
+
+   9326   2 0002AB  E805                                 LDR,R6   ,B5
+          2 0002AC  E7C6 0006                            STH,R6   6,B6
+
+      583     9327    2         STRCTR$ = PINCRW(ADDR(KV_STRCTR), SIZEW(KV$STRCTR)*(%KV_STRCTR.BYTSIZ-1));
+
+   9327   2 0002AE  B805                                 LDR,R3   ,B5
+          2 0002AF  CB80 0000 0000  01                   LAB,B4   KV_STRCTR
+          2 0002B2  CFC7 0014                            STB,B4   Y@STT$+5,AUTO
+          2 0002B4  8CC7 0014                            LDI      Y@STT$+5,AUTO
+          2 0002B6  8D47 0016                            SDI      Y@STT$+7,AUTO
+          2 0002B8  F853                                 LDR,R7   R3
+          2 0002B9  6C00                                 LDV,R6   0
+          2 0002BA  7082                                 DOL,R7   2
+          2 0002BB  8447 0016                            AID      Y@STT$+7,AUTO
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:61   
+          2 0002BD  8470 FFFF FFFC                       AID      -4,IMO
+          2 0002C0  8D47 0006                            SDI      STRCTR$,AUTO
+
+      584     9328    2      END;
+
+      585     9329
+      586     9330        /* determine how large a buffer to release                                    */
+      587     9331
+      588     9332    2      IF %KV_STRCTR.SHRBFR THEN DO;
+
+   9332   2 0002C2  DCC7 0006                            LDB,B5   STRCTR$,AUTO
+          2 0002C4  89C5 0003                            CMZ      3,B5
+          2 0002C6  0881 0059                            BAGE     s:9375+2,PREL
+
+      589     9333
+      590     9334        /* this is a shared buffer                                                    */
+      591     9335
+      592     9336        /* if its usage count is > 1, just decr
+      593     9337           the usage count and don't worry about anything else.                       */
+      594     9338
+      595     9339    3         IF VDH_RLSBFR.SHRBFRSRC AND KV$SHRBFR.USRCNT > 1 THEN DO;
+
+   9339   2 0002C8  82C6 0006                            LB,'0080'X        6,B6
+   9339   2 0002CA       0080
+          2 0002CB  0581 0010                            BBF      s:9349,PREL
+          2 0002CD  CCC7 000B                            LDB,B4   BFR$,AUTO
+          2 0002CF  E844 0003                            LDR,R6   3,B4
+          2 0002D1  6D01                                 CMV,R6   1
+          2 0002D2  0381 0009                            BLE      s:9349,PREL
+
+      596     9340
+      597     9341        /* we can just decrement the usage count                                      */
+      598     9342    3            IF KV$SHRBFR.USRCNT ~= %KV_SHRBFR_CNSUSRCNT
+
+   9342   2 0002D4  E970 7FFF                            CMR,R6   32767,IMO
+          2 0002D6  0901 0003                            BE       s:9344,PREL
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:62   
+      599     9343    3            THEN KV$SHRBFR.USRCNT = KV$SHRBFR.USRCNT-1;
+
+   9343   2 0002D8  88C4 0003                            DEC      3,B4
+
+      600     9344    3            GOTO ENABLE_RETURN;
+
+   9344   2 0002DA  0F81 FF6A                            B        s:9275,PREL
+
+      601     9345    3         END /* IF */;
+      602     9346
+      603     9347        /* if this buffer is shared, run the chain and find it                        */
+      604     9348
+      605     9349    3         IF VDH_RLSBFR.SHRBFRSRC THEN DO;
+
+   9349   2 0002DC  0581 0037                            BBF      s:9370,PREL
+
+      606     9350
+      607     9351    3            BFR$ = ADDR(%KV_STRCTR.SHRBFRHED$);
+
+   9351   2 0002DE  CBC5 0001                            LAB,B4   1,B5
+          2 0002E0  CFC7 000B                            STB,B4   BFR$,AUTO
+
+      608     9352    3            IF KV$SHRBFR.LNK$=ADDR(NIL)
+
+   9352   2 0002E2  8D84                                 CMN      ,B4
+          2 0002E3  0981 0004                            BNE      s:9357,PREL
+
+      609     9353    3            THEN CALL Y$GETSHRBFRHED$_ADR;
+
+   9353   2 0002E5  E3C0 009D                            LNJ,B6   s:0,PREL
+          2 0002E7       0001                            DC       s:9357,PREL
+
+      610     9354
+      611     9355        /* search the chain                                                           */
+      612     9356
+      613     9357    4            DO WHILE KV$SHRBFR.LNK$ ~= VDH_RLSBFR.BFR$;
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:63   
+   9357   2 0002E8  ECC7 000B                            LDB,B6   BFR$,AUTO
+          2 0002EA  DC86                                 LDB,B5   ,B6
+          2 0002EB  CCC7 0004                            LDB,B4   @AV$,AUTO
+          2 0002ED  DDC4 0001                            CMB,B5   1,B4
+          2 0002EF  0901 001A                            BE       s:9366,PREL
+
+      614     9358    5               IF KV$SHRBFR.LNK$ = ADDR(NIL) THEN DO;
+
+   9358   2 0002F1  ECC7 000B                            LDB,B6   BFR$,AUTO
+          2 0002F3  8D86                                 CMN      ,B6
+          2 0002F4  0981 000A                            BNE      s:9364,PREL
+
+      615     9359        /*S* SCREECH_CODE: KVS-S$KV_SHRCHN
+      616     9360             MESSAGE: Shared buffer release not found in its chain.
+      617     9361        */
+      618     9362    5                  CALL KHD$SCREECH (KVS_SHRCHN);
+
+   9362   2 0002F6  BB80 0000 0002  03                   LAB,B3   +2
+          2 0002F9  CBF0 0100                            LAB,B4   256,IMO
+          2 0002FB  E380 0000 0000  xent                 LNJ,B6   KHD$SCREECH
+          2 0002FE       0001                            DC       s:9364,PREL
+
+      619     9363    5               END /* IF */;
+
+      620     9364    4               BFR$ = KV$SHRBFR.LNK$;
+
+   9364   2 0002FF  ECC7 000B                            LDB,B6   BFR$,AUTO
+          2 000301  DC86                                 LDB,B5   ,B6
+          2 000302  DFC7 000B                            STB,B5   BFR$,AUTO
+
+      621     9365    4            END /* LOOP */;
+
+   9365   2 000304  EC85                                 LDB,B6   ,B5
+          2 000305  CCC7 0004                            LDB,B4   @AV$,AUTO
+          2 000307  EDC4 0001                            CMB,B6   1,B4
+          2 000309  09E8                                 BNE      s:9358,SPREL
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:64   
+      622     9366    3            KV$SHRBFR.LNK$ = VDH_RLSBFR.BFR$->KV$SHRBFR.LNK$;
+
+   9366   2 00030A  ECC4 0001                            LDB,B6   1,B4
+          2 00030C  DC86                                 LDB,B5   ,B6
+          2 00030D  BCC7 000B                            LDB,B3   BFR$,AUTO
+          2 00030F  DF83                                 STB,B5   ,B3
+
+      623     9367    3            BFR$ = VDH_RLSBFR.BFR$;
+
+   9367   2 000310  ECC4 0001                            LDB,B6   1,B4
+          2 000312  EFC7 000B                            STB,B6   BFR$,AUTO
+
+      624     9368
+      625     9369    3         END /* IF */;
+
+      626     9370    2         BFRBYTSIZ = KV$SHRBFR.BYTSIZ+MOD(KV$SHRBFR.BYTSIZ,2);
+
+   9370   2 000314  ECC7 000B                            LDB,B6   BFR$,AUTO
+          2 000316  E846 0002                            LDR,R6   2,B6
+          2 000318  E570 0001                            AND,R6   1,IMO
+          2 00031A  EA46 0002                            ADD,R6   2,B6
+          2 00031C  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      627     9371
+      628     9372        /* otherwise, the byte size of the structure is in the argument
+      629     9373           structure (variable) or the buffer control structure (fixed)               */
+      630     9374
+      631     9375    2      END; ELSE IF (VDH_RLSBFR.BYTSIZ ~= 0) THEN DO;
+
+   9375   2 00031E  0F81 0010                            B        s:9383,PREL
+
+   9375   2 000320  E846 0003                            LDR,R6   3,B6
+          2 000322  6901 0009                            BEZ,R6   s:9378,PREL
+
+      632     9376    2         BFRBYTSIZ = VDH_RLSBFR.BYTSIZ+MOD(VDH_RLSBFR.BYTSIZ,2);
+
+   9376   2 000324  E570 0001                            AND,R6   1,IMO
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:65   
+          2 000326  EA46 0003                            ADD,R6   3,B6
+          2 000328  EF47 0009                            STR,R6   BFRBYTSIZ,AUTO
+
+      633     9377    2      END; ELSE DO;
+
+   9377   2 00032A  0F81 0004                            B        s:9383,PREL
+
+      634     9378    2         BFRBYTSIZ = %KV_STRCTR.BYTSIZ;
+
+   9378   2 00032C  D805                                 LDR,R5   ,B5
+          2 00032D  DF47 0009                            STR,R5   BFRBYTSIZ,AUTO
+
+      635     9379    2      END /* IF */;
+
+      636     9380
+      637     9381        /* stuff the stats                                                      */
+      638     9382
+      639     9383    1      %KV_STT.BYTUTL(VDH_RLSBFR.STRTYP) = %KV_STT.BYTUTL(VDH_RLSBFR.STRTYP)-BFRBYTSIZ;
+
+   9383   2 00032F  ECC7 0004                            LDB,B6   @AV$,AUTO
+          2 000331  B2C6 0006                            LLH,R3   6,B6
+          2 000333  DCC7 000F                            LDB,B5   Y@STT$,AUTO
+          2 000335  BF47 0014                            STR,R3   Y@STT$+5,AUTO
+          2 000337  3E6D                                 ADV,R3   109
+          2 000338  F847 0009                            LDR,R7   BFRBYTSIZ,AUTO
+          2 00033A  6C00                                 LDV,R6   0
+          2 00033B  84B5                                 SID      ,B5,R3
+          2 00033C  8656                                 CPL      R6
+          2 00033D  8657                                 CPL      R7
+          2 00033E  8470 0000 0001                       AID      1,IMO
+          2 000341  B847 0014                            LDR,R3   Y@STT$+5,AUTO
+          2 000343  3E6D                                 ADV,R3   109
+          2 000344  8D35                                 SDI      ,B5,R3
+
+      640     9384    1      %KV_STT.BFRCNT(VDH_RLSBFR.STRTYP) = %KV_STT.BFRCNT(VDH_RLSBFR.STRTYP)-1;
+
+   9384   2 000345  A2C6 0006                            LLH,R2   6,B6
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:66   
+          2 000347  CBC5 016E                            LAB,B4   366,B5
+          2 000349  8CA4                                 LDI      ,B4,R2
+          2 00034A  8470 FFFF FFFF                       AID      -1,IMO
+          2 00034D  CBC5 016E                            LAB,B4   366,B5
+          2 00034F  8D24                                 SDI      ,B4,R2
+
+      641     9385
+      642     9386        /* convert from bytes to words                                                */
+      643     9387
+      644     9388    1      KV_B.SIZ = (BFRBYTSIZ+1)/2;
+
+   9388   2 000350  E847 0009                            LDR,R6   BFRBYTSIZ,AUTO
+          2 000352  6E01                                 ADV,R6   1
+          2 000353  6041                                 SOR,R6   1
+          2 000354  CCC7 000B                            LDB,B4   BFR$,AUTO
+          2 000356  EF04                                 STR,R6   ,B4
+
+      645     9389        /* do the actual release                                                      */
+      646     9390
+      647     9391    2      IF %KV_STRCTR.PWR2 THEN DO;
+
+   9391   2 000357  BCC7 0006                            LDB,B3   STRCTR$,AUTO
+          2 000359  82C3 0003                            LB,'4000'X        3,B3
+          2 00035B       4000
+          2 00035C  0581 000B                            BBF      s:9394,PREL
+
+      648     9392    2         CALL KVB$RLS2NSYS(KV_B.SIZ) ;
+
+   9392   2 00035E  BBC7 000B                            LAB,B3   BFR$,AUTO
+          2 000360  CBF0 0100                            LAB,B4   256,IMO
+          2 000362  E380 0000 0000  xent                 LNJ,B6   KVB$RLS2NSYS
+          2 000365       0001                            DC       s:9393,PREL
+
+      649     9393    2      END; ELSE DO;
+
+   9393   2 000366  0F81 0009                            B        s:9401,PREL
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:67   
+      650     9394    2         CALL KVB$RLSSYS(KV_B.SIZ) ;
+
+   9394   2 000368  BBC7 000B                            LAB,B3   BFR$,AUTO
+          2 00036A  CBF0 0100                            LAB,B4   256,IMO
+          2 00036C  E380 0000 0000  xent                 LNJ,B6   KVB$RLSSYS
+          2 00036F       0001                            DC       s:9401,PREL
+
+      651     9395    2      END /* IF */;
+
+      652     9396
+      653     9397        /*N*     %KH$TRC (FCG = 'KVS', EVENT = %KV_TRC_BFRRLS, IF = DEFAULT);
+              9397        */
+      654     9398        /* if we were called from below the vhd inhibit level, do an enable to
+      655     9399           get to the level we were called at                                         */
+      656     9400
+      657     9401    1      IF LVL>%KH_INHLVL THEN CALL KHI$ENABLE;
+
+   9401   2 000370  EC80 0000 0000  xsym                 LDB,B6   KH_CTLTBL$
+          2 000373  DCC6 0002                            LDB,B5   2,B6
+          2 000375  E847 000A                            LDR,R6   LVL,AUTO
+          2 000377  E905                                 CMR,R6   ,B5
+          2 000378  0381 0007                            BLE      s:9402,PREL
+
+   9401   2 00037A  CBF0 0000                            LAB,B4   0,IMO
+          2 00037C  E380 0000 0000  xent                 LNJ,B6   KHI$ENABLE
+          2 00037F       0001                            DC       s:9402,PREL
+
+      658     9402    1      RETURN;
+
+   9402   2 000380  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      659     9403        %EJECT;
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:68   
+      660     9404    1   Y$GETSHRBFRHED$_ADR: PROC;
+
+   9404   2 000383  EFC7 0012            Y$GETSHRBFRHED$*STB,B6   Y@STT$+3,AUTO
+
+      661     9405        /*
+      662     9406        Get the shared buffer head pointer address.
+      663     9407        */
+      664     9408    3      DO SELECT VDH_GETBFR.STRTYP;
+
+   9408   2 000385  DCC7 0004                            LDB,B5   @AV$,AUTO
+          2 000387  E2C5 0006                            LLH,R6   6,B5
+          2 000389  E970 0018                            CMR,R6   24,IMO
+          2 00038B  0201 0008                            BL       s:9408+15,PREL
+          2 00038D  0901 0017                            BE       s:9418,PREL
+          2 00038F  6D1A                                 CMV,R6   26
+          2 000390  0981 0020                            BNE      s:9423,PREL
+          2 000392  0F81 0006                            B        s:9413,PREL
+          2 000394  6D15                                 CMV,R6   21
+          2 000395  0981 001B                            BNE      s:9423,PREL
+          2 000397  0F81 0001                            B        s:9413,PREL
+
+      665     9409    3         SELECT %KV_STRTYP_SSTINPFNCTBL,%KV_STRTYP_USRINPFNCTBL;
+
+      666     9410        /*
+      667     9411        Get the input function table head pointer address.
+      668     9412        */
+      669     9413    3         BFR$ = %KV_USRPRM.INPFNCTBLHEDPTR$;
+
+   9413   2 000399  CC80 0000 0000  xsym                 LDB,B4   KV$PTR$
+          2 00039C  BC84                                 LDB,B3   ,B4
+          2 00039D  ACC3 0008                            LDB,B2   8,B3
+          2 00039F  9CC2 002F                            LDB,B1   47,B2
+          2 0003A1  9FC7 000B                            STB,B1   BFR$,AUTO
+          2 0003A3  0F81 0013                            B        s:9425,PREL
+
+      670     9414    3         SELECT %KV_STRTYP_TRNTBL;
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:69   
+      671     9415        /*
+      672     9416        Get the translate table head pointer address.
+      673     9417        */
+      674     9418    3         BFR$ = %KV_USRPRM.TRNTBLHEDPTR$;
+
+   9418   2 0003A5  CC80 0000 0000  xsym                 LDB,B4   KV$PTR$
+          2 0003A8  BC84                                 LDB,B3   ,B4
+          2 0003A9  ACC3 0008                            LDB,B2   8,B3
+          2 0003AB  9CC2 0031                            LDB,B1   49,B2
+          2 0003AD  9FC7 000B                            STB,B1   BFR$,AUTO
+          2 0003AF  0F81 0007                            B        s:9425,PREL
+
+      675     9419    3         SELECT ELSE;
+
+      676     9420        /*
+      677     9421        Not a special case.  The head pointer is in KV$STRCTR.
+      678     9422        */
+      679     9423    3      BFR$ = ADDR(%KV_STRCTR.SHRBFRHED$);
+
+   9423   2 0003B1  CCC7 0006                            LDB,B4   STRCTR$,AUTO
+          2 0003B3  BBC4 0001                            LAB,B3   1,B4
+          2 0003B5  BFC7 000B                            STB,B3   BFR$,AUTO
+
+      680     9424    3      END; /* END DO SELECT %KV_STRCTR.STRTYP */
+
+      681     9425    2   END Y$GETSHRBFRHED$_ADR;                /* END PROC                           */
+
+   9425   2 0003B7  ECC7 0012                            LDB,B6   Y@STT$+3,AUTO
+          2 0003B9  C3C6 0001                            LNJ,B4   1,B6
+      682     9426    1   END /* SUBROUTINE */;
+      683     9427        %EOD;
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:70   
+--  Include file information  --
+
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   KV_SCODE_C.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   KL_CONTROL_C.:E05TOU  is referenced.
+   KH_MACRO_C.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  was found in the system file and is referenced.
+   KV_GLBCNS_E.:E05TOU  was found in the system file and is referenced.
+   KV$VDO.:E05TOU  was found in the system file and is never referenced.
+   KV$VDH.:E05TOU  was found in the system file and is referenced.
+   KV$USR.:E05TOU  was found in the system file and is referenced.
+   KV$SND.:E05TOU  was found in the system file and is never referenced.
+   KV$INT.:E05TOU  was found in the system file and is referenced.
+   KV$GLBCTX.:E05TOU  was found in the system file and is referenced.
+   KV$GLB.:E05TOU  was found in the system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure KVS$BFR.
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:71   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData KVS$BFR
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(48)    r     1 KVS_NOMMR                  3-0-0/w STRC(48)    r     1 KVS_SHRCHN
+    1A-0-0/w STRC(320)   r     1 KV_ACTCHR1                2E-0-0/w STRC(320)   r     1 KV_ACTCHR2
+     6-0-0/w STRC(320)   r     1 KV_ACTCHRTBLNRM           5E-0-0/w STRC(128)   r     1 KV_LINLST
+    66-0-0/w STRC(512)   r     1 KV_MRD                    86-0-0/w STRC(512)   r     1 KV_MVD
+    B5-0-0/w STRC(480)   r     1 KV_PTR                    42-0-0/w STRC(64)    r     1 KV_SHRBFR
+    46-0-0/w STRC(64)    r     1 KV_SHRBFR_ENTSRD          A6-0-0/w STRC(80)    r     1 KV_SHRBFR_PRM1
+    AB-0-0/w STRC(80)    r     1 KV_SHRBFR_PRM2            B0-0-0/w STRC(80)    r     1 KV_SHRBFR_PRM3
+    4A-0-0/w STRC(320)   r     1 KV_SHRBFR_TAB             D3-0-0/w STRC(496)   r     1 KV_SRD
+    F2-0-0/w STRC(1024)  r     1 KV_SSN                   132-0-0/w STRC(512)   r     1 KV_STR
+   152-0-0/w STRC(48)    r     1 KV_TYPAHDBFR             155-0-0/w STRC(512)   r     1 KV_VDI
+
+  ****  Section 001  Data  KVS$BFR
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(2304)  r     1 KV_STRCTR
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @AV$                      *0-0-0/w ACHR        r     1 AV$
+     B-0-0/w PTR         r     1 BFR$                       9-0-0/w UBIN(16)    r     1 BFRBYTSIZ
+     D-0-0/w PTR         r     1 DAT$                       8-0-0/w UBIN(16)    r     1 INTDATSIZ
+     A-0-0/w UBIN(16)    r     1 LVL                        6-0-0/w PTR         r     1 STRCTR$
+    *0-0-0/w STRC(176)   r     1 VDH_GETBFR                *0-0-0/w STRC(112)   r     1 VDH_RLSBFR
+     F-0-0/w PTR         r     1 Y@STT$
+
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:72   
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 KH_CTLTBL$                 0-0-0/w PTR         r     1 KV$PTR$
+     0-0-0/w STRC(304)   r     1 KV_X364
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/c CHAR(256)   r     1 CHARS                      0-0-0/w STRC(64)    r     1 KH_CTLTBL
+     0-0-0/w STRC(480)   r     1 KV$PTR                     0-0-0/w STRC(128)   r     1 KV$SHRBFR
+     0-0-0/w STRC(64)    r     1 KV$STRCTR                  0-0-0/w STRC(912)   r     1 KV$USRPRM
+     0-0-0/w STRC(512)   r     1 KV$VDI                     0-0-0/w STRC(16)    r     1 KV_B
+     0-0-0/w STRC(8960)  r     1 Y$STT                      0-0-0/w UBIN(16)    r     1 Y$WRD
+
+
+   Procedure KVS$BFR requires 955 words for executable code.
+   Procedure KVS$BFR requires 24 words of local(AUTO) storage.
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:73   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:74   
+          MINI XREF LISTING
+
+AV$
+      8893**DCL         9--PROC     8921--REDEF    8986--REDEF    9000--ENTRY    9296--ENTRY
+BFR$
+      8880**DCL      5290--IMP-PTR  8995--IMP-PTR  9088<<ASSIGN   9089>>IF       9091>>IF       9091<<ASSIGN
+      9091>>ASSIGN   9096>>DOWHILE  9098>>IF       9098>>IF       9098>>IF       9098>>IF       9109>>ASSIGN
+      9111>>IF       9112>>ASSIGN   9112>>ASSIGN   9116<<ASSIGN   9116>>ASSIGN   9215<<ASSIGN   9217<<ASSIGN
+      9217>>ASSIGN   9222>>ASSIGN   9242<<ASSIGN   9245>>ASSIGN   9246>>ASSIGN   9248>>ASSIGN   9255>>ASSIGN
+      9256<<ASSIGN   9257>>IF       9268>>ASSIGN   9272>>ASSIGN   9301<<ASSIGN   9339>>IF       9342>>IF
+      9343>>ASSIGN   9343>>ASSIGN   9351<<ASSIGN   9352>>IF       9357>>DOWHILE  9358>>IF       9364<<ASSIGN
+      9364>>ASSIGN   9366>>ASSIGN   9367<<ASSIGN   9370>>ASSIGN   9370>>ASSIGN   9388>>ASSIGN   9392>>CALL
+      9394>>CALL     9413<<ASSIGN   9418<<ASSIGN   9423<<ASSIGN
+BFRBYTSIZ
+      8872**DCL      9054<<ASSIGN   9064>>IF       9064>>IF       9065<<ASSIGN   9066>>IF       9066<<ASSIGN
+      9082<<ASSIGN   9098>>IF       9098>>IF       9125>>IF       9128<<ASSIGN   9139<<ASSIGN   9139>>ASSIGN
+      9145<>CALL     9148<>CALL     9154<<ASSIGN   9185<<ASSIGN   9185>>ASSIGN   9186>>ASSIGN   9189>>ASSIGN
+      9225<<ASSIGN   9248>>ASSIGN   9370<<ASSIGN   9376<<ASSIGN   9378<<ASSIGN   9383>>ASSIGN   9388>>ASSIGN
+CHARS
+      8997**DCL      9098>>IF       9222<<ASSIGN   9222>>ASSIGN
+DAT$
+      8884**DCL      9198<<ASSIGN   9202<<ASSIGN   9207<<ASSIGN   9212>>IF       9222>>ASSIGN
+ENABLE_RETURN
+      9257**LABEL    9113--GOTO     9121--GOTO     9176--GOTO     9344--GOTO
+INTDATSIZ
+      8865**DCL      8867--REDEF    8893--IMP-SIZ  9055<<ASSIGN   9066>>ASSIGN   9082>>ASSIGN   9098>>IF
+      9098>>IF       9203<<ASSIGN   9222>>ASSIGN   9222>>ASSIGN   9225>>ASSIGN
+KHD$SCREECH
+      6444**DCL-ENT  9166--CALL     9362--CALL
+KHI$DISABLE
+      6442**DCL-ENT  9036--CALL     9320--CALL
+KHI$ENABLE
+      6443**DCL-ENT  9283--CALL     9401--CALL
+KH_CTLTBL.PARM.PTR$
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:75   
+      5159**DCL      9035>>ASSIGN   9282>>IF       9319>>ASSIGN   9401>>IF
+KH_CTLTBL$
+      5228**DCL      5033--IMP-PTR  9035>>ASSIGN   9282>>IF       9319>>ASSIGN   9401>>IF
+KV$PTR.INPCNDPND
+      5257**DCL      5266--REDEF    5270--REDEF
+KV$PTR.LINLST$
+      5253**DCL      5254--REDEF
+KV$PTR.VDI$
+      5251**DCL      9026>>ASSIGN   9316>>ASSIGN   9413>>ASSIGN   9418>>ASSIGN
+KV$PTR$
+      5245**DCL      5251--IMP-PTR  9026>>ASSIGN   9316>>ASSIGN   9413>>ASSIGN   9418>>ASSIGN
+KV$SHRBFR.BYTSIZ
+      5299**DCL      9098>>IF       9098>>IF       9248<<ASSIGN   9370>>ASSIGN   9370>>ASSIGN
+KV$SHRBFR.LNK$
+      5294**DCL      9091>>ASSIGN   9116>>ASSIGN   9245<<ASSIGN   9257>>IF       9268<<ASSIGN   9268>>ASSIGN
+      9272<<ASSIGN   9352>>IF       9357>>DOWHILE  9358>>IF       9364>>ASSIGN   9366<<ASSIGN   9366>>ASSIGN
+KV$SHRBFR.NAM
+      5303**DCL      9098>>IF       9231<<ASSIGN
+KV$SHRBFR.USRCNT
+      5303**DCL      9098>>IF       9111>>IF       9112<<ASSIGN   9112>>ASSIGN   9246<<ASSIGN   9255<<ASSIGN
+      9339>>IF       9342>>IF       9343<<ASSIGN   9343>>ASSIGN
+KV$SSN.REDRSPCNT
+      5334**DCL      5335--REDEF
+KV$STRCTR
+      8846**DCL      9041--ASSIGN   9044--ASSIGN   9324--ASSIGN   9327--ASSIGN
+KV$STRCTR.BYTSIZ
+      8850**DCL      9043>>ASSIGN   9044>>ASSIGN   9054>>ASSIGN   9153>>IF       9203>>ASSIGN   9326>>ASSIGN
+      9327>>ASSIGN   9378>>ASSIGN
+KV$STRCTR.CHKSIZ
+      8852**DCL      9064>>IF       9098>>IF
+KV$STRCTR.DUMMY
+      8852**DCL      9042>>IF       9325>>IF
+KV$STRCTR.INTDAT$
+      8850**DCL      8850--REDEF    9201>>IF       9202>>ASSIGN
+KV$STRCTR.INTSTRTYP
+      8852**DCL      9230>>IF
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:76   
+KV$STRCTR.PWR2
+      8851**DCL      9143>>IF       9391>>IF
+KV$STRCTR.SHRBFR
+      8851**DCL      9059>>IF       9135>>IF       9153>>IF       9216>>IF       9239>>IF       9332>>IF
+KV$STRCTR.SHRBFRHED$
+      8850**DCL      9088>>ASSIGN   9256--ASSIGN   9351--ASSIGN   9423--ASSIGN
+KV$STT.REQSTATS.DSPMSK
+      5744**DCL      5750--REDEF
+KV$STT.REQSTATS.SLCMSK
+      5785**DCL      5792--REDEF
+KV$USRPRM.INPFNCTBLHEDPTR$
+      6307**DCL      9413>>ASSIGN
+KV$USRPRM.STT$
+      6308**DCL      9026>>ASSIGN   9316>>ASSIGN
+KV$USRPRM.TRNTBLHEDPTR$
+      6307**DCL      9418>>ASSIGN
+KV$VDI.USRPRM$
+      6333**DCL      9026>>ASSIGN   9316>>ASSIGN   9413>>ASSIGN   9418>>ASSIGN
+KVB$GET2NSYS
+      6439**DCL-ENT  9145--CALL
+KVB$GETSYS
+      6438**DCL-ENT  9148--CALL
+KVB$RLS2NSYS
+      6441**DCL-ENT  9392--CALL
+KVB$RLSSYS
+      6440**DCL-ENT  9394--CALL
+KVS_NOMMR
+      4920**DCL      9166<>CALL
+KVS_SHRCHN
+      4981**DCL      9362<>CALL
+KV_ACTCHR1
+      6497**DCL      6467--DCLINIT  6506--DCLINIT
+KV_ACTCHR2
+      6531**DCL      6501--DCLINIT  6540--DCLINIT
+KV_ACTCHRTBLNRM
+      6463**DCL      6472--DCLINIT  7330--DCLINIT  7559--DCLINIT
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:77   
+KV_B.SIZ
+      8996**DCL      9154>>ASSIGN   9388<<ASSIGN   9392<>CALL     9394<>CALL
+KV_LINLST
+      6667**DCL      7843--DCLINIT
+KV_MRD
+      6694**DCL      7879--DCLINIT  7879--DCLINIT
+KV_MVD
+      6742**DCL      7951--DCLINIT  7951--DCLINIT
+KV_PTR
+      6931**DCL      8095--DCLINIT  8095--DCLINIT
+KV_PTR.INPCNDPND
+      6937**DCL      6946--REDEF    6950--REDEF
+KV_PTR.LINLST$
+      6933**DCL      6934--REDEF
+KV_SHRBFR
+      6566**DCL      6575--DCLINIT  9082--ASSIGN   9217--ASSIGN   9225--ASSIGN
+KV_SHRBFR_ENTSRD
+      6598**DCL      6607--DCLINIT
+KV_SHRBFR_PRM1
+      6796**DCL      6805--DCLINIT  8059--DCLINIT
+KV_SHRBFR_PRM2
+      6845**DCL      6800--DCLINIT  6854--DCLINIT
+KV_SHRBFR_PRM3
+      6893**DCL      6849--DCLINIT  6902--DCLINIT
+KV_SHRBFR_TAB
+      6630**DCL      6639--DCLINIT  7630--DCLINIT  7772--DCLINIT  8455--DCLINIT  8527--DCLINIT  8599--DCLINIT
+      8635--DCLINIT  8671--DCLINIT
+KV_SRD
+      6974**DCL      8167--DCLINIT  8167--DCLINIT
+KV_SRD.BTMRHT
+      7070**DCL      7075--REDEF
+KV_SRD.CRT
+      7146**DCL      7151--REDEF
+KV_SRD.FLDEND
+      7110**DCL      7115--REDEF
+KV_SRD.HI_NONBLN
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:78   
+      7180**DCL      7185--REDEF
+KV_SRD.ORG
+      7002**DCL      7007--REDEF
+KV_SRD.SRDEND
+      7215**DCL      7220--REDEF
+KV_SRD.TOPLFT
+      7036**DCL      7041--REDEF
+KV_SSN
+      7251**DCL      8203--DCLINIT  8203--DCLINIT
+KV_SSN.REDRSPCNT
+      7257**DCL      7258--REDEF
+KV_STR
+      7328**DCL      8311--DCLINIT  8311--DCLINIT
+KV_STRCTR
+      7527**DCL      9041--ASSIGN   9044--ASSIGN   9324--ASSIGN   9327--ASSIGN
+KV_STRCTR.ACTCHR.INTDAT$
+      7559**DCL      7559--REDEF
+KV_STRCTR.DCBHDN.INTDAT$
+      7630**DCL      7630--REDEF
+KV_STRCTR.DCB_.INTDAT$
+      7594**DCL      7594--REDEF
+KV_STRCTR.ENTSRD.INTDAT$
+      8671**DCL      8671--REDEF
+KV_STRCTR.ERD.INTDAT$
+      8635**DCL      8635--REDEF
+KV_STRCTR.ERR.INTDAT$
+      7665**DCL      7665--REDEF
+KV_STRCTR.FLD.INTDAT$
+      7700**DCL      7700--REDEF
+KV_STRCTR.FLDLST.INTDAT$
+      7736**DCL      7736--REDEF
+KV_STRCTR.INPTAB.INTDAT$
+      7772**DCL      7772--REDEF
+KV_STRCTR.LIN.INTDAT$
+      7807**DCL      7807--REDEF
+KV_STRCTR.LINLST.INTDAT$
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:79   
+      7843**DCL      7843--REDEF
+KV_STRCTR.MRD.INTDAT$
+      7879**DCL      7879--REDEF
+KV_STRCTR.MSG.INTDAT$
+      7915**DCL      7915--REDEF
+KV_STRCTR.MVD.INTDAT$
+      7951**DCL      7951--REDEF
+KV_STRCTR.OTPTAB.INTDAT$
+      7987**DCL      7987--REDEF
+KV_STRCTR.PAG.INTDAT$
+      8023**DCL      8023--REDEF
+KV_STRCTR.PRM.INTDAT$
+      8059**DCL      8059--REDEF
+KV_STRCTR.PTR_.INTDAT$
+      8095**DCL      8095--REDEF
+KV_STRCTR.RCR.INTDAT$
+      8779**DCL      8779--REDEF
+KV_STRCTR.RCRLST.INTDAT$
+      8815**DCL      8815--REDEF
+KV_STRCTR.REDBFR.INTDAT$
+      8131**DCL      8131--REDEF
+KV_STRCTR.SRD.INTDAT$
+      8167**DCL      8167--REDEF
+KV_STRCTR.SSN.INTDAT$
+      8203**DCL      8203--REDEF
+KV_STRCTR.SSNHDN.INTDAT$
+      8239**DCL      8239--REDEF
+KV_STRCTR.SSTINPFNCTBL.INTDAT$
+      8275**DCL      8275--REDEF
+KV_STRCTR.STR.INTDAT$
+      8311**DCL      8311--REDEF
+KV_STRCTR.TRCBFR.INTDAT$
+      8707**DCL      8707--REDEF
+KV_STRCTR.TRMTAB.INTDAT$
+      8347**DCL      8347--REDEF
+KV_STRCTR.TRNTBL.INTDAT$
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:80   
+      8383**DCL      8383--REDEF
+KV_STRCTR.TYPAHDBFR.INTDAT$
+      8419**DCL      8419--REDEF
+KV_STRCTR.USRBFR.INTDAT$
+      8491**DCL      8491--REDEF
+KV_STRCTR.USRINPFNCTBL.INTDAT$
+      8455**DCL      8455--REDEF
+KV_STRCTR.USRSHRBFR.INTDAT$
+      8527**DCL      8527--REDEF
+KV_STRCTR.VDI.INTDAT$
+      8563**DCL      8563--REDEF
+KV_STRCTR.VFU.INTDAT$
+      8599**DCL      8599--REDEF
+KV_STRCTR.X364.INTDAT$
+      8743**DCL      8743--REDEF
+KV_TYPAHDBFR
+      7412**DCL      7415--REDEF    8419--DCLINIT
+KV_VDI
+      7474**DCL      8563--DCLINIT  8563--DCLINIT
+KV_X364
+      7439**DCL      8743--DCLINIT  8743--DCLINIT
+LVL
+      8876**DCL      9035<<ASSIGN   9036<>CALL     9282>>IF       9319<<ASSIGN   9320<>CALL     9401>>IF
+NOGET
+      9154**LABEL    9145--CALLALT
+STRCTR$
+      8860**DCL      9041<<ASSIGN   9042>>IF       9043>>ASSIGN   9044<<ASSIGN   9044>>ASSIGN   9054>>ASSIGN
+      9059>>IF       9064>>IF       9088>>ASSIGN   9098>>IF       9135>>IF       9143>>IF       9153>>IF
+      9153>>IF       9201>>IF       9202>>ASSIGN   9203>>ASSIGN   9216>>IF       9230>>IF       9239>>IF
+      9256>>ASSIGN   9324<<ASSIGN   9325>>IF       9326>>ASSIGN   9327<<ASSIGN   9327>>ASSIGN   9332>>IF
+      9351>>ASSIGN   9378>>ASSIGN   9391>>IF       9423>>ASSIGN
+VDH_GETBFR.BFR$
+      8927**DCL      9063<<ASSIGN   9079<<ASSIGN   9109<<ASSIGN   9145<>CALL     9148<>CALL     9154>>ASSIGN
+      9165>>IF       9215>>ASSIGN   9231>>ASSIGN   9240>>IF       9242>>ASSIGN   9268>>ASSIGN   9272>>ASSIGN
+VDH_GETBFR.BYTSIZ
+      8927**DCL      9064>>IF       9065>>ASSIGN   9125>>IF       9128>>ASSIGN   9186<<ASSIGN
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:81   
+VDH_GETBFR.DAT_.ADR$
+      8955**DCL      9098>>IF       9197>>IF       9198>>ASSIGN
+VDH_GETBFR.DAT_.BYTSIZ
+      8955**DCL      9055>>ASSIGN
+VDH_GETBFR.DAT_.BYTX
+      8955**DCL      9098>>IF       9198>>ASSIGN
+VDH_GETBFR.ERR
+      8929**DCL      9029<<ASSIGN   9287>>IF
+VDH_GETBFR.ERR.NOT_FND
+      8930**DCL      9120<<ASSIGN
+VDH_GETBFR.ERR.NO_MMR
+      8930**DCL      9175<<ASSIGN
+VDH_GETBFR.SCRNO_MMR
+      8931**DCL      9165>>IF
+VDH_GETBFR.SHRBFR.ADD
+      8929**DCL      9240>>IF       9251>>IF
+VDH_GETBFR.SHRBFR.GET
+      8928**DCL      9071>>IF       9118>>IF       9135>>IF       9240>>IF       9247>>IF
+VDH_GETBFR.SHRBFR.SRC
+      8928**DCL      9071>>IF       9086>>IF
+VDH_GETBFR.STRTYP
+      8927**DCL      9041>>ASSIGN   9043<<ASSIGN   9189>>ASSIGN   9189>>ASSIGN   9190>>ASSIGN   9190>>ASSIGN
+      9191>>ASSIGN   9191>>ASSIGN   9231>>ASSIGN   9326<<ASSIGN   9408>>DOSELCT
+VDH_GETBFR.STT$
+      8927**DCL      9015>>IF       9021>>ASSIGN   9305>>IF       9311>>ASSIGN
+VDH_RLSBFR.BFR$
+      8992**DCL      9300>>IF       9301>>ASSIGN   9357>>DOWHILE  9366>>ASSIGN   9367>>ASSIGN
+VDH_RLSBFR.BYTSIZ
+      8992**DCL      9375>>IF       9376>>ASSIGN   9376>>ASSIGN
+VDH_RLSBFR.SHRBFRSRC
+      8993**DCL      9339>>IF       9349>>IF
+VDH_RLSBFR.STRTYP
+      8992**DCL      9324>>ASSIGN   9383>>ASSIGN   9383>>ASSIGN   9384>>ASSIGN   9384>>ASSIGN
+Y$GETSHRBFRHED$_ADR
+      9404**PROC     9090--CALL     9258--CALL     9353--CALL
+Y$STT.BFRCNT
+PL6.E3A0      #001=KVS$BFR File=KVS$BFR.:E05TSI                                  WED 07/30/97 02:14 Page:82   
+      6254**DCL      9191<<ASSIGN   9191>>ASSIGN   9384<<ASSIGN   9384>>ASSIGN
+Y$STT.BFRGETCNT
+      6253**DCL      9190<<ASSIGN   9190>>ASSIGN
+Y$STT.BYTUTL
+      6253**DCL      9189<<ASSIGN   9189>>ASSIGN   9383<<ASSIGN   9383>>ASSIGN
+Y$STT.REQSTATS.DSPMSK
+      6138**DCL      6144--REDEF
+Y$STT.REQSTATS.SLCMSK
+      6179**DCL      6186--REDEF
+Y$WRD
+      6435**DCL      9035>>ASSIGN   9282>>IF       9319>>ASSIGN   9401>>IF
+Y@STT$
+      8889**DCL      5498--IMP-PTR  5892--IMP-PTR  9021<<ASSIGN   9026<<ASSIGN   9189>>ASSIGN   9189>>ASSIGN
+      9190>>ASSIGN   9190>>ASSIGN   9191>>ASSIGN   9191>>ASSIGN   9311<<ASSIGN   9316<<ASSIGN   9383>>ASSIGN
+      9383>>ASSIGN   9384>>ASSIGN   9384>>ASSIGN
+
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:83   
+      684        1        /*T***********************************************************/
+      685        2        /*T*                                                         */
+      686        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      687        4        /*T*                                                         */
+      688        5        /*T***********************************************************/
+      689        6        /*X*     NSO,PLM=3,SQB=Y,AND=Y,ENI=0,SDI=3,MCL=10,CSI=0,ECI=0,IND=0,IAD=3 */
+      690        7        KVS$GETREDBFR: PROC(BYTSIZ) ALTRET;
+      691        8
+      692        9    1   DCL BYTSIZ UBIN ALIGNED;
+      693       10
+      694       11 S      %INCLUDE KV$GLB;
+      695       12 S      %INCLUDE KV$GLBCTX;
+      696       13 S      %INCLUDE KV$VDH;
+      697       14 S      %INCLUDE KV_GLBCNS_E;
+      698       15
+      699       16         %KV$VDH_GETBFR(NAME = VDH_GETBFR, STCLASS = AUTO);
+      700       81         %KV$VDH_RLSBFR(NAME = VDH_RLSBFR, STCLASS = AUTO);
+      701      117
+      702      118        %KV$VDH_GETBFR(NAME = KV_VDH_GETBFR, STCLASS = SYMREF);
+      703      183        %KV$VDH_RLSBFR(NAME = KV_VDH_RLSBFR, STCLASS = SYMREF);
+      704      219
+      705      220        %KV$PTR;
+      706      263        %KV$VDI;
+      707      334        %KV$SSN;
+      708      413
+      709      414        %KV_BFRRLSDSP_E;
+      710      420        %KV_STRTYP_E;
+      711      458
+      712      459    1   DCL KVS$GETBFR ENTRY(1) ALTRET;
+      713      460    1   DCL KVS$RLSBFR ENTRY(1) ALTRET;
+      714      461
+      715      462        /* this routine will get a read buffer for a particular user in
+      716      463           the following manner.                                                      */
+      717      464
+      718      465        /* IF KV$SSN.REDBFR__.ADR$ = ADDR(NIL)                                        */
+      719      466
+      720      467        /* then allocate a 16 word buffer                                             */
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:84   
+      721      468
+      722      469
+      723      470        /* otherwise double the size of the buffer and copy the new data into
+      724      471           the new buffer and the release the buffer.                                 */
+      725      472
+      726      473
+      727      474    1      VDH_RLSBFR = KV_VDH_RLSBFR;
+      728      475    1      VDH_GETBFR = KV_VDH_GETBFR;
+      729      476    1      VDH_GETBFR.DAT_.ADR$ = %KV_SSN.REDBFR__.ADR$;
+      730      477    1      VDH_GETBFR.DAT_.BYTSIZ = %KV_SSN.REDBFR__.BYTX+%KV_SSN.REDBFR__.DATBYTSIZ;
+      731      478
+      732      479        /* set up the rlsbfr for the release later                                    */
+      733      480
+      734      481    1      VDH_RLSBFR.BFR$ = %KV_SSN.REDBFR__.ADR$;
+      735      482    1      VDH_RLSBFR.BYTSIZ = %KV_SSN.REDBFR__.BFRBYTSIZ;
+      736      483
+      737      484        /* check to see if we had a buffer                                            */
+      738      485
+      739      486    1      IF ADDR(BYTSIZ)~=ADDR(NIL)
+      740      487
+      741      488        /* A required buffer size was passed.  Use it. */
+      742      489    1      THEN VDH_GETBFR.BYTSIZ = BYTSIZ;
+      743      490    2      ELSE IF (VDH_RLSBFR.BFR$ = ADDR(NIL)) THEN DO;
+      744      491    2         VDH_GETBFR.BYTSIZ = 32;
+      745      492    2         %KV_SSN.REDBFR = '0'B;
+      746      493    2      END; ELSE DO;
+      747      494    2         VDH_GETBFR.BYTSIZ = VDH_RLSBFR.BYTSIZ*2;
+      748      495    2      END /* IF */;
+      749      496
+      750      497        /* get the buffer                                                             */
+      751      498
+      752      499    1      VDH_GETBFR.STRTYP = %KV_STRTYP_REDBFR;
+      753      500    1      VDH_RLSBFR.STRTYP = %KV_STRTYP_REDBFR;
+      754      501    2      CALL KVS$GETBFR(VDH_GETBFR) WHENRETURN DO;
+      755      502
+      756      503        /* we now have the larger buffer and the old data is in it, so release it. */
+      757      504
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:85   
+      758      505    3         IF (ADDR(NIL) ~= VDH_RLSBFR.BFR$) THEN DO;
+      759      506    3            CALL KVS$RLSBFR(VDH_RLSBFR) ;
+      760      507    3         END /* IF */;
+      761      508
+      762      509        /* set up the read buffer descriptor                                             */
+      763      510
+      764      511    2         %KV_SSN.REDBFR__.ADR$ = VDH_GETBFR.BFR$;
+      765      512    2         %KV_SSN.REDBFR__.BFRBYTSIZ = VDH_GETBFR.BYTSIZ;
+      766      513    2         %KV_SSN.REDBFR__.BFRRLSDSP = %KV_BFRRLSDSP_MSG;
+      767      514    2         %KV_SSN.REDBFR__.STRTYP = %KV_STRTYP_REDBFR;
+      768      515    2         RETURN;
+      769      516    2      END /* WHENRETURN */;
+      770      517    1      ALTRETURN;
+      771      518    1   END /* SUBROUTINE */;
+
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:86   
+--  Include file information  --
+
+   KV_PRMID_E.:E05TOU  was found in the system file and is never referenced.
+   KV_GLBCNS_E.:E05TOU  was found in the system file and is referenced.
+   KV$VDO.:E05TOU  was found in the system file and is never referenced.
+   KV$VDH.:E05TOU  was found in the system file and is referenced.
+   KV$USR.:E05TOU  was found in the system file and is never referenced.
+   KV$SND.:E05TOU  was found in the system file and is never referenced.
+   KV$INT.:E05TOU  was found in the system file and is never referenced.
+   KV$GLBCTX.:E05TOU  was found in the system file and is referenced.
+   KV$GLB.:E05TOU  was found in the system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is never referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure KVS$GETREDBFR.
+
+   Procedure KVS$GETREDBFR requires 146 words for executable code.
+   Procedure KVS$GETREDBFR requires 26 words of local(AUTO) storage.
+
+    No errors detected in file KVS$BFR.:E05TSI    .
+
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:87   
+
+ Object Unit name= KVS$GETREDBFR                              File name= KVS$BFR.:E05TOU
+ UTS= JUL 30 '97 02:15:03.96 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   146     92  KVS$GETREDBFR
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes    yes     yes      Std        1  KVS$GETREDBFR
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 KVS$GETBFR
+ yes     yes           Std       1 KVS$RLSBFR
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6A_ARET
+                       nStd      0 X6A_AALT
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KV_VDH_GETBFR                         KV_VDH_RLSBFR                         KV$PTR$
+r    G$ROS$
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:88   
+
+
+      684        1        /*T***********************************************************/
+      685        2        /*T*                                                         */
+      686        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      687        4        /*T*                                                         */
+      688        5        /*T***********************************************************/
+      689        6        /*X*     NSO,PLM=3,SQB=Y,AND=Y,ENI=0,SDI=3,MCL=10,CSI=0,ECI=0,IND=0,IAD=3 */
+      690        7        KVS$GETREDBFR: PROC(BYTSIZ) ALTRET;
+
+      7   0 000000  D380 0000 0000  xent KVS$GETREDBFR   LNJ,B5   X6A_AUTO_1
+          0 000003       001A 0001                       DC       26,1
+
+      691        8
+      692        9    1   DCL BYTSIZ UBIN ALIGNED;
+      693       10
+      694       11 S      %INCLUDE KV$GLB;
+      695       12 S      %INCLUDE KV$GLBCTX;
+      696       13 S      %INCLUDE KV$VDH;
+      697       14 S      %INCLUDE KV_GLBCNS_E;
+      698       15
+      699       16         %KV$VDH_GETBFR(NAME = VDH_GETBFR, STCLASS = AUTO);
+      700       81         %KV$VDH_RLSBFR(NAME = VDH_RLSBFR, STCLASS = AUTO);
+      701      117
+      702      118        %KV$VDH_GETBFR(NAME = KV_VDH_GETBFR, STCLASS = SYMREF);
+      703      183        %KV$VDH_RLSBFR(NAME = KV_VDH_RLSBFR, STCLASS = SYMREF);
+      704      219
+      705      220        %KV$PTR;
+      706      263        %KV$VDI;
+      707      334        %KV$SSN;
+      708      413
+      709      414        %KV_BFRRLSDSP_E;
+      710      420        %KV_STRTYP_E;
+      711      458
+      712      459    1   DCL KVS$GETBFR ENTRY(1) ALTRET;
+      713      460    1   DCL KVS$RLSBFR ENTRY(1) ALTRET;
+      714      461
+      715      462        /* this routine will get a read buffer for a particular user in
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:89   
+      716      463           the following manner.                                                      */
+      717      464
+      718      465        /* IF KV$SSN.REDBFR__.ADR$ = ADDR(NIL)                                        */
+      719      466
+      720      467        /* then allocate a 16 word buffer                                             */
+      721      468
+      722      469
+      723      470        /* otherwise double the size of the buffer and copy the new data into
+      724      471           the new buffer and the release the buffer.                                 */
+      725      472
+      726      473
+      727      474    1      VDH_RLSBFR = KV_VDH_RLSBFR;
+
+    474   0 000005  AB80 0000 0000  xsym                 LAB,B2   KV_VDH_RLSBFR
+          0 000008  2C00                                 LDV,R2   0
+          0 000009  6C0E                                 LDV,R6   14
+          0 00000A  BB87                                 LAB,B3   ,AUTO
+          0 00000B  3C22                                 LDV,R3   34
+          0 00000C  0008                                 MMM
+
+      728      475    1      VDH_GETBFR = KV_VDH_GETBFR;
+
+    475   0 00000D  AB80 0000 0000  xsym                 LAB,B2   KV_VDH_GETBFR
+          0 000010  2C00                                 LDV,R2   0
+          0 000011  6C16                                 LDV,R6   22
+          0 000012  BB87                                 LAB,B3   ,AUTO
+          0 000013  3C0C                                 LDV,R3   12
+          0 000014  0008                                 MMM
+
+      729      476    1      VDH_GETBFR.DAT_.ADR$ = %KV_SSN.REDBFR__.ADR$;
+
+    476   0 000015  EC80 0000 0000  xsym                 LDB,B6   KV$PTR$
+          0 000018  DCC6 0002                            LDB,B5   2,B6
+          0 00001A  CCC5 0030                            LDB,B4   48,B5
+          0 00001C  CFC7 000D                            STB,B4   VDH_GETBFR+7,AUTO
+
+      730      477    1      VDH_GETBFR.DAT_.BYTSIZ = %KV_SSN.REDBFR__.BYTX+%KV_SSN.REDBFR__.DATBYTSIZ;
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:90   
+
+    477   0 00001E  DCC6 0002                            LDB,B5   2,B6
+          0 000020  E845 0032                            LDR,R6   50,B5
+          0 000022  EA45 0033                            ADD,R6   51,B5
+          0 000024  EF47 0010                            STR,R6   VDH_GETBFR+10,AUTO
+
+      731      478
+      732      479        /* set up the rlsbfr for the release later                                    */
+      733      480
+      734      481    1      VDH_RLSBFR.BFR$ = %KV_SSN.REDBFR__.ADR$;
+
+    481   0 000026  DCC6 0002                            LDB,B5   2,B6
+          0 000028  ACC5 0030                            LDB,B2   48,B5
+          0 00002A  AFC7 0012                            STB,B2   VDH_RLSBFR+1,AUTO
+
+      735      482    1      VDH_RLSBFR.BYTSIZ = %KV_SSN.REDBFR__.BFRBYTSIZ;
+
+    482   0 00002C  DCC6 0002                            LDB,B5   2,B6
+          0 00002E  D845 0034                            LDR,R5   52,B5
+          0 000030  DF47 0014                            STR,R5   VDH_RLSBFR+3,AUTO
+
+      736      483
+      737      484        /* check to see if we had a buffer                                            */
+      738      485
+      739      486    1      IF ADDR(BYTSIZ)~=ADDR(NIL)
+
+    486   0 000032  DCC7 0004                            LDB,B5   @BYTSIZ,AUTO
+          0 000034  8DD5                                 CMN      B5
+          0 000035  0901 0006                            BE       s:490,PREL
+
+      740      487
+      741      488        /* A required buffer size was passed.  Use it. */
+      742      489    1      THEN VDH_GETBFR.BYTSIZ = BYTSIZ;
+
+    489   0 000037  C805                                 LDR,R4   ,B5
+          0 000038  CF47 0009                            STR,R4   VDH_GETBFR+3,AUTO
+          0 00003A  0F81 0016                            B        s:499,PREL
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:91   
+
+      743      490    2      ELSE IF (VDH_RLSBFR.BFR$ = ADDR(NIL)) THEN DO;
+
+    490   0 00003C  8DC7 0012                            CMN      VDH_RLSBFR+1,AUTO
+          0 00003E  0981 000F                            BNE      s:494,PREL
+
+      744      491    2         VDH_GETBFR.BYTSIZ = 32;
+
+    491   0 000040  4C20                                 LDV,R4   32
+          0 000041  CF47 0009                            STR,R4   VDH_GETBFR+3,AUTO
+
+      745      492    2         %KV_SSN.REDBFR = '0'B;
+
+    492   0 000043  9CC6 0002                            LDB,B1   2,B6
+          0 000045  5C0C                                 LDV,R5   12
+          0 000046  0021                                 ALR      ;
+          0 000047       4178 0000                                ALPHANUM('0000'X,IMO,,1),;
+          0 000049       4001 002A                                ALPHANUM(42,B1,,R5,FILL)
+
+      746      493    2      END; ELSE DO;
+
+    493   0 00004B  437F                                 CSYNC    s:492+7,SPREL
+          0 00004C  0F81 0004                            B        s:499,PREL
+
+      747      494    2         VDH_GETBFR.BYTSIZ = VDH_RLSBFR.BYTSIZ*2;
+
+    494   0 00004E  5001                                 SOL,R5   1
+          0 00004F  DF47 0009                            STR,R5   VDH_GETBFR+3,AUTO
+
+      748      495    2      END /* IF */;
+
+      749      496
+      750      497        /* get the buffer                                                             */
+      751      498
+      752      499    1      VDH_GETBFR.STRTYP = %KV_STRTYP_REDBFR;
+
+    499   0 000051  5C11                                 LDV,R5   17
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:92   
+          0 000052  D7C7 000C                            STH,R5   VDH_GETBFR+6,AUTO
+
+      753      500    1      VDH_RLSBFR.STRTYP = %KV_STRTYP_REDBFR;
+
+    500   0 000054  D7C7 0017                            STH,R5   VDH_RLSBFR+6,AUTO
+
+      754      501    2      CALL KVS$GETBFR(VDH_GETBFR) WHENRETURN DO;
+
+    501   0 000056  9BC7 0006                            LAB,B1   VDH_GETBFR,AUTO
+          0 000058  9FC7 0018                            STB,B1   VDH_RLSBFR+7,AUTO
+          0 00005A  BBC7 0018                            LAB,B3   VDH_RLSBFR+7,AUTO
+          0 00005C  CBF0 0100                            LAB,B4   256,IMO
+          0 00005E  E380 0000 0000  xent                 LNJ,B6   KVS$GETBFR
+          0 000061       002E                            DC       s:517,PREL
+
+      755      502
+      756      503        /* we now have the larger buffer and the old data is in it, so release it. */
+      757      504
+      758      505    3         IF (ADDR(NIL) ~= VDH_RLSBFR.BFR$) THEN DO;
+
+    505   0 000062  8DC7 0012                            CMN      VDH_RLSBFR+1,AUTO
+          0 000064  0901 000D                            BE       s:511,PREL
+
+      759      506    3            CALL KVS$RLSBFR(VDH_RLSBFR) ;
+
+    506   0 000066  EBC7 0011                            LAB,B6   VDH_RLSBFR,AUTO
+          0 000068  EFC7 0018                            STB,B6   VDH_RLSBFR+7,AUTO
+          0 00006A  BBC7 0018                            LAB,B3   VDH_RLSBFR+7,AUTO
+          0 00006C  CBF0 0100                            LAB,B4   256,IMO
+          0 00006E  E380 0000 0000  xent                 LNJ,B6   KVS$RLSBFR
+          0 000071       0001                            DC       s:511,PREL
+
+      760      507    3         END /* IF */;
+
+      761      508
+      762      509        /* set up the read buffer descriptor                                             */
+      763      510
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:93   
+      764      511    2         %KV_SSN.REDBFR__.ADR$ = VDH_GETBFR.BFR$;
+
+    511   0 000072  EC80 0000 0000  xsym                 LDB,B6   KV$PTR$
+          0 000075  DCC6 0002                            LDB,B5   2,B6
+          0 000077  CCC7 0007                            LDB,B4   VDH_GETBFR+1,AUTO
+          0 000079  CFC5 0030                            STB,B4   48,B5
+
+      765      512    2         %KV_SSN.REDBFR__.BFRBYTSIZ = VDH_GETBFR.BYTSIZ;
+
+    512   0 00007B  DCC6 0002                            LDB,B5   2,B6
+          0 00007D  E847 0009                            LDR,R6   VDH_GETBFR+3,AUTO
+          0 00007F  EF45 0034                            STR,R6   52,B5
+
+      766      513    2         %KV_SSN.REDBFR__.BFRRLSDSP = %KV_BFRRLSDSP_MSG;
+
+    513   0 000081  DCC6 0002                            LDB,B5   2,B6
+          0 000083  5C01                                 LDV,R5   1
+          0 000084  DAC5 0035                            SRM,R5,'00FF'X    53,B5
+          0 000086       00FF
+
+      767      514    2         %KV_SSN.REDBFR__.STRTYP = %KV_STRTYP_REDBFR;
+
+    514   0 000087  DCC6 0002                            LDB,B5   2,B6
+          0 000089  4C11                                 LDV,R4   17
+          0 00008A  C7C5 0035                            STH,R4   53,B5
+
+      768      515    2         RETURN;
+
+    515   0 00008C  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      769      516    2      END /* WHENRETURN */;
+      770      517    1      ALTRETURN;
+
+    517   0 00008F  C380 0000 0000  xent                 LNJ,B4   X6A_AALT
+      771      518    1   END /* SUBROUTINE */;
+
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:94   
+--  Include file information  --
+
+   KV_PRMID_E.:E05TOU  was found in the system file and is never referenced.
+   KV_GLBCNS_E.:E05TOU  was found in the system file and is referenced.
+   KV$VDO.:E05TOU  was found in the system file and is never referenced.
+   KV$VDH.:E05TOU  was found in the system file and is referenced.
+   KV$USR.:E05TOU  was found in the system file and is never referenced.
+   KV$SND.:E05TOU  was found in the system file and is never referenced.
+   KV$INT.:E05TOU  was found in the system file and is never referenced.
+   KV$GLBCTX.:E05TOU  was found in the system file and is referenced.
+   KV$GLB.:E05TOU  was found in the system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is never referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure KVS$GETREDBFR.
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:95   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @BYTSIZ                   *0-0-0/w UBIN(16)    r     1 BYTSIZ
+     6-0-0/w STRC(176)   r     1 VDH_GETBFR                11-0-0/w STRC(112)   r     1 VDH_RLSBFR
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 KV$PTR$                    0-0-0/w STRC(176)   r     1 KV_VDH_GETBFR
+     0-0-0/w STRC(112)   r     1 KV_VDH_RLSBFR
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(480)   r     1 KV$PTR                     0-0-0/w STRC(1024)  r     1 KV$SSN
+
+
+   Procedure KVS$GETREDBFR requires 146 words for executable code.
+   Procedure KVS$GETREDBFR requires 26 words of local(AUTO) storage.
+
+    No errors detected in file KVS$BFR.:E05TSI    .
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:96   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:97   
+          MINI XREF LISTING
+
+BYTSIZ
+         9**DCL         7--PROC      486--IF        489>>ASSIGN
+KV$PTR.INPCNDPND
+       247**DCL       256--REDEF     260--REDEF
+KV$PTR.LINLST$
+       243**DCL       244--REDEF
+KV$PTR.SSN$
+       241**DCL       476>>ASSIGN    477>>ASSIGN    477>>ASSIGN    481>>ASSIGN    482>>ASSIGN    492>>ASSIGN
+       511>>ASSIGN    512>>ASSIGN    513>>ASSIGN    514>>ASSIGN
+KV$PTR$
+       235**DCL       241--IMP-PTR   476>>ASSIGN    477>>ASSIGN    477>>ASSIGN    481>>ASSIGN    482>>ASSIGN
+       492>>ASSIGN    511>>ASSIGN    512>>ASSIGN    513>>ASSIGN    514>>ASSIGN
+KV$SSN.REDBFR
+       376**DCL       492<<ASSIGN
+KV$SSN.REDBFR__.ADR$
+       403**DCL       476>>ASSIGN    481>>ASSIGN    511<<ASSIGN
+KV$SSN.REDBFR__.BFRBYTSIZ
+       404**DCL       482>>ASSIGN    512<<ASSIGN
+KV$SSN.REDBFR__.BFRRLSDSP
+       405**DCL       513<<ASSIGN
+KV$SSN.REDBFR__.BYTX
+       403**DCL       477>>ASSIGN
+KV$SSN.REDBFR__.DATBYTSIZ
+       403**DCL       477>>ASSIGN
+KV$SSN.REDBFR__.STRTYP
+       404**DCL       514<<ASSIGN
+KV$SSN.REDRSPCNT
+       363**DCL       364--REDEF
+KVS$GETBFR
+       459**DCL-ENT   501--CALL
+KVS$RLSBFR
+       460**DCL-ENT   506--CALL
+PL6.E3A0      #002=KVS$GETREDBFR File=KVS$BFR.:E05TSI                            WED 07/30/97 02:15 Page:98   
+KV_VDH_GETBFR
+       145**DCL       475>>ASSIGN
+KV_VDH_RLSBFR
+       210**DCL       474>>ASSIGN
+VDH_GETBFR
+        43**DCL       475<<ASSIGN    501<>CALL
+VDH_GETBFR.BFR$
+        49**DCL       511>>ASSIGN
+VDH_GETBFR.BYTSIZ
+        49**DCL       489<<ASSIGN    491<<ASSIGN    494<<ASSIGN    512>>ASSIGN
+VDH_GETBFR.DAT_.ADR$
+        77**DCL       476<<ASSIGN
+VDH_GETBFR.DAT_.BYTSIZ
+        77**DCL       477<<ASSIGN
+VDH_GETBFR.STRTYP
+        49**DCL       499<<ASSIGN
+VDH_RLSBFR
+       108**DCL       474<<ASSIGN    506<>CALL
+VDH_RLSBFR.BFR$
+       114**DCL       481<<ASSIGN    490>>IF        505>>IF
+VDH_RLSBFR.BYTSIZ
+       114**DCL       482<<ASSIGN    494>>ASSIGN
+VDH_RLSBFR.STRTYP
+       114**DCL       500<<ASSIGN

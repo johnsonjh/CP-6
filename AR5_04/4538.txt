@@ -1,0 +1,608 @@
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ELEPHARK: PROC MAIN;
+ 
+%INCLUDE B$JIT_C;
+  %B$JIT0(STCLASS="BASED(JIT$)" );
+  %U$JIT1;
+  %M$JIT2;
+  %F$JIT3;
+  %S$JIT4;
+  %J$JIT5;
+  %A$JIT6;
+%INCLUDE B$P;
+%INCLUDE B$USER;
+%INCLUDE B_SEGIDS_C;
+%INCLUDE CP_6;
+  %B$ALT;
+  %B$TCB;
+  %F$DCB;
+%INCLUDE CP_6_SUBS;
+%INCLUDE SS_SCHED_C;
+ 
+%EQU NUM_CMDS                = 11;      /* # entries in the CMD table         */
+%EQU MING                    = 15;
+ 
+%EQU SPYING#                 = 1;
+%EQU AUTO#                   = 2;
+%EQU LOGGING#                = 3;
+%EJECT;
+/**/
+/* FPTs */
+/**/
+%FPT_TIME    (FPTN                     = FPT_TIME,
+              DEST=LOCAL,
+              SOURCE=CLOCK,
+              TSTAMP=I );
+ 
+%FPT_MONINFO (FPTN                     = FPT_MONINFO,
+              MONINFO=MONINFO,
+              MONPTRS=MONPTRS,
+              SITEINFO=SITEINFO,
+              STCLASS="STATIC SYMDEF" );
+%VLR_MONINFO (FPTN                     = MONINFO,
+              STCLASS="STATIC SYMDEF" );
+%VLR_MONPTRS (FPTN                     = MONPTRS,
+              STCLASS="STATIC SYMDEF" );
+%VLR_SITEINFO(FPTN                     = SITEINFO,
+              STCLASS="STATIC SYMDEF" );
+ 
+%FPT_WAIT    (FPTN                     = FPT_WAIT,
+              UNITS=10 );
+ 
+%FPT_WRITE   (FPTN                     = WRITE_OUT,
+              DCB=F$OUT,
+              KEY=KEY,
+              ONEWKEY=YES );
+ 
+%FPT_TRUNC   (FPTN                     = FPT_TRUNC );
+ 
+%FPT_CLOSE   (FPTN                     = FPT_CLOSE,
+              CHGATT=YES,
+              DCB=F$OUT,
+              DISP=SAVE,
+              NAME=NAME_CLOSE,
+              RELG=YES );
+%VLP_NAME    (FPTN                     = NAME_CLOSE,
+              LEN=31 );
+ 
+ 
+%FPT_READ    (FPTN                     = READ_SI,
+              BUF=SIBUF,
+              DCB=M$SI );
+ 
+%FPT_KEYIN   (FPTN                     = READ_OC,
+              REPLY=SIBUF,
+              RESULTS=TYCARS );
+ 
+%FPT_CVM     (FPTN                     = FPT_CVM,
+              VPNO=100,
+              WSQFLG=NO );
+ 
+%FPT_OLAY    (FPTN                     = OLAY,
+              CANCEL=YES,
+              ONAME=OLAY_NAME );
+%VLP_NAME    (FPTN                     = OLAY_NAME,
+              NAME='*ELEPHARK_OU62' );
+ 
+%FPT_RUE     (FPTN                     = FPT_RUE,
+              EVENT=%SS_ABRT );
+ 
+%FPT_EXIT    (FPTN                     = FPT_EXIT,
+              STEPCC=OK );
+%EJECT;
+/**/
+/* BASED items */
+/**/
+DCL FLH                      UBIN(18)  BASED;
+DCL FLC                      CHAR(L)   BASED;
+DCL S_RQHX(0:7)              UBIN      BASED(RQH$);
+DCL 1 PT  BASED,
+      2 *(0:10)              UBIN,
+      2 JIT                  UBIN(18);
+ 
+/**/
+/* BITs */
+/**/
+DCL I_AM_LOGGING             BIT(1);
+DCL I_AM_A_GHOST             BIT(1)    STATIC SYMDEF;
+DCL MOP6(0:1) BIT(9) CONSTANT INIT('105'O,'327'O /*MVZB5,MVC7*/);
+DCL HERE_ONCE                BIT(1)     STATIC SYMDEF INIT('0'B);
+DCL MOP4(0:1) BIT(9) CONSTANT INIT('103'O,'327'O /*MVZB3,MVC7*/);
+DCL OPTION(0:35)             BIT(1)    STATIC INIT('0'B*0);
+ 
+/**/
+/* CHARacter items, listed alphabetically */
+/**/
+DCL CMD(0:%(NUM_CMDS-1))     CHAR(9)   STATIC INIT(
+    'AUTOMATIC',
+    'CONTINUE ',
+    'END      ',
+    'GO       ',
+    'LOGON    ',
+    'LOGOFF   ',
+    'NOAUTO   ',
+    'NOSPYING ',
+    'QUIT     ',
+    'SPY      ',
+    'THRESHOLD' );
+DCL DWORK1                   CHAR(8);
+DCL DWORK2                   CHAR(8);
+DCL LOBUF                    CHAR(80)  STATIC;
+DCL MODES(0:4)               CHAR(1)   STATIC INIT('*','B','G','O','T');
+DCL SIBUF                    CHAR(80)  STATIC;
+ 
+/**/
+/* DCBs */
+/**/
+DCL F$OUT                    DCB;
+DCL M$SI                     DCB;
+DCL M$LO                     DCB;
+ 
+/**/
+/* ENTRYs */
+/**/
+DCL INITIALIZE               ENTRY     ALTRET;
+DCL OLAY1                    ENTRY;
+DCL PUT_MESG                 ENTRY(1);
+DCL UCALLDB                  ENTRY     ASYNC;
+DCL UCALLDX                  ENTRY     ASYNC;
+ 
+/**/
+/* PTRs */
+/**/
+DCL 1 B$ISX STATIC SYMDEF,
+      2 *                    BIT(24)   UNAL   INIT('0'B),
+      2 *                    BIT(12)   UNAL   INIT(%ISSID);
+DCL B$IS$ REDEF B$ISX        PTR;
+DCL 1 B$USERX STATIC,
+      2 WD                   UBIN(18)  UNAL   INIT(0),
+      2 *                    BIT(6)    UNAL   INIT('0'B),
+      2 *                    BIT(12)   UNAL   INIT(%SPCL1SID);
+DCL B$USER$ REDEF B$USERX    PTR;
+DCL 1 BP$X  STATIC,
+      2 *                    BIT(24),
+      2 SID                  BIT(12);
+DCL BP$ REDEF BP$X           PTR;
+DCL B$JIT$                   PTR       SYMREF;
+DCL JIT$                     PTR;
+DCL P                        PTR;
+DCL RQH$                     PTR       STATIC SYMDEF;
+DCL 1 RQH$X REDEF RQH$,
+      2 *                    BIT(24),
+      2 SID                  BIT(12);
+DCL U$JIT$                   PTR;
+ 
+/**/
+/* SBIN/UBIN items, listed alphabetically */
+/**/
+DCL BROKEN                   SBIN      STATIC SYMDEF;
+DCL CUR                      UBIN;
+DCL H                        SBIN;
+DCL I                        SBIN      STATIC;
+DCL ISYS                     UBIN;
+DCL J                        SBIN;
+DCL L                        SBIN;
+DCL LOG_TIMER                SBIN;
+DCL MAX                      UBIN;
+DCL MAXU                     UBIN;
+DCL SYSIDS(0:7)              UBIN      STATIC INIT(0*0);
+DCL USER#                    SBIN;
+DCL SNULL                    SBIN      STATIC SYMDEF;
+DCL TIME_INTERVAL            SBIN      STATIC INIT(60);
+DCL THRESHOLD                SBIN      STATIC INIT(128);
+ 
+/**/
+/* Structures */
+/**/
+DCL 1 KEY  STATIC,
+      2 *                    UBIN(9)   UNAL   INIT(7),
+      2 STAMP                UBIN      UNAL,
+      2 T                    CHAR(1)   UNAL,
+      2 N                    UBIN(18)  UNAL;
+ 
+DCL 1 MSG  STATIC,
+      2 MO                   CHAR(2),
+      2 AC                   CHAR(8),
+      2 UN                   CHAR(12),
+      2 SYSID                CHAR(6),
+      2 X                    CHAR(2)          INIT('  '),
+      2 MEM                  CHAR(4),
+      2 *                    CHAR(1)          INIT(' '),
+      2 CC                   CHAR(44),
+      2 *                    CHAR(1)          INIT('\');
+ 
+DCL 1 MSG1  STATIC,
+      2 *                    CHAR(0)          INIT('Sysid'),
+      2 SYSID                CHAR(6),
+      2 *                    CHAR(0)          INIT(' still in system.\');
+ 
+DCL 1 TYCARS STATIC,
+      2 TYC                  UBIN,
+      2 ARS                  UBIN;
+ 
+%EJECT;
+MAINLINE: ;
+ 
+        CALL INITIALIZE ALTRET( OOPS );
+        CALL M$OLAY(OLAY) ALTRET( OOPS );
+        FPT_TRUNC.V.DCB#= %M$LM#;
+        CALL M$TRUNC(FPT_TRUNC);
+        FPT_TRUNC.V.DCB#= DCBNUM(F$OUT);
+        CALL M$TRUNC(FPT_TRUNC);
+        OPTION(%LOGGING#)= %YES#;       /* LOG by default                     */
+        LOG_TIMER= 0;
+        ISYS= 0;
+        DO WHILE('0'B);
+OOPS:
+           CALL M$ERR;
+           END;
+%EJECT;
+TIME_TO_GET_UP:
+ 
+        CALL M$MONINFO( FPT_MONINFO );
+        LOG_TIMER= LOG_TIMER - FPT_WAIT.V.UNITS#;
+        IF LOG_TIMER > 0 THEN
+           GOTO LOOK_AT_USERS;
+        BP$= MONPTRS.B$P$;
+        BP$X.SID= %SPCL1SID;
+        RQH$X.SID= %SPCL2SID;
+        IF MONINFO.ACORE# <= THRESHOLD THEN
+           IF OPTION(%LOGGING#) THEN
+              IF I_AM_LOGGING THEN
+                 ;
+              ELSE DO;                  /* Start logging                      */
+                 I_AM_LOGGING= %YES#;
+                 CALL PUT_MESG('ELEPHARK logging initiated.\');
+                 END;
+           ELSE
+              IF I_AM_LOGGING THEN
+                 GOTO STOP_LOGGING;
+              ELSE
+                 ;                      /* Continue NOT logging               */
+        ELSE
+           IF I_AM_LOGGING THEN DO;
+STOP_LOGGING:
+              I_AM_LOGGING= %NO#;       /* Stop logging                       */
+              CALL PUT_MESG('ELEPHARK logging suspended.\');
+              END;
+ 
+        IF I_AM_LOGGING THEN DO;
+           CALL M$TIME( FPT_TIME );
+           KEY.STAMP= I;
+           KEY.T= 'H';                  /* Set record type to Header          */
+           KEY.N= 0;
+           WRITE_OUT.BUF_= VECTOR(MONINFO.ACORE#);
+           CALL M$WRITE( WRITE_OUT );
+           END;
+LOOK_AT_USERS:
+        IF I_AM_LOGGING OR OPTION(%SPYING#) OR OPTION(%AUTO#) THEN DO;
+           KEY.T= 'U';                  /* Set record type to User            */
+           USER#= 0;
+           MAX= 0;
+USER_LOOP:
+           DO WHILE( USER# < MONINFO.MUAIS# );
+              USER#= USER# + 1;
+              CALL GETU ALTRET( NXT );
+              IF I_AM_LOGGING AND LOG_TIMER<=0 THEN
+                 CALL LOG_USER;
+              IF USER# > %MING THEN DO;
+                 DO J=0 TO 7;
+                    IF B$USER$->B$U.SYSID = SYSIDS(J) THEN DO;
+                       CALL BINCHAR( DWORK1,B$USER$->B$U.SYSID );
+                       CALL EDITSTR( MSG1.SYSID,0,6,MOP6,SUBSTR(DWORK1,2,6) );
+                       CALL PUT_MESG( MSG1 );
+                       GOTO NXT;
+                       END;
+                    END;
+                 CUR= B$USER$->B$U.PCT;
+                 I= B$USER$->B$U.APR;
+                 IF I > 0 THEN DO;
+                    IF BP$->B$P.UC(I) = 1 THEN
+                       CUR= CUR + BP$->B$P.PPC(I);
+                    I= B$USER$->B$U.APO;
+                    IF I>0 AND BP$->B$P.UC(I)=1 THEN
+                       CUR= CUR + BP$->B$P.PPC(I);
+                    END;
+                 IF CUR > MAX THEN DO;  /* Is this guy the biggest?           */
+                    MAX= CUR;           /* Yep, remember him.                 */
+                    MAXU= USER#;
+                    END;
+                 END;
+NXT:          END USER_LOOP;            /* WHILE( USER# < MONINFO.MUAIS# )    */
+           IF LOG_TIMER<=0 THEN
+              LOG_TIMER=MAXIMUM(MINIMUM(TIME_INTERVAL*MONINFO.ACORE#/
+                THRESHOLD,TIME_INTERVAL),5);
+           IF OPTION(%SPYING#) OR OPTION(%AUTO#) THEN
+              CALL DISPLAY_USER( MAXU,MAX );
+           END;
+%EJECT;
+GO_TO_SLEEP:
+ 
+        IF I_AM_LOGGING THEN
+           CALL M$TRUNC( FPT_TRUNC );
+        IF BROKEN > 0 THEN DO;
+           CALL BINCHAR(DWORK1,MONINFO.ACORE#);
+           I= 0;
+           DO WHILE( I<7 AND SUBSTR(DWORK1,I,1)='0' );
+              I= I+1;
+              END;
+           CALL BINCHAR(DWORK2,THRESHOLD);
+           J= 0;
+           DO WHILE( J<7 AND SUBSTR(DWORK2,J,1)='0' );
+              J= J+1;
+              END;
+           CALL CONCAT(LOBUF,SUBSTR(DWORK1,I,8-I),' pages available; threshold is ',
+             SUBSTR(DWORK2,J,8-J),' pages.\');
+           CALL PUT_MESG( LOBUF );
+           IF OPTION(%LOGGING#) THEN
+              IF I_AM_LOGGING THEN
+                 CALL PUT_MESG('Therefore, I am logging data.\');
+              ELSE
+                 CALL PUT_MESG('Therefore, I am not logging data.\');
+ 
+GET_CMDS:
+                 DO WHILE('1'B);
+                    SIBUF= ' ';
+                    IF I_AM_A_GHOST THEN DO;
+                       IF HERE_ONCE THEN DO;
+                          CALL M$KEYIN( READ_OC ) ALTRET( DONE_HERE );
+                          END;
+                       ELSE DO;
+                          HERE_ONCE = '1'B;
+                          IF DCBADDR(DCBNUM(M$SI))->F$DCB.AMR# THEN DO;
+                             CALL M$READ( READ_SI ) ALTRET( DONE_HERE );
+                             TYCARS.ARS= DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+                             END; /* PICK FIRST COMMAND OFF M$SI EVEN IN GHOST */
+                          ELSE DO;
+                             CALL M$KEYIN( READ_OC ) ALTRET( DONE_HERE );
+                             END;
+                          END;
+                       END;             /* DO IF FIRST TIME THRU              */
+                    ELSE DO;
+                       CALL M$READ( READ_SI ) ALTRET( DONE_HERE );
+                       TYCARS.ARS= DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+                       END;
+ 
+                    IF TYCARS.ARS<1 THEN /* Was the line blank?               */
+                       GOTO DONE_HERE;  /* Yep, Go to work.                   */
+ 
+                    H= 0;
+                    DO WHILE( H<TYCARS.ARS AND SUBSTR(SIBUF,H,1)=' ' );/* Skip leading*/
+                       H= H+1;          /* blanks                             */
+                       END;
+                    IF H >= TYCARS.ARS THEN /* Nothing but blanks entered?    */
+                       GOTO DONE_HERE;  /* Yep.                               */
+                    I= H;
+                    DO WHILE( I<TYCARS.ARS AND SUBSTR(SIBUF,I,1)>='A' );
+                       I= I+1;
+                       END;
+ 
+                    J= 0;
+                    DO WHILE( J<%NUM_CMDS AND SUBSTR(SIBUF,H,I-H)~=SUBSTR(CMD(J),0,I-H) );
+                       J= J+1;
+                       END;
+                    IF J+1<%NUM_CMDS AND SUBSTR(SIBUF,H,I-H)=SUBSTR(CMD(J+1),0,I-H) THEN
+                       J=%NUM_CMDS;     /* Command not unique                 */
+ 
+DO_SELECT:
+                    DO SELECT( CMD(J) );
+                     SELECT( 'AUTOMATIC' );
+                       OPTION(%AUTO#)= %YES#;
+                     SELECT( 'END', 'QUIT' );
+                       FPT_CLOSE.V.OPER.CHGATT#= %NO#;
+                       CALL M$CLOSE( FPT_CLOSE );
+                       CALL M$EXIT;
+                     SELECT( 'CONTINUE', 'GO' );
+                       GOTO DONE_HERE;
+                     SELECT( 'LOGON' );
+                       OPTION(%LOGGING#)= %YES#;
+                     SELECT( 'LOGOFF' );
+                       OPTION(%LOGGING#)= %NO#;
+                     SELECT( 'NOAUTO' );
+                       OPTION(%AUTO#)= %NO#;
+                     SELECT( 'NOSPYING' );
+                       OPTION(%SPYING#)= %NO#;
+                     SELECT( 'THRESHOLD' );
+                       J= 0;
+                       DO WHILE( I<TYCARS.ARS AND
+                         (SUBSTR(SIBUF,I,1)=' ' OR SUBSTR(SIBUF,I,1)='=') );
+                          I= I+1;
+                          END;
+                       DO WHILE( I<TYCARS.ARS AND
+                         SUBSTR(SIBUF,I,1)>='0' AND SUBSTR(SIBUF,I,1)<='9' );
+                          J= 10*J+ASCBIN(SUBSTR(SIBUF,I,1))-ASCBIN('0');
+                          I= I+1;
+                          END;
+                       IF J<0 OR J>16384 OR I<TYCARS.ARS THEN
+                          CALL PUT_MESG('**Sorry, that''s not a legal threshold.\');
+                       ELSE DO;
+                          THRESHOLD= J;
+                          BROKEN= 0;
+                          CALL PUT_MESG('..OK\');
+                          GOTO TIME_TO_GET_UP;
+                          END;
+                     SELECT( 'SPY' );
+                       OPTION(%SPYING#)= %YES#;
+                     SELECT( ELSE );
+                       CALL PUT_MESG('..Eh?\');
+                     END DO_SELECT;
+                    END GET_CMDS;
+ 
+DONE_HERE:
+           CALL PUT_MESG('..OK\');
+           END;                         /* end IF BROKEN>0                    */
+ 
+        BROKEN=0;
+        CALL M$WAIT(FPT_WAIT);
+        IF BROKEN>0 THEN
+           GOTO GO_TO_SLEEP;
+        ELSE
+           GOTO TIME_TO_GET_UP;
+%EJECT;
+LOG_USER: PROC  ALTRET;
+ 
+        CALL GETJIT;
+        L= SIZEW(B$USER$->B$U)*4;
+        WRITE_OUT.BUF_= VECTOR(B$USER$->FLC);
+        WRITE_OUT.V.DVBYTE.CONT#= %YES#;/* Set CONTinued WRITE bit            */
+        CALL M$WRITE( WRITE_OUT );
+        WRITE_OUT.V.DVBYTE.CONT#=  %NO#;/* Turn off CONTinued WRITE bit*/
+        L= SIZEW(B$JIT)*4;
+        WRITE_OUT.BUF_= VECTOR(JIT$->FLC);
+        KEY.N= USER#;
+        CALL M$WRITE( WRITE_OUT );
+RE_TURN:
+        RETURN;
+ 
+END LOG_USER;
+%EJECT;
+GETU:   PROC ALTRET;
+ 
+        B$USERX.WD= (USER#)*SIZEW(B$USER$->B$U)+ADDR(MONPTRS.B$USRT$)->FLH;
+        IF B$USER$->B$U.US >= SNULL THEN
+           ALTRETURN;
+        ELSE
+           RETURN;
+ 
+END GETU;
+%EJECT;
+GETJIT: PROC;
+ 
+        FPT_CVM.V.PPNO#= B$USER$->B$U.PT*64/1024;
+        CALL M$CVM( FPT_CVM );
+        JIT$= PINCRW(B$IS$,1024*100);
+        FPT_CVM.V.PPNO#= JIT$->PT.JIT;
+        CALL M$CVM( FPT_CVM );
+RE_TURN:
+        RETURN;
+ 
+END GETJIT;
+%EJECT;
+DISPLAY_USER: PROC( USR#,SIZ )  ALTRET;
+DCL USR#                     UBIN;
+DCL SIZ                      UBIN;
+ 
+        USER#= USR#;
+        CALL GETU ALTRET( ALT_RETURN );
+        CALL GETJIT;
+        MSG.CC= B$JIT.CCBUF;
+        MSG.AC= B$JIT.ACCN;
+        MSG.UN= B$JIT.UNAME;
+        MSG.MO= MODES(B$JIT.MODE);
+        CALL BINCHAR( MSG.MEM,SIZ );
+        CALL EDITCHAR( MSG.MEM,0,4,MOP4,MSG.MEM );
+        CALL BINCHAR( MSG.SYSID,B$JIT.SYSID );
+        CALL EDITCHAR( MSG.SYSID,0,6,MOP6,MSG.SYSID );
+        IF OPTION(%AUTO#) THEN
+           IF RQH$->S_RQHX(%SS_NC/2-%SS_CBF/2) ~= 0 THEN DO;
+              FPT_RUE.V.USER#= B$JIT.SYSID;
+              SYSIDS(ISYS)= B$JIT.SYSID;
+              ISYS= MOD(ISYS+1,8);
+              MSG.X= '!X';
+              CALL M$RUE( FPT_RUE ) ALTRET( NOMSYS );
+NOMSYS:       END;
+           ELSE
+              MSG.X= '  ';
+        IF OPTION(%SPYING#) OR MSG.X='!X' THEN
+           CALL PUT_MESG( MSG );
+RE_TURN:
+        RETURN;
+ 
+ALT_RETURN:
+        ALTRETURN;
+ 
+END DISPLAY_USER;
+%EJECT;
+END ELEPHARK;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+PUT_MESG: PROC( BUF )  NOAUTO;
+DCL BUF                      CHAR(132);
+ 
+DCL I_AM_A_GHOST             BIT(1)           SYMREF;
+DCL POS                      UBIN;
+%INCLUDE CP_6;
+DCL M$LO                     DCB;
+%FPT_WRITE   (FPTN                     = PUT_MSG,
+              DCB=M$LO,
+              STCLASS="STATIC SYMDEF" );
+%FPT_KEYIN   (FPTN                     = WRITE_OC );
+ 
+        CALL INDEX( POS,'\',BUF );
+        IF I_AM_A_GHOST THEN DO;
+           WRITE_OC.MESS_= VECTOR(SUBSTR(BUF,0,POS));
+           CALL M$KEYIN( WRITE_OC );
+           END;
+        ELSE DO;
+           PUT_MSG.BUF_= VECTOR(SUBSTR(BUF,0,POS));
+           CALL M$WRITE( PUT_MSG );
+           END;
+RE_TURN:
+        RETURN;
+ 
+END PUT_MESG;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+UCALLDB: PROC ASYNC;
+ 
+/****
+*
+*   Handle on-line break event.
+*
+****/
+ 
+%INCLUDE CP_6;
+ 
+%FPT_TRMPRG(RSTBRK=YES);
+ 
+DCL BROKEN SYMREF                  SBIN;
+ 
+        BROKEN=1;
+        CALL M$TRMPRG(FPT_TRMPRG);
+        RETURN;
+END;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+UCALLDX: PROC ASYNC;
+ 
+/****
+*
+*   Handle ghost error event.
+*
+****/
+ 
+%INCLUDE CP_6;
+%B$TCB;
+ 
+%B$XCON;
+ 
+DCL B$TCB$ SYMREF                  PTR;
+DCL P                              PTR;
+ 
+DCL BROKEN SYMREF                  SBIN;
+ 
+        P=B$TCB$->B$TCB.STK$;
+        IF P->B$XCON.RNST.OPERR THEN
+           BROKEN=2;
+        ELSE IF ~P->B$XCON.RNST.XXX THEN
+              CALL M$EXIT;
+           ELSE
+              CALL M$XXX;
+        CALL M$TRTN;
+END;

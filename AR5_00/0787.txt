@@ -1,0 +1,1792 @@
+VERSION E05
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:1    
+        1        1        /*M* GFS$ROSPACE  LCP-6 Read-Only Segment space manager. */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* PLM=3,IND=5,ENU=0,ECU=0,CRM=70  */
+        8        8        /*P*     NAME:    GFS$ROSPACE
+        9        9
+       10       10                 PURPOSE: To manage the free space in the Read Only Segment.
+       11       11        */
+       12       12
+       13       13        /*F*     NAME:    GFS$GSP
+       14       14
+       15       15                 PURPOSE: Get a block of space in the Read Only Segment.
+       16       16
+       17       17                 CALL:    CALL GFS$GSP (N,BLK$) ALTRET;
+       18       18                          The alternate return is taken if space cannot be allocated.
+       19       19
+       20       20                 INPUT:   N = number of words needed
+       21       21
+       22       22                          G$JIT.PCROS = number of pages currently in the ROS
+       23       23                          G$ROS.AVAIL$ = poniter to the available ROS blocks
+       24       24
+       25       25                 OUTPUT:  BLK$ = pointer to the block allocated
+       26       26
+       27       27                          ERR - contains the error code if the ALTRET is taken
+       28       28
+       29       29                          G$ROS.AVAIL$  = updated pointer to available ROS blocks
+       30       30
+       31       31                 DESCRIPTION:  The free space chain is examined, and if an
+       32       32                               available block is found, it is unlinked from
+       33       33                               the free space chain and the address of the
+       34       34                               allocated area is returned in BLK$.  If necessary
+       35       35                               additional pages will be obtained in the Read Only
+       36       36                               Segment.
+       37       37        */
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:2    
+       38       38
+       39       39
+       40       40        GFS$GSP: PROC(N,BLK$,ERR) ALTRET;
+       41       41
+       42       42        %INCLUDE G_JIT_M;
+       43      307        %INCLUDE G_ROS_M;
+       44      389 S      %INCLUDE GU_LCP6_M;
+       45      390
+       46      391 S      %INCLUDE G_LCP6_E;
+       47      392        %INCLUDE GM_MACRO_M;
+       48      874        %INCLUDE GM_VIRTUAL_E;
+       49     1084
+       50     1085        %INCLUDE MM_SCODE_C;
+       51     1132        %INCLUDE F_SCODE_C;
+       52     1168
+       53     1169                                                /* Input Parameters         */
+       54     1170    1   DCL N SBIN;                   /* Number of words to get or return   */
+       55     1171    1   DCL BLK$ PTR;                      /* Will be set to space obtained */
+       56     1172                                           /* or points to space to free    */
+       57     1173        %VLP_ERRCODE (FPTN=ERR, STCLASS=PARAM);
+       58     1219
+       59     1220                                                /* Auto Storage             */
+       60     1221    1   DCL CURR$ PTR;           /* Points to current available ROS block   */
+       61     1222    1   DCL PREV$ PTR;                /* Points to prev available ROS block */
+       62     1223    1   DCL NEW$ PTR;                 /* Points to new first avail block    */
+       63     1224    1   DCL GM#PGSZ SBIN;             /* # of pages for MM to get or free   */
+       64     1225    1   DCL PCROS UBIN;               /* initial ROS pgs + user ROS pages   */
+       65     1226
+       66     1227        %GM_CHKSZ_PARAMS (FPTN=CHKSZ, STCLASS=AUTO);
+       67     1321
+       68     1322                                                /* External Data            */
+       69     1323    1   DCL G$JIT$ PTR SYMREF READONLY;
+       70     1324    1   DCL G$ROS$ PTR SYMREF READONLY;
+       71     1325    1   DCL GM_ROS_PGSZ UBIN SYMREF;
+       72     1326
+       73     1327                                                /* BASED Data               */
+       74     1328        %G$JIT (STCLASS="BASED(G$JIT$)");
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:3    
+       75     1742        %G$ROS (STCLASS="BASED(G$ROS$)");
+       76     1786        %G$ROS_AVAIL_HDR (FPTN=G$ROAVAIL);
+       77     1806
+       78     1807                                                /* Internal Data            */
+       79     1808        %VLP_SCODE (FPTN=SMMFAILED,ERR#=%S$MM49,SEV=G_SEV_SNAP#,
+       80     1809                            STCLASS=CONSTANT,FCG=GF,MID=S,MON='1'B);
+       81     1870
+       82     1871
+       83     1872        %VLP_SCODE (FPTN=SBADRO,ERR#=%S$FSBADRO,SEV=G_SEV_SNAP#,
+       84     1873                            STCLASS=CONSTANT,FCG=GF,MID=S,MON='1'B);
+       85     1934
+       86     1935                                                /* External Procedures      */
+       87     1936    1   DCL GMA$GET ENTRY(5)ALTRET;
+       88     1937    1   DCL GMA$REL ENTRY(2) ALTRET;
+       89     1938    1   DCL GMA$CHKSIZE ENTRY(1) ALTRET;
+       90     1939    1   DCL GMA$REL_ACCTMEM ENTRY(1) ALTRET;
+       91     1940    1   DCL SCREECH ENTRY(1);
+       92     1941
+       93     1942        %EJECT;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:4    
+       94     1943    1      PCROS = GM_ROS_PGSZ + G$JIT.PCROS;
+       95     1944    1      IF N < SIZEW(G$ROAVAIL)
+       96     1945    2      THEN DO;
+       97     1946    2           CALL SCREECH(SBADRO);
+       98     1947    2           ALTRETURN;
+       99     1948    2           END;
+      100     1949
+      101     1950    1   GSPLOOP:;
+      102     1951    1      PREV$ = ADDR(NIL);
+      103     1952    1      CURR$ = G$ROS$->G$ROS.AVAIL$;
+      104     1953
+      105     1954    2      DO WHILE('1'B);
+      106     1955    3           DO WHILE (CURR$ ~= ADDR(NIL));
+      107     1956
+      108     1957        /* If there is a block large enough, use it.  If larger than what
+      109     1958           is needed, build a new G$ROAVAIL header in the first 3 words of
+      110     1959           what is left over.
+      111     1960        */
+      112     1961    3                IF (CURR$->G$ROAVAIL.NWORDS = N) OR
+      113     1962    3                  (CURR$->G$ROAVAIL.NWORDS >= (N + SIZEW(G$ROAVAIL)) )
+      114     1963    4                THEN DO;
+      115     1964    4                     IF CURR$->G$ROAVAIL.NWORDS > N
+      116     1965    5                     THEN DO;
+      117     1966    5                          NEW$ = PINCRW(CURR$,N);
+      118     1967    5                          NEW$->G$ROAVAIL.NEXT$ = CURR$->G$ROAVAIL.NEXT$;
+      119     1968    5                          NEW$->G$ROAVAIL.NWORDS = CURR$->G$ROAVAIL.NWORDS-N;
+      120     1969    5                          CURR$->G$ROAVAIL.NEXT$ = NEW$;
+      121     1970    5                          END /*do if using partial block */;
+      122     1971
+      123     1972    4                     ELSE /* its an exact fix */;
+      124     1973
+      125     1974        /* If the block used was the head of the chain, the head is reset
+      126     1975           to be what was the link pointer in the block used.
+      127     1976        */
+      128     1977    4                     IF PREV$ = ADDR(NIL)
+      129     1978    4                     THEN G$ROS$->G$ROS.AVAIL$ = CURR$->G$ROAVAIL.NEXT$;
+      130     1979
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:5    
+      131     1980        /* If not the head of the chain, the link word in the previous block
+      132     1981           is reset to the link word from the used block.
+      133     1982        */
+      134     1983    4                     ELSE PREV$->G$ROAVAIL.NEXT$ = CURR$->G$ROAVAIL.NEXT$;
+      135     1984
+      136     1985        /* The address of the block is moved to BLK$ and control returns
+      137     1986           to the caller.
+      138     1987        */
+      139     1988    4                     BLK$ = CURR$;
+      140     1989    4                     RETURN;
+      141     1990    4                     END /* do if block is useable*/;
+      142     1991
+      143     1992        /* This block wasn't big enough - keep looking.
+      144     1993        */
+      145     1994    3                PREV$ = CURR$;
+      146     1995    3                CURR$ = PREV$->G$ROAVAIL.NEXT$;
+      147     1996    3                END /* do while CURR$ ~= NIL */;
+      148     1997
+      149     1998        /* If no available block is big enough, get another page in the
+      150     1999           Read Only Segment.  Altret if ROS is already fully allocated
+      151     2000           or the user has allocated all memory available to him.
+      152     2001        */
+      153     2002    2           GM#PGSZ = (N + 255) /256;
+      154     2003
+      155     2004    2           CHKSZ = '0'B;
+      156     2005    2           CHKSZ.SIZE = GM#PGSZ;
+      157     2006    2           CHKSZ.FLGS.REQ_ALL = '1'B;
+      158     2007    2           CHKSZ.FLGS.PARK = '1'B;
+      159     2008    2           CALL GMA$CHKSIZE(CHKSZ)
+      160     2009    3           WHENALTRETURN DO;
+      161     2010    3                ERR = CHKSZ.ERR;
+      162     2011    3                ALTRETURN;
+      163     2012    3                END;
+      164     2013
+      165     2014    2           CALL GMA$GET(%GM_ROS#,GM#PGSZ,%G_R_USR#,%G_R_MON#,%G_RING0#)
+      166     2015    3           WHENALTRETURN DO;
+      167     2016    3                CALL SCREECH(SMMFAILED);
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:6    
+      168     2017    3                ALTRETURN;
+      169     2018    3                END;
+      170     2019
+      171     2020    2           CURR$ = PINCRW(G$ROS$,256 * PCROS);
+      172     2021    2           G$JIT.PCROS = G$JIT.PCROS + GM#PGSZ;
+      173     2022
+      174     2023    2           CURR$->G$ROAVAIL.NEXT$ = ADDR(NIL);
+      175     2024    2           CURR$->G$ROAVAIL.NWORDS = 256;
+      176     2025
+      177     2026        /* If there were no available blocks to begin with, the new page
+      178     2027           address becomes the first header.
+      179     2028        */
+      180     2029    2           IF PREV$ = ADDR(NIL)
+      181     2030    2           THEN G$ROS$->G$ROS.AVAIL$ = CURR$;
+      182     2031
+      183     2032        /* If the new page was allocated immediately after the last available
+      184     2033           block, the size of that block is reset to include the new page.
+      185     2034        */
+      186     2035    3           ELSE DO;
+      187     2036    3                IF PINCRW(PREV$,PREV$->G$ROAVAIL.NWORDS) = CURR$
+      188     2037
+      189     2038    4                THEN DO;
+      190     2039    4                     PREV$->G$ROAVAIL.NWORDS = PREV$->G$ROAVAIL.NWORDS+256;
+      191     2040    4                     GOTO GSPLOOP;         /*Restart; we lost PREV$.*/
+      192     2041    4                     END;
+      193     2042
+      194     2043        /* Otherwise the new block address is set as the link word in the
+      195     2044           previous block.
+      196     2045        */
+      197     2046    3                ELSE PREV$->G$ROAVAIL.NEXT$ = CURR$;
+      198     2047    3                END;
+      199     2048    2           END /*DO FOREVER*/;
+      200     2049        %EJECT;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:7    
+      201     2050        /*F*     NAME:    GFS$RSP
+      202     2051
+      203     2052                 PURPOSE: To release a block of space in the Read Only Segment.
+      204     2053
+      205     2054                 CALL:    CALL GFS$RSP (N,BLK$) ALTRET;
+      206     2055
+      207     2056                 INPUT:   N = number of words to return
+      208     2057                          BLK$ = pointer of the block to be returned
+      209     2058
+      210     2059                          G$ROS.AVAIL$ = poniter to the available ROS blocks
+      211     2060                               block is returned to the caller.
+      212     2061
+      213     2062                 OUTPUT:  BLK$ = ADDR(NIL)
+      214     2063
+      215     2064                          G$ROS.AVAIL$  = updated pointer to available ROS blocks
+      216     2065
+      217     2066                 DESCRIPTION: The block is added to the free space chain.
+      218     2067                              If this yields free pages, they are returned
+      219     2068                              memory management.
+      220     2069        */
+      221     2070    1   GFS$RSP: ENTRY(N,BLK$) ALTRET;
+      222     2071    1      PCROS = GM_ROS_PGSZ + G$JIT.PCROS;
+      223     2072
+      224     2073    1      IF N < SIZEW(G$ROAVAIL) THEN GOTO BADREL;
+      225     2074
+      226     2075    1      PREV$ = ADDR(NIL);
+      227     2076    1      CURR$ = G$ROS$->G$ROS.AVAIL$;
+      228     2077
+      229     2078    2      DO WHILE ((CURR$ ~= ADDR(NIL)) AND (BLK$ > CURR$));
+      230     2079    2           PREV$ = CURR$;
+      231     2080    2           CURR$ = CURR$->G$ROAVAIL.NEXT$;
+      232     2081    2           END;
+      233     2082
+      234     2083        /* If the block to be released immediately precedes a currently
+      235     2084           available block, the link header is built in the block being
+      236     2085           released and the size includes both.
+      237     2086        */
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:8    
+      238     2087    1      IF (PINCRW(BLK$,N) = CURR$)
+      239     2088    2      THEN DO;
+      240     2089    2           BLK$->G$ROAVAIL.NEXT$ = CURR$->G$ROAVAIL.NEXT$;
+      241     2090    2           BLK$->G$ROAVAIL.NWORDS= CURR$->G$ROAVAIL.NWORDS +N;
+      242     2091    2           END;
+      243     2092
+      244     2093    2      ELSE DO;
+      245     2094    2           IF BLK$ = CURR$
+      246     2095    2           THEN GOTO BADREL;
+      247     2096
+      248     2097    3           ELSE DO;
+      249     2098    3                BLK$->G$ROAVAIL.NWORDS = N;
+      250     2099    3                BLK$->G$ROAVAIL.NEXT$ = CURR$;
+      251     2100    3                END;
+      252     2101    2           END;
+      253     2102
+      254     2103        /* Set CURR$ to the addr of the (maybe combined) new block.
+      255     2104        */
+      256     2105    1      CURR$ = BLK$;
+      257     2106
+      258     2107    1      BLK$ = ADDR(NIL);
+      259     2108    1      IF PREV$ ~= ADDR(NIL)                /*Not first block*/
+      260     2109    2      THEN DO;
+      261     2110    2           IF PINCRW(PREV$,PREV$->G$ROAVAIL.NWORDS) = CURR$
+      262     2111    3           THEN DO;
+      263     2112    3                PREV$->G$ROAVAIL.NWORDS = PREV$->G$ROAVAIL.NWORDS+
+      264     2113    3                  CURR$->G$ROAVAIL.NWORDS;
+      265     2114    3                PREV$->G$ROAVAIL.NEXT$ = CURR$->G$ROAVAIL.NEXT$;
+      266     2115    3                CURR$ = PREV$;
+      267     2116    3                END;
+      268     2117
+      269     2118        /* Not first block, not next to prev block.
+      270     2119        */
+      271     2120    2           ELSE PREV$->G$ROAVAIL.NEXT$ = CURR$;
+      272     2121    2           END/* do if PREV$ ~= NIL */;
+      273     2122
+      274     2123        /* First block
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:9    
+      275     2124        */
+      276     2125    1      ELSE G$ROS$->G$ROS.AVAIL$ = CURR$;
+      277     2126
+      278     2127
+      279     2128    1      IF CURR$->G$ROAVAIL.NEXT$ ~= ADDR(NIL) THEN RETURN;
+      280     2129    1      IF CURR$->G$ROAVAIL.NWORDS<256 THEN RETURN;
+      281     2130    1      IF CURR$->G$ROAVAIL.NWORDS + POFFW(CURR$,G$ROS$) ~= 256 * PCROS
+      282     2131    1      THEN RETURN;
+      283     2132
+      284     2133    1      IF MOD(CURR$->G$ROAVAIL.NWORDS,256) = 0
+      285     2134    2      THEN DO;
+      286     2135    2           IF PREV$ = ADDR(NIL)            /*Rel all of first block*/
+      287     2136    2           THEN G$ROS$->G$ROS.AVAIL$ = ADDR(NIL);
+      288     2137    2           ELSE IF PREV$ = CURR$           /*Rel PREV+CURR*/
+      289     2138    3                THEN DO;
+      290     2139    3                     PREV$ = ADDR(G$ROS$->G$ROS.AVAIL$);
+      291     2140    4                     DO WHILE (PREV$->G$ROAVAIL.NEXT$ ~= CURR$);
+      292     2141    4                          PREV$ = PREV$->G$ROAVAIL.NEXT$;
+      293     2142    4                          END;
+      294     2143    3                     PREV$->G$ROAVAIL.NEXT$ = ADDR(NIL);
+      295     2144    3                     END;
+      296     2145                                                /*Rel CURR, not first*/
+      297     2146    2                ELSE PREV$->G$ROAVAIL.NEXT$ = ADDR(NIL);
+      298     2147    2           END;
+      299     2148
+      300     2149    1      GM#PGSZ = CURR$->G$ROAVAIL.NWORDS/256;
+      301     2150    1      CURR$->G$ROAVAIL.NWORDS = MOD(CURR$->G$ROAVAIL.NWORDS,256);
+      302     2151
+      303     2152    1      CALL GMA$REL(%GM_ROS#,GM#PGSZ) ALTRET(BADREL);
+      304     2153
+      305     2154    1      CALL GMA$REL_ACCTMEM(GM#PGSZ) ALTRET(BADREL);
+      306     2155
+      307     2156    1      G$JIT.PCROS = G$JIT.PCROS - GM#PGSZ;
+      308     2157    1      RETURN;
+      309     2158
+      310     2159
+      311     2160    1   BADREL: ;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:10   
+      312     2161    1      CALL SCREECH(SBADRO);
+      313     2162    1      BLK$ = ADDR(NIL);
+      314     2163    1      RETURN;
+      315     2164
+      316     2165        /*S*    SCREECH_CODE:  GFS-S$FSBADRO
+      317     2166                TYPE: SNAP
+      318     2167                MESSAGE: Read-Only Segment Space Foulup.
+      319     2168        */
+      320     2169    1   END;
+      321     2170        %EOD;
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:11   
+--  Include file information  --
+
+   F_SCODE_C.:E05TOU  is referenced.
+   MM_SCODE_C.:E05TOU  is referenced.
+   GM_VIRTUAL_E.:E05TOU  is referenced.
+   GM_MACRO_M.:E05TOU  is referenced.
+   G_ROS_M.:E05TOU  is referenced.
+   G_JIT_M.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GFS$GSP.
+
+   Procedure GFS$GSP requires 572 words for executable code.
+   Procedure GFS$GSP requires 32 words of local(AUTO) storage.
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:12   
+
+ Object Unit name= GFS$GSP                                    File name= GFS$ROSPACE.:E05TOU
+ UTS= JUL 29 '97 21:32:30.76 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0  RoData even  UTS      6      6  GFS$GSP
+    1   Proc  even  none   572    23C  GFS$GSP
+    2  RoData even  none     4      4  GFS$GSP
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes    yes     yes      Std        3  GFS$GSP
+     1    10A          yes     yes      Std        2  GFS$RSP
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 SCREECH
+ yes     yes           Std       5 GMA$GET
+ yes     yes           Std       1 GMA$REL_ACCTMEM
+ yes     yes           Std       1 GMA$CHKSIZE
+ yes     yes           Std       2 GMA$REL
+                       nStd      0 X6A_AUTO_3
+                       nStd      0 X6A_AALT
+                       nStd      0 X6A_ARET
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:13   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+r    G$JIT$                           r    G$ROS$                                GM_ROS_PGSZ
+r    G$ROS$
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:14   
+
+
+        1        1        /*M* GFS$ROSPACE  LCP-6 Read-Only Segment space manager. */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* PLM=3,IND=5,ENU=0,ECU=0,CRM=70  */
+        8        8        /*P*     NAME:    GFS$ROSPACE
+        9        9
+       10       10                 PURPOSE: To manage the free space in the Read Only Segment.
+       11       11        */
+       12       12
+       13       13        /*F*     NAME:    GFS$GSP
+       14       14
+       15       15                 PURPOSE: Get a block of space in the Read Only Segment.
+       16       16
+       17       17                 CALL:    CALL GFS$GSP (N,BLK$) ALTRET;
+       18       18                          The alternate return is taken if space cannot be allocated.
+       19       19
+       20       20                 INPUT:   N = number of words needed
+       21       21
+       22       22                          G$JIT.PCROS = number of pages currently in the ROS
+       23       23                          G$ROS.AVAIL$ = poniter to the available ROS blocks
+       24       24
+       25       25                 OUTPUT:  BLK$ = pointer to the block allocated
+       26       26
+       27       27                          ERR - contains the error code if the ALTRET is taken
+       28       28
+       29       29                          G$ROS.AVAIL$  = updated pointer to available ROS blocks
+       30       30
+       31       31                 DESCRIPTION:  The free space chain is examined, and if an
+       32       32                               available block is found, it is unlinked from
+       33       33                               the free space chain and the address of the
+       34       34                               allocated area is returned in BLK$.  If necessary
+       35       35                               additional pages will be obtained in the Read Only
+       36       36                               Segment.
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:15   
+       37       37        */
+       38       38
+       39       39
+       40       40        GFS$GSP: PROC(N,BLK$,ERR) ALTRET;
+
+     40   1 000000  D380 0000 0000  xent GFS$GSP         LNJ,B5   X6A_AUTO_3
+          1 000003       0020 0003                       DC       32,3
+
+       41       41
+       42       42        %INCLUDE G_JIT_M;
+       43      307        %INCLUDE G_ROS_M;
+       44      389 S      %INCLUDE GU_LCP6_M;
+       45      390
+       46      391 S      %INCLUDE G_LCP6_E;
+       47      392        %INCLUDE GM_MACRO_M;
+       48      874        %INCLUDE GM_VIRTUAL_E;
+       49     1084
+       50     1085        %INCLUDE MM_SCODE_C;
+       51     1132        %INCLUDE F_SCODE_C;
+       52     1168
+       53     1169                                                /* Input Parameters         */
+       54     1170    1   DCL N SBIN;                   /* Number of words to get or return   */
+       55     1171    1   DCL BLK$ PTR;                      /* Will be set to space obtained */
+       56     1172                                           /* or points to space to free    */
+       57     1173        %VLP_ERRCODE (FPTN=ERR, STCLASS=PARAM);
+       58     1219
+       59     1220                                                /* Auto Storage             */
+       60     1221    1   DCL CURR$ PTR;           /* Points to current available ROS block   */
+       61     1222    1   DCL PREV$ PTR;                /* Points to prev available ROS block */
+       62     1223    1   DCL NEW$ PTR;                 /* Points to new first avail block    */
+       63     1224    1   DCL GM#PGSZ SBIN;             /* # of pages for MM to get or free   */
+       64     1225    1   DCL PCROS UBIN;               /* initial ROS pgs + user ROS pages   */
+       65     1226
+       66     1227        %GM_CHKSZ_PARAMS (FPTN=CHKSZ, STCLASS=AUTO);
+       67     1321
+       68     1322                                                /* External Data            */
+       69     1323    1   DCL G$JIT$ PTR SYMREF READONLY;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:16   
+       70     1324    1   DCL G$ROS$ PTR SYMREF READONLY;
+       71     1325    1   DCL GM_ROS_PGSZ UBIN SYMREF;
+       72     1326
+       73     1327                                                /* BASED Data               */
+       74     1328        %G$JIT (STCLASS="BASED(G$JIT$)");
+       75     1742        %G$ROS (STCLASS="BASED(G$ROS$)");
+       76     1786        %G$ROS_AVAIL_HDR (FPTN=G$ROAVAIL);
+       77     1806
+       78     1807                                                /* Internal Data            */
+       79     1808        %VLP_SCODE (FPTN=SMMFAILED,ERR#=%S$MM49,SEV=G_SEV_SNAP#,
+       80     1809                            STCLASS=CONSTANT,FCG=GF,MID=S,MON='1'B);
+       81     1870
+       82     1871
+       83     1872        %VLP_SCODE (FPTN=SBADRO,ERR#=%S$FSBADRO,SEV=G_SEV_SNAP#,
+       84     1873                            STCLASS=CONSTANT,FCG=GF,MID=S,MON='1'B);
+       85     1934
+       86     1935                                                /* External Procedures      */
+       87     1936    1   DCL GMA$GET ENTRY(5)ALTRET;
+       88     1937    1   DCL GMA$REL ENTRY(2) ALTRET;
+       89     1938    1   DCL GMA$CHKSIZE ENTRY(1) ALTRET;
+       90     1939    1   DCL GMA$REL_ACCTMEM ENTRY(1) ALTRET;
+       91     1940    1   DCL SCREECH ENTRY(1);
+       92     1941
+       93     1942        %EJECT;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:17   
+       94     1943    1      PCROS = GM_ROS_PGSZ + G$JIT.PCROS;
+
+   1943   1 000005  EC80 0000 0000  xsym                 LDB,B6   G$JIT$
+          1 000008  E800 0000 0000  xsym                 LDR,R6   GM_ROS_PGSZ
+          1 00000B  EA46 0086                            ADD,R6   134,B6
+          1 00000D  EF47 0011                            STR,R6   PCROS,AUTO
+
+       95     1944    1      IF N < SIZEW(G$ROAVAIL)
+
+   1944   1 00000F  DCC7 0004                            LDB,B5   @N,AUTO
+          1 000011  D805                                 LDR,R5   ,B5
+          1 000012  5D03                                 CMV,R5   3
+          1 000013  0881 000D                            BAGE     s:1944,PREL
+
+       96     1945    2      THEN DO;
+
+       97     1946    2           CALL SCREECH(SBADRO);
+
+   1946   1 000015  BB80 0000 0000  02                   LAB,B3   0
+          1 000018  CBF0 0100                            LAB,B4   256,IMO
+          1 00001A  E380 0000 0000  xent                 LNJ,B6   SCREECH
+          1 00001D       0001                            DC       s:1947,PREL
+
+       98     1947    2           ALTRETURN;
+
+   1947   1 00001E  C380 0000 0000  xent                 LNJ,B4   X6A_AALT
+
+   1944   1                              GSPLOOP         null
+       99     1948    2           END;
+      100     1949
+      101     1950    1   GSPLOOP:;
+      102     1951    1      PREV$ = ADDR(NIL);
+
+   1951   1 000021  EB80 0000 0000       GSPLOOP         LAB,B6   0
+          1 000024  EFC7 000C                            STB,B6   PREV$,AUTO
+
+      103     1952    1      CURR$ = G$ROS$->G$ROS.AVAIL$;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:18   
+
+   1952   1 000026  DC80 0000 0000  xsym                 LDB,B5   G$ROS$
+          1 000029  CCC5 000A                            LDB,B4   10,B5
+          1 00002B  CFC7 000A                            STB,B4   CURR$,AUTO
+
+      104     1953
+      105     1954    2      DO WHILE('1'B);
+
+      106     1955    3           DO WHILE (CURR$ ~= ADDR(NIL));
+
+   1955   1 00002D  0F81 003F                            B        s:1996,PREL
+
+      107     1956
+      108     1957        /* If there is a block large enough, use it.  If larger than what
+      109     1958           is needed, build a new G$ROAVAIL header in the first 3 words of
+      110     1959           what is left over.
+      111     1960        */
+      112     1961    3                IF (CURR$->G$ROAVAIL.NWORDS = N) OR
+
+   1961   1 00002F  ECC7 000A                            LDB,B6   CURR$,AUTO
+          1 000031  DCC7 0004                            LDB,B5   @N,AUTO
+          1 000033  E846 0002                            LDR,R6   2,B6
+          1 000035  6801 0004                            BLZ,R6   s:1961+11,PREL
+          1 000037  E905                                 CMR,R6   ,B5
+          1 000038  0901 0008                            BE       s:1964,PREL
+          1 00003A  D805                                 LDR,R5   ,B5
+          1 00003B  5E03                                 ADV,R5   3
+          1 00003C  5801 0004                            BLZ,R5   s:1964,PREL
+          1 00003E  D956                                 CMR,R5   R6
+          1 00003F  0301 0028                            BG       s:1994,PREL
+
+      113     1962    3                  (CURR$->G$ROAVAIL.NWORDS >= (N + SIZEW(G$ROAVAIL)) )
+      114     1963    4                THEN DO;
+
+      115     1964    4                     IF CURR$->G$ROAVAIL.NWORDS > N
+
+   1964   1 000041  6801 0004                            BLZ,R6   s:1966,PREL
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:19   
+          1 000043  E905                                 CMR,R6   ,B5
+          1 000044  0A81 000D                            BALE     s:1977,PREL
+
+      116     1965    5                     THEN DO;
+
+      117     1966    5                          NEW$ = PINCRW(CURR$,N);
+
+   1966   1 000046  B805                                 LDR,R3   ,B5
+          1 000047  CBB6                                 LAB,B4   ,B6,R3
+          1 000048  CFC7 000E                            STB,B4   NEW$,AUTO
+
+      118     1967    5                          NEW$->G$ROAVAIL.NEXT$ = CURR$->G$ROAVAIL.NEXT$;
+
+   1967   1 00004A  BC86                                 LDB,B3   ,B6
+          1 00004B  BF84                                 STB,B3   ,B4
+
+      119     1968    5                          NEW$->G$ROAVAIL.NWORDS = CURR$->G$ROAVAIL.NWORDS-N;
+
+   1968   1 00004C  E846 0002                            LDR,R6   2,B6
+          1 00004E  E205                                 SUB,R6   ,B5
+          1 00004F  EF44 0002                            STR,R6   2,B4
+
+      120     1969    5                          CURR$->G$ROAVAIL.NEXT$ = NEW$;
+
+   1969   1 000051  CF86                                 STB,B4   ,B6
+
+      121     1970    5                          END /*do if using partial block */;
+
+      122     1971
+      123     1972    4                     ELSE /* its an exact fix */;
+      124     1973
+      125     1974        /* If the block used was the head of the chain, the head is reset
+      126     1975           to be what was the link pointer in the block used.
+      127     1976        */
+      128     1977    4                     IF PREV$ = ADDR(NIL)
+
+   1977   1 000052  8DC7 000C                            CMN      PREV$,AUTO
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:20   
+          1 000054  0981 0009                            BNE      s:1983,PREL
+
+      129     1978    4                     THEN G$ROS$->G$ROS.AVAIL$ = CURR$->G$ROAVAIL.NEXT$;
+
+   1978   1 000056  CC86                                 LDB,B4   ,B6
+          1 000057  BC80 0000 0000  xsym                 LDB,B3   G$ROS$
+          1 00005A  CFC3 000A                            STB,B4   10,B3
+          1 00005C  0F81 0005                            B        s:1988,PREL
+
+      130     1979
+      131     1980        /* If not the head of the chain, the link word in the previous block
+      132     1981           is reset to the link word from the used block.
+      133     1982        */
+      134     1983    4                     ELSE PREV$->G$ROAVAIL.NEXT$ = CURR$->G$ROAVAIL.NEXT$;
+
+   1983   1 00005E  CC86                                 LDB,B4   ,B6
+          1 00005F  BCC7 000C                            LDB,B3   PREV$,AUTO
+          1 000061  CF83                                 STB,B4   ,B3
+
+      135     1984
+      136     1985        /* The address of the block is moved to BLK$ and control returns
+      137     1986           to the caller.
+      138     1987        */
+      139     1988    4                     BLK$ = CURR$;
+
+   1988   1 000062  CCC7 0006                            LDB,B4   @BLK$,AUTO
+          1 000064  EF84                                 STB,B6   ,B4
+
+      140     1989    4                     RETURN;
+
+   1989   1 000065  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      141     1990    4                     END /* do if block is useable*/;
+      142     1991
+      143     1992        /* This block wasn't big enough - keep looking.
+      144     1993        */
+      145     1994    3                PREV$ = CURR$;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:21   
+
+   1994   1 000068  EFC7 000C                            STB,B6   PREV$,AUTO
+
+      146     1995    3                CURR$ = PREV$->G$ROAVAIL.NEXT$;
+
+   1995   1 00006A  CC86                                 LDB,B4   ,B6
+          1 00006B  CFC7 000A                            STB,B4   CURR$,AUTO
+
+      147     1996    3                END /* do while CURR$ ~= NIL */;
+
+   1996   1 00006D  8DC7 000A                            CMN      CURR$,AUTO
+          1 00006F  09C0                                 BNE      s:1961,SPREL
+
+      148     1997
+      149     1998        /* If no available block is big enough, get another page in the
+      150     1999           Read Only Segment.  Altret if ROS is already fully allocated
+      151     2000           or the user has allocated all memory available to him.
+      152     2001        */
+      153     2002    2           GM#PGSZ = (N + 255) /256;
+
+   2002   1 000070  ECC7 0004                            LDB,B6   @N,AUTO
+          1 000072  E806                                 LDR,R6   ,B6
+          1 000073  EA70 00FF                            ADD,R6   255,IMO
+          1 000075  E370 0100                            DIV,R6   256,IMO
+          1 000077  EF47 0010                            STR,R6   GM#PGSZ,AUTO
+
+      154     2003
+      155     2004    2           CHKSZ = '0'B;
+
+   2004   1 000079  5C08                                 LDV,R5   8
+          1 00007A  0021                                 ALR      ;
+          1 00007B       4178 0000                                ALPHANUM('0000'X,IMO,,1),;
+          1 00007D       4007 0012                                ALPHANUM(CHKSZ,AUTO,,R5,FILL)
+
+      156     2005    2           CHKSZ.SIZE = GM#PGSZ;
+
+   2005   1 00007F  437F                                 CSYNC    s:2004+5,SPREL
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:22   
+          1 000080  EF47 0012                            STR,R6   CHKSZ,AUTO
+
+      157     2006    2           CHKSZ.FLGS.REQ_ALL = '1'B;
+
+   2006   1 000082  8947 0015                            LBT,'4000'X       CHKSZ+3,AUTO
+   2006   1 000084       4000
+
+      158     2007    2           CHKSZ.FLGS.PARK = '1'B;
+
+   2007   1 000085  8947 0015                            LBT,'2000'X       CHKSZ+3,AUTO
+   2007   1 000087       2000
+
+      159     2008    2           CALL GMA$CHKSIZE(CHKSZ)
+
+   2008   1 000088  DBC7 0012                            LAB,B5   CHKSZ,AUTO
+          1 00008A  DFC7 0016                            STB,B5   CHKSZ+4,AUTO
+          1 00008C  BBC7 0016                            LAB,B3   CHKSZ+4,AUTO
+          1 00008E  CBF0 0100                            LAB,B4   256,IMO
+          1 000090  E380 0000 0000  xent                 LNJ,B6   GMA$CHKSIZE
+          1 000093       0003                            DC       s:2010,PREL
+          1 000094  0F81 0009                            B        s:2014,PREL
+
+      160     2009    3           WHENALTRETURN DO;
+
+      161     2010    3                ERR = CHKSZ.ERR;
+
+   2010   1 000096  8CC7 0013                            LDI      CHKSZ+1,AUTO
+          1 000098  ECC7 0008                            LDB,B6   @ERR,AUTO
+          1 00009A  8D06                                 SDI      ,B6
+
+      162     2011    3                ALTRETURN;
+
+   2011   1 00009B  C380 0000 0000  xent                 LNJ,B4   X6A_AALT
+
+      163     2012    3                END;
+      164     2013
+      165     2014    2           CALL GMA$GET(%GM_ROS#,GM#PGSZ,%G_R_USR#,%G_R_MON#,%G_RING0#)
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:23   
+
+   2014   1 00009E  EBF0 0001                            LAB,B6   1,IMO
+          1 0000A0  DBF0 0000                            LAB,B5   0,IMO
+          1 0000A2  CBF0 8000                            LAB,B4   -32768,IMO
+          1 0000A4  BBF0 C000                            LAB,B3   -16384,IMO
+          1 0000A6  BFC7 001E                            STB,B3   CHKSZ+12,AUTO
+          1 0000A8  CFC7 001C                            STB,B4   CHKSZ+10,AUTO
+          1 0000AA  DFC7 001A                            STB,B5   CHKSZ+8,AUTO
+          1 0000AC  ABC7 0010                            LAB,B2   GM#PGSZ,AUTO
+          1 0000AE  AFC7 0018                            STB,B2   CHKSZ+6,AUTO
+          1 0000B0  EFC7 0016                            STB,B6   CHKSZ+4,AUTO
+          1 0000B2  BBC7 0016                            LAB,B3   CHKSZ+4,AUTO
+          1 0000B4  CBF0 0500                            LAB,B4   1280,IMO
+          1 0000B6  E380 0000 0000  xent                 LNJ,B6   GMA$GET
+          1 0000B9       0003                            DC       s:2016,PREL
+          1 0000BA  0F81 000D                            B        s:2020,PREL
+
+      166     2015    3           WHENALTRETURN DO;
+
+      167     2016    3                CALL SCREECH(SMMFAILED);
+
+   2016   1 0000BC  BB80 0000 0002  02                   LAB,B3   +2
+          1 0000BF  CBF0 0100                            LAB,B4   256,IMO
+          1 0000C1  E380 0000 0000  xent                 LNJ,B6   SCREECH
+          1 0000C4       0001                            DC       s:2017,PREL
+
+      168     2017    3                ALTRETURN;
+
+   2017   1 0000C5  C380 0000 0000  xent                 LNJ,B4   X6A_AALT
+
+      169     2018    3                END;
+      170     2019
+      171     2020    2           CURR$ = PINCRW(G$ROS$,256 * PCROS);
+
+   2020   1 0000C8  F847 0011                            LDR,R7   PCROS,AUTO
+          1 0000CA  6C00                                 LDV,R6   0
+          1 0000CB  7088                                 DOL,R7   8
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:24   
+          1 0000CC  8400 0000 0000  xsym                 AID      G$ROS$
+          1 0000CF  8D47 000A                            SDI      CURR$,AUTO
+
+      172     2021    2           G$JIT.PCROS = G$JIT.PCROS + GM#PGSZ;
+
+   2021   1 0000D1  EC80 0000 0000  xsym                 LDB,B6   G$JIT$
+          1 0000D4  D846 0086                            LDR,R5   134,B6
+          1 0000D6  DA47 0010                            ADD,R5   GM#PGSZ,AUTO
+          1 0000D8  DF46 0086                            STR,R5   134,B6
+
+      173     2022
+      174     2023    2           CURR$->G$ROAVAIL.NEXT$ = ADDR(NIL);
+
+   2023   1 0000DA  DB80 0000 0000                       LAB,B5   0
+          1 0000DD  CCC7 000A                            LDB,B4   CURR$,AUTO
+          1 0000DF  DF84                                 STB,B5   ,B4
+
+      175     2024    2           CURR$->G$ROAVAIL.NWORDS = 256;
+
+   2024   1 0000E0  D870 0100                            LDR,R5   256,IMO
+          1 0000E2  DF44 0002                            STR,R5   2,B4
+
+      176     2025
+      177     2026        /* If there were no available blocks to begin with, the new page
+      178     2027           address becomes the first header.
+      179     2028        */
+      180     2029    2           IF PREV$ = ADDR(NIL)
+
+   2029   1 0000E4  8DC7 000C                            CMN      PREV$,AUTO
+          1 0000E6  0981 0008                            BNE      s:2036,PREL
+
+      181     2030    2           THEN G$ROS$->G$ROS.AVAIL$ = CURR$;
+
+   2030   1 0000E8  BC80 0000 0000  xsym                 LDB,B3   G$ROS$
+          1 0000EB  CFC3 000A                            STB,B4   10,B3
+          1 0000ED  0F81 FF3F                            B        s:1955,PREL
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:25   
+      182     2031
+      183     2032        /* If the new page was allocated immediately after the last available
+      184     2033           block, the size of that block is reset to include the new page.
+      185     2034        */
+      186     2035    3           ELSE DO;
+
+      187     2036    3                IF PINCRW(PREV$,PREV$->G$ROAVAIL.NWORDS) = CURR$
+
+   2036   1 0000EF  BCC7 000C                            LDB,B3   PREV$,AUTO
+          1 0000F1  B843 0002                            LDR,R3   2,B3
+          1 0000F3  F853                                 LDR,R7   R3
+          1 0000F4  6C00                                 LDV,R6   0
+          1 0000F5  8447 000C                            AID      PREV$,AUTO
+          1 0000F7  8D47 0016                            SDI      CHKSZ+4,AUTO
+          1 0000F9  DCC7 0016                            LDB,B5   CHKSZ+4,AUTO
+          1 0000FB  DDC7 000A                            CMB,B5   CURR$,AUTO
+          1 0000FD  0981 0009                            BNE      s:2046,PREL
+
+      188     2037
+      189     2038    4                THEN DO;
+
+      190     2039    4                     PREV$->G$ROAVAIL.NWORDS = PREV$->G$ROAVAIL.NWORDS+256;
+
+   2039   1 0000FF  C843 0002                            LDR,R4   2,B3
+          1 000101  CA70 0100                            ADD,R4   256,IMO
+          1 000103  CF43 0002                            STR,R4   2,B3
+
+      191     2040    4                     GOTO GSPLOOP;         /*Restart; we lost PREV$.*/
+
+   2040   1 000105  0F81 FF1B                            B        s:1944,PREL
+
+      192     2041    4                     END;
+      193     2042
+      194     2043        /* Otherwise the new block address is set as the link word in the
+      195     2044           previous block.
+      196     2045        */
+      197     2046    3                ELSE PREV$->G$ROAVAIL.NEXT$ = CURR$;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:26   
+
+   2046   1 000107  CF83                                 STB,B4   ,B3
+
+      198     2047    3                END;
+
+      199     2048    2           END /*DO FOREVER*/;
+
+   2048   1 000108  0F81 FF24                            B        s:1955,PREL
+
+      200     2049        %EJECT;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:27   
+      201     2050        /*F*     NAME:    GFS$RSP
+      202     2051
+      203     2052                 PURPOSE: To release a block of space in the Read Only Segment.
+      204     2053
+      205     2054                 CALL:    CALL GFS$RSP (N,BLK$) ALTRET;
+      206     2055
+      207     2056                 INPUT:   N = number of words to return
+      208     2057                          BLK$ = pointer of the block to be returned
+      209     2058
+      210     2059                          G$ROS.AVAIL$ = poniter to the available ROS blocks
+      211     2060                               block is returned to the caller.
+      212     2061
+      213     2062                 OUTPUT:  BLK$ = ADDR(NIL)
+      214     2063
+      215     2064                          G$ROS.AVAIL$  = updated pointer to available ROS blocks
+      216     2065
+      217     2066                 DESCRIPTION: The block is added to the free space chain.
+      218     2067                              If this yields free pages, they are returned
+      219     2068                              memory management.
+      220     2069        */
+      221     2070    1   GFS$RSP: ENTRY(N,BLK$) ALTRET;
+
+   2070   1 00010A  D380 0000 0000  xent GFS$RSP         LNJ,B5   X6A_AUTO_3
+          1 00010D       0020 0003                       DC       32,3
+
+      222     2071    1      PCROS = GM_ROS_PGSZ + G$JIT.PCROS;
+
+   2071   1 00010F  EC80 0000 0000  xsym                 LDB,B6   G$JIT$
+          1 000112  E800 0000 0000  xsym                 LDR,R6   GM_ROS_PGSZ
+          1 000115  EA46 0086                            ADD,R6   134,B6
+          1 000117  EF47 0011                            STR,R6   PCROS,AUTO
+
+      223     2072
+      224     2073    1      IF N < SIZEW(G$ROAVAIL) THEN GOTO BADREL;
+
+   2073   1 000119  DCC7 0004                            LDB,B5   @N,AUTO
+          1 00011B  D805                                 LDR,R5   ,B5
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:28   
+          1 00011C  5D03                                 CMV,R5   3
+          1 00011D  0801 010C                            BAL      s:2156,PREL
+
+      225     2074
+      226     2075    1      PREV$ = ADDR(NIL);
+
+   2075   1 00011F  CB80 0000 0000                       LAB,B4   0
+          1 000122  CFC7 000C                            STB,B4   PREV$,AUTO
+
+      227     2076    1      CURR$ = G$ROS$->G$ROS.AVAIL$;
+
+   2076   1 000124  BC80 0000 0000  xsym                 LDB,B3   G$ROS$
+          1 000127  ACC3 000A                            LDB,B2   10,B3
+          1 000129  AFC7 000A                            STB,B2   CURR$,AUTO
+
+      228     2077
+      229     2078    2      DO WHILE ((CURR$ ~= ADDR(NIL)) AND (BLK$ > CURR$));
+
+   2078   1 00012B  0F81 0008                            B        s:2081,PREL
+
+      230     2079    2           PREV$ = CURR$;
+
+   2079   1 00012D  ECC7 000A                            LDB,B6   CURR$,AUTO
+          1 00012F  EFC7 000C                            STB,B6   PREV$,AUTO
+
+      231     2080    2           CURR$ = CURR$->G$ROAVAIL.NEXT$;
+
+   2080   1 000131  DC86                                 LDB,B5   ,B6
+          1 000132  DFC7 000A                            STB,B5   CURR$,AUTO
+
+      232     2081    2           END;
+
+   2081   1 000134  8DC7 000A                            CMN      CURR$,AUTO
+          1 000136  0901 0007                            BE       s:2087,PREL
+          1 000138  ECC7 0006                            LDB,B6   @BLK$,AUTO
+          1 00013A  DC86                                 LDB,B5   ,B6
+          1 00013B  DDC7 000A                            CMB,B5   CURR$,AUTO
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:29   
+          1 00013D  0370                                 BG       s:2079,SPREL
+
+      233     2082
+      234     2083        /* If the block to be released immediately precedes a currently
+      235     2084           available block, the link header is built in the block being
+      236     2085           released and the size includes both.
+      237     2086        */
+      238     2087    1      IF (PINCRW(BLK$,N) = CURR$)
+
+   2087   1 00013E  ECC7 0004                            LDB,B6   @N,AUTO
+          1 000140  B806                                 LDR,R3   ,B6
+          1 000141  DCC7 0006                            LDB,B5   @BLK$,AUTO
+          1 000143  CC85                                 LDB,B4   ,B5
+          1 000144  BBB4                                 LAB,B3   ,B4,R3
+          1 000145  BDC7 000A                            CMB,B3   CURR$,AUTO
+          1 000147  0981 000D                            BNE      s:2094,PREL
+
+      239     2088    2      THEN DO;
+
+      240     2089    2           BLK$->G$ROAVAIL.NEXT$ = CURR$->G$ROAVAIL.NEXT$;
+
+   2089   1 000149  BCC7 000A                            LDB,B3   CURR$,AUTO
+          1 00014B  AC83                                 LDB,B2   ,B3
+          1 00014C  AF84                                 STB,B2   ,B4
+
+      241     2090    2           BLK$->G$ROAVAIL.NWORDS= CURR$->G$ROAVAIL.NWORDS +N;
+
+   2090   1 00014D  CC85                                 LDB,B4   ,B5
+          1 00014E  E843 0002                            LDR,R6   2,B3
+          1 000150  EA06                                 ADD,R6   ,B6
+          1 000151  EF44 0002                            STR,R6   2,B4
+
+      242     2091    2           END;
+
+   2091   1 000153  0F81 000B                            B        s:2105,PREL
+
+      243     2092
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:30   
+      244     2093    2      ELSE DO;
+
+      245     2094    2           IF BLK$ = CURR$
+
+   2094   1 000155  CDC7 000A                            CMB,B4   CURR$,AUTO
+          1 000157  0901 00D2                            BE       s:2156,PREL
+
+      246     2095    2           THEN GOTO BADREL;
+      247     2096
+      248     2097    3           ELSE DO;
+
+      249     2098    3                BLK$->G$ROAVAIL.NWORDS = N;
+
+   2098   1 000159  BF44 0002                            STR,R3   2,B4
+
+      250     2099    3                BLK$->G$ROAVAIL.NEXT$ = CURR$;
+
+   2099   1 00015B  CC85                                 LDB,B4   ,B5
+          1 00015C  BCC7 000A                            LDB,B3   CURR$,AUTO
+          1 00015E  BF84                                 STB,B3   ,B4
+
+      251     2100    3                END;
+
+      252     2101    2           END;
+
+      253     2102
+      254     2103        /* Set CURR$ to the addr of the (maybe combined) new block.
+      255     2104        */
+      256     2105    1      CURR$ = BLK$;
+
+   2105   1 00015F  CC85                                 LDB,B4   ,B5
+          1 000160  CFC7 000A                            STB,B4   CURR$,AUTO
+
+      257     2106
+      258     2107    1      BLK$ = ADDR(NIL);
+
+   2107   1 000162  BB80 0000 0000                       LAB,B3   0
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:31   
+          1 000165  BF85                                 STB,B3   ,B5
+
+      259     2108    1      IF PREV$ ~= ADDR(NIL)                /*Not first block*/
+
+   2108   1 000166  8DC7 000C                            CMN      PREV$,AUTO
+          1 000168  0901 0020                            BE       s:2125,PREL
+
+      260     2109    2      THEN DO;
+
+      261     2110    2           IF PINCRW(PREV$,PREV$->G$ROAVAIL.NWORDS) = CURR$
+
+   2110   1 00016A  ACC7 000C                            LDB,B2   PREV$,AUTO
+          1 00016C  B842 0002                            LDR,R3   2,B2
+          1 00016E  F853                                 LDR,R7   R3
+          1 00016F  6C00                                 LDV,R6   0
+          1 000170  8447 000C                            AID      PREV$,AUTO
+          1 000172  8D47 0016                            SDI      CHKSZ+4,AUTO
+          1 000174  BCC7 0016                            LDB,B3   CHKSZ+4,AUTO
+          1 000176  BDC7 000A                            CMB,B3   CURR$,AUTO
+          1 000178  0981 000D                            BNE      s:2120,PREL
+
+      262     2111    3           THEN DO;
+
+      263     2112    3                PREV$->G$ROAVAIL.NWORDS = PREV$->G$ROAVAIL.NWORDS+
+
+   2112   1 00017A  D842 0002                            LDR,R5   2,B2
+          1 00017C  DA44 0002                            ADD,R5   2,B4
+          1 00017E  DF42 0002                            STR,R5   2,B2
+
+      264     2113    3                  CURR$->G$ROAVAIL.NWORDS;
+      265     2114    3                PREV$->G$ROAVAIL.NEXT$ = CURR$->G$ROAVAIL.NEXT$;
+
+   2114   1 000180  BC84                                 LDB,B3   ,B4
+          1 000181  BF82                                 STB,B3   ,B2
+
+      266     2115    3                CURR$ = PREV$;
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:32   
+   2115   1 000182  AFC7 000A                            STB,B2   CURR$,AUTO
+
+      267     2116    3                END;
+
+   2116   1 000184  0F81 0009                            B        s:2128,PREL
+
+      268     2117
+      269     2118        /* Not first block, not next to prev block.
+      270     2119        */
+      271     2120    2           ELSE PREV$->G$ROAVAIL.NEXT$ = CURR$;
+
+   2120   1 000186  CF82                                 STB,B4   ,B2
+
+      272     2121    2           END/* do if PREV$ ~= NIL */;
+
+   2121   1 000187  0F81 0006                            B        s:2128,PREL
+
+      273     2122
+      274     2123        /* First block
+      275     2124        */
+      276     2125    1      ELSE G$ROS$->G$ROS.AVAIL$ = CURR$;
+
+   2125   1 000189  AC80 0000 0000  xsym                 LDB,B2   G$ROS$
+          1 00018C  CFC2 000A                            STB,B4   10,B2
+
+      277     2126
+      278     2127
+      279     2128    1      IF CURR$->G$ROAVAIL.NEXT$ ~= ADDR(NIL) THEN RETURN;
+
+   2128   1 00018E  CCC7 000A                            LDB,B4   CURR$,AUTO
+          1 000190  8D84                                 CMN      ,B4
+          1 000191  0901 0004                            BE       s:2129,PREL
+
+   2128   1 000193  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      280     2129    1      IF CURR$->G$ROAVAIL.NWORDS<256 THEN RETURN;
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:33   
+   2129   1 000196  E844 0002                            LDR,R6   2,B4
+          1 000198  E970 0100                            CMR,R6   256,IMO
+          1 00019A  0281 0004                            BGE      s:2130,PREL
+
+   2129   1 00019C  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      281     2130    1      IF CURR$->G$ROAVAIL.NWORDS + POFFW(CURR$,G$ROS$) ~= 256 * PCROS
+
+   2130   1 00019F  8CC7 000A                            LDI      CURR$,AUTO
+          1 0001A1  8480 0000 0000  xsym                 SID      G$ROS$
+          1 0001A4  8D47 0016                            SDI      CHKSZ+4,AUTO
+          1 0001A6  F844 0002                            LDR,R7   2,B4
+          1 0001A8  6C00                                 LDV,R6   0
+          1 0001A9  8447 0016                            AID      CHKSZ+4,AUTO
+          1 0001AB  8D47 0018                            SDI      CHKSZ+6,AUTO
+          1 0001AD  F847 0011                            LDR,R7   PCROS,AUTO
+          1 0001AF  6C00                                 LDV,R6   0
+          1 0001B0  7088                                 DOL,R7   8
+          1 0001B1  84C7 0018                            SID      CHKSZ+6,AUTO
+          1 0001B3  6981 0003                            BNEZ,R6  s:2131,PREL
+          1 0001B5  7901 0004                            BEZ,R7   s:2133,PREL
+
+      282     2131    1      THEN RETURN;
+
+   2131   1 0001B7  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      283     2132
+      284     2133    1      IF MOD(CURR$->G$ROAVAIL.NWORDS,256) = 0
+
+   2133   1 0001BA  E844 0002                            LDR,R6   2,B4
+          1 0001BC  E570 00FF                            AND,R6   255,IMO
+          1 0001BE  6981 0036                            BNEZ,R6  s:2149,PREL
+
+      285     2134    2      THEN DO;
+
+      286     2135    2           IF PREV$ = ADDR(NIL)            /*Rel all of first block*/
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:34   
+   2135   1 0001C0  8DC7 000C                            CMN      PREV$,AUTO
+          1 0001C2  0981 000B                            BNE      s:2137,PREL
+
+      287     2136    2           THEN G$ROS$->G$ROS.AVAIL$ = ADDR(NIL);
+
+   2136   1 0001C4  BB80 0000 0000                       LAB,B3   0
+          1 0001C7  AC80 0000 0000  xsym                 LDB,B2   G$ROS$
+          1 0001CA  BFC2 000A                            STB,B3   10,B2
+          1 0001CC  0F81 0028                            B        s:2149,PREL
+
+      288     2137    2           ELSE IF PREV$ = CURR$           /*Rel PREV+CURR*/
+
+   2137   1 0001CE  BCC7 000C                            LDB,B3   PREV$,AUTO
+          1 0001D0  BDC7 000A                            CMB,B3   CURR$,AUTO
+          1 0001D2  0981 001E                            BNE      s:2146,PREL
+
+      289     2138    3                THEN DO;
+
+      290     2139    3                     PREV$ = ADDR(G$ROS$->G$ROS.AVAIL$);
+
+   2139   1 0001D4  AC80 0000 0000  xsym                 LDB,B2   G$ROS$
+          1 0001D7  9BC2 000A                            LAB,B1   10,B2
+          1 0001D9  9FC7 000C                            STB,B1   PREV$,AUTO
+
+      291     2140    4                     DO WHILE (PREV$->G$ROAVAIL.NEXT$ ~= CURR$);
+
+   2140   1 0001DB  BC81                                 LDB,B3   ,B1
+          1 0001DC  BDC7 000A                            CMB,B3   CURR$,AUTO
+          1 0001DE  0901 000A                            BE       s:2143,PREL
+
+      292     2141    4                          PREV$ = PREV$->G$ROAVAIL.NEXT$;
+
+   2141   1 0001E0  ECC7 000C                            LDB,B6   PREV$,AUTO
+          1 0001E2  DC86                                 LDB,B5   ,B6
+          1 0001E3  DFC7 000C                            STB,B5   PREV$,AUTO
+
+      293     2142    4                          END;
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:35   
+
+   2142   1 0001E5  EC85                                 LDB,B6   ,B5
+          1 0001E6  EDC7 000A                            CMB,B6   CURR$,AUTO
+          1 0001E8  09F8                                 BNE      s:2141,SPREL
+
+      294     2143    3                     PREV$->G$ROAVAIL.NEXT$ = ADDR(NIL);
+
+   2143   1 0001E9  EB80 0000 0000                       LAB,B6   0
+          1 0001EC  DCC7 000C                            LDB,B5   PREV$,AUTO
+          1 0001EE  EF85                                 STB,B6   ,B5
+
+      295     2144    3                     END;
+
+   2144   1 0001EF  0F81 0005                            B        s:2149,PREL
+
+      296     2145                                                /*Rel CURR, not first*/
+      297     2146    2                ELSE PREV$->G$ROAVAIL.NEXT$ = ADDR(NIL);
+
+   2146   1 0001F1  AB80 0000 0000                       LAB,B2   0
+          1 0001F4  AF83                                 STB,B2   ,B3
+
+      298     2147    2           END;
+
+      299     2148
+      300     2149    1      GM#PGSZ = CURR$->G$ROAVAIL.NWORDS/256;
+
+   2149   1 0001F5  ECC7 000A                            LDB,B6   CURR$,AUTO
+          1 0001F7  E846 0002                            LDR,R6   2,B6
+          1 0001F9  6048                                 SOR,R6   8
+          1 0001FA  EF47 0010                            STR,R6   GM#PGSZ,AUTO
+
+      301     2150    1      CURR$->G$ROAVAIL.NWORDS = MOD(CURR$->G$ROAVAIL.NWORDS,256);
+
+   2150   1 0001FC  D846 0002                            LDR,R5   2,B6
+          1 0001FE  D570 00FF                            AND,R5   255,IMO
+          1 000200  DF46 0002                            STR,R5   2,B6
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:36   
+      302     2151
+      303     2152    1      CALL GMA$REL(%GM_ROS#,GM#PGSZ) ALTRET(BADREL);
+
+   2152   1 000202  DBF0 0001                            LAB,B5   1,IMO
+          1 000204  CBC7 0010                            LAB,B4   GM#PGSZ,AUTO
+          1 000206  CFC7 0018                            STB,B4   CHKSZ+6,AUTO
+          1 000208  DFC7 0016                            STB,B5   CHKSZ+4,AUTO
+          1 00020A  BBC7 0016                            LAB,B3   CHKSZ+4,AUTO
+          1 00020C  CBF0 0200                            LAB,B4   512,IMO
+          1 00020E  E380 0000 0000  xent                 LNJ,B6   GMA$REL
+          1 000211       0019                            DC       s:2156,PREL
+
+      304     2153
+      305     2154    1      CALL GMA$REL_ACCTMEM(GM#PGSZ) ALTRET(BADREL);
+
+   2154   1 000212  EBC7 0010                            LAB,B6   GM#PGSZ,AUTO
+          1 000214  EFC7 0016                            STB,B6   CHKSZ+4,AUTO
+          1 000216  BBC7 0016                            LAB,B3   CHKSZ+4,AUTO
+          1 000218  CBF0 0100                            LAB,B4   256,IMO
+          1 00021A  E380 0000 0000  xent                 LNJ,B6   GMA$REL_ACCTMEM
+          1 00021D       000D                            DC       s:2156,PREL
+
+      306     2155
+      307     2156    1      G$JIT.PCROS = G$JIT.PCROS - GM#PGSZ;
+
+   2156   1 00021E  EC80 0000 0000  xsym                 LDB,B6   G$JIT$
+          1 000221  E846 0086                            LDR,R6   134,B6
+          1 000223  E247 0010                            SUB,R6   GM#PGSZ,AUTO
+          1 000225  EF46 0086                            STR,R6   134,B6
+
+      308     2157    1      RETURN;
+
+   2157   1 000227  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+   2156   1                              BADREL          null
+      309     2158
+      310     2159
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:37   
+      311     2160    1   BADREL: ;
+      312     2161    1      CALL SCREECH(SBADRO);
+
+   2161   1 00022A  BB80 0000 0000  02   BADREL          LAB,B3   0
+          1 00022D  CBF0 0100                            LAB,B4   256,IMO
+          1 00022F  E380 0000 0000  xent                 LNJ,B6   SCREECH
+          1 000232       0001                            DC       s:2162,PREL
+
+      313     2162    1      BLK$ = ADDR(NIL);
+
+   2162   1 000233  EB80 0000 0000                       LAB,B6   0
+          1 000236  DCC7 0006                            LDB,B5   @BLK$,AUTO
+          1 000238  EF85                                 STB,B6   ,B5
+
+      314     2163    1      RETURN;
+
+   2163   1 000239  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      315     2164
+      316     2165        /*S*    SCREECH_CODE:  GFS-S$FSBADRO
+      317     2166                TYPE: SNAP
+      318     2167                MESSAGE: Read-Only Segment Space Foulup.
+      319     2168        */
+      320     2169    1   END;
+      321     2170        %EOD;
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:38   
+--  Include file information  --
+
+   F_SCODE_C.:E05TOU  is referenced.
+   MM_SCODE_C.:E05TOU  is referenced.
+   GM_VIRTUAL_E.:E05TOU  is referenced.
+   GM_MACRO_M.:E05TOU  is referenced.
+   G_ROS_M.:E05TOU  is referenced.
+   G_JIT_M.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GFS$GSP.
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:39   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData GFS$GSP
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w STRC(48)    r     1 SBADRO                     0-0-0/w STRC(48)    r     1 SMMFAILED
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w PTR         r     1 @BLK$                      8-0-0/w PTR         r     1 @ERR
+     4-0-0/w PTR         r     1 @N                        *0-0-0/w PTR         r     1 BLK$
+    12-0-0/w STRC(64)    r     1 CHKSZ                      A-0-0/w PTR         r     1 CURR$
+    *0-0-0/w STRC(32)    r     1 ERR                       10-0-0/w SBIN(16)    r     1 GM#PGSZ
+    *0-0-0/w SBIN(16)    r     1 N                          E-0-0/w PTR         r     1 NEW$
+    11-0-0/w UBIN(16)    r     1 PCROS                      C-0-0/w PTR         r     1 PREV$
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 G$JIT$                     0-0-0/w PTR         r     1 G$ROS$
+     0-0-0/w UBIN(16)    r     1 GM_ROS_PGSZ
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(5616)  r     1 G$JIT                      0-0-0/w STRC(48)    r     1 G$ROAVAIL
+     0-0-0/w STRC(928)   r     1 G$ROS
+
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:40   
+
+   Procedure GFS$GSP requires 572 words for executable code.
+   Procedure GFS$GSP requires 32 words of local(AUTO) storage.
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:41   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:42   
+          MINI XREF LISTING
+
+BADREL
+      2156**LABEL    2073--GOTO     2095--GOTO     2152--CALLALT  2154--CALLALT
+BLK$
+      1171**DCL        40--PROC     1988<<ASSIGN   2070--ENTRY    2078>>DOWHILE  2087>>IF       2089>>ASSIGN
+      2090>>ASSIGN   2094>>IF       2098>>ASSIGN   2099>>ASSIGN   2105>>ASSIGN   2107<<ASSIGN   2162<<ASSIGN
+CHKSZ
+      1233**DCL      2004<<ASSIGN   2008<>CALL
+CHKSZ.ERR
+      1254**DCL      2010>>ASSIGN
+CHKSZ.FLGS.PARK
+      1301**DCL      2007<<ASSIGN
+CHKSZ.FLGS.REQ_ALL
+      1295**DCL      2006<<ASSIGN
+CHKSZ.SIZE
+      1234**DCL      2005<<ASSIGN
+CURR$
+      1221**DCL      1952<<ASSIGN   1955>>DOWHILE  1961>>IF       1961>>IF       1964>>IF       1966>>ASSIGN
+      1967>>ASSIGN   1968>>ASSIGN   1969>>ASSIGN   1978>>ASSIGN   1983>>ASSIGN   1988>>ASSIGN   1994>>ASSIGN
+      1995<<ASSIGN   2020<<ASSIGN   2023>>ASSIGN   2024>>ASSIGN   2030>>ASSIGN   2036>>IF       2046>>ASSIGN
+      2076<<ASSIGN   2078>>DOWHILE  2078>>DOWHILE  2079>>ASSIGN   2080<<ASSIGN   2080>>ASSIGN   2087>>IF
+      2089>>ASSIGN   2090>>ASSIGN   2094>>IF       2099>>ASSIGN   2105<<ASSIGN   2110>>IF       2112>>ASSIGN
+      2114>>ASSIGN   2115<<ASSIGN   2120>>ASSIGN   2125>>ASSIGN   2128>>IF       2129>>IF       2130>>IF
+      2130>>IF       2133>>IF       2137>>IF       2140>>DOWHILE  2149>>ASSIGN   2150>>ASSIGN   2150>>ASSIGN
+ERR
+      1187**DCL        40--PROC     2010<<ASSIGN
+G$JIT.ERRLOG
+      1672**DCL      1675--REDEF
+G$JIT.JSUNIT
+      1411**DCL      1412--REDEF
+G$JIT.MCLS
+      1410**DCL      1410--REDEF
+G$JIT.PCROS
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:43   
+      1519**DCL      1943>>ASSIGN   2021<<ASSIGN   2021>>ASSIGN   2071>>ASSIGN   2156<<ASSIGN   2156>>ASSIGN
+G$JIT.TMRZ
+      1679**DCL      1680--REDEF
+G$JIT.USER_EXTIME
+      1403**DCL      1404--REDEF
+G$JIT.USER_MEMTIME
+      1406**DCL      1406--REDEF
+G$JIT.USER_SVTIME
+      1405**DCL      1405--REDEF
+G$JIT$
+      1323**DCL      1342--IMP-PTR  1943>>ASSIGN   2021>>ASSIGN   2021>>ASSIGN   2071>>ASSIGN   2156>>ASSIGN
+      2156>>ASSIGN
+G$ROAVAIL
+      1800**DCL      1944--IF       1961--IF       2073--IF
+G$ROAVAIL.NEXT$
+      1804**DCL      1967<<ASSIGN   1967>>ASSIGN   1969<<ASSIGN   1978>>ASSIGN   1983<<ASSIGN   1983>>ASSIGN
+      1995>>ASSIGN   2023<<ASSIGN   2046<<ASSIGN   2080>>ASSIGN   2089<<ASSIGN   2089>>ASSIGN   2099<<ASSIGN
+      2114<<ASSIGN   2114>>ASSIGN   2120<<ASSIGN   2128>>IF       2140>>DOWHILE  2141>>ASSIGN   2143<<ASSIGN
+      2146<<ASSIGN
+G$ROAVAIL.NWORDS
+      1804**DCL      1961>>IF       1961>>IF       1964>>IF       1968<<ASSIGN   1968>>ASSIGN   2024<<ASSIGN
+      2036>>IF       2039<<ASSIGN   2039>>ASSIGN   2090<<ASSIGN   2090>>ASSIGN   2098<<ASSIGN   2110>>IF
+      2112<<ASSIGN   2112>>ASSIGN   2112>>ASSIGN   2129>>IF       2130>>IF       2133>>IF       2149>>ASSIGN
+      2150<<ASSIGN   2150>>ASSIGN
+G$ROS.AUTO_DS$
+      1765**DCL      1766--REDEF
+G$ROS.AUTO_T$
+      1766**DCL      1766--REDEF
+G$ROS.AVAIL$
+      1763**DCL      1952>>ASSIGN   1978<<ASSIGN   2030<<ASSIGN   2076>>ASSIGN   2125<<ASSIGN   2136<<ASSIGN
+      2139--ASSIGN
+G$ROS$
+      1324**DCL      1756--IMP-PTR  1952>>ASSIGN   1978>>ASSIGN   2020>>ASSIGN   2030>>ASSIGN   2076>>ASSIGN
+      2125>>ASSIGN   2130>>IF       2136>>ASSIGN   2139>>ASSIGN
+GM#PGSZ
+      1224**DCL      2002<<ASSIGN   2005>>ASSIGN   2014<>CALL     2021>>ASSIGN   2149<<ASSIGN   2152<>CALL
+PL6.E3A0      #001=GFS$GSP File=GFS$ROSPACE.:E05TSI                              TUE 07/29/97 21:32 Page:44   
+      2154<>CALL     2156>>ASSIGN
+GMA$CHKSIZE
+      1938**DCL-ENT  2008--CALL
+GMA$GET
+      1936**DCL-ENT  2014--CALL
+GMA$REL
+      1937**DCL-ENT  2152--CALL
+GMA$REL_ACCTMEM
+      1939**DCL-ENT  2154--CALL
+GM_ROS_PGSZ
+      1325**DCL      1943>>ASSIGN   2071>>ASSIGN
+GSPLOOP
+      1944**LABEL    2040--GOTO
+N
+      1170**DCL        40--PROC     1944>>IF       1961>>IF       1961>>IF       1964>>IF       1966>>ASSIGN
+      1968>>ASSIGN   2002>>ASSIGN   2070--ENTRY    2073>>IF       2087>>IF       2090>>ASSIGN   2098>>ASSIGN
+NEW$
+      1223**DCL      1966<<ASSIGN   1967>>ASSIGN   1968>>ASSIGN   1969>>ASSIGN
+PCROS
+      1225**DCL      1943<<ASSIGN   2020>>ASSIGN   2071<<ASSIGN   2130>>IF
+PREV$
+      1222**DCL      1951<<ASSIGN   1977>>IF       1983>>ASSIGN   1994<<ASSIGN   1995>>ASSIGN   2029>>IF
+      2036>>IF       2036>>IF       2039>>ASSIGN   2039>>ASSIGN   2046>>ASSIGN   2075<<ASSIGN   2079<<ASSIGN
+      2108>>IF       2110>>IF       2110>>IF       2112>>ASSIGN   2112>>ASSIGN   2114>>ASSIGN   2115>>ASSIGN
+      2120>>ASSIGN   2135>>IF       2137>>IF       2139<<ASSIGN   2140>>DOWHILE  2141<<ASSIGN   2141>>ASSIGN
+      2143>>ASSIGN   2146>>ASSIGN
+SBADRO
+      1900**DCL      1946<>CALL     2161<>CALL
+SCREECH
+      1940**DCL-ENT  1946--CALL     2016--CALL     2161--CALL
+SMMFAILED
+      1836**DCL      2016<>CALL
+
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:45   
+      322        1        /*T***********************************************************/
+      323        2        /*T*                                                         */
+      324        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      325        4        /*T*                                                         */
+      326        5        /*T***********************************************************/
+      327        6        /*F*    NAME: GFS$RDCB
+      328        7
+      329        8                PURPOSE: Release a DCB, including all its appendage blocks.
+      330        9         */
+      331       10
+      332       11
+      333       12        /*D*    NAME: GFS$RDCB
+      334       13
+      335       14                CALL:  CALL  GFS$RDCB(DCB$);
+      336       15
+      337       16                INPUT: DCB$ points to the DCB to be freed.
+      338       17
+      339       18                OUTPUT: DCB$ is ADDR(NIL).
+      340       19
+      341       20                DESCRIPTION:   Free a TAB$ block if there is one.
+      342       21                               Free a HEADER$ block if there is one.
+      343       22                               Free the DCB space.
+      344       23        */
+      345       24
+      346       25        %EJECT;
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:46   
+      347       26        GFS$RDCB: PROC(DCB$);
+      348       27    1   DCL DCB$ PTR;                      /* Points to DCB to be freed     */
+      349       28
+      350       29    1   DCL GFS$RSP ENTRY(2)ALTRET;
+      351       30
+      352       31 S      %INCLUDE GF_LCP6_M;
+      353       32
+      354       33        %M$DCB (DCBN=G$DCB,STCLASS=BASED);
+      355       84        %VLP_TAB(FPTN=VLP$TAB,STCLASS=BASED);
+      356       98        %VLP_HDR(FPTN=VLP$HDR,STCLASS=BASED,LEN=160);
+      357      114
+      358      115    1      CALL SCRUB;
+      359      116    1      CALL GFS$RSP(SIZEW(DCB$->G$DCB),DCB$);
+      360      117    1      RETURN;
+      361      118
+      362      119
+      363      120        /*F*    NAME: GFS$SCRUB
+      364      121
+      365      122                PURPOSE: Free the appendages of a DCB.
+      366      123        */
+      367      124
+      368      125        /*D*    NAME: GFS$SCRUB
+      369      126
+      370      127                CALL:  CALL  GFS$SCRUB(DCB$);
+      371      128
+      372      129                INPUT: DCB$ -> DCB whose appendages are to be freeded.
+      373      130
+      374      131                OUTPUT:  The DCB's TAB$ and HEADER$ are ADDR(NIL).
+      375      132
+      376      133                DESCRIPTION: Free a TAB$ block if there is one.
+      377      134                             Free a HEADER$ block if there is one.
+      378      135        */
+      379      136    1   GFS$SCRUB: ENTRY(DCB$);
+      380      137    1      CALL SCRUB;
+      381      138    1      RETURN;
+      382      139
+      383      140        %EJECT;
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:47   
+      384      141
+      385      142    1   SCRUB: PROC;
+      386      143    2      IF DCB$->G$DCB.TAB$ ~= ADDR(NIL)
+      387      144    2      THEN CALL GFS$RSP(SIZEW(VLP$TAB),DCB$->G$DCB.TAB$);
+      388      145
+      389      146    2      IF DCB$->G$DCB.HEADER$ ~= ADDR(NIL)
+      390      147    2      THEN CALL GFS$RSP(SIZEW(VLP$HDR),DCB$->G$DCB.HEADER$);
+      391      148
+      392      149    2      RETURN;
+      393      150    2   END SCRUB;
+      394      151    1   END;
+
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:48   
+--  Include file information  --
+
+   G_LCP6_E.:E05TOU  was found in the system file and is never referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GFS$RDCB.
+
+   Procedure GFS$RDCB requires 99 words for executable code.
+   Procedure GFS$RDCB requires 13 words of local(AUTO) storage.
+
+    No errors detected in file GFS$ROSPACE.:E05TSI    .
+
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:49   
+
+ Object Unit name= GFS$RDCB                                   File name= GFS$ROSPACE.:E05TOU
+ UTS= JUL 29 '97 21:32:53.52 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none    99     63  GFS$RDCB
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  GFS$RDCB
+     0     24                  yes      Std        1  GFS$SCRUB
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       2 GFS$RSP
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+r    G$ROS$
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:50   
+
+
+      322        1        /*T***********************************************************/
+      323        2        /*T*                                                         */
+      324        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      325        4        /*T*                                                         */
+      326        5        /*T***********************************************************/
+      327        6        /*F*    NAME: GFS$RDCB
+      328        7
+      329        8                PURPOSE: Release a DCB, including all its appendage blocks.
+      330        9         */
+      331       10
+      332       11
+      333       12        /*D*    NAME: GFS$RDCB
+      334       13
+      335       14                CALL:  CALL  GFS$RDCB(DCB$);
+      336       15
+      337       16                INPUT: DCB$ points to the DCB to be freed.
+      338       17
+      339       18                OUTPUT: DCB$ is ADDR(NIL).
+      340       19
+      341       20                DESCRIPTION:   Free a TAB$ block if there is one.
+      342       21                               Free a HEADER$ block if there is one.
+      343       22                               Free the DCB space.
+      344       23        */
+      345       24
+      346       25        %EJECT;
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:51   
+      347       26        GFS$RDCB: PROC(DCB$);
+
+     26   0 000000  D380 0000 0000  xent GFS$RDCB        LNJ,B5   X6A_AUTO_1
+          0 000003       000D 0001                       DC       13,1
+
+      348       27    1   DCL DCB$ PTR;                      /* Points to DCB to be freed     */
+      349       28
+      350       29    1   DCL GFS$RSP ENTRY(2)ALTRET;
+      351       30
+      352       31 S      %INCLUDE GF_LCP6_M;
+      353       32
+      354       33        %M$DCB (DCBN=G$DCB,STCLASS=BASED);
+      355       84        %VLP_TAB(FPTN=VLP$TAB,STCLASS=BASED);
+      356       98        %VLP_HDR(FPTN=VLP$HDR,STCLASS=BASED,LEN=160);
+      357      114
+      358      115    1      CALL SCRUB;
+
+    115   0 000005  E3C0 0029                            LNJ,B6   s:0,PREL
+          0 000007       0001                            DC       s:116,PREL
+
+      359      116    1      CALL GFS$RSP(SIZEW(DCB$->G$DCB),DCB$);
+
+    116   0 000008  ECC7 0004                            LDB,B6   @DCB$,AUTO
+          0 00000A  DC86                                 LDB,B5   ,B6
+          0 00000B  E2C5 0032                            LLH,R6   50,B5
+          0 00000D  6003                                 SOL,R6   3
+          0 00000E  EA70 0337                            ADD,R6   823,IMO
+          0 000010  6044                                 SOR,R6   4
+          0 000011  EF47 0008                            STR,R6   @DCB$+4,AUTO
+          0 000013  EFC7 000B                            STB,B6   @DCB$+7,AUTO
+          0 000015  DBC7 0008                            LAB,B5   @DCB$+4,AUTO
+          0 000017  DFC7 0009                            STB,B5   @DCB$+5,AUTO
+          0 000019  BBC7 0009                            LAB,B3   @DCB$+5,AUTO
+          0 00001B  CBF0 0200                            LAB,B4   512,IMO
+          0 00001D  E380 0000 0000  xent                 LNJ,B6   GFS$RSP
+          0 000020       0001                            DC       s:117,PREL
+
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:52   
+      360      117    1      RETURN;
+
+    117   0 000021  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      361      118
+      362      119
+      363      120        /*F*    NAME: GFS$SCRUB
+      364      121
+      365      122                PURPOSE: Free the appendages of a DCB.
+      366      123        */
+      367      124
+      368      125        /*D*    NAME: GFS$SCRUB
+      369      126
+      370      127                CALL:  CALL  GFS$SCRUB(DCB$);
+      371      128
+      372      129                INPUT: DCB$ -> DCB whose appendages are to be freeded.
+      373      130
+      374      131                OUTPUT:  The DCB's TAB$ and HEADER$ are ADDR(NIL).
+      375      132
+      376      133                DESCRIPTION: Free a TAB$ block if there is one.
+      377      134                             Free a HEADER$ block if there is one.
+      378      135        */
+      379      136    1   GFS$SCRUB: ENTRY(DCB$);
+
+    136   0 000024  D380 0000 0000  xent GFS$SCRUB       LNJ,B5   X6A_AUTO_1
+          0 000027       000D 0001                       DC       13,1
+
+      380      137    1      CALL SCRUB;
+
+    137   0 000029  E3C0 0005                            LNJ,B6   s:0,PREL
+          0 00002B       0001                            DC       s:138,PREL
+
+      381      138    1      RETURN;
+
+    138   0 00002C  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      382      139
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:53   
+      383      140        %EJECT;
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:54   
+      384      141
+      385      142    1   SCRUB: PROC;
+
+    142   0 00002F  EFC7 0006            SCRUB           STB,B6   @DCB$+2,AUTO
+
+      386      143    2      IF DCB$->G$DCB.TAB$ ~= ADDR(NIL)
+
+    143   0 000031  DCC7 0004                            LDB,B5   @DCB$,AUTO
+          0 000033  CC85                                 LDB,B4   ,B5
+          0 000034  8DC4 0028                            CMN      40,B4
+          0 000036  0901 0011                            BE       s:146,PREL
+
+      387      144    2      THEN CALL GFS$RSP(SIZEW(VLP$TAB),DCB$->G$DCB.TAB$);
+
+    144   0 000038  BBF0 0010                            LAB,B3   16,IMO
+          0 00003A  ABC4 0028                            LAB,B2   40,B4
+          0 00003C  AFC7 000A                            STB,B2   @DCB$+6,AUTO
+          0 00003E  BFC7 0008                            STB,B3   @DCB$+4,AUTO
+          0 000040  BBC7 0008                            LAB,B3   @DCB$+4,AUTO
+          0 000042  CBF0 0200                            LAB,B4   512,IMO
+          0 000044  E380 0000 0000  xent                 LNJ,B6   GFS$RSP
+          0 000047       0001                            DC       s:146,PREL
+
+      388      145
+      389      146    2      IF DCB$->G$DCB.HEADER$ ~= ADDR(NIL)
+
+    146   0 000048  ECC7 0004                            LDB,B6   @DCB$,AUTO
+          0 00004A  DC86                                 LDB,B5   ,B6
+          0 00004B  8DC5 0026                            CMN      38,B5
+          0 00004D  0901 0011                            BE       s:149,PREL
+
+      390      147    2      THEN CALL GFS$RSP(SIZEW(VLP$HDR),DCB$->G$DCB.HEADER$);
+
+    147   0 00004F  CBF0 0053                            LAB,B4   83,IMO
+          0 000051  BBC5 0026                            LAB,B3   38,B5
+          0 000053  BFC7 000A                            STB,B3   @DCB$+6,AUTO
+          0 000055  CFC7 0008                            STB,B4   @DCB$+4,AUTO
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:55   
+          0 000057  BBC7 0008                            LAB,B3   @DCB$+4,AUTO
+          0 000059  CBF0 0200                            LAB,B4   512,IMO
+          0 00005B  E380 0000 0000  xent                 LNJ,B6   GFS$RSP
+          0 00005E       0001                            DC       s:149,PREL
+
+      391      148
+      392      149    2      RETURN;
+
+    149   0 00005F  ECC7 0006                            LDB,B6   @DCB$+2,AUTO
+          0 000061  C3C6 0001                            LNJ,B4   1,B6
+      393      150    2   END SCRUB;
+      394      151    1   END;
+
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:56   
+--  Include file information  --
+
+   G_LCP6_E.:E05TOU  was found in the system file and is never referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GFS$RDCB.
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:57   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @DCB$                     *0-0-0/w PTR         r     1 DCB$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w ASTR(808)   r     1 G$DCB                      0-0-0/w STRC(1320)  r     1 VLP$HDR
+     0-0-0/w STRC(256)   r     1 VLP$TAB
+
+
+   Procedure GFS$RDCB requires 99 words for executable code.
+   Procedure GFS$RDCB requires 13 words of local(AUTO) storage.
+
+    No errors detected in file GFS$ROSPACE.:E05TSI    .
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:58   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=GFS$RDCB File=GFS$ROSPACE.:E05TSI                             TUE 07/29/97 21:32 Page:59   
+          MINI XREF LISTING
+
+DCB$
+        27**DCL        26--PROC      116>>CALL      116>>CALL      116<>CALL      136--ENTRY     143>>IF
+       144>>CALL      146>>IF        147>>CALL
+G$DCB
+        53**DCL       116--CALL
+G$DCB.DCBNAME.L
+        80**DCL        80--IMP-SIZ   116>>CALL
+G$DCB.EOMCHAR
+        71**DCL        71--REDEF      72--REDEF
+G$DCB.FLDID
+        70**DCL        70--REDEF
+G$DCB.HEADER$
+        74**DCL       146>>IF        147<>CALL
+G$DCB.RES
+        65**DCL        66--REDEF
+G$DCB.TAB$
+        74**DCL       143>>IF        144<>CALL
+GFS$RSP
+        29**DCL-ENT   116--CALL      144--CALL      147--CALL
+SCRUB
+       142**PROC      115--CALL      137--CALL
+VLP$HDR
+       109**DCL       147--CALL
+VLP$TAB
+        95**DCL       144--CALL

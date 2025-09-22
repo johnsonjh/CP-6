@@ -1,0 +1,243 @@
+/*M*    ALARMD_SI61     Server for asynchronous wait clients            */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMC,PLM=4,IND=4,DCI=8,DTI=0,ENI=4,ECI=4,CSI=4,DIN=4,SDI=0 */
+SERVER: PROC MAIN;
+ 
+    DCL ALARMD ENTRY;
+ 
+    CALL ALARMD;
+ 
+END SERVER;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMC,PLM=4,IND=4,DCI=8,DTI=0,ENI=4,ECI=4,CSI=4,DIN=4,SDI=0 */
+ALARMD: PROC;
+%INCLUDE CP_6;
+    %FPT_EVENT( UENTRY=ALARMD$ASYNC, STCLASS=CONSTANT);
+    %FPT_OPEN( DCB=F$CG, ASN=COMGROUP, AU=YES, CTG=YES, STCLASS=CONSTANT,
+               FUN=CREATE, EXIST=NEWFILE, SHARE=ALL, IXTNSIZE=20,
+               ACCT=VLP_ACCT, NAME=VLP_NAME, SETSTA=VLP_SETSTA,
+               ACCESS=ACCESS);
+    %FPT_READ( DCB=F$CG, BUF=BUF, WAIT=NO, EVENT=1, STCLASS=CONSTANT);
+    %FPT_TIME( SOURCE=CLOCK, DEST=UTS, TSTAMP=UNITS, STCLASS=CONSTANT);
+    %FPT_WAIT( UTYPE=TUN, UETIME=UETIME);
+    %FPT_WAIT( FPTN=FPT_WAIT0, UNITS=0, STCLASS=CONSTANT);
+    %FPT_WRITE( DCB=F$CG, STATION=VLP_STATION, BUF=MSG, STCLASS=CONSTANT);
+    %VLP_ATTR( FPTN=ACCESS, STCLASS=CONSTANT);
+    %VLP_ACCESS( READ=YES, UPD=YES, WNEW=YES, ACCT='?', LAST=";");
+    %VLP_ACCT( ACCT=':SYS', STCLASS=CONSTANT);
+    %VLP_NAME( NAME='ALARMCG', STCLASS=CONSTANT);
+    %VLP_SETSTA( MYSTATION='SERVER', STCLASS=CONSTANT);
+    %VLP_STATION;
+%INCLUDE XUD_UTS_M;
+    %XUD$UTS_ENTRIES;
+    %XUD_UTS_EQU;
+ 
+    DCL ALARMD$ASYNC ENTRY ASYNC;
+    DCL F$CG DCB;
+%EJECT;
+%EQU MAXALRM=9;
+    DCL 1 ALARM(0:%MAXALRM) STATIC SYMDEF,
+        2 LNK SBIN,
+        2 WAKEUP UBIN,
+        2 STATION CHAR(8);
+    DCL ALARMHD SBIN STATIC SYMDEF INIT( -1);
+    DCL ALARMTL SBIN STATIC SYMDEF INIT( -1);
+    DCL BUF(0:3) UBIN STATIC SYMDEF INIT( 4*0);
+    DCL CURRENT SBIN;
+    DCL CURRSTATION CHAR(8) STATIC SYMDEF INIT( '        ');
+    DCL CURRWAKEUP UBIN STATIC SYMDEF INIT( 0);
+    DCL FOREVERWAIT BIT(1);
+    DCL I SBIN;
+    DCL MSG UBIN STATIC;
+    DCL MUSTREAD BIT(1) STATIC SYMDEF INIT( '1'B);
+    DCL PREVIOUS SBIN;
+    DCL REQUESTSPENDING UBIN STATIC SYMDEF INIT( 0);
+    DCL UETIME UBIN STATIC;
+    DCL UNITS UBIN STATIC;
+%EJECT;
+    CALL M$OPEN( FPT_OPEN);
+    CALL M$EVENT( FPT_EVENT);
+    DO I = 0 TO %MAXALRM;
+        ALARM.LNK( I) = ALARMTL;
+        ALARM.WAKEUP( I) = CURRWAKEUP;
+        ALARM.STATION( I) = CURRSTATION;
+        END;
+LOOP:
+    IF REQUESTSPENDING > 0 THEN
+        GOTO DO_REQUEST;
+    CURRWAKEUP = 0;
+    IF MUSTREAD THEN DO INHIBIT;
+        MUSTREAD = '0'B;
+        CALL M$READ( FPT_READ);  /* asynch wait for request from a client */
+        END;
+    /* wait forever if no requests pending, or wait for shortest pending */
+    IF ALARMHD = -1 THEN DO;
+        FOREVERWAIT = '1'B;
+        FPT_WAIT.V.UNITS# = %UTS_CSEC_DAY# - 1;
+        END;
+    ELSE DO;
+        FOREVERWAIT = '0'B;
+        CALL M$TIME( FPT_TIME);  /* get current time */
+        IF UNITS >= ALARM.WAKEUP( ALARMHD) THEN
+            UNITS = 0;
+        ELSE
+            CALL XUD$UTS_DIFF( UNITS, ALARM.WAKEUP( ALARMHD), UNITS);
+        FPT_WAIT.V.UNITS# = UNITS;
+        END;
+    DO INHIBIT;
+        IF CURRWAKEUP ~= 0 THEN DO;
+            CALL M$WAIT( FPT_WAIT0);  /* force event delivery */
+            GOTO DO_REQUEST;
+            END;
+        IF MUSTREAD THEN
+            GOTO LOOP;
+        CALL M$WAIT( FPT_WAIT);
+        END;
+    IF UETIME = 0 AND ALARMHD ~= -1 AND NOT FOREVERWAIT THEN DO INHIBIT;
+        /* time to send response to first client on the queue */
+DO_RESPONSE:
+        I = ALARMHD;
+        IF I = ALARMTL THEN
+            ALARMTL = -1;
+        ALARMHD = ALARM.LNK( I);
+        ALARM.LNK( I) = -1;
+        MSG = ALARM.WAKEUP( I);
+        ALARM.WAKEUP( I) = 0;
+        VLP_STATION.STATION# = ALARM.STATION( I);
+        ALARM.STATION( I) = ' ';
+        CALL M$WRITE( FPT_WRITE) ALTRET( LOOP);
+        GOTO LOOP;
+        END;
+DO_REQUEST:
+    IF CURRWAKEUP = 0 THEN
+        GOTO LOOP;
+    IF REQUESTSPENDING > 0 THEN
+        REQUESTSPENDING = REQUESTSPENDING - 1;
+    CALL CANCEL;
+    CURRENT = -1;
+FIND1:
+    DO I = 0 TO %MAXALRM;
+        IF ALARM.WAKEUP( I) = 0 THEN DO;
+            CURRENT = I;
+            EXIT FIND1;
+            END;
+        END;
+    IF CURRENT = -1 THEN
+        CALL M$ERR;
+    ALARM.WAKEUP( CURRENT) = CURRWAKEUP;
+    ALARM.STATION( CURRENT) = CURRSTATION;
+    IF ALARMHD = -1 THEN DO;
+        ALARMHD = CURRENT;
+        ALARMTL = CURRENT;
+        GOTO LOOP;
+        END;
+    I = ALARMHD;
+    PREVIOUS = -1;
+    DO WHILE( I ~= -1);
+        IF ALARM.WAKEUP( CURRENT) < ALARM.WAKEUP( I) THEN DO;
+            IF PREVIOUS = -1 THEN
+                ALARMHD = CURRENT;
+            ELSE
+                ALARM.LNK( PREVIOUS) = CURRENT;
+            ALARM.LNK( CURRENT) = I;
+            GOTO LOOP;
+            END;
+        IF I = ALARMTL THEN DO;
+            ALARM.LNK( CURRENT) = -1;
+            ALARM.LNK( I) = CURRENT;
+            ALARMTL = CURRENT;
+            GOTO LOOP;
+            END;
+        PREVIOUS = I;
+        I = ALARM.LNK( I);
+        END;
+    GOTO LOOP;
+%EJECT;
+CANCEL: ENTRY;
+ 
+    I = ALARMHD;
+    PREVIOUS = -1;
+    DO WHILE( I ~= -1);
+        IF CURRSTATION = ALARM.STATION( I) THEN DO;
+            IF PREVIOUS = -1 THEN
+                ALARMHD = ALARM.LNK( I);
+            ELSE
+                ALARM.LNK( PREVIOUS) = ALARM.LNK( I);
+            IF I = ALARMTL THEN
+                ALARMTL = PREVIOUS;
+            ALARM.LNK( I) = -1;
+            ALARM.WAKEUP( I) = 0;
+            ALARM.STATION( I) = ' ';
+            EXIT;
+            END;
+        PREVIOUS = I;
+        I = ALARM.LNK( I);
+        END;
+    RETURN;
+ 
+END ALARMD;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMC,PLM=4,IND=4,DCI=8,DTI=0,ENI=4,ECI=4,CSI=4,DIN=4,SDI=0 */
+ALARMD$ASYNC: PROC ASYNC;
+%INCLUDE CP_6;
+    %B$CGAURD( STCLASS="BASED( BUF$)");
+    %EQU_CG;
+    %B$TCB;
+    %F$DCB;
+    %FPT_EXTEND( DCB=F$CG, SIZ=10, STCLASS=CONSTANT);
+    %VLP_STATION( FPTN=B$STATION, STCLASS="BASED( P$)");
+ 
+    DCL CANCEL ENTRY;
+ 
+    DCL F$CG DCB;
+ 
+    DCL B$TCB$ PTR SYMREF READONLY;
+    DCL BUF(0:3) UBIN SYMREF;
+    DCL BUF$ PTR CONSTANT INIT( ADDR( BUF(0)));
+    DCL CURRSTATION CHAR(8) SYMREF;
+    DCL CURRWAKEUP UBIN SYMREF;
+    DCL MUSTREAD BIT(1) SYMREF;
+    DCL REQUESTSPENDING UBIN SYMREF;
+ 
+    DCL P$ PTR;
+%EJECT;
+HANDLER:
+    DO INHIBIT;
+        MUSTREAD = '1'B;
+        P$ = DCBADDR( DCBNUM( F$CG))->F$DCB.LASTSTA$;
+        CURRSTATION = B$STATION.STATION#;
+        IF B$STATION.MSGTYP# = '*AUEV   ' THEN DO;
+            /* admin event */
+            DO SELECT( B$CGAURD.EVENT);
+                SELECT( %CG_DCLS#);
+                    /* DCB close.  Cancel any pending request */
+                    CALL CANCEL;
+                SELECT( %CG_WARN#);
+                    DO SELECT( B$CGAURD.INFO);
+                        SELECT( %CG_WARN_DISK#);
+                            CALL M$EXTEND( FPT_EXTEND);
+                        END;
+                END;
+            CURRWAKEUP = 0;
+            EXIT HANDLER;
+            END;
+        CURRWAKEUP = BUF(0);
+        REQUESTSPENDING = REQUESTSPENDING + 1;
+        END;
+    RETURN;
+ 
+END ALARMD$ASYNC;

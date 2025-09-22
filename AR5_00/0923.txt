@@ -1,0 +1,1077 @@
+VERSION E05
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:1    
+        1        1        /*M* IPB$READ - A general Run Unit record-type reader for SPIDER.  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* PLM=8,IND=2,THI=2,ENU=2,CSU=2,DTI=4,DCI=4,ECU=4,AND */
+        8        8        /*F*    NAME:   IPB$READ                                             */
+        9        9        /*F*    PURPOSE: To read records from an open Run Unit.              */
+       10       10        /*F*    DESCRIPTION: This routine is a general Run Unit record-type  */
+       11       11        /*,* reader. It will read all of the records of type 'KTYPE' for a   */
+       12       12        /*,* processor of type 'PFLGS', starting at 'BIAS' and totalling at  */
+       13       13        /*,* most 'TOTSIZE' words in length. The run unit records have a max */
+       14       14        /*,* size of 'PGSZ' words, and are for the overlay node 'NODE'. If   */
+       15       15        /*,* the processor being read is special shared, then PGT$ points to */
+       16       16        /*,* its page table, and 'WSQPG' is the page number of the next free */
+       17       17        /*,* page in the special shared WSQ. If the processor is special     */
+       18       18        /*,* shared, it will be mapped into the given page table beginning   */
+       19       19        /*,* at the page indicated. If standard shared, it will simply be    */
+       20       20        /*,* read into physical memory pages, and the head, tail, and count  */
+       21       21        /*,* of the pages used will be returned in 'PH', 'PT', and 'PC'.     */
+       22       22        /*,* BUF$ is a pointer to the pages (as many as the maximum program  */
+       23       23        /*,* record size in the RU) to be used to map a buffer into.         */
+       24       24        IPB$READ: PROC(PFLGS,KTYPE,BIAS,TOTSIZE,PGSZ,NODE,PH,PT,PC,
+       25       25                  PGT$,WSQPG,BUF$,ERR,PNUM) ALTRET;
+       26       26    1   DCL PFLGS BIT(36) ALIGNED;              /* Processor type flags               */
+       27       27    1   DCL KTYPE UBIN;                         /* Record key type                    */
+       28       28    1   DCL BIAS SBIN;                          /* Program section bias               */
+       29       29    1   DCL TOTSIZE UBIN;                       /* Max size of program section        */
+       30       30    1   DCL PGSZ SBIN;                          /* Page size for run unit records     */
+       31       31    1   DCL NODE UBIN;                     /* Node number for overlaid processors     */
+       32       32                                                /* Or SEGID for reading data segments */
+       33       33    1   DCL PH UBIN;                       /* Processor page chain head (returned)    */
+       34       34    1   DCL PT UBIN;                       /* Processor page chain tail (returned)    */
+       35       35    1   DCL PC UBIN;                       /* Processor page chain count (returned)   */
+       36       36    1   DCL PGT$ PTR;                      /* Pointer to wsq's pg tbl (spcl shared)   */
+       37       37    1   DCL WSQPG UBIN;                         /* Next free page in spcl shared wsq  */
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:2    
+       38       38    1   DCL BUF$ PTR;                           /* PTR to buffer page(s)              */
+       39       39    1   DCL ERR BIT(36) ALIGNED;                /* Returned error code                */
+       40       40    1   DCL PNUM UBIN;                          /* Processor number                   */
+       41       41        /**/
+       42       42        %EJECT;
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:3    
+       43       43        /**/
+       44       44        %INCLUDE B_ERRORS_C;
+       45     1171        %INCLUDE B$P;
+       46     1255        %INCLUDE CP_6;
+       47     1336        %INCLUDE U$JIT_C;
+       48     1522        %INCLUDE MM_DATA_R;
+       49     2042        %INCLUDE B$MAP;
+       50     2141        %INCLUDE B$OBJECT_C;
+       51     5571          %B$RECORDSUBS;
+       52     5599        /**/
+       53     5600    1   DCL ENDPROC UBIN;
+       54     5601    1   DCL BUFVP UBIN;
+       55     5602    1   DCL ADR SBIN;
+       56     5603    1   DCL LAST UBIN;
+       57     5604    1   DCL PGNO UBIN;
+       58     5605    1   DCL K SBIN;
+       59     5606    1   DCL BUF2$ PTR;
+       60     5607    1   DCL GETBUF BIT(1) STATIC INIT(%TRUE);
+       61     5608    1   DCL 1 STLVEC STATIC DALIGNED,
+       62     5609    1         2 * UBIN WORD,
+       63     5610    1         2 PNO UBIN WORD;
+       64     5611    1   DCL 1 RU_KEY STATIC,
+       65     5612    1         2 COUNT UBIN(9) UNAL,
+       66     5613    1         2 TYPE UBIN(9) UNAL,
+       67     5614    1         2 NODE UBIN(18) UNAL,
+       68     5615    1         2 ADR UBIN(18) UNAL;
+       69     5616    1   DCL M$EI DCB;
+       70     5617        /* SYMREF */
+       71     5618    1   DCL PPUT$ PTR SYMREF;
+       72     5619    1   DCL IP_WSQ0PT BIT(1) ALIGNED SYMREF;
+       73     5620    1   DCL B$JIT$ PTR SYMREF;
+       74     5621    1   DCL B$IS$ PTR SYMREF;
+       75     5622    1   DCL B$SPCL3$ PTR SYMREF;
+       76     5623    1   DCL TMP UBIN;
+       77     5624    1   DCL IPD$REAL_TO_PHYS ENTRY(2);
+       78     5625        /**/
+       79     5626        /*  FPT'S  */
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:4    
+       80     5627        %FPT_READ(FPTN=READ_EI,
+       81     5628                DCB=M$EI,
+       82     5629                KEY=RU_KEY,
+       83     5630                KEYS=YES);
+       84     5669        %FPT_CVM;
+       85     5685        %FPT_STLPP(RESULTS=STLVEC);
+       86     5698        /**/
+       87     5699        %SUB MM$PPUT =PPUT$->MM$PPUT;
+       88     5700        /**/
+       89     5701        %EJECT;
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:5    
+       90     5702        /**/
+       91     5703        /* Internal procedure to free pages allocated to a processor after */
+       92     5704        /* Getting some type of unrecoverable error while reading it in.   */
+       93     5705    1   RELPROC: PROC;
+       94     5706    2           LAST = PH;
+       95     5707    3           DO WHILE (LAST ~= 0);
+       96     5708    3             PGNO = MM$PPUT.PPNO(LAST);
+       97     5709    3             STLVEC.PNO = LAST;
+       98     5710    3             CALL M$RSPP(FPT_STLPP) ALTRET(SO_WHAT);
+       99     5711    3   SO_WHAT:  LAST = PGNO;
+      100     5712    3           END;
+      101     5713    2           PC = 0;
+      102     5714    2           PH = 0;
+      103     5715    2           PT = 0;
+      104     5716    2   END RELPROC;
+      105     5717        /**/
+      106     5718        %EJECT;
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:6    
+      107     5719        /**/
+      108     5720        /* Initialize for the record-reading LOOP:                         */
+      109     5721    1           RU_KEY.COUNT = 5;
+      110     5722    1           RU_KEY.TYPE = KTYPE;
+      111     5723    1           RU_KEY.NODE = NODE;
+      112     5724    1           RU_KEY.ADR = BIAS;              /* For first read of this rec. Type   */
+      113     5725    1           BUF2$ = PINCRW(BUF$,MOD(BIAS,1024));
+      114     5726    1           ENDPROC = BIAS + TOTSIZE ;      /* Addr of end of section             */
+      115     5727    1           ADR = (BIAS/PGSZ) * PGSZ;       /* Addr t be used on furthe reads     */
+      116     5728    1           IF ADDR(PGT$) = ADDR(NIL)
+      117     5729    1             THEN PGNO = 0;
+      118     5730    1             ELSE PGNO = WSQPG;
+      119     5731        /* Get buffer virtual page number */
+      120     5732    1           BUFVP = POFFW(BUF$,B$IS$)/1024;
+      121     5733    1           PH = 0;                    /* Initialize head, count, last alloc. Pg  */
+      122     5734    1           PC = 0;
+      123     5735    1           LAST = 0;
+      124     5736        /* Read each record of the given type, allocating as many pages as  */
+      125     5737        /* Necessary to read each piece (record).                           */
+      126     5738    2           DO WHILE (ADR < ENDPROC);
+      127     5739    2             IF GETBUF THEN                /* Get buffer if we dont have one     */
+      128     5740    3                 DO K = 0 TO (PGSZ/1024)-1; /* Do for # pages in each rec        */
+      129     5741    3                   CALL M$STLPP(FPT_STLPP) ALTRET(NOPAGE);
+      130     5742    3                   FPT_CVM.V.PPNO# = STLVEC.PNO;
+      131     5743    3                   FPT_CVM.V.VPNO# = BUFVP + K;
+      132     5744    3                   FPT_CVM.V.PHYSICAL# = '0'B; /* PPNO is WSQ0 relative          */
+      133     5745    3                   CALL M$CVM(FPT_CVM) ALTRET(BADCVM);
+      134     5746    3                   IF PH = 0
+      135     5747    4                     THEN DO;              /* Do if 1st read for this section    */
+      136     5748    4                         PH = STLVEC.PNO;
+      137     5749    4                         LAST = PH;
+      138     5750    4                       END;
+      139     5751    4                     ELSE DO;
+      140     5752    4                         MM$PPUT.PPNO(LAST) = STLVEC.PNO;
+      141     5753    4                         LAST = STLVEC.PNO;
+      142     5754    4                       END;
+      143     5755    3                   MM$PPUT.PRC(LAST) = '1'B;
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:7    
+      144     5756    3                   MM$PPUT.PNUM(LAST) = PNUM;
+      145     5757    3                   PC = PC + 1;
+      146     5758        /* If this processor is special shared, enter it into the page tbl */
+      147     5759        /* Pointed to by 'PGT$'.                                           */
+      148     5760    3                   IF (PFLGS & (%P_CP | %P_DB | %P_ASL))
+      149     5761    3                     AND (ADDR(PGT$) ~= ADDR(NIL)) THEN
+      150     5762    4                       DO;
+      151     5763    5                         IF IP_WSQ0PT THEN DO;
+      152     5764    5                               CALL IPD$REAL_TO_PHYS(LAST,TMP);
+      153     5765    5                               PGT$->B$MAP.RPN(PGNO)=TMP;
+      154     5766    5                             END;
+      155     5767    4                           ELSE
+      156     5768    4                           PGT$->B$MAP.RPN(PGNO) = LAST;
+      157     5769    4                         PGT$->B$MAP.CTRL(PGNO) = %PGINMEM | %PGIOM;
+      158     5770    4                         PGNO = PGNO + 1;
+      159     5771    4                       END;
+      160     5772    3                 END;
+      161     5773    2             PT = LAST;                    /* Set tail                           */
+      162     5774    2             MM$PPUT.PPNO(LAST) = 0;
+      163     5775        /* Setup for reading a record into the buffer we just got.         */
+      164     5776    2             READ_EI.BUF_.BOUND = (PGSZ*4) - 1;
+      165     5777    2             READ_EI.BUF_.BUF$ = BUF2$;
+      166     5778    2             CALL M$READ(READ_EI) ALTRET(CHKNOREC);
+      167     5779    2   CONT_READ:;
+      168     5780    2             GETBUF = %TRUE;               /* Get a new buffer                   */
+      169     5781    2             ADR = ADR + PGSZ;
+      170     5782    2             RU_KEY.ADR = ADR;
+      171     5783    2             BUF2$ = BUF$;
+      172     5784    2           END;
+      173     5785    1           RETURN;
+      174     5786        /**/
+      175     5787        /**/
+      176     5788    1   CHKNOREC:;
+      177     5789    1           IF B$JIT$->B$JIT.ERR.CODE = %E$NOKEY THEN
+      178     5790    1             GOTO CONT_READ;               /* E$NOKEY for uninitialized data     */
+      179     5791    1   NOPAGE: ;
+      180     5792    1   BADCVM: ;
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:8    
+      181     5793    1           ERR = B$JIT.ERR;
+      182     5794    1           CALL RELPROC;
+      183     5795    1           ALTRETURN;
+      184     5796    1   END IPB$READ;
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:9    
+--  Include file information  --
+
+   B$OBJECT_C.:E05TOU  is referenced.
+   B$MAP.:E05TOU  cannot be made into a system file and is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   U$JIT_C.:E05TOU  cannot be made into a system file and is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B$P.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure IPB$READ.
+
+   Procedure IPB$READ requires 223 words for executable code.
+   Procedure IPB$READ requires 30 words of local(AUTO) storage.
+
+    No errors detected in file IPB$READ.:E05TSI    .
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:10   
+
+ Object Unit name= IPB$READ                                   File name= IPB$READ.:E05TOU
+ UTS= JUL 29 '97 22:40:05.36 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   DCB   even  none     0      0  M$UC
+    1   Data  even  none    28     34  IPB$READ
+    2   DCB   even  none     0      0  M$EI
+    3   Proc  even  none   223    337  IPB$READ
+    4  RoData even  none     2      2  IPB$READ
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     3      0   yes    yes     yes      Std       14  IPB$READ
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       2 IPD$REAL_TO_PHYS
+                       nStd      0 X66_AUTO_N
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+                       nStd      0 X66_AALT
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:11   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     M$UC                             r    MM_BYP$                               M$EI
+     PPUT$                                 IP_WSQ0PT                             B$JIT$
+     B$IS$                                 B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID                                 NULLSID
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:12   
+
+
+        1        1        /*M* IPB$READ - A general Run Unit record-type reader for SPIDER.  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* PLM=8,IND=2,THI=2,ENU=2,CSU=2,DTI=4,DCI=4,ECU=4,AND */
+        8        8        /*F*    NAME:   IPB$READ                                             */
+        9        9        /*F*    PURPOSE: To read records from an open Run Unit.              */
+       10       10        /*F*    DESCRIPTION: This routine is a general Run Unit record-type  */
+       11       11        /*,* reader. It will read all of the records of type 'KTYPE' for a   */
+       12       12        /*,* processor of type 'PFLGS', starting at 'BIAS' and totalling at  */
+       13       13        /*,* most 'TOTSIZE' words in length. The run unit records have a max */
+       14       14        /*,* size of 'PGSZ' words, and are for the overlay node 'NODE'. If   */
+       15       15        /*,* the processor being read is special shared, then PGT$ points to */
+       16       16        /*,* its page table, and 'WSQPG' is the page number of the next free */
+       17       17        /*,* page in the special shared WSQ. If the processor is special     */
+       18       18        /*,* shared, it will be mapped into the given page table beginning   */
+       19       19        /*,* at the page indicated. If standard shared, it will simply be    */
+       20       20        /*,* read into physical memory pages, and the head, tail, and count  */
+       21       21        /*,* of the pages used will be returned in 'PH', 'PT', and 'PC'.     */
+       22       22        /*,* BUF$ is a pointer to the pages (as many as the maximum program  */
+       23       23        /*,* record size in the RU) to be used to map a buffer into.         */
+       24       24        IPB$READ: PROC(PFLGS,KTYPE,BIAS,TOTSIZE,PGSZ,NODE,PH,PT,PC,
+
+     24  3 000000   000000 700200 xent  IPB$READ     TSX0  ! X66_AUTO_N
+         3 000001   000036 000016                    ZERO    30,14
+         3 000002   000036 710000 3                  TRA     s:5721
+
+       25       25                  PGT$,WSQPG,BUF$,ERR,PNUM) ALTRET;
+       26       26    1   DCL PFLGS BIT(36) ALIGNED;              /* Processor type flags               */
+       27       27    1   DCL KTYPE UBIN;                         /* Record key type                    */
+       28       28    1   DCL BIAS SBIN;                          /* Program section bias               */
+       29       29    1   DCL TOTSIZE UBIN;                       /* Max size of program section        */
+       30       30    1   DCL PGSZ SBIN;                          /* Page size for run unit records     */
+       31       31    1   DCL NODE UBIN;                     /* Node number for overlaid processors     */
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:13   
+       32       32                                                /* Or SEGID for reading data segments */
+       33       33    1   DCL PH UBIN;                       /* Processor page chain head (returned)    */
+       34       34    1   DCL PT UBIN;                       /* Processor page chain tail (returned)    */
+       35       35    1   DCL PC UBIN;                       /* Processor page chain count (returned)   */
+       36       36    1   DCL PGT$ PTR;                      /* Pointer to wsq's pg tbl (spcl shared)   */
+       37       37    1   DCL WSQPG UBIN;                         /* Next free page in spcl shared wsq  */
+       38       38    1   DCL BUF$ PTR;                           /* PTR to buffer page(s)              */
+       39       39    1   DCL ERR BIT(36) ALIGNED;                /* Returned error code                */
+       40       40    1   DCL PNUM UBIN;                          /* Processor number                   */
+       41       41        /**/
+       42       42        %EJECT;
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:14   
+       43       43        /**/
+       44       44        %INCLUDE B_ERRORS_C;
+       45     1171        %INCLUDE B$P;
+       46     1255        %INCLUDE CP_6;
+       47     1336        %INCLUDE U$JIT_C;
+       48     1522        %INCLUDE MM_DATA_R;
+       49     2042        %INCLUDE B$MAP;
+       50     2141        %INCLUDE B$OBJECT_C;
+       51     5571          %B$RECORDSUBS;
+       52     5599        /**/
+       53     5600    1   DCL ENDPROC UBIN;
+       54     5601    1   DCL BUFVP UBIN;
+       55     5602    1   DCL ADR SBIN;
+       56     5603    1   DCL LAST UBIN;
+       57     5604    1   DCL PGNO UBIN;
+       58     5605    1   DCL K SBIN;
+       59     5606    1   DCL BUF2$ PTR;
+       60     5607    1   DCL GETBUF BIT(1) STATIC INIT(%TRUE);
+       61     5608    1   DCL 1 STLVEC STATIC DALIGNED,
+       62     5609    1         2 * UBIN WORD,
+       63     5610    1         2 PNO UBIN WORD;
+       64     5611    1   DCL 1 RU_KEY STATIC,
+       65     5612    1         2 COUNT UBIN(9) UNAL,
+       66     5613    1         2 TYPE UBIN(9) UNAL,
+       67     5614    1         2 NODE UBIN(18) UNAL,
+       68     5615    1         2 ADR UBIN(18) UNAL;
+       69     5616    1   DCL M$EI DCB;
+       70     5617        /* SYMREF */
+       71     5618    1   DCL PPUT$ PTR SYMREF;
+       72     5619    1   DCL IP_WSQ0PT BIT(1) ALIGNED SYMREF;
+       73     5620    1   DCL B$JIT$ PTR SYMREF;
+       74     5621    1   DCL B$IS$ PTR SYMREF;
+       75     5622    1   DCL B$SPCL3$ PTR SYMREF;
+       76     5623    1   DCL TMP UBIN;
+       77     5624    1   DCL IPD$REAL_TO_PHYS ENTRY(2);
+       78     5625        /**/
+       79     5626        /*  FPT'S  */
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:15   
+       80     5627        %FPT_READ(FPTN=READ_EI,
+       81     5628                DCB=M$EI,
+       82     5629                KEY=RU_KEY,
+       83     5630                KEYS=YES);
+       84     5669        %FPT_CVM;
+       85     5685        %FPT_STLPP(RESULTS=STLVEC);
+       86     5698        /**/
+       87     5699        %SUB MM$PPUT =PPUT$->MM$PPUT;
+       88     5700        /**/
+       89     5701        %EJECT;
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:16   
+       90     5702        /**/
+       91     5703        /* Internal procedure to free pages allocated to a processor after */
+       92     5704        /* Getting some type of unrecoverable error while reading it in.   */
+       93     5705    1   RELPROC: PROC;
+
+   5705  3 000003   200032 741300       RELPROC      STX1  ! TMP+2,,AUTO
+
+       94     5706    2           LAST = PH;
+
+   5706  3 000004   200011 470500                    LDP0    @PH,,AUTO
+         3 000005   000000 235100                    LDA     0,,PR0
+         3 000006   200024 755100                    STA     LAST,,AUTO
+
+       95     5707    3           DO WHILE (LAST ~= 0);
+
+   5707  3 000007   000026 600000 3                  TZE     s:5713
+
+       96     5708    3             PGNO = MM$PPUT.PPNO(LAST);
+
+   5708  3 000010   000000 470400 xsym               LDP0    PPUT$
+         3 000011   200024 720100                    LXL0    LAST,,AUTO
+         3 000012   000000 236110                    LDQ     0,X0,PR0
+         3 000013   777777 376007                    ANQ     -1,DL
+         3 000014   200025 756100                    STQ     PGNO,,AUTO
+
+       97     5709    3             STLVEC.PNO = LAST;
+
+   5709  3 000015   200024 235100                    LDA     LAST,,AUTO
+         3 000016   000003 755000 1                  STA     STLVEC+1
+
+       98     5710    3             CALL M$RSPP(FPT_STLPP) ALTRET(SO_WHAT);
+
+   5710  3 000017   000032 630400 1                  EPPR0   FPT_STLPP
+         3 000020   430010 713400                    CLIMB   alt,+12296
+         3 000021   400000 401760                    pmme    nvectors=1
+         3 000022   000023 702000 3                  TSX2    SO_WHAT
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:17   
+       99     5711    3   SO_WHAT:  LAST = PGNO;
+
+   5711  3 000023   200025 235100       SO_WHAT      LDA     PGNO,,AUTO
+         3 000024   200024 755100                    STA     LAST,,AUTO
+
+      100     5712    3           END;
+
+   5712  3 000025   000010 601000 3                  TNZ     s:5708
+
+      101     5713    2           PC = 0;
+
+   5713  3 000026   200013 470500                    LDP0    @PC,,AUTO
+         3 000027   000000 450100                    STZ     0,,PR0
+
+      102     5714    2           PH = 0;
+
+   5714  3 000030   200011 471500                    LDP1    @PH,,AUTO
+         3 000031   100000 450100                    STZ     0,,PR1
+
+      103     5715    2           PT = 0;
+
+   5715  3 000032   200012 473500                    LDP3    @PT,,AUTO
+         3 000033   300000 450100                    STZ     0,,PR3
+
+      104     5716    2   END RELPROC;
+
+   5716  3 000034   200032 221300                    LDX1  ! TMP+2,,AUTO
+         3 000035   000001 702211                    TSX2  ! 1,X1
+
+      105     5717        /**/
+      106     5718        %EJECT;
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:18   
+      107     5719        /**/
+      108     5720        /* Initialize for the record-reading LOOP:                         */
+      109     5721    1           RU_KEY.COUNT = 5;
+
+   5721  3 000036   005000 236003                    LDQ     2560,DU
+         3 000037   000004 552040 1                  STBQ    RU_KEY,'40'O
+
+      110     5722    1           RU_KEY.TYPE = KTYPE;
+
+   5722  3 000040   200004 470500                    LDP0    @KTYPE,,AUTO
+         3 000041   000000 236100                    LDQ     0,,PR0
+         3 000042   000022 736000                    QLS     18
+         3 000043   000004 552020 1                  STBQ    RU_KEY,'20'O
+
+      111     5723    1           RU_KEY.NODE = NODE;
+
+   5723  3 000044   200010 471500                    LDP1    @NODE,,AUTO
+         3 000045   100000 720100                    LXL0    0,,PR1
+         3 000046   000004 440000 1                  SXL0    RU_KEY
+
+      112     5724    1           RU_KEY.ADR = BIAS;              /* For first read of this rec. Type   */
+
+   5724  3 000047   200005 473500                    LDP3    @BIAS,,AUTO
+         3 000050   300000 721100                    LXL1    0,,PR3
+         3 000051   000005 741000 1                  STX1    RU_KEY+1
+
+      113     5725    1           BUF2$ = PINCRW(BUF$,MOD(BIAS,1024));
+
+   5725  3 000052   300000 236100                    LDQ     0,,PR3
+         3 000053   002000 506007                    DIV     1024,DL
+         3 000054   200016 474500                    LDP4    @BUF$,,AUTO
+         3 000055   400000 475500                    LDP5    0,,PR4
+         3 000056   500000 636505                    EPPR6   0,AL,PR5
+         3 000057   200027 456500                    STP6    BUF2$,,AUTO
+
+      114     5726    1           ENDPROC = BIAS + TOTSIZE ;      /* Addr of end of section             */
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:19   
+   5726  3 000060   200006 477500                    LDP7    @TOTSIZE,,AUTO
+         3 000061   300000 236100                    LDQ     0,,PR3
+         3 000062   700000 036100                    ADLQ    0,,PR7
+         3 000063   200021 756100                    STQ     ENDPROC,,AUTO
+
+      115     5727    1           ADR = (BIAS/PGSZ) * PGSZ;       /* Addr t be used on furthe reads     */
+
+   5727  3 000064   200007 470500                    LDP0    @PGSZ,,AUTO
+         3 000065   300000 236100                    LDQ     0,,PR3
+         3 000066   000000 506100                    DIV     0,,PR0
+         3 000067   000000 402100                    MPY     0,,PR0
+         3 000070   200023 756100                    STQ     ADR,,AUTO
+
+      116     5728    1           IF ADDR(PGT$) = ADDR(NIL)
+
+   5728  3 000071   200014 236100                    LDQ     @PGT$,,AUTO
+         3 000072   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         3 000073   000076 601000 3                  TNZ     s:5730
+
+      117     5729    1             THEN PGNO = 0;
+
+   5729  3 000074   200025 450100                    STZ     PGNO,,AUTO
+         3 000075   000101 710000 3                  TRA     s:5732
+
+      118     5730    1             ELSE PGNO = WSQPG;
+
+   5730  3 000076   200015 470500                    LDP0    @WSQPG,,AUTO
+         3 000077   000000 235100                    LDA     0,,PR0
+         3 000100   200025 755100                    STA     PGNO,,AUTO
+
+      119     5731        /* Get buffer virtual page number */
+      120     5732    1           BUFVP = POFFW(BUF$,B$IS$)/1024;
+
+   5732  3 000101   000000 235000 xsym               LDA     B$IS$
+         3 000102   000022 771000                    ARL     18
+         3 000103   200034 755100                    STA     TMP+4,,AUTO
+         3 000104   400000 236100                    LDQ     0,,PR4
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:20   
+         3 000105   000022 772000                    QRL     18
+         3 000106   200034 136100                    SBLQ    TMP+4,,AUTO
+         3 000107   002000 506007                    DIV     1024,DL
+         3 000110   200022 756100                    STQ     BUFVP,,AUTO
+
+      121     5733    1           PH = 0;                    /* Initialize head, count, last alloc. Pg  */
+
+   5733  3 000111   200011 470500                    LDP0    @PH,,AUTO
+         3 000112   000000 450100                    STZ     0,,PR0
+
+      122     5734    1           PC = 0;
+
+   5734  3 000113   200013 475500                    LDP5    @PC,,AUTO
+         3 000114   500000 450100                    STZ     0,,PR5
+
+      123     5735    1           LAST = 0;
+
+   5735  3 000115   200024 450100                    STZ     LAST,,AUTO
+
+      124     5736        /* Read each record of the given type, allocating as many pages as  */
+      125     5737        /* Necessary to read each piece (record).                           */
+      126     5738    2           DO WHILE (ADR < ENDPROC);
+
+   5738  3 000116   200023 236100                    LDQ     ADR,,AUTO
+         3 000117   000122 604000 3                  TMI     s:5739
+         3 000120   200021 116100                    CMPQ    ENDPROC,,AUTO
+         3 000121   000322 603000 3                  TRC     s:5785
+
+      127     5739    2             IF GETBUF THEN                /* Get buffer if we dont have one     */
+
+   5739  3 000122   000000 234000 1                  SZN     GETBUF
+         3 000123   000256 605000 3                  TPL     s:5773
+
+      128     5740    3                 DO K = 0 TO (PGSZ/1024)-1; /* Do for # pages in each rec        */
+
+   5740  3 000124   200026 450100                    STZ     K,,AUTO
+         3 000125   000251 710000 3                  TRA     s:5772+1
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:21   
+
+      129     5741    3                   CALL M$STLPP(FPT_STLPP) ALTRET(NOPAGE);
+
+   5741  3 000126   000032 630400 1                  EPPR0   FPT_STLPP
+         3 000127   430007 713400                    CLIMB   alt,+12295
+         3 000130   400000 401760                    pmme    nvectors=1
+         3 000131   000330 702000 3                  TSX2    NOPAGE
+
+      130     5742    3                   FPT_CVM.V.PPNO# = STLVEC.PNO;
+
+   5742  3 000132   000003 235000 1                  LDA     STLVEC+1
+         3 000133   000027 755000 1                  STA     FPT_CVM+3
+
+      131     5743    3                   FPT_CVM.V.VPNO# = BUFVP + K;
+
+   5743  3 000134   200022 236100                    LDQ     BUFVP,,AUTO
+         3 000135   200026 036100                    ADLQ    K,,AUTO
+         3 000136   000000 620006                    EAX0    0,QL
+         3 000137   000030 440000 1                  SXL0    FPT_CVM+4
+
+      132     5744    3                   FPT_CVM.V.PHYSICAL# = '0'B; /* PPNO is WSQ0 relative          */
+
+   5744  3 000140   000000 236000 4                  LDQ     0
+         3 000141   000026 356000 1                  ANSQ    FPT_CVM+2
+
+      133     5745    3                   CALL M$CVM(FPT_CVM) ALTRET(BADCVM);
+
+   5745  3 000142   000024 630400 1                  EPPR0   FPT_CVM
+         3 000143   430011 713400                    CLIMB   alt,+12297
+         3 000144   400000 401760                    pmme    nvectors=1
+         3 000145   000330 702000 3                  TSX2    NOPAGE
+
+      134     5746    3                   IF PH = 0
+
+   5746  3 000146   200011 470500                    LDP0    @PH,,AUTO
+         3 000147   000000 235100                    LDA     0,,PR0
+         3 000150   000155 601000 3                  TNZ     s:5752
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:22   
+
+      135     5747    4                     THEN DO;              /* Do if 1st read for this section    */
+
+      136     5748    4                         PH = STLVEC.PNO;
+
+   5748  3 000151   000003 236000 1                  LDQ     STLVEC+1
+         3 000152   000000 756100                    STQ     0,,PR0
+
+      137     5749    4                         LAST = PH;
+
+   5749  3 000153   200024 756100                    STQ     LAST,,AUTO
+
+      138     5750    4                       END;
+
+   5750  3 000154   000163 710000 3                  TRA     s:5755
+
+      139     5751    4                     ELSE DO;
+
+      140     5752    4                         MM$PPUT.PPNO(LAST) = STLVEC.PNO;
+
+   5752  3 000155   000003 720000 1                  LXL0    STLVEC+1
+         3 000156   000000 471400 xsym               LDP1    PPUT$
+         3 000157   200024 721100                    LXL1    LAST,,AUTO
+         3 000160   100000 440111                    SXL0    0,X1,PR1
+
+      141     5753    4                         LAST = STLVEC.PNO;
+
+   5753  3 000161   000003 235000 1                  LDA     STLVEC+1
+         3 000162   200024 755100                    STA     LAST,,AUTO
+
+      142     5754    4                       END;
+
+      143     5755    3                   MM$PPUT.PRC(LAST) = '1'B;
+
+   5755  3 000163   000000 471400 xsym               LDP1    PPUT$
+         3 000164   200024 720100                    LXL0    LAST,,AUTO
+         3 000165   004000 236003                    LDQ     2048,DU
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:23   
+         3 000166   100000 256110                    ORSQ    0,X0,PR1
+
+      144     5756    3                   MM$PPUT.PNUM(LAST) = PNUM;
+
+   5756  3 000167   200020 471500                    LDP1    @PNUM,,AUTO
+         3 000170   000000 473400 xsym               LDP3    PPUT$
+         3 000171   200024 720100                    LXL0    LAST,,AUTO
+         3 000172   100000 236100                    LDQ     0,,PR1
+         3 000173   000022 736000                    QLS     18
+         3 000174   300000 676110                    ERQ     0,X0,PR3
+         3 000175   000777 376003                    ANQ     511,DU
+         3 000176   300000 656110                    ERSQ    0,X0,PR3
+
+      145     5757    3                   PC = PC + 1;
+
+   5757  3 000177   200013 473500                    LDP3    @PC,,AUTO
+         3 000200   300000 235100                    LDA     0,,PR3
+         3 000201   000001 035007                    ADLA    1,DL
+         3 000202   300000 755100                    STA     0,,PR3
+
+      146     5758        /* If this processor is special shared, enter it into the page tbl */
+      147     5759        /* Pointed to by 'PGT$'.                                           */
+      148     5760    3                   IF (PFLGS & (%P_CP | %P_DB | %P_ASL))
+
+   5760  3 000203   200003 474500                    LDP4    @PFLGS,,AUTO
+         3 000204   400000 236100                    LDQ     0,,PR4
+         3 000205   620000 376003                    ANQ     -57344,DU
+         3 000206   000250 600000 3                  TZE     s:5772
+         3 000207   200014 236100                    LDQ     @PGT$,,AUTO
+         3 000210   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         3 000211   000250 600000 3                  TZE     s:5772
+
+      149     5761    3                     AND (ADDR(PGT$) ~= ADDR(NIL)) THEN
+      150     5762    4                       DO;
+
+      151     5763    5                         IF IP_WSQ0PT THEN DO;
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:24   
+   5763  3 000212   000000 234000 xsym               SZN     IP_WSQ0PT
+         3 000213   000232 605000 3                  TPL     s:5768
+
+      152     5764    5                               CALL IPD$REAL_TO_PHYS(LAST,TMP);
+
+   5764  3 000214   200030 635500                    EPPR5   TMP,,AUTO
+         3 000215   200035 455500                    STP5    TMP+5,,AUTO
+         3 000216   200024 636500                    EPPR6   LAST,,AUTO
+         3 000217   200034 456500                    STP6    TMP+4,,AUTO
+         3 000220   200034 630500                    EPPR0   TMP+4,,AUTO
+         3 000221   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         3 000222   000000 701000 xent               TSX1    IPD$REAL_TO_PHYS
+         3 000223   000000 011000                    NOP     0
+
+      153     5765    5                               PGT$->B$MAP.RPN(PGNO)=TMP;
+
+   5765  3 000224   200014 470500                    LDP0    @PGT$,,AUTO
+         3 000225   000000 471500                    LDP1    0,,PR0
+         3 000226   200030 720100                    LXL0    TMP,,AUTO
+         3 000227   200025 721100                    LXL1    PGNO,,AUTO
+         3 000230   100000 740111                    STX0    0,X1,PR1
+
+      154     5766    5                             END;
+
+   5766  3 000231   000237 710000 3                  TRA     s:5769
+
+      155     5767    4                           ELSE
+      156     5768    4                           PGT$->B$MAP.RPN(PGNO) = LAST;
+
+   5768  3 000232   200014 475500                    LDP5    @PGT$,,AUTO
+         3 000233   500000 476500                    LDP6    0,,PR5
+         3 000234   200024 720100                    LXL0    LAST,,AUTO
+         3 000235   200025 721100                    LXL1    PGNO,,AUTO
+         3 000236   600000 740111                    STX0    0,X1,PR6
+
+      157     5769    4                         PGT$->B$MAP.CTRL(PGNO) = %PGINMEM | %PGIOM;
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:25   
+   5769  3 000237   200014 470500                    LDP0    @PGT$,,AUTO
+         3 000240   000000 471500                    LDP1    0,,PR0
+         3 000241   100000 236111                    LDQ     0,X1,PR1
+         3 000242   000001 376000 4                  ANQ     1
+         3 000243   000044 276007                    ORQ     36,DL
+         3 000244   100000 756111                    STQ     0,X1,PR1
+
+      158     5770    4                         PGNO = PGNO + 1;
+
+   5770  3 000245   200025 235100                    LDA     PGNO,,AUTO
+         3 000246   000001 035007                    ADLA    1,DL
+         3 000247   200025 755100                    STA     PGNO,,AUTO
+
+      159     5771    4                       END;
+
+      160     5772    3                 END;
+
+   5772  3 000250   200026 054100                    AOS     K,,AUTO
+         3 000251   200007 470500                    LDP0    @PGSZ,,AUTO
+         3 000252   000000 236100                    LDQ     0,,PR0
+         3 000253   002000 506007                    DIV     1024,DL
+         3 000254   200026 116100                    CMPQ    K,,AUTO
+         3 000255   000126 605400 3                  TPNZ    s:5741
+
+      161     5773    2             PT = LAST;                    /* Set tail                           */
+
+   5773  3 000256   200012 470500                    LDP0    @PT,,AUTO
+         3 000257   200024 235100                    LDA     LAST,,AUTO
+         3 000260   000000 755100                    STA     0,,PR0
+
+      162     5774    2             MM$PPUT.PPNO(LAST) = 0;
+
+   5774  3 000261   000000 220003                    LDX0    0,DU
+         3 000262   000000 471400 xsym               LDP1    PPUT$
+         3 000263   200024 721100                    LXL1    LAST,,AUTO
+         3 000264   100000 440111                    SXL0    0,X1,PR1
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:26   
+      163     5775        /* Setup for reading a record into the buffer we just got.         */
+      164     5776    2             READ_EI.BUF_.BOUND = (PGSZ*4) - 1;
+
+   5776  3 000265   200007 471500                    LDP1    @PGSZ,,AUTO
+         3 000266   100000 236100                    LDQ     0,,PR1
+         3 000267   000002 736000                    QLS     2
+         3 000270   000001 136007                    SBLQ    1,DL
+         3 000271   000020 736000                    QLS     16
+         3 000272   000012 676000 1                  ERQ     READ_EI+4
+         3 000273   000034 376000 xsym               ANQ     B_VECTNIL+28
+         3 000274   000012 656000 1                  ERSQ    READ_EI+4
+
+      165     5777    2             READ_EI.BUF_.BUF$ = BUF2$;
+
+   5777  3 000275   200027 236100                    LDQ     BUF2$,,AUTO
+         3 000276   000013 756000 1                  STQ     READ_EI+5
+
+      166     5778    2             CALL M$READ(READ_EI) ALTRET(CHKNOREC);
+
+   5778  3 000277   000006 630400 1                  EPPR0   READ_EI
+         3 000300   440000 713400                    CLIMB   alt,read
+         3 000301   401400 401760                    pmme    nvectors=4
+         3 000302   000323 702000 3                  TSX2    CHKNOREC
+
+   5777  3 000303                       CONT_READ    null
+      167     5779    2   CONT_READ:;
+      168     5780    2             GETBUF = %TRUE;               /* Get a new buffer                   */
+
+   5780  3 000303   400000 236003                    LDQ     -131072,DU
+         3 000304   000000 756000 1                  STQ     GETBUF
+
+      169     5781    2             ADR = ADR + PGSZ;
+
+   5781  3 000305   200007 470500                    LDP0    @PGSZ,,AUTO
+         3 000306   200023 236100                    LDQ     ADR,,AUTO
+         3 000307   000000 036100                    ADLQ    0,,PR0
+         3 000310   200023 756100                    STQ     ADR,,AUTO
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:27   
+
+      170     5782    2             RU_KEY.ADR = ADR;
+
+   5782  3 000311   000000 620006                    EAX0    0,QL
+         3 000312   000005 740000 1                  STX0    RU_KEY+1
+
+      171     5783    2             BUF2$ = BUF$;
+
+   5783  3 000313   200016 471500                    LDP1    @BUF$,,AUTO
+         3 000314   100000 236100                    LDQ     0,,PR1
+         3 000315   200027 756100                    STQ     BUF2$,,AUTO
+
+      172     5784    2           END;
+
+   5784  3 000316   200023 236100                    LDQ     ADR,,AUTO
+         3 000317   000122 604000 3                  TMI     s:5739
+         3 000320   200021 116100                    CMPQ    ENDPROC,,AUTO
+         3 000321   000122 602000 3                  TNC     s:5739
+
+      173     5785    1           RETURN;
+
+   5785  3 000322   000000 702200 xent               TSX2  ! X66_ARET
+
+   5776  3 000323                       CHKNOREC     null
+      174     5786        /**/
+      175     5787        /**/
+      176     5788    1   CHKNOREC:;
+      177     5789    1           IF B$JIT$->B$JIT.ERR.CODE = %E$NOKEY THEN
+
+   5789  3 000323   000000 470400 xsym               LDP0    B$JIT$
+         3 000324   000012 236100                    LDQ     10,,PR0
+         3 000325   377770 376007                    ANQ     131064,DL
+         3 000326   001020 116007                    CMPQ    528,DL
+         3 000327   000303 600000 3                  TZE     CONT_READ
+
+   5789  3 000330                       NOPAGE       null
+   5789  3 000330                       BADCVM       null
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:28   
+      178     5790    1             GOTO CONT_READ;               /* E$NOKEY for uninitialized data     */
+      179     5791    1   NOPAGE: ;
+      180     5792    1   BADCVM: ;
+      181     5793    1           ERR = B$JIT.ERR;
+
+   5793  3 000330   000000 470400 xsym               LDP0    B$JIT$
+         3 000331   000012 236100                    LDQ     10,,PR0
+         3 000332   200017 471500                    LDP1    @ERR,,AUTO
+         3 000333   100000 756100                    STQ     0,,PR1
+
+      182     5794    1           CALL RELPROC;
+
+   5794  3 000334   000003 701000 3                  TSX1    RELPROC
+         3 000335   000000 011000                    NOP     0
+
+      183     5795    1           ALTRETURN;
+
+   5795  3 000336   000000 702200 xent               TSX2  ! X66_AALT
+      184     5796    1   END IPB$READ;
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:29   
+--  Include file information  --
+
+   B$OBJECT_C.:E05TOU  is referenced.
+   B$MAP.:E05TOU  cannot be made into a system file and is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   U$JIT_C.:E05TOU  cannot be made into a system file and is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B$P.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure IPB$READ.
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:30   
+
+ **** Variables and constants ****
+
+  ****  Section 001  Data  IPB$READ
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    24-0-0/d STRC(216)   r     1 FPT_CVM                   32-0-0/d STRC(72)    r     1 FPT_STLPP
+     0-0-0/b BIT         r     1 GETBUF                     6-0-0/d STRC(504)   r     1 READ_EI
+     4-0-0/b STRC(54)    r     1 RU_KEY                     2-0-0/d STRC(72)    r     1 STLVEC
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     5-0-0/w PTR         r     1 @BIAS                     16-0-0/w PTR         r     1 @BUF$
+    17-0-0/w PTR         r     1 @ERR                       4-0-0/w PTR         r     1 @KTYPE
+    10-0-0/w PTR         r     1 @NODE                     13-0-0/w PTR         r     1 @PC
+     3-0-0/w PTR         r     1 @PFLGS                     7-0-0/w PTR         r     1 @PGSZ
+    14-0-0/w PTR         r     1 @PGT$                     11-0-0/w PTR         r     1 @PH
+    20-0-0/w PTR         r     1 @PNUM                     12-0-0/w PTR         r     1 @PT
+     6-0-0/w PTR         r     1 @TOTSIZE                  15-0-0/w PTR         r     1 @WSQPG
+    23-0-0/w SBIN        r     1 ADR                       *0-0-0/w SBIN        r     1 BIAS
+    *0-0-0/w PTR         r     1 BUF$                      27-0-0/w PTR         r     1 BUF2$
+    22-0-0/w UBIN        r     1 BUFVP                     21-0-0/w UBIN        r     1 ENDPROC
+    *0-0-0/w BIT         r     1 ERR                       26-0-0/w SBIN        r     1 K
+    *0-0-0/w UBIN        r     1 KTYPE                     24-0-0/w UBIN        r     1 LAST
+    *0-0-0/w UBIN        r     1 NODE                      *0-0-0/w UBIN        r     1 PC
+    *0-0-0/w BIT         r     1 PFLGS                     25-0-0/w UBIN        r     1 PGNO
+    *0-0-0/w SBIN        r     1 PGSZ                      *0-0-0/w PTR         r     1 PGT$
+    *0-0-0/w UBIN        r     1 PH                        *0-0-0/w UBIN        r     1 PNUM
+    *0-0-0/w UBIN        r     1 PT                        30-0-0/w UBIN        r     1 TMP
+    *0-0-0/w UBIN        r     1 TOTSIZE                   *0-0-0/w UBIN        r     1 WSQPG
+
+  ****  SYMREF variables  ****
+
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:31   
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$IS$                      0-0-0/w PTR         r     1 B$JIT$
+     0-0-0/w BIT         r     1 IP_WSQ0PT                  0-0-0/w PTR         r     1 MM_BYP$
+     0-0-0/w PTR         r     1 PPUT$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(8856)  r     1 B$JIT                      0-0-0/w STRC        r     1 B$MAP(0:1023)
+     0-0-0N  NULL        r     1 M$EI
+     0-0-0/w STRC        r     1 MM$PPUT(0:0)
+
+
+   Procedure IPB$READ requires 223 words for executable code.
+   Procedure IPB$READ requires 30 words of local(AUTO) storage.
+
+    No errors detected in file IPB$READ.:E05TSI    .
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:32   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:33   
+          MINI XREF LISTING
+
+ADR
+      5602**DCL      5727<<ASSIGN   5738>>DOWHILE  5781<<ASSIGN   5781>>ASSIGN   5782>>ASSIGN
+B$IS$
+      5621**DCL      5732>>ASSIGN
+B$JIT.CPFLAGS1.SLEAZE
+      1444**DCL      1444--REDEF
+B$JIT.ERR
+      1350**DCL      5793>>ASSIGN
+B$JIT.ERR.CODE
+      1351**DCL      5789>>IF
+B$JIT.ERR.MID
+      1351**DCL      1351--REDEF
+B$JIT$
+      5620**DCL      1345--IMP-PTR  5789>>IF       5793>>ASSIGN
+B$MAP.CTRL
+      2088**DCL      5769<<ASSIGN
+B$MAP.RPN
+      2084**DCL      5765<<ASSIGN   5768<<ASSIGN
+B$MAP.SCTRL
+      2085**DCL      2086--REDEF
+BADCVM
+      5789**LABEL    5745--CALLALT
+BIAS
+        28**DCL        24--PROC     5724>>ASSIGN   5725>>ASSIGN   5726>>ASSIGN   5727>>ASSIGN
+BUF$
+        38**DCL        24--PROC     5725>>ASSIGN   5732>>ASSIGN   5783>>ASSIGN
+BUF2$
+      5606**DCL      5725<<ASSIGN   5777>>ASSIGN   5783<<ASSIGN
+BUFVP
+      5601**DCL      5732<<ASSIGN   5743>>ASSIGN
+CHKNOREC
+      5776**LABEL    5778--CALLALT
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:34   
+CONT_READ
+      5777**LABEL    5790--GOTO
+ENDPROC
+      5600**DCL      5726<<ASSIGN   5738>>DOWHILE
+ERR
+        39**DCL        24--PROC     5793<<ASSIGN
+FPT_CVM
+      5680**DCL      5745<>CALL
+FPT_CVM.V
+      5680**DCL      5680--DCLINIT
+FPT_CVM.V.PHYSICAL#
+      5680**DCL      5744<<ASSIGN
+FPT_CVM.V.PPNO#
+      5681**DCL      5742<<ASSIGN
+FPT_CVM.V.VPNO#
+      5682**DCL      5743<<ASSIGN
+FPT_STLPP
+      5696**DCL      5710<>CALL     5741<>CALL
+GETBUF
+      5607**DCL      5739>>IF       5780<<ASSIGN
+IPD$REAL_TO_PHYS
+      5624**DCL-ENT  5764--CALL
+IP_WSQ0PT
+      5619**DCL      5763>>IF
+K
+      5605**DCL      5740<<DOINDEX  5743>>ASSIGN
+KTYPE
+        27**DCL        24--PROC     5722>>ASSIGN
+LAST
+      5603**DCL      5706<<ASSIGN   5707>>DOWHILE  5708>>ASSIGN   5709>>ASSIGN   5711<<ASSIGN   5735<<ASSIGN
+      5749<<ASSIGN   5752>>ASSIGN   5753<<ASSIGN   5755>>ASSIGN   5756>>ASSIGN   5764<>CALL     5768>>ASSIGN
+      5773>>ASSIGN   5774>>ASSIGN
+M$CVM
+      1302**DCL-ENT  5745--CALL
+M$READ
+      1265**DCL-ENT  5778--CALL
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:35   
+M$RSPP
+      1302**DCL-ENT  5710--CALL
+M$STLPP
+      1301**DCL-ENT  5741--CALL
+MM$DESC.BOUND
+      1993**DCL      1994--REDEF
+MM$DESC.FLGS
+      1994**DCL      1994--REDEF
+MM$PPUT.PNUM
+      1982**DCL      5756<<ASSIGN
+MM$PPUT.PPNO
+      1982**DCL      5708>>ASSIGN   5752<<ASSIGN   5774<<ASSIGN
+MM$PPUT.PRC
+      1981**DCL      5755<<ASSIGN
+MM$PPUT.USER#
+      1982**DCL      1982--REDEF
+MM_BYP$
+      1913**DCL      1913--IMP-PTR
+NODE
+        31**DCL        24--PROC     5723>>ASSIGN
+NOPAGE
+      5789**LABEL    5741--CALLALT
+PC
+        35**DCL        24--PROC     5713<<ASSIGN   5734<<ASSIGN   5757<<ASSIGN   5757>>ASSIGN
+PFLGS
+        26**DCL        24--PROC     5760>>IF
+PGNO
+      5604**DCL      5708<<ASSIGN   5711>>ASSIGN   5729<<ASSIGN   5730<<ASSIGN   5765>>ASSIGN   5768>>ASSIGN
+      5769>>ASSIGN   5770<<ASSIGN   5770>>ASSIGN
+PGSZ
+        30**DCL        24--PROC     5727>>ASSIGN   5727>>ASSIGN   5740>>DOINDEX  5776>>ASSIGN   5781>>ASSIGN
+PGT$
+        36**DCL        24--PROC     5728--IF       5760--IF       5765>>ASSIGN   5768>>ASSIGN   5769>>ASSIGN
+PH
+        33**DCL        24--PROC     5706>>ASSIGN   5714<<ASSIGN   5733<<ASSIGN   5746>>IF       5748<<ASSIGN
+      5749>>ASSIGN
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:36   
+PNUM
+        40**DCL        24--PROC     5756>>ASSIGN
+PPUT$
+      5618**DCL      5708>>ASSIGN   5752>>ASSIGN   5755>>ASSIGN   5756>>ASSIGN   5774>>ASSIGN
+PT
+        34**DCL        24--PROC     5715<<ASSIGN   5773<<ASSIGN
+READ_EI
+      5647**DCL      5778<>CALL
+READ_EI.BUF_.BOUND
+      5649**DCL      5776<<ASSIGN
+READ_EI.BUF_.BUF$
+      5650**DCL      5777<<ASSIGN
+READ_EI.STATION_
+      5650**DCL      5651--REDEF
+READ_EI.V
+      5651**DCL      5647--DCLINIT
+READ_EI.V.DVBYTE.REREAD#
+      5662**DCL      5662--REDEF
+READ_EI.V.INDX#
+      5660**DCL      5660--REDEF
+RELPROC
+      5705**PROC     5794--CALL
+RU_KEY
+      5611**DCL      5647--DCLINIT  5648--DCLINIT
+RU_KEY.ADR
+      5615**DCL      5724<<ASSIGN   5782<<ASSIGN
+RU_KEY.COUNT
+      5612**DCL      5721<<ASSIGN
+RU_KEY.NODE
+      5614**DCL      5723<<ASSIGN
+RU_KEY.TYPE
+      5613**DCL      5722<<ASSIGN
+SO_WHAT IN PROCEDURE RELPROC
+      5711**LABEL    5710--CALLALT
+STLVEC
+      5608**DCL      5696--DCLINIT
+PL6.E3A0      #001=IPB$READ File=IPB$READ.:E05TSI                                TUE 07/29/97 22:40 Page:37   
+STLVEC.PNO
+      5610**DCL      5709<<ASSIGN   5742>>ASSIGN   5748>>ASSIGN   5752>>ASSIGN   5753>>ASSIGN
+TMP
+      5623**DCL      5764<>CALL     5765>>ASSIGN
+TOTSIZE
+        29**DCL        24--PROC     5726>>ASSIGN
+WSQPG
+        37**DCL        24--PROC     5730>>ASSIGN

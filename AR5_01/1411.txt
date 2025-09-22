@@ -1,0 +1,3083 @@
+VERSION E05
+
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:1    
+        1        1        /*M* KYN$INTR_HNDLR       CALL THE APPROPRIATE DEVICE CONTROLLER */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+        8        8               ECI=0,DIN=7,CSU=3,AND      */
+        9        9        /*
+       10       10
+       11       11          E X T E R N A L    I N T E R F A C E    D E S C R I P T I O N
+       12       12
+       13       13        Nothing could be simpler.  Whenever an interrupt occurs at our
+       14       14        device interrupt level, the SIL routine KYO$SIL_INTRPT calls this
+       15       15        routine passing in the context block.  This routine then looks
+       16       16        at the context in order to decide what device handler will best
+       17       17        be able to handle this interrupt.  And it calls that routine,
+       18       18        passing it the context block, and an indicator that the call is
+       19       19        due to a interrupt.
+       20       20
+       21       21        */
+       22       22        %EJECT;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:2    
+       23       23        /*
+       24       24                  I N T E R N A L   O V E R V I E W
+       25       25
+       26       26        Well, it is slightly trickier than that.  Because for each of the
+       27       27        interrupts that this code catches, we need to attempt to enter VDI.
+       28       28        But that is really not a problem.
+       29       29
+       30       30        There is one sleeze going on here, however.  If the device that the
+       31       31        interrupt is for is already waiting to talk to VDI then we don't
+       32       32        want to even bother attempting to do the enter.  Things should run
+       33       33        slightly faster that way.
+       34       34
+       35       35           <Do a Get-Status-Word>
+       36       36           Ack:
+       37       37             <Is our Device already waiting for VDH?>
+       38       38             Yes:
+       39       39               <Remember that we are dealing with multiple interrupts>
+       40       40             No:
+       41       41               <Attempt to enter VDI>
+       42       42               Success:
+       43       43                  <Do Case on the Device Type>
+       44       44                      in order to invoke the correct device handler
+       45       45                  <Exit VDH>
+       46       46               Failure:
+       47       47                  <Remember the deferred event: interrupt>
+       48       48
+       49       49
+       50       50        We have a little bit of weirdness going on here that was not made
+       51       51        clear before.  So I'll explain it now:  KY$CTX.STATUSW will be
+       52       52        forced to always contain the interrupt that the device handler will
+       53       53        process next.  Now that sounds real simple except for the following
+       54       54        two badnesses:  1) The Get-Status call to KYI$IO always puts
+       55       55        the status word in KY$CTX.STATUSW, and 2) when we have deferr'd
+       56       56        events we need to save the 'second' interrupt somewhere.  I.E. there
+       57       57        is a necessity for holding on to 2 interrupts in the case where the
+       58       58        first interrupt was not allowed to Enter VDH, and a second interrupt
+       59       59        occur'd before that first one could be processed.  But, note that
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:3    
+       60       60        we only need to know about the status word for the 'First' interrupt
+       61       61        and the 'Last' interrupt, and not about any in the middle.
+       62       62
+       63       63        As a result of the combined weirdnesses, you will notice some amount
+       64       64        of mucking around with 'temprorary storage' during the coure of this
+       65       65        routine.
+       66       66
+       67       67        */
+       68       68        %EJECT;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:4    
+       69       69        /*P* NAME: KYN$INTR_HNDLR      Invoke the correct device controller */
+       70       70        KYN$INTR_HNDLR: PROC ASYNC;
+       71       71        /**/
+       72       72        %INCLUDE LCP_6;
+       73     4351        %INCLUDE GH_HARDWARE_M;
+       74     4449        %INCLUDE G_HJIT_M;
+       75     4594        %INCLUDE KH$CHN;
+       76     4716        %INCLUDE KH_CHN;
+       77     4756        %INCLUDE KL_AFCN_C;
+       78     4857        %INCLUDE KL_MACRO_C;
+       79     8209        %INCLUDE K_ID_E;
+       80     8259        %K#ENTID_E;
+       81     8278        %K#LYRID_E;
+       82     8285        %INCLUDE KV_GLBCNS_E;
+       83     8626        %INCLUDE KV$GLBCTX;
+       84     9071        %INCLUDE KV$GLB;
+       85     9490        %INCLUDE KV_GLB_M;
+       86     9612        %INCLUDE KV$PRM;
+       87     9825        %INCLUDE KV_PRMID_E;
+       88     9999        %INCLUDE KY_URP_M;
+       89    10294        %INCLUDE KY_SUBS_C;
+       90    10383        %INCLUDE KH$STT;
+       91    10413        %INCLUDE KY_DATA_R;
+       92    11208        %INCLUDE KY_PERR_C;
+       93    11230        /**/
+       94    11231    1          DCL KYN$OUR_HNDLR ENTRY(1);
+       95    11232    1          DCL KYN$IUR_HNDLR ENTRY(1);
+       96    11233    1          DCL KYI$IO ENTRY(2) ALTRET;
+       97    11234    1          DCL X6A_INTRET ENTRY(1);
+       98    11235    1          DCL KHC$XEQ2 ENTRY(1) ALTRET;
+       99    11236    1          DCL KHA$ERRLOG ENTRY(2) ALTRET;
+      100    11237        /**/
+      101    11238    1          DCL CHAN UBIN WORD;
+      102    11239    1          DCL CTX$ PTR;
+      103    11240    1          DCL CHN$ PTR;
+      104    11241    1          DCL SVDXEQTIM UBIN(32);
+      105    11242    1          DCL CURXEQTIM UBIN(32);
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:5    
+      106    11243        %KV$VDI;
+      107    11314        %KV$SSN;
+      108    11393        %KV$STT;
+      109    11787        %KV$PTR;
+      110    11830        %KV$USRPRM;
+      111    11881        %KV@USRENT;
+      112    11901        %KH$CHN (STCLASS="BASED(CHN$)");
+      113    12025        %KH_CHNDAT;
+      114    12043        %KY$CTX (STCLASS="BASED(CTX$)");
+      115    12220        %G$UHJIT(STCLASS="BASED(G$UHJIT$)");
+      116    15194    1          DCL OLDPTR$ PTR;
+      117    15195    1          DCL TEMP_STATUSW UBIN WORD;
+      118    15196        %FPT_INTRET;
+      119    15216        %FPT_WRSYSLOG(STCLASS=STATIC);
+      120    15311        %VLP_ERRCODE(FPTN=INVCHAN,FCG='KY',MID='N',SEV=%G_WRSYSLOG_SEV_INFO#,ERR#=
+             15311            %GG#EC_KYN_INVCHAN,STCLASS=CONSTANT);
+      121    15357                   /*E*  ERROR: KYN-GG#EC_KYN_INVCHAN
+      122    15358                         MESSAGE: interrupt received on an invalid channel.
+      123    15359                         MESSAGE1: value(0) contains the channel#.  */
+      124    15360        %VLP_ERRCODE(FPTN=NOCONTEXT,FCG='KY',MID='N',SEV=%G_WRSYSLOG_SEV_INFO#,ERR#=
+             15360            %GG#EC_KYN_NOCONTEXT,STCLASS=CONSTANT);
+      125    15406                   /*E* ERROR: KYN-GG#EC_KYN_NOCONTEXT
+      126    15407                        MESSAGE: interrupt on channel with no context associated.
+      127    15408                        MESSAGE1: kh$chn.ctx$ is nil.  */
+      128    15409        /**/
+      129    15410    1          DCL G$UHJIT$ PTR SYMREF;
+      130    15411        /**/
+      131    15412        %EJECT;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:6    
+      132    15413    1          KY_DISABLE_CNT = KY_DISABLE_CNT + 1;
+      133    15414    1          KY_INTFLG = '1'B;
+      134    15415    1          CHAN = BITBIN(G$UHJIT.ISA_USR.DEV);
+      135    15416    1          IF CHAN > KH_CHNHI THEN
+      136    15417    2             DO;
+      137    15418                /* Error log it - interrupt on invalid channel */
+      138    15419    2                FPT_WRSYSLOG.V.ERRCODE = INVCHAN;
+      139    15420    2                FPT_WRSYSLOG.V.VALUES(0) = CHAN;
+             15420                         /* interrupting channel as if anyone cares */
+      140    15421    2                FPT_WRSYSLOG.V.TERMID = '0'B;
+      141    15422    2                CALL KHA$ERRLOG(FPT_WRSYSLOG);
+      142    15423    2                GOTO INTRET;
+      143    15424    2             END;                          /* IF CHANNEL OUT OF RANGE */
+      144    15425    1          CHN$ = PINCRW(KH_CHNLOW$,SIZEW(KH$CHN)*(CHAN/128));
+      145    15426    1          CTX$ = KH$CHN.CTX$;
+      146    15427    1          KH$CHN.INTCNT = KH$CHN.INTCNT + 1;
+      147    15428    1          CALL KHC$XEQ2(SVDXEQTIM);
+      148    15429    1          IF CTX$ ~= ADDR(NIL) THEN
+      149    15430    2             DO;
+      150    15431        /*%TRACE(WHEREAT = 10,INPUT$="KY$CTX.Q.INPUT$"); */
+      151    15432    2                IF KY$CTX.RESCHEDULE.TIMER THEN
+      152    15433    2                   GOTO INTRET;
+      153    15434    2                TEMP_STATUSW = KY$CTX.STATUSW;
+      154    15435                                      /*%TRACE(WHEREAT = 21,INPUT$="KY$CTX.Q.INPUT$");*/
+      155    15436    3                CALL KYI$IO(KY$CTX,%KY#GET_STAT) WHENALTRETURN DO;
+      156    15437                                      /*%TRACE(WHEREAT = 22,INPUT$="KY$CTX.Q.INPUT$");*/
+      157    15438    3                      KY$CTX.STATUSW = TEMP_STATUSW;
+      158    15439    3                      GOTO INTRET;
+      159    15440    3                   END;                    /* WHENALTRETURN */
+      160    15441                                      /*%TRACE(WHEREAT = 23,INPUT$="KY$CTX.Q.INPUT$");*/
+      161    15442    2                KY$CTX.DEFRD.STATUSW = KY$CTX.STATUSW;
+      162    15443    2                IF KY$CTX.RESCHEDULE.INTERRUPT THEN
+      163    15444    3                   DO;
+      164    15445    3                      KY$CTX.DEFRD.INTRPT = '1'B;
+      165    15446    3                      KY$CTX.STATUSW = TEMP_STATUSW;
+      166    15447                                      /*%TRACE(WHEREAT = 24,INPUT$="KY$CTX.Q.INPUT$");*/
+      167    15448    3                   END;                    /* IF RESCHEDULE.INTERRUPT */
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:7    
+      168    15449    2                ELSE
+      169    15450    3                   DO;
+      170    15451                                      /*%TRACE(WHEREAT = 25,INPUT$="KY$CTX.Q.INPUT$");*/
+      171    15452                           %KV$USRENT (VDI$="KY$CTX.VDI$",DFR$=DFR,SCHRSN=1);
+             15465    3           KY$CTX.VDI$->KV$VDI.USRPRM$->KV$USRPRM.STT$->KV$STT.USRENTCNT =
+             15465                    KY$CTX.VDI$->KV$VDI.USRPRM$->KV$USRPRM.STT$->KV$STT.USRENTCNT + 1;
+             15466    4           IF NOT KY$CTX.VDI$->KV$VDI.BSY THEN DO;
+             15467    4              KY$CTX.VDI$->KV$VDI.BSY = '1'B;
+             15468    4              KV@USRENT.SVDPTR$ = KV$PTR$;
+             15469    4              KV$PTR$ = KY$CTX.VDI$->KV$VDI.ASNINPPTR$;
+             15470    4              END;                         /* ELSE IF ~BSY                       */
+             15471    4           ELSE DO;
+             15472    4              KY$CTX.VDI$->KV$VDI.DFR.USR(1) = '1'B;
+             15473    4           KY$CTX.VDI$->KV$VDI.USRPRM$->KV$USRPRM.STT$->KV$STT.USRENTDFRCNT =
+             15473                    KY$CTX.VDI$->KV$VDI.USRPRM$->KV$USRPRM.STT$->KV$STT.USRENTDFRCNT + 1;
+             15474    4              GOTO DFR;
+             15475    4              END;                         /* END IF                             */
+      172    15478    4                      DO CASE(KY$CTX.DVCTYP);
+      173    15479    4                         CASE(%KY#TYP_LP,%KY#TYP_CP);
+      174    15480    4                            CALL KYN$OUR_HNDLR(KY$CTX);
+      175    15481    4                         CASE(%KY#TYP_CR);
+      176    15482    4                            CALL KYN$IUR_HNDLR(KY$CTX);
+      177    15483    4                      END;                 /* DO CASE(DVCTYP) */
+      178    15484                                      /*%TRACE(WHEREAT = 26,INPUT$="KY$CTX.Q.INPUT$");*/
+      179    15485                           %KV$USREXT;
+             15491    3           KV$PTR.VDI$->KV$VDI.BSY = '0'B;
+             15493    3           KV$PTR$ = KV@USRENT.SVDPTR$;
+      180    15495                                      /*%TRACE(WHEREAT = 27,INPUT$="KY$CTX.Q.INPUT$");*/
+      181    15496    3                      GOTO INTRET;
+      182    15497    3   DFR:               ;
+      183    15498                                      /*%TRACE(WHEREAT = 28,INPUT$="KY$CTX.Q.INPUT$");*/
+      184    15499    3                      KY$CTX.DEFRD.INTRPT = '0'B;
+      185    15500    3                      KY$CTX.RESCHEDULE.INTERRUPT = '1'B;
+      186    15501    3                   END; /* ELSE
+      187    15502                                  */
+      188    15503    2             END;                          /* IF CTX$ ~= ADDR(NIL) */
+      189    15504    1          ELSE
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:8    
+      190    15505    2             DO;
+      191    15506                /* Error log: interrpt with no context associated */
+      192    15507    2                FPT_WRSYSLOG.V.ERRCODE = NOCONTEXT;
+      193    15508    2                FPT_WRSYSLOG.V.TERMID = KH$CHN.TERMID;
+      194    15509    2                CALL KHA$ERRLOG(FPT_WRSYSLOG);
+      195    15510    2             END; /* ELSE
+      196    15511                               */
+      197    15512    1   INTRET:;
+      198    15513    1          CALL KHC$XEQ2(CURXEQTIM);
+      199    15514    1          IF CTX$ ~= ADDR(NIL) THEN
+      200    15515    2             DO CASE (KY$CTX.DVCTYP);
+      201    15516    2                CASE(%KY#TYP_LP,%KY#TYP_CP);
+      202    15517    2                   KY_STT_URP.USRSTT.OTPINTISATIM = KY_STT_URP.USRSTT.OTPINTISATIM +
+      203    15518    2                      CURXEQTIM - SVDXEQTIM;
+      204    15519    2                CASE(%KY#TYP_CR);
+      205    15520    2                   KY_STT_URP.USRSTT.INPINTISATIM = KY_STT_URP.USRSTT.INPINTISATIM +
+      206    15521    2                      CURXEQTIM - SVDXEQTIM;
+      207    15522    2             END;
+      208    15523    1          KY_DISABLE_CNT = KY_DISABLE_CNT - 1;
+      209    15524    1          KY_INTFLG = '0'B;
+      210    15525        /*%TRACE(WHEREAT = 20,INPUT$="KY$CTX.Q.INPUT$");*/
+      211    15526    1          CALL X6A_INTRET(FPT_INTRET);
+      212    15527    1   END KYN$INTR_HNDLR;
+      213    15528        %EOD;
+
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:9    
+--  Include file information  --
+
+   KY_PERR_C.:E05TOU  is referenced.
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   KH_CHN.:E05TOU  is referenced.
+   KH$CHN.:E05TOU  is referenced.
+   G_HJIT_M.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure KYN$INTR_HNDLR.
+
+   Procedure KYN$INTR_HNDLR requires 346 words for executable code.
+   Procedure KYN$INTR_HNDLR requires 22 words of local(AUTO) storage.
+
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:10   
+
+ Object Unit name= KYN$INTR_HNDLR                             File name= KYN$INTRPT.:E05TOU
+ UTS= JUL 30 '97 02:43:35.56 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Data  even  none    28     1C  KYN$INTR_HNDLR
+    1  RoData even  UTS      4      4  KYN$INTR_HNDLR
+    2   Proc  even  none   346    15A  KYN$INTR_HNDLR
+    3  RoData even  none     4      4  KYN$INTR_HNDLR
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes            yes     Async       0  KYN$INTR_HNDLR
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       2 KHA$ERRLOG
+         yes           Std       1 KYN$IUR_HNDLR
+ yes     yes           Std       1 KHC$XEQ2
+ yes     yes           Std       2 KYI$IO
+         yes           Std       1 KYN$OUR_HNDLR
+         yes           Std       1 X6A_INTRET
+                       nStd      0 X6A_AAUTO
+                       nStd      0 X6A_AARET
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:11   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KY_STT_URP                            KY_DISABLE_CNT                        KY_INTFLG
+     KV$PTR$                          r    KH_CHNLOW$                       r    KH_CHNHI
+r    KH_CHNLOW                             G$UHJIT$                         r    G$ROS$
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:12   
+
+
+        1        1        /*M* KYN$INTR_HNDLR       CALL THE APPROPRIATE DEVICE CONTROLLER */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+        8        8               ECI=0,DIN=7,CSU=3,AND      */
+        9        9        /*
+       10       10
+       11       11          E X T E R N A L    I N T E R F A C E    D E S C R I P T I O N
+       12       12
+       13       13        Nothing could be simpler.  Whenever an interrupt occurs at our
+       14       14        device interrupt level, the SIL routine KYO$SIL_INTRPT calls this
+       15       15        routine passing in the context block.  This routine then looks
+       16       16        at the context in order to decide what device handler will best
+       17       17        be able to handle this interrupt.  And it calls that routine,
+       18       18        passing it the context block, and an indicator that the call is
+       19       19        due to a interrupt.
+       20       20
+       21       21        */
+       22       22        %EJECT;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:13   
+       23       23        /*
+       24       24                  I N T E R N A L   O V E R V I E W
+       25       25
+       26       26        Well, it is slightly trickier than that.  Because for each of the
+       27       27        interrupts that this code catches, we need to attempt to enter VDI.
+       28       28        But that is really not a problem.
+       29       29
+       30       30        There is one sleeze going on here, however.  If the device that the
+       31       31        interrupt is for is already waiting to talk to VDI then we don't
+       32       32        want to even bother attempting to do the enter.  Things should run
+       33       33        slightly faster that way.
+       34       34
+       35       35           <Do a Get-Status-Word>
+       36       36           Ack:
+       37       37             <Is our Device already waiting for VDH?>
+       38       38             Yes:
+       39       39               <Remember that we are dealing with multiple interrupts>
+       40       40             No:
+       41       41               <Attempt to enter VDI>
+       42       42               Success:
+       43       43                  <Do Case on the Device Type>
+       44       44                      in order to invoke the correct device handler
+       45       45                  <Exit VDH>
+       46       46               Failure:
+       47       47                  <Remember the deferred event: interrupt>
+       48       48
+       49       49
+       50       50        We have a little bit of weirdness going on here that was not made
+       51       51        clear before.  So I'll explain it now:  KY$CTX.STATUSW will be
+       52       52        forced to always contain the interrupt that the device handler will
+       53       53        process next.  Now that sounds real simple except for the following
+       54       54        two badnesses:  1) The Get-Status call to KYI$IO always puts
+       55       55        the status word in KY$CTX.STATUSW, and 2) when we have deferr'd
+       56       56        events we need to save the 'second' interrupt somewhere.  I.E. there
+       57       57        is a necessity for holding on to 2 interrupts in the case where the
+       58       58        first interrupt was not allowed to Enter VDH, and a second interrupt
+       59       59        occur'd before that first one could be processed.  But, note that
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:14   
+       60       60        we only need to know about the status word for the 'First' interrupt
+       61       61        and the 'Last' interrupt, and not about any in the middle.
+       62       62
+       63       63        As a result of the combined weirdnesses, you will notice some amount
+       64       64        of mucking around with 'temprorary storage' during the coure of this
+       65       65        routine.
+       66       66
+       67       67        */
+       68       68        %EJECT;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:15   
+       69       69        /*P* NAME: KYN$INTR_HNDLR      Invoke the correct device controller */
+       70       70        KYN$INTR_HNDLR: PROC ASYNC;
+
+     70   2 000000  D380 0000 0000  xent KYN$INTR_HNDLR  LNJ,B5   X6A_AAUTO
+          2 000003       0016 0000                       DC       22,0
+
+       71       71        /**/
+       72       72        %INCLUDE LCP_6;
+       73     4351        %INCLUDE GH_HARDWARE_M;
+       74     4449        %INCLUDE G_HJIT_M;
+       75     4594        %INCLUDE KH$CHN;
+       76     4716        %INCLUDE KH_CHN;
+       77     4756        %INCLUDE KL_AFCN_C;
+       78     4857        %INCLUDE KL_MACRO_C;
+       79     8209        %INCLUDE K_ID_E;
+       80     8259        %K#ENTID_E;
+       81     8278        %K#LYRID_E;
+       82     8285        %INCLUDE KV_GLBCNS_E;
+       83     8626        %INCLUDE KV$GLBCTX;
+       84     9071        %INCLUDE KV$GLB;
+       85     9490        %INCLUDE KV_GLB_M;
+       86     9612        %INCLUDE KV$PRM;
+       87     9825        %INCLUDE KV_PRMID_E;
+       88     9999        %INCLUDE KY_URP_M;
+       89    10294        %INCLUDE KY_SUBS_C;
+       90    10383        %INCLUDE KH$STT;
+       91    10413        %INCLUDE KY_DATA_R;
+       92    11208        %INCLUDE KY_PERR_C;
+       93    11230        /**/
+       94    11231    1          DCL KYN$OUR_HNDLR ENTRY(1);
+       95    11232    1          DCL KYN$IUR_HNDLR ENTRY(1);
+       96    11233    1          DCL KYI$IO ENTRY(2) ALTRET;
+       97    11234    1          DCL X6A_INTRET ENTRY(1);
+       98    11235    1          DCL KHC$XEQ2 ENTRY(1) ALTRET;
+       99    11236    1          DCL KHA$ERRLOG ENTRY(2) ALTRET;
+      100    11237        /**/
+      101    11238    1          DCL CHAN UBIN WORD;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:16   
+      102    11239    1          DCL CTX$ PTR;
+      103    11240    1          DCL CHN$ PTR;
+      104    11241    1          DCL SVDXEQTIM UBIN(32);
+      105    11242    1          DCL CURXEQTIM UBIN(32);
+      106    11243        %KV$VDI;
+      107    11314        %KV$SSN;
+      108    11393        %KV$STT;
+      109    11787        %KV$PTR;
+      110    11830        %KV$USRPRM;
+      111    11881        %KV@USRENT;
+      112    11901        %KH$CHN (STCLASS="BASED(CHN$)");
+      113    12025        %KH_CHNDAT;
+      114    12043        %KY$CTX (STCLASS="BASED(CTX$)");
+      115    12220        %G$UHJIT(STCLASS="BASED(G$UHJIT$)");
+      116    15194    1          DCL OLDPTR$ PTR;
+      117    15195    1          DCL TEMP_STATUSW UBIN WORD;
+      118    15196        %FPT_INTRET;
+      119    15216        %FPT_WRSYSLOG(STCLASS=STATIC);
+      120    15311        %VLP_ERRCODE(FPTN=INVCHAN,FCG='KY',MID='N',SEV=%G_WRSYSLOG_SEV_INFO#,ERR#=
+             15311            %GG#EC_KYN_INVCHAN,STCLASS=CONSTANT);
+      121    15357                   /*E*  ERROR: KYN-GG#EC_KYN_INVCHAN
+      122    15358                         MESSAGE: interrupt received on an invalid channel.
+      123    15359                         MESSAGE1: value(0) contains the channel#.  */
+      124    15360        %VLP_ERRCODE(FPTN=NOCONTEXT,FCG='KY',MID='N',SEV=%G_WRSYSLOG_SEV_INFO#,ERR#=
+             15360            %GG#EC_KYN_NOCONTEXT,STCLASS=CONSTANT);
+      125    15406                   /*E* ERROR: KYN-GG#EC_KYN_NOCONTEXT
+      126    15407                        MESSAGE: interrupt on channel with no context associated.
+      127    15408                        MESSAGE1: kh$chn.ctx$ is nil.  */
+      128    15409        /**/
+      129    15410    1          DCL G$UHJIT$ PTR SYMREF;
+      130    15411        /**/
+      131    15412        %EJECT;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:17   
+      132    15413    1          KY_DISABLE_CNT = KY_DISABLE_CNT + 1;
+
+  15413   2 000005  8A80 0000 0000  xsym                 INC      KY_DISABLE_CNT
+
+      133    15414    1          KY_INTFLG = '1'B;
+
+  15414   2 000008  8900 0000 0000  xsym                 LBT,'8000'X       KY_INTFLG
+  15414   2 00000B       8000
+
+      134    15415    1          CHAN = BITBIN(G$UHJIT.ISA_USR.DEV);
+
+  15415   2 00000C  EC80 0000 0000  xsym                 LDB,B6   G$UHJIT$
+          2 00000F  E846 0081                            LDR,R6   129,B6
+          2 000011  EF47 0004                            STR,R6   CHAN,AUTO
+
+      135    15416    1          IF CHAN > KH_CHNHI THEN
+
+  15416   2 000013  E900 0000 0000  xsym                 CMR,R6   KH_CHNHI
+          2 000016  0381 0021                            BLE      s:15425,PREL
+
+      136    15417    2             DO;
+
+      137    15418                /* Error log it - interrupt on invalid channel */
+      138    15419    2                FPT_WRSYSLOG.V.ERRCODE = INVCHAN;
+
+  15419   2 000018  8C80 0000 0000  01                   LDI      INVCHAN
+          2 00001B  8D00 0000 000D  00                   SDI      FPT_WRSYSLOG+6
+
+      139    15420    2                FPT_WRSYSLOG.V.VALUES(0) = CHAN;
+             15420                         /* interrupting channel as if anyone cares */
+
+  15420   2 00001E  D847 0004                            LDR,R5   CHAN,AUTO
+          2 000020  DF00 0000 0017  00                   STR,R5   FPT_WRSYSLOG+16
+
+      140    15421    2                FPT_WRSYSLOG.V.TERMID = '0'B;
+
+  15421   2 000023  DB80 0000 0000  00                   LAB,B5   FPT_INTRET
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:18   
+          2 000026  5C10                                 LDV,R5   16
+          2 000027  0021                                 ALR      ;
+          2 000028       4178 0000                                ALPHANUM('0000'X,IMO,,1),;
+          2 00002A       4005 000F                                ALPHANUM(15,B5,,R5,FILL)
+
+      141    15422    2                CALL KHA$ERRLOG(FPT_WRSYSLOG);
+
+  15422   2 00002C  BB80 0000 0000  03                   LAB,B3   0
+          2 00002F  CBF0 0100                            LAB,B4   256,IMO
+          2 000031  437F                                 CSYNC    s:15422+4,SPREL
+          2 000032  E380 0000 0000  xent                 LNJ,B6   KHA$ERRLOG
+          2 000035       0001                            DC       s:15423,PREL
+
+      142    15423    2                GOTO INTRET;
+
+  15423   2 000036  0F81 00DA                            B        s:15510,PREL
+
+      143    15424    2             END;                          /* IF CHANNEL OUT OF RANGE */
+      144    15425    1          CHN$ = PINCRW(KH_CHNLOW$,SIZEW(KH$CHN)*(CHAN/128));
+
+  15425   2 000038  6047                                 SOR,R6   7
+          2 000039  F856                                 LDR,R7   R6
+          2 00003A  6C00                                 LDV,R6   0
+          2 00003B  7085                                 DOL,R7   5
+          2 00003C  8400 0000 0000  xsym                 AID      KH_CHNLOW$
+          2 00003F  8D47 0007                            SDI      CHN$,AUTO
+
+      145    15426    1          CTX$ = KH$CHN.CTX$;
+
+  15426   2 000041  DCC7 0007                            LDB,B5   CHN$,AUTO
+          2 000043  CCC5 000C                            LDB,B4   12,B5
+          2 000045  CFC7 0005                            STB,B4   CTX$,AUTO
+
+      146    15427    1          KH$CHN.INTCNT = KH$CHN.INTCNT + 1;
+
+  15427   2 000047  8AC5 000F                            INC      15,B5
+          2 000049  8EC5 000E                            CAD      14,B5
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:19   
+
+      147    15428    1          CALL KHC$XEQ2(SVDXEQTIM);
+
+  15428   2 00004B  BBC7 0009                            LAB,B3   SVDXEQTIM,AUTO
+          2 00004D  BFC7 0012                            STB,B3   TEMP_STATUSW+1,AUTO
+          2 00004F  BBC7 0012                            LAB,B3   TEMP_STATUSW+1,AUTO
+          2 000051  CBF0 0100                            LAB,B4   256,IMO
+          2 000053  E380 0000 0000  xent                 LNJ,B6   KHC$XEQ2
+          2 000056       0001                            DC       s:15429,PREL
+
+      148    15429    1          IF CTX$ ~= ADDR(NIL) THEN
+
+  15429   2 000057  8DC7 0005                            CMN      CTX$,AUTO
+          2 000059  0901 009F                            BE       s:15507,PREL
+
+      149    15430    2             DO;
+
+      150    15431        /*%TRACE(WHEREAT = 10,INPUT$="KY$CTX.Q.INPUT$"); */
+      151    15432    2                IF KY$CTX.RESCHEDULE.TIMER THEN
+
+  15432   2 00005B  ECC7 0005                            LDB,B6   CTX$,AUTO
+          2 00005D  89C6 0021                            CMZ      33,B6
+          2 00005F  0801 00B1                            BAL      s:15510,PREL
+
+      152    15433    2                   GOTO INTRET;
+      153    15434    2                TEMP_STATUSW = KY$CTX.STATUSW;
+
+  15434   2 000061  E846 0006                            LDR,R6   6,B6
+          2 000063  EF47 0011                            STR,R6   TEMP_STATUSW,AUTO
+
+      154    15435                                      /*%TRACE(WHEREAT = 21,INPUT$="KY$CTX.Q.INPUT$");*/
+      155    15436    3                CALL KYI$IO(KY$CTX,%KY#GET_STAT) WHENALTRETURN DO;
+
+  15436   2 000065  DBF0 0002                            LAB,B5   2,IMO
+          2 000067  DFC7 0014                            STB,B5   TEMP_STATUSW+3,AUTO
+          2 000069  EFC7 0012                            STB,B6   TEMP_STATUSW+1,AUTO
+          2 00006B  BBC7 0012                            LAB,B3   TEMP_STATUSW+1,AUTO
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:20   
+          2 00006D  CBF0 0200                            LAB,B4   512,IMO
+          2 00006F  E380 0000 0000  xent                 LNJ,B6   KYI$IO
+          2 000072       0003                            DC       s:15438,PREL
+          2 000073  0F81 0009                            B        s:15442,PREL
+
+      156    15437                                      /*%TRACE(WHEREAT = 22,INPUT$="KY$CTX.Q.INPUT$");*/
+      157    15438    3                      KY$CTX.STATUSW = TEMP_STATUSW;
+
+  15438   2 000075  ECC7 0005                            LDB,B6   CTX$,AUTO
+          2 000077  E847 0011                            LDR,R6   TEMP_STATUSW,AUTO
+          2 000079  EF46 0006                            STR,R6   6,B6
+
+      158    15439    3                      GOTO INTRET;
+
+  15439   2 00007B  0F81 0095                            B        s:15510,PREL
+
+      159    15440    3                   END;                    /* WHENALTRETURN */
+      160    15441                                      /*%TRACE(WHEREAT = 23,INPUT$="KY$CTX.Q.INPUT$");*/
+      161    15442    2                KY$CTX.DEFRD.STATUSW = KY$CTX.STATUSW;
+
+  15442   2 00007D  ECC7 0005                            LDB,B6   CTX$,AUTO
+          2 00007F  E846 0006                            LDR,R6   6,B6
+          2 000081  EF46 0020                            STR,R6   32,B6
+
+      162    15443    2                IF KY$CTX.RESCHEDULE.INTERRUPT THEN
+
+  15443   2 000083  82C6 0021                            LB,'4000'X        33,B6
+  15443   2 000085       4000
+          2 000086  0581 000A                            BBF      s:15465,PREL
+
+      163    15444    3                   DO;
+
+      164    15445    3                      KY$CTX.DEFRD.INTRPT = '1'B;
+
+  15445   2 000088  8946 001F                            LBT,'8000'X       31,B6
+  15445   2 00008A       8000
+
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:21   
+      165    15446    3                      KY$CTX.STATUSW = TEMP_STATUSW;
+
+  15446   2 00008B  E847 0011                            LDR,R6   TEMP_STATUSW,AUTO
+          2 00008D  EF46 0006                            STR,R6   6,B6
+
+      166    15447                                      /*%TRACE(WHEREAT = 24,INPUT$="KY$CTX.Q.INPUT$");*/
+      167    15448    3                   END;                    /* IF RESCHEDULE.INTERRUPT */
+
+  15448   2 00008F  0F81 0081                            B        s:15510,PREL
+
+      168    15449    2                ELSE
+      169    15450    3                   DO;
+
+      170    15451                                      /*%TRACE(WHEREAT = 25,INPUT$="KY$CTX.Q.INPUT$");*/
+      171    15452                           %KV$USRENT (VDI$="KY$CTX.VDI$",DFR$=DFR,SCHRSN=1);
+             15465    3           KY$CTX.VDI$->KV$VDI.USRPRM$->KV$USRPRM.STT$->KV$STT.USRENTCNT =
+             15465                    KY$CTX.VDI$->KV$VDI.USRPRM$->KV$USRPRM.STT$->KV$STT.USRENTCNT + 1;
+
+  15465   2 000091  DCC6 0008                            LDB,B5   8,B6
+          2 000093  CCC5 0008                            LDB,B4   8,B5
+          2 000095  BCC4 0033                            LDB,B3   51,B4
+          2 000097  8AC3 0039                            INC      57,B3
+          2 000099  8EC3 0038                            CAD      56,B3
+
+             15466    4           IF NOT KY$CTX.VDI$->KV$VDI.BSY THEN DO;
+
+  15466   2 00009B  DCC6 0008                            LDB,B5   8,B6
+          2 00009D  82C5 0019                            LB,'0080'X        25,B5
+          2 00009F       0080
+          2 0000A0  0501 0012                            BBT      s:15472,PREL
+
+             15467    4              KY$CTX.VDI$->KV$VDI.BSY = '1'B;
+
+  15467   2 0000A2  8945 0019                            LBT,'0080'X       25,B5
+  15467   2 0000A4       0080
+
+             15468    4              KV@USRENT.SVDPTR$ = KV$PTR$;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:22   
+
+  15468   2 0000A5  DC80 0000 0000  xsym                 LDB,B5   KV$PTR$
+          2 0000A8  DFC7 000D                            STB,B5   KV@USRENT,AUTO
+
+             15469    4              KV$PTR$ = KY$CTX.VDI$->KV$VDI.ASNINPPTR$;
+
+  15469   2 0000AA  CCC6 0008                            LDB,B4   8,B6
+          2 0000AC  BCC4 0006                            LDB,B3   6,B4
+          2 0000AE  BF80 0000 0000  xsym                 STB,B3   KV$PTR$
+
+             15470    4              END;                         /* ELSE IF ~BSY                       */
+
+  15470   2 0000B1  0F81 0010                            B        s:15478,PREL
+
+             15471    4           ELSE DO;
+
+             15472    4              KY$CTX.VDI$->KV$VDI.DFR.USR(1) = '1'B;
+
+  15472   2 0000B3  8945 0018                            LBT,'4000'X       24,B5
+  15472   2 0000B5       4000
+
+             15473    4           KY$CTX.VDI$->KV$VDI.USRPRM$->KV$USRPRM.STT$->KV$STT.USRENTDFRCNT =
+             15473                    KY$CTX.VDI$->KV$VDI.USRPRM$->KV$USRPRM.STT$->KV$STT.USRENTDFRCNT + 1;
+
+  15473   2 0000B6  DCC6 0008                            LDB,B5   8,B6
+          2 0000B8  CCC5 0008                            LDB,B4   8,B5
+          2 0000BA  BCC4 0033                            LDB,B3   51,B4
+          2 0000BC  8AC3 003B                            INC      59,B3
+          2 0000BE  8EC3 003A                            CAD      58,B3
+
+             15474    4              GOTO DFR;
+
+  15474   2 0000C0  0F81 0030                            B        s:15493,PREL
+
+             15475    4              END;                         /* END IF                             */
+      172    15478    4                      DO CASE(KY$CTX.DVCTYP);
+
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:23   
+  15478   2 0000C2  B2C6 000B                            LLH,R3   11,B6
+          2 0000C4  3D04                                 CMV,R3   4
+          2 0000C5  0281 001D                            BGE      s:15491,PREL
+          2 0000C7  A830 0000 00CD  02                   LDR,R2   s:15478+11,R3
+          2 0000CA  83A0 0000 00D1  02                   JMP      s:15480,R2
+          2 0000CD       0012                            DC       s:15491,PREL
+          2 0000CE       0000                            DC       s:15480,PREL
+          2 0000CF       0000                            DC       s:15480,PREL
+          2 0000D0       000A                            DC       s:15482,PREL
+
+      173    15479    4                         CASE(%KY#TYP_LP,%KY#TYP_CP);
+
+      174    15480    4                            CALL KYN$OUR_HNDLR(KY$CTX);
+
+  15480   2 0000D1  BBC7 0005                            LAB,B3   CTX$,AUTO
+          2 0000D3  CBF0 0100                            LAB,B4   256,IMO
+          2 0000D5  E380 0000 0000  xent                 LNJ,B6   KYN$OUR_HNDLR
+          2 0000D8       0001                            DC       s:15480+8,PREL
+          2 0000D9  0F81 0009                            B        s:15491,PREL
+
+      175    15481    4                         CASE(%KY#TYP_CR);
+
+      176    15482    4                            CALL KYN$IUR_HNDLR(KY$CTX);
+
+  15482   2 0000DB  BBC7 0005                            LAB,B3   CTX$,AUTO
+          2 0000DD  CBF0 0100                            LAB,B4   256,IMO
+          2 0000DF  E380 0000 0000  xent                 LNJ,B6   KYN$IUR_HNDLR
+          2 0000E2       0001                            DC       s:15491,PREL
+
+      177    15483    4                      END;                 /* DO CASE(DVCTYP) */
+
+      178    15484                                      /*%TRACE(WHEREAT = 26,INPUT$="KY$CTX.Q.INPUT$");*/
+      179    15485                           %KV$USREXT;
+             15491    3           KV$PTR.VDI$->KV$VDI.BSY = '0'B;
+
+  15491   2 0000E3  EC80 0000 0000  xsym                 LDB,B6   KV$PTR$
+          2 0000E6  DC86                                 LDB,B5   ,B6
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:24   
+          2 0000E7  8845 0019                            LBF,'0080'X       25,B5
+          2 0000E9       0080
+
+             15493    3           KV$PTR$ = KV@USRENT.SVDPTR$;
+
+  15493   2 0000EA  DCC7 000D                            LDB,B5   KV@USRENT,AUTO
+          2 0000EC  DF80 0000 0000  xsym                 STB,B5   KV$PTR$
+
+      180    15495                                      /*%TRACE(WHEREAT = 27,INPUT$="KY$CTX.Q.INPUT$");*/
+      181    15496    3                      GOTO INTRET;
+
+  15496   2 0000EF  0F81 0021                            B        s:15510,PREL
+
+  15493   2                              DFR             null
+      182    15497    3   DFR:               ;
+      183    15498                                      /*%TRACE(WHEREAT = 28,INPUT$="KY$CTX.Q.INPUT$");*/
+      184    15499    3                      KY$CTX.DEFRD.INTRPT = '0'B;
+
+  15499   2 0000F1  8846 001F            DFR             LBF,'8000'X       31,B6
+  15499   2 0000F3       8000
+
+      185    15500    3                      KY$CTX.RESCHEDULE.INTERRUPT = '1'B;
+
+  15500   2 0000F4  8946 0021                            LBT,'4000'X       33,B6
+  15500   2 0000F6       4000
+
+      186    15501    3                   END; /* ELSE
+
+      187    15502                                  */
+      188    15503    2             END;                          /* IF CTX$ ~= ADDR(NIL) */
+
+  15503   2 0000F7  0F81 0019                            B        s:15510,PREL
+
+      189    15504    1          ELSE
+      190    15505    2             DO;
+
+      191    15506                /* Error log: interrpt with no context associated */
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:25   
+      192    15507    2                FPT_WRSYSLOG.V.ERRCODE = NOCONTEXT;
+
+  15507   2 0000F9  8C80 0000 0002  01                   LDI      NOCONTEXT
+          2 0000FC  8D00 0000 000D  00                   SDI      FPT_WRSYSLOG+6
+
+      193    15508    2                FPT_WRSYSLOG.V.TERMID = KH$CHN.TERMID;
+
+  15508   2 0000FF  ACC7 0007                            LDB,B2   CHN$,AUTO
+          2 000101  2C24                                 LDV,R2   36
+          2 000102  6C10                                 LDV,R6   16
+          2 000103  BB80 0000 0000  00                   LAB,B3   FPT_INTRET
+          2 000106  3C1E                                 LDV,R3   30
+          2 000107  0008                                 MMM
+
+      194    15509    2                CALL KHA$ERRLOG(FPT_WRSYSLOG);
+
+  15509   2 000108  BB80 0000 0000  03                   LAB,B3   0
+          2 00010B  CBF0 0100                            LAB,B4   256,IMO
+          2 00010D  E380 0000 0000  xent                 LNJ,B6   KHA$ERRLOG
+          2 000110       0001                            DC       s:15510,PREL
+
+      195    15510    2             END; /* ELSE
+
+  15508   2                              INTRET          null
+      196    15511                               */
+      197    15512    1   INTRET:;
+      198    15513    1          CALL KHC$XEQ2(CURXEQTIM);
+
+  15513   2 000111  EBC7 000B            INTRET          LAB,B6   CURXEQTIM,AUTO
+          2 000113  EFC7 0012                            STB,B6   TEMP_STATUSW+1,AUTO
+          2 000115  BBC7 0012                            LAB,B3   TEMP_STATUSW+1,AUTO
+          2 000117  CBF0 0100                            LAB,B4   256,IMO
+          2 000119  E380 0000 0000  xent                 LNJ,B6   KHC$XEQ2
+          2 00011C       0001                            DC       s:15514,PREL
+
+      199    15514    1          IF CTX$ ~= ADDR(NIL) THEN
+
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:26   
+  15514   2 00011D  8DC7 0005                            CMN      CTX$,AUTO
+          2 00011F  0901 0028                            BE       s:15523,PREL
+
+      200    15515    2             DO CASE (KY$CTX.DVCTYP);
+
+  15515   2 000121  ECC7 0005                            LDB,B6   CTX$,AUTO
+          2 000123  B2C6 000B                            LLH,R3   11,B6
+          2 000125  3D04                                 CMV,R3   4
+          2 000126  0281 0021                            BGE      s:15523,PREL
+          2 000128  A830 0000 012E  02                   LDR,R2   s:15515+13,R3
+          2 00012B  83A0 0000 0132  02                   JMP      s:15517,R2
+          2 00012E       0016                            DC       s:15523,PREL
+          2 00012F       0000                            DC       s:15517,PREL
+          2 000130       0000                            DC       s:15517,PREL
+          2 000131       000C                            DC       s:15520,PREL
+
+      201    15516    2                CASE(%KY#TYP_LP,%KY#TYP_CP);
+
+      202    15517    2                   KY_STT_URP.USRSTT.OTPINTISATIM = KY_STT_URP.USRSTT.OTPINTISATIM +
+
+  15517   2 000132  8C80 0000 001A  xsym                 LDI      KY_STT_URP+26
+          2 000135  8447 000B                            AID      CURXEQTIM,AUTO
+          2 000137  84C7 0009                            SID      SVDXEQTIM,AUTO
+          2 000139  8D00 0000 001A  xsym                 SDI      KY_STT_URP+26
+          2 00013C  0F81 000B                            B        s:15523,PREL
+
+      203    15518    2                      CURXEQTIM - SVDXEQTIM;
+      204    15519    2                CASE(%KY#TYP_CR);
+
+      205    15520    2                   KY_STT_URP.USRSTT.INPINTISATIM = KY_STT_URP.USRSTT.INPINTISATIM +
+
+  15520   2 00013E  8C80 0000 0018  xsym                 LDI      KY_STT_URP+24
+          2 000141  8447 000B                            AID      CURXEQTIM,AUTO
+          2 000143  84C7 0009                            SID      SVDXEQTIM,AUTO
+          2 000145  8D00 0000 0018  xsym                 SDI      KY_STT_URP+24
+
+      206    15521    2                      CURXEQTIM - SVDXEQTIM;
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:27   
+      207    15522    2             END;
+
+      208    15523    1          KY_DISABLE_CNT = KY_DISABLE_CNT - 1;
+
+  15523   2 000148  8880 0000 0000  xsym                 DEC      KY_DISABLE_CNT
+
+      209    15524    1          KY_INTFLG = '0'B;
+
+  15524   2 00014B  8700 0000 0000  xsym                 CL       KY_INTFLG
+
+      210    15525        /*%TRACE(WHEREAT = 20,INPUT$="KY$CTX.Q.INPUT$");*/
+      211    15526    1          CALL X6A_INTRET(FPT_INTRET);
+
+  15526   2 00014E  BB80 0000 0002  03                   LAB,B3   +2
+          2 000151  CBF0 0100                            LAB,B4   256,IMO
+          2 000153  E380 0000 0000  xent                 LNJ,B6   X6A_INTRET
+          2 000156       0001                            DC       s:15527,PREL
+
+      212    15527    1   END KYN$INTR_HNDLR;
+
+  15527   2 000157  C380 0000 0000  xent                 LNJ,B4   X6A_AARET
+      213    15528        %EOD;
+
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:28   
+--  Include file information  --
+
+   KY_PERR_C.:E05TOU  is referenced.
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   KH_CHN.:E05TOU  is referenced.
+   KH$CHN.:E05TOU  is referenced.
+   G_HJIT_M.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure KYN$INTR_HNDLR.
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:29   
+
+ **** Variables and constants ****
+
+  ****  Section 000  Data  KYN$INTR_HNDLR
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(112)   r     1 FPT_INTRET                 7-0-0/w STRC(336)   r     1 FPT_WRSYSLOG
+
+  ****  Section 001 RoData KYN$INTR_HNDLR
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(32)    r     1 INVCHAN                    2-0-0/w STRC(32)    r     1 NOCONTEXT
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w UBIN(16)    r     1 CHAN                       7-0-0/w PTR         r     1 CHN$
+     5-0-0/w PTR         r     1 CTX$                       B-0-0/w UBIN(32)    r     1 CURXEQTIM
+     D-0-0/w STRC(32)    r     1 KV@USRENT                  9-0-0/w UBIN(32)    r     1 SVDXEQTIM
+    11-0-0/w UBIN(16)    r     1 TEMP_STATUSW
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 G$UHJIT$                   0-0-0/w UBIN(16)    r     1 KH_CHNHI
+     0-0-0/w PTR         r     1 KH_CHNLOW$                 0-0-0/w PTR         r     1 KV$PTR$
+     0-0-0/w SBIN(16)    r     1 KY_DISABLE_CNT             0-0-0/b BIT         r     1 KY_INTFLG
+     0-0-0/w STRC(672)   r     1 KY_STT_URP
+
+  ****  BASED and DCB variables  ****
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:30   
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(6480)  r     1 G$UHJIT                    0-0-0/w STRC(512)   r     1 KH$CHN
+     0-0-0/w STRC(480)   r     1 KV$PTR                     0-0-0/w STRC(8960)  r     1 KV$STT
+     0-0-0/w STRC(912)   r     1 KV$USRPRM                  0-0-0/w STRC(512)   r     1 KV$VDI
+     0-0-0/w STRC(608)   r     1 KY$CTX
+
+
+   Procedure KYN$INTR_HNDLR requires 346 words for executable code.
+   Procedure KYN$INTR_HNDLR requires 22 words of local(AUTO) storage.
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:31   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:32   
+          MINI XREF LISTING
+
+CHAN
+     11238**DCL     15415<<ASSIGN  15416>>IF      15420>>ASSIGN  15425>>ASSIGN
+CHN$
+     11240**DCL     11916--IMP-PTR 15425<<ASSIGN  15426>>ASSIGN  15427>>ASSIGN  15427>>ASSIGN  15508>>ASSIGN
+CTX$
+     11239**DCL     12054--IMP-PTR 15426<<ASSIGN  15429>>IF      15432>>IF      15434>>ASSIGN  15436>>CALL
+     15438>>ASSIGN  15442>>ASSIGN  15442>>ASSIGN  15443>>IF      15445>>ASSIGN  15446>>ASSIGN  15465>>ASSIGN
+     15465>>ASSIGN  15466>>IF      15467>>ASSIGN  15469>>ASSIGN  15472>>ASSIGN  15473>>ASSIGN  15473>>ASSIGN
+     15478>>DOCASE  15480>>CALL    15482>>CALL    15499>>ASSIGN  15500>>ASSIGN  15514>>IF      15515>>DOCASE
+CURXEQTIM
+     11242**DCL     15513<>CALL    15517>>ASSIGN  15520>>ASSIGN
+DFR
+     15493**LABEL   15474--GOTO
+FPT_INTRET
+     15209**DCL     15526<>CALL
+FPT_INTRET.V
+     15213**DCL     15211--DCLINIT
+FPT_WRSYSLOG
+     15229**DCL     15422<>CALL    15509<>CALL
+FPT_WRSYSLOG.V
+     15233**DCL     15231--DCLINIT
+FPT_WRSYSLOG.V.ERRCODE
+     15250**DCL     15419<<ASSIGN  15507<<ASSIGN
+FPT_WRSYSLOG.V.TERMID
+     15296**DCL     15421<<ASSIGN  15508<<ASSIGN
+FPT_WRSYSLOG.V.TERMID.TERM
+     15298**DCL     15307--REDEF
+FPT_WRSYSLOG.V.VALUES
+     15309**DCL     15420<<ASSIGN
+G$UHJIT.ISA_USR
+     13660**DCL     13955--REDEF
+G$UHJIT.ISA_USR.DEV
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:33   
+     13682**DCL     15415>>ASSIGN
+G$UHJIT.ISA_USR.P$$
+     13735**DCL     13735--REDEF
+G$UHJIT.TSA_CP.ISA.P$$
+     14942**DCL     14942--REDEF
+G$UHJIT.TSA_CP.P$$
+     14813**DCL     14813--REDEF   14814--REDEF
+G$UHJIT.TSA_DB.ISA.P$$
+     14554**DCL     14554--REDEF
+G$UHJIT.TSA_DB.P$$
+     14425**DCL     14425--REDEF   14426--REDEF
+G$UHJIT.TSA_RTT.P$$
+     15188**DCL     15188--REDEF   15189--REDEF
+G$UHJIT.TSA_USR.ISA.P$$
+     14144**DCL     14144--REDEF
+G$UHJIT.TSA_USR.P$$
+     14015**DCL     14015--REDEF   14016--REDEF
+G$UHJIT$
+     15410**DCL     12237--IMP-PTR 15415>>ASSIGN
+INTRET
+     15508**LABEL   15423--GOTO    15433--GOTO    15439--GOTO    15496--GOTO
+INVCHAN
+     15325**DCL     15419>>ASSIGN
+KH$CHN
+     11916**DCL     15425--ASSIGN
+KH$CHN.CTX$
+     11986**DCL     15426>>ASSIGN
+KH$CHN.INTCNT
+     11992**DCL     15427<<ASSIGN  15427>>ASSIGN
+KH$CHN.TERMID
+     12010**DCL     15508>>ASSIGN
+KH$CHN.TERMID.TERM
+     12012**DCL     12021--REDEF
+KHA$ERRLOG
+     11236**DCL-ENT 15422--CALL    15509--CALL
+KHC$XEQ2
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:34   
+     11235**DCL-ENT 15428--CALL    15513--CALL
+KH_CHNHI
+     12038**DCL     12039--REDEF   15416>>IF
+KH_CHNLOW
+     12039**DCL     12040--REDEF
+KH_CHNLOW$
+     12038**DCL     15425>>ASSIGN
+KV$PTR.INPCNDPND
+     11814**DCL     11823--REDEF   11827--REDEF
+KV$PTR.LINLST$
+     11810**DCL     11811--REDEF
+KV$PTR.VDI$
+     11808**DCL     15491>>ASSIGN
+KV$PTR$
+     11802**DCL     11808--IMP-PTR 15468>>ASSIGN  15469<<ASSIGN  15491>>ASSIGN  15493<<ASSIGN
+KV$SSN.REDRSPCNT
+     11343**DCL     11344--REDEF
+KV$STT.REQSTATS.DSPMSK
+     11666**DCL     11672--REDEF
+KV$STT.REQSTATS.SLCMSK
+     11707**DCL     11714--REDEF
+KV$STT.USRENTCNT
+     11776**DCL     15465<<ASSIGN  15465>>ASSIGN
+KV$STT.USRENTDFRCNT
+     11777**DCL     15473<<ASSIGN  15473>>ASSIGN
+KV$USRPRM.STT$
+     11878**DCL     15465>>ASSIGN  15465>>ASSIGN  15473>>ASSIGN  15473>>ASSIGN
+KV$VDI.ASNINPPTR$
+     11265**DCL     15469>>ASSIGN
+KV$VDI.BSY
+     11299**DCL     15466>>IF      15467<<ASSIGN  15491<<ASSIGN
+KV$VDI.DFR.USR
+     11296**DCL     15472<<ASSIGN
+KV$VDI.USRPRM$
+     11265**DCL     15465>>ASSIGN  15465>>ASSIGN  15473>>ASSIGN  15473>>ASSIGN
+KV@USRENT.SVDPTR$
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:35   
+     11899**DCL     15468<<ASSIGN  15493>>ASSIGN
+KV_STT.REQSTATS.DSPMSK
+     11084**DCL     11090--REDEF
+KV_STT.REQSTATS.SLCMSK
+     11125**DCL     11132--REDEF
+KY$CTX
+     12054**DCL     15436<>CALL    15480<>CALL    15482<>CALL
+KY$CTX.DEFRD.INTRPT
+     12191**DCL     15445<<ASSIGN  15499<<ASSIGN
+KY$CTX.DEFRD.STATUSW
+     12196**DCL     12198--REDEF   15442<<ASSIGN
+KY$CTX.DVCTYP
+     12142**DCL     15478>>DOCASE  15515>>DOCASE
+KY$CTX.MODE
+     12145**DCL     12153--REDEF
+KY$CTX.RESCHEDULE.INTERRUPT
+     12205**DCL     15443>>IF      15500<<ASSIGN
+KY$CTX.RESCHEDULE.TIMER
+     12204**DCL     15432>>IF
+KY$CTX.STATUSW
+     12072**DCL     12074--REDEF   12082--REDEF   12096--REDEF   12110--REDEF   12124--REDEF   15434>>ASSIGN
+     15438<<ASSIGN  15442>>ASSIGN  15446<<ASSIGN
+KY$CTX.VDI$
+     12139**DCL     15465>>ASSIGN  15465>>ASSIGN  15466>>IF      15467>>ASSIGN  15469>>ASSIGN  15472>>ASSIGN
+     15473>>ASSIGN  15473>>ASSIGN
+KY$CTX.VDIENB
+     12210**DCL     12216--REDEF
+KYI$IO
+     11233**DCL-ENT 15436--CALL
+KYN$IUR_HNDLR
+     11232**DCL-ENT 15482--CALL
+KYN$OUR_HNDLR
+     11231**DCL-ENT 15480--CALL
+KY_DISABLE_CNT
+     11205**DCL     15413<<ASSIGN  15413>>ASSIGN  15523<<ASSIGN  15523>>ASSIGN
+KY_INTFLG
+PL6.E3A0      #001=KYN$INTR_HNDLR File=KYN$INTRPT.:E05TSI                        WED 07/30/97 02:43 Page:36   
+     11206**DCL     15414<<ASSIGN  15524<<ASSIGN
+KY_STT_URP.REQSTATS.DSPMSK
+     10733**DCL     10739--REDEF
+KY_STT_URP.REQSTATS.SLCMSK
+     10774**DCL     10781--REDEF
+KY_STT_URP.USRSTT.INPINTISATIM
+     10804**DCL     15520<<ASSIGN  15520>>ASSIGN
+KY_STT_URP.USRSTT.OTPINTISATIM
+     10804**DCL     15517<<ASSIGN  15517>>ASSIGN
+NOCONTEXT
+     15374**DCL     15507>>ASSIGN
+SVDXEQTIM
+     11241**DCL     15428<>CALL    15517>>ASSIGN  15520>>ASSIGN
+TEMP_STATUSW
+     15195**DCL     15434<<ASSIGN  15438>>ASSIGN  15446>>ASSIGN
+X6A_INTRET
+     11234**DCL-ENT 15526--CALL
+
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:37   
+      214        1        /*M* KYN$IUR_HNDLR - Input device handler */
+      215        2        /*T***********************************************************/
+      216        3        /*T*                                                         */
+      217        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      218        5        /*T*                                                         */
+      219        6        /*T***********************************************************/
+      220        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      221        8               ECI=0,DIN=7,CSU=3,AND      */
+      222        9        /* This routine is called to handle an interrupt from an input unit
+      223       10        record device (i.e. a card reader).
+      224       11
+      225       12        This routine does a call to KYC$CHECK_STATUS, then a DO CASE on
+      226       13        KY$CTX.DVC_STATE to determine what needs to be done.     */
+      227       14
+      228       15        /*P* NAME: KYN$IUR_HNDLR - Input device handler */
+      229       16        KYN$IUR_HNDLR: PROC(KY$CTX);
+      230       17        /**/
+      231       18        %INCLUDE GH_HARDWARE_M;
+      232      116        %INCLUDE LCP_6;
+      233     4395        %INCLUDE KL_AFCN_C;
+      234     4496        %INCLUDE KL_MACRO_C;
+      235     7848        %INCLUDE K_ID_E;
+      236     7898        %K#ENTID_E;
+      237     7917        %K#LYRID_E;
+      238     7924        %INCLUDE KY_URP_M;
+      239     8219        %INCLUDE KY_SUBS_C;
+      240     8308        %INCLUDE KV_GLBCNS_E;
+      241     8649        %INCLUDE KV_PRMID_E;
+      242     8823        %INCLUDE KV$GLB;
+      243     9242        %INCLUDE KV$GLBCTX;
+      244     9687        %INCLUDE KV$PRM;
+      245     9900        %INCLUDE KH$STT;
+      246     9930        %INCLUDE OC_SUBS_C;
+      247    10661        %INCLUDE KV_GLB_M;
+      248    10783        %INCLUDE KY_DATA_R;
+      249    11578        /**/
+      250    11579        %KY$CTX;
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:38   
+      251    11756        /**/
+      252    11757    1          DCL KYK$OPCON ENTRY(2);
+      253    11758    1          DCL KYC$CHECK_STATUS ENTRY(1);
+      254    11759    1          DCL KYS$IUR_SCHED ENTRY(2);
+      255    11760    1          DCL KYP$PROCESS ENTRY(1);
+      256    11761        /**/
+      257    11762        %KV_PRMID_E;
+      258    11918        /**/
+      259    11919        %EJECT;
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:39   
+      260    11920    1          KY_STT_URP.USRSTT.INPINTCNT = KY_STT_URP.USRSTT.INPINTCNT + 1;
+      261    11921        /*%TRACE(WHEREAT = 12,INPUT$="KY$CTX.Q.INPUT$");*/
+      262    11922    1          KY$CTX.RESCHEDULE.INTERRUPT = '0'B;
+      263    11923    1          CALL KYC$CHECK_STATUS(KY$CTX);
+      264    11924    2          DO CASE(KY$CTX.DVC_STATE);
+      265    11925    2             CASE(%KY#ST_IDLE,%KY#ST_OFFLINE);
+      266    11926    2                IF KY$CTX.DVC_STATUS = %KY#DVC_READY THEN
+      267    11927    3                   DO;
+      268    11928    3                      KY$CTX.DVC_STATE = %KY#ST_IDLE;
+      269    11929    3                      CALL KYS$IUR_SCHED(KY$CTX,%KY#CALL_VDH);
+      270    11930    3                   END;                    /* STATUS = READY */
+      271    11931    2                ELSE
+      272    11932    3                   DO;
+      273    11933    3                      KY$CTX.DVC_STATE = %KY#ST_OFFLINE;
+      274    11934    3                   END; /* ELSE
+      275    11935                                     */
+      276    11936    2             CASE(%KY#ST_OPWAIT_ON,%KY#ST_OPWAIT_OFF);
+      277    11937    2                IF KY$CTX.DVC_STATUS = %KY#DVC_READY THEN
+      278    11938    2                   KY$CTX.DVC_STATE = %KY#ST_OPWAIT_ON;
+      279    11939    2                ELSE
+      280    11940    2                   KY$CTX.DVC_STATE = %KY#ST_OPWAIT_OFF;
+      281    11941    2             CASE(%KY#ST_NONINIT);
+      282    11942                                                /* Ignore the interrupt */
+      283    11943    2             CASE(%KY#ST_RDYWAIT);
+      284    11944    2                CALL KYK$OPCON(KY$CTX,OC_STTM);
+      285    11945    2                IF KY$CTX.DVC_STATUS = %KY#DVC_READY THEN
+      286    11946    3                   DO;
+      287    11947    3                      KY$CTX.RTRYNUM = 0;
+      288    11948    3                      KY$CTX.TIMEOUT = 6;
+      289    11949    3                      KY$CTX.DVC_STATE = %KY#ST_IDLE;
+      290    11950    3                      CALL KYK$OPCON(KY$CTX,OC_STTM);
+      291    11951    3                      CALL KYS$IUR_SCHED(KY$CTX,%KY#READ);
+      292    11952    3                   END;                    /* IF STATUS = READY */
+      293    11953    2                ELSE
+      294    11954    3                   DO;
+      295    11955    3                      CALL KYK$OPCON(KY$CTX,OC_WRTM);
+      296    11956    3                   END; /* ELSE
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:40   
+      297    11957                                     */
+      298    11958    2             CASE(%KY#ST_BUSY);
+      299    11959    3                DO CASE(KY$CTX.DVC_STATUS);
+      300    11960    3                   CASE(%KY#DVC_READY,%KY#DVC_HOPEMPTY);
+      301    11961    3                      KY$CTX.RTRYNUM = 0;
+      302    11962    3                      KY$CTX.TIMEOUT = 6;
+      303    11963    3                      KY_IUR_CALLED=1;
+      304    11964    3                      CALL KYP$PROCESS(KY$CTX);
+      305    11965    3                      KY_IUR_CALLED=0;
+      306    11966    3                      IF KY$CTX.DVC_STATUS = %KY#DVC_HOPEMPTY AND
+      307    11967    3                         NOT KY$CTX.INPUT.EOF THEN
+      308    11968    4                         DO;
+      309    11969    4                            KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+      310    11970    4                            CALL KYK$OPCON(KY$CTX,OC_WRTM);
+      311    11971    4                         END;              /* IF */
+      312    11972    3                   CASE(ELSE);
+      313    11973    3                      KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+      314    11974    3                      CALL KYK$OPCON(KY$CTX,OC_WRTM);
+      315    11975    3                END;                       /* DO CASE(KY$CTX.DVC_STATUS) */
+      316    11976    2          END;                             /* DO CASE DVC_STATE */
+      317    11977    1          RETURN;
+      318    11978    1   END KYN$IUR_HNDLR;
+      319    11979        %EOD;
+
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:41   
+--  Include file information  --
+
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYN$IUR_HNDLR.
+
+   Procedure KYN$IUR_HNDLR requires 259 words for executable code.
+   Procedure KYN$IUR_HNDLR requires 10 words of local(AUTO) storage.
+
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:42   
+
+ Object Unit name= KYN$IUR_HNDLR                              File name= KYN$INTRPT.:E05TOU
+ UTS= JUL 30 '97 02:44:52.52 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   259    103  KYN$IUR_HNDLR
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  KYN$IUR_HNDLR
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 KYC$CHECK_STATUS
+         yes           Std       2 KYS$IUR_SCHED
+         yes           Std       2 KYK$OPCON
+         yes           Std       1 KYP$PROCESS
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KY_STT_URP                            KY_IUR_CALLED                    r    G$ROS$
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:43   
+
+
+      214        1        /*M* KYN$IUR_HNDLR - Input device handler */
+      215        2        /*T***********************************************************/
+      216        3        /*T*                                                         */
+      217        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      218        5        /*T*                                                         */
+      219        6        /*T***********************************************************/
+      220        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      221        8               ECI=0,DIN=7,CSU=3,AND      */
+      222        9        /* This routine is called to handle an interrupt from an input unit
+      223       10        record device (i.e. a card reader).
+      224       11
+      225       12        This routine does a call to KYC$CHECK_STATUS, then a DO CASE on
+      226       13        KY$CTX.DVC_STATE to determine what needs to be done.     */
+      227       14
+      228       15        /*P* NAME: KYN$IUR_HNDLR - Input device handler */
+      229       16        KYN$IUR_HNDLR: PROC(KY$CTX);
+
+     16   0 000000  D380 0000 0000  xent KYN$IUR_HNDLR   LNJ,B5   X6A_AUTO_1
+          0 000003       000A 0001                       DC       10,1
+
+      230       17        /**/
+      231       18        %INCLUDE GH_HARDWARE_M;
+      232      116        %INCLUDE LCP_6;
+      233     4395        %INCLUDE KL_AFCN_C;
+      234     4496        %INCLUDE KL_MACRO_C;
+      235     7848        %INCLUDE K_ID_E;
+      236     7898        %K#ENTID_E;
+      237     7917        %K#LYRID_E;
+      238     7924        %INCLUDE KY_URP_M;
+      239     8219        %INCLUDE KY_SUBS_C;
+      240     8308        %INCLUDE KV_GLBCNS_E;
+      241     8649        %INCLUDE KV_PRMID_E;
+      242     8823        %INCLUDE KV$GLB;
+      243     9242        %INCLUDE KV$GLBCTX;
+      244     9687        %INCLUDE KV$PRM;
+      245     9900        %INCLUDE KH$STT;
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:44   
+      246     9930        %INCLUDE OC_SUBS_C;
+      247    10661        %INCLUDE KV_GLB_M;
+      248    10783        %INCLUDE KY_DATA_R;
+      249    11578        /**/
+      250    11579        %KY$CTX;
+      251    11756        /**/
+      252    11757    1          DCL KYK$OPCON ENTRY(2);
+      253    11758    1          DCL KYC$CHECK_STATUS ENTRY(1);
+      254    11759    1          DCL KYS$IUR_SCHED ENTRY(2);
+      255    11760    1          DCL KYP$PROCESS ENTRY(1);
+      256    11761        /**/
+      257    11762        %KV_PRMID_E;
+      258    11918        /**/
+      259    11919        %EJECT;
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:45   
+      260    11920    1          KY_STT_URP.USRSTT.INPINTCNT = KY_STT_URP.USRSTT.INPINTCNT + 1;
+
+  11920   0 000005  8A80 0000 0015  xsym                 INC      KY_STT_URP+21
+          0 000008  8E80 0000 0014  xsym                 CAD      KY_STT_URP+20
+
+      261    11921        /*%TRACE(WHEREAT = 12,INPUT$="KY$CTX.Q.INPUT$");*/
+      262    11922    1          KY$CTX.RESCHEDULE.INTERRUPT = '0'B;
+
+  11922   0 00000B  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 00000D  8846 0021                            LBF,'4000'X       33,B6
+          0 00000F       4000
+
+      263    11923    1          CALL KYC$CHECK_STATUS(KY$CTX);
+
+  11923   0 000010  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          0 000012  CBF0 0100                            LAB,B4   256,IMO
+          0 000014  E380 0000 0000  xent                 LNJ,B6   KYC$CHECK_STATUS
+          0 000017       0001                            DC       s:11924,PREL
+
+      264    11924    2          DO CASE(KY$CTX.DVC_STATE);
+
+  11924   0 000018  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 00001A  B2C6 0004                            LLH,R3   4,B6
+          0 00001C  3D07                                 CMV,R3   7
+          0 00001D  0281 00E2                            BGE      s:11977,PREL
+          0 00001F  A830 0000 0025  00                   LDR,R2   s:11924+13,R3
+          0 000022  83A0 0000 002C  00                   JMP      s:11926,R2
+          0 000025       00D4                            DC       s:11977,PREL
+          0 000026       0000                            DC       s:11926,PREL
+          0 000027       002C                            DC       s:11944,PREL
+          0 000028       001D                            DC       s:11937,PREL
+          0 000029       007A                            DC       s:11959,PREL
+          0 00002A       001D                            DC       s:11937,PREL
+          0 00002B       0000                            DC       s:11926,PREL
+
+      265    11925    2             CASE(%KY#ST_IDLE,%KY#ST_OFFLINE);
+
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:46   
+      266    11926    2                IF KY$CTX.DVC_STATUS = %KY#DVC_READY THEN
+
+  11926   0 00002C  82C6 0004                            LB,'00FF'X        4,B6
+  11926   0 00002E       00FF
+          0 00002F  0501 0014                            BBT      s:11933,PREL
+
+      267    11927    3                   DO;
+
+      268    11928    3                      KY$CTX.DVC_STATE = %KY#ST_IDLE;
+
+  11928   0 000031  6C01                                 LDV,R6   1
+          0 000032  E7C6 0004                            STH,R6   4,B6
+
+      269    11929    3                      CALL KYS$IUR_SCHED(KY$CTX,%KY#CALL_VDH);
+
+  11929   0 000034  DBF0 0001                            LAB,B5   1,IMO
+          0 000036  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 000038  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 00003A  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 00003C  CBF0 0200                            LAB,B4   512,IMO
+          0 00003E  E380 0000 0000  xent                 LNJ,B6   KYS$IUR_SCHED
+          0 000041       0001                            DC       s:11930,PREL
+
+      270    11930    3                   END;                    /* STATUS = READY */
+
+  11930   0 000042  0F81 00BD                            B        s:11977,PREL
+
+      271    11931    2                ELSE
+      272    11932    3                   DO;
+
+      273    11933    3                      KY$CTX.DVC_STATE = %KY#ST_OFFLINE;
+
+  11933   0 000044  6C06                                 LDV,R6   6
+          0 000045  E7C6 0004                            STH,R6   4,B6
+
+      274    11934    3                   END; /* ELSE
+
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:47   
+  11934   0 000047  0F81 00B8                            B        s:11977,PREL
+
+      275    11935                                     */
+      276    11936    2             CASE(%KY#ST_OPWAIT_ON,%KY#ST_OPWAIT_OFF);
+
+      277    11937    2                IF KY$CTX.DVC_STATUS = %KY#DVC_READY THEN
+
+  11937   0 000049  82C6 0004                            LB,'00FF'X        4,B6
+  11937   0 00004B       00FF
+          0 00004C  0501 0006                            BBT      s:11940,PREL
+
+      278    11938    2                   KY$CTX.DVC_STATE = %KY#ST_OPWAIT_ON;
+
+  11938   0 00004E  6C05                                 LDV,R6   5
+          0 00004F  E7C6 0004                            STH,R6   4,B6
+          0 000051  0F81 00AE                            B        s:11977,PREL
+
+      279    11939    2                ELSE
+      280    11940    2                   KY$CTX.DVC_STATE = %KY#ST_OPWAIT_OFF;
+
+  11940   0 000053  6C03                                 LDV,R6   3
+          0 000054  E7C6 0004                            STH,R6   4,B6
+          0 000056  0F81 00A9                            B        s:11977,PREL
+
+      281    11941    2             CASE(%KY#ST_NONINIT);
+
+      282    11942                                                /* Ignore the interrupt */
+      283    11943    2             CASE(%KY#ST_RDYWAIT);
+
+      284    11944    2                CALL KYK$OPCON(KY$CTX,OC_STTM);
+
+  11944   0 000058  DBF0 0001                            LAB,B5   1,IMO
+          0 00005A  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 00005C  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 00005E  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 000060  CBF0 0200                            LAB,B4   512,IMO
+          0 000062  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:48   
+          0 000065       0001                            DC       s:11945,PREL
+
+      285    11945    2                IF KY$CTX.DVC_STATUS = %KY#DVC_READY THEN
+
+  11945   0 000066  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 000068  82C6 0004                            LB,'00FF'X        4,B6
+          0 00006A       00FF
+          0 00006B  0501 002A                            BBT      s:11955,PREL
+
+      286    11946    3                   DO;
+
+      287    11947    3                      KY$CTX.RTRYNUM = 0;
+
+  11947   0 00006D  87C6 000C                            CLH      12,B6
+
+      288    11948    3                      KY$CTX.TIMEOUT = 6;
+
+  11948   0 00006F  6C06                                 LDV,R6   6
+          0 000070  EAC6 000B                            SRM,R6,'00FF'X    11,B6
+          0 000072       00FF
+
+      289    11949    3                      KY$CTX.DVC_STATE = %KY#ST_IDLE;
+
+  11949   0 000073  5C01                                 LDV,R5   1
+          0 000074  D7C6 0004                            STH,R5   4,B6
+
+      290    11950    3                      CALL KYK$OPCON(KY$CTX,OC_STTM);
+
+  11950   0 000076  DBF0 0001                            LAB,B5   1,IMO
+          0 000078  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 00007A  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 00007C  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 00007E  CBF0 0200                            LAB,B4   512,IMO
+          0 000080  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 000083       0001                            DC       s:11951,PREL
+
+      291    11951    3                      CALL KYS$IUR_SCHED(KY$CTX,%KY#READ);
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:49   
+
+  11951   0 000084  EBF0 0002                            LAB,B6   2,IMO
+          0 000086  EFC7 0008                            STB,B6   @KY$CTX+4,AUTO
+          0 000088  DCC7 0004                            LDB,B5   @KY$CTX,AUTO
+          0 00008A  DFC7 0006                            STB,B5   @KY$CTX+2,AUTO
+          0 00008C  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 00008E  CBF0 0200                            LAB,B4   512,IMO
+          0 000090  E380 0000 0000  xent                 LNJ,B6   KYS$IUR_SCHED
+          0 000093       0001                            DC       s:11952,PREL
+
+      292    11952    3                   END;                    /* IF STATUS = READY */
+
+  11952   0 000094  0F81 006B                            B        s:11977,PREL
+
+      293    11953    2                ELSE
+      294    11954    3                   DO;
+
+      295    11955    3                      CALL KYK$OPCON(KY$CTX,OC_WRTM);
+
+  11955   0 000096  DBF0 0002                            LAB,B5   2,IMO
+          0 000098  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 00009A  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 00009C  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 00009E  CBF0 0200                            LAB,B4   512,IMO
+          0 0000A0  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 0000A3       0001                            DC       s:11956,PREL
+
+      296    11956    3                   END; /* ELSE
+
+  11956   0 0000A4  0F81 005B                            B        s:11977,PREL
+
+      297    11957                                     */
+      298    11958    2             CASE(%KY#ST_BUSY);
+
+      299    11959    3                DO CASE(KY$CTX.DVC_STATUS);
+
+  11959   0 0000A6  9846 0004                            LDR,R1   4,B6
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:50   
+          0 0000A8  9570 00FF                            AND,R1   255,IMO
+          0 0000AA  1D06                                 CMV,R1   6
+          0 0000AB  0281 0043                            BGE      s:11973,PREL
+          0 0000AD  B810 0000 00B3  00                   LDR,R3   s:11959+13,R1
+          0 0000B0  83B0 0000 00B9  00                   JMP      s:11961,R3
+          0 0000B3       0000                            DC       s:11961,PREL
+          0 0000B4       0036                            DC       s:11973,PREL
+          0 0000B5       0036                            DC       s:11973,PREL
+          0 0000B6       0036                            DC       s:11973,PREL
+          0 0000B7       0036                            DC       s:11973,PREL
+          0 0000B8       0000                            DC       s:11961,PREL
+
+      300    11960    3                   CASE(%KY#DVC_READY,%KY#DVC_HOPEMPTY);
+
+      301    11961    3                      KY$CTX.RTRYNUM = 0;
+
+  11961   0 0000B9  87C6 000C                            CLH      12,B6
+
+      302    11962    3                      KY$CTX.TIMEOUT = 6;
+
+  11962   0 0000BB  6C06                                 LDV,R6   6
+          0 0000BC  EAC6 000B                            SRM,R6,'00FF'X    11,B6
+          0 0000BE       00FF
+
+      303    11963    3                      KY_IUR_CALLED=1;
+
+  11963   0 0000BF  5C01                                 LDV,R5   1
+          0 0000C0  DF00 0000 0000  xsym                 STR,R5   KY_IUR_CALLED
+
+      304    11964    3                      CALL KYP$PROCESS(KY$CTX);
+
+  11964   0 0000C3  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          0 0000C5  CBF0 0100                            LAB,B4   256,IMO
+          0 0000C7  E380 0000 0000  xent                 LNJ,B6   KYP$PROCESS
+          0 0000CA       0001                            DC       s:11965,PREL
+
+      305    11965    3                      KY_IUR_CALLED=0;
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:51   
+
+  11965   0 0000CB  8700 0000 0000  xsym                 CL       KY_IUR_CALLED
+
+      306    11966    3                      IF KY$CTX.DVC_STATUS = %KY#DVC_HOPEMPTY AND
+
+  11966   0 0000CE  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 0000D0  E846 0004                            LDR,R6   4,B6
+          0 0000D2  E570 00FF                            AND,R6   255,IMO
+          0 0000D4  6D05                                 CMV,R6   5
+          0 0000D5  0981 002A                            BNE      s:11977,PREL
+          0 0000D7  82C6 001E                            LB,'4000'X        30,B6
+          0 0000D9       4000
+          0 0000DA  0501 0025                            BBT      s:11977,PREL
+
+      307    11967    3                         NOT KY$CTX.INPUT.EOF THEN
+      308    11968    4                         DO;
+
+      309    11969    4                            KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+
+  11969   0 0000DC  5C02                                 LDV,R5   2
+          0 0000DD  D7C6 0004                            STH,R5   4,B6
+
+      310    11970    4                            CALL KYK$OPCON(KY$CTX,OC_WRTM);
+
+  11970   0 0000DF  DBF0 0002                            LAB,B5   2,IMO
+          0 0000E1  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 0000E3  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 0000E5  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 0000E7  CBF0 0200                            LAB,B4   512,IMO
+          0 0000E9  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 0000EC       0001                            DC       s:11971,PREL
+
+      311    11971    4                         END;              /* IF */
+
+  11971   0 0000ED  0F81 0012                            B        s:11977,PREL
+
+      312    11972    3                   CASE(ELSE);
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:52   
+
+      313    11973    3                      KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+
+  11973   0 0000EF  6C02                                 LDV,R6   2
+          0 0000F0  E7C6 0004                            STH,R6   4,B6
+
+      314    11974    3                      CALL KYK$OPCON(KY$CTX,OC_WRTM);
+
+  11974   0 0000F2  DBF0 0002                            LAB,B5   2,IMO
+          0 0000F4  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 0000F6  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 0000F8  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 0000FA  CBF0 0200                            LAB,B4   512,IMO
+          0 0000FC  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 0000FF       0001                            DC       s:11977,PREL
+
+      315    11975    3                END;                       /* DO CASE(KY$CTX.DVC_STATUS) */
+
+      316    11976    2          END;                             /* DO CASE DVC_STATE */
+
+      317    11977    1          RETURN;
+
+  11977   0 000100  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      318    11978    1   END KYN$IUR_HNDLR;
+      319    11979        %EOD;
+
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:53   
+--  Include file information  --
+
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYN$IUR_HNDLR.
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:54   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @KY$CTX                   *0-0-0/w STRC(608)   r     1 KY$CTX
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w SBIN(16)    r     1 KY_IUR_CALLED              0-0-0/w STRC(672)   r     1 KY_STT_URP
+
+
+   Procedure KYN$IUR_HNDLR requires 259 words for executable code.
+   Procedure KYN$IUR_HNDLR requires 10 words of local(AUTO) storage.
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:55   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:56   
+          MINI XREF LISTING
+
+KV_STT.REQSTATS.DSPMSK
+     11454**DCL     11460--REDEF
+KV_STT.REQSTATS.SLCMSK
+     11495**DCL     11502--REDEF
+KY$CTX
+     11590**DCL        16--PROC    11923<>CALL    11929<>CALL    11944<>CALL    11950<>CALL    11951<>CALL
+     11955<>CALL    11964<>CALL    11970<>CALL    11974<>CALL
+KY$CTX.DEFRD.STATUSW
+     11732**DCL     11734--REDEF
+KY$CTX.DVC_STATE
+     11593**DCL     11924>>DOCASE  11928<<ASSIGN  11933<<ASSIGN  11938<<ASSIGN  11940<<ASSIGN  11949<<ASSIGN
+     11969<<ASSIGN  11973<<ASSIGN
+KY$CTX.DVC_STATUS
+     11594**DCL     11926>>IF      11937>>IF      11945>>IF      11959>>DOCASE  11966>>IF
+KY$CTX.INPUT.EOF
+     11718**DCL     11966>>IF
+KY$CTX.MODE
+     11681**DCL     11689--REDEF
+KY$CTX.RESCHEDULE.INTERRUPT
+     11741**DCL     11922<<ASSIGN
+KY$CTX.RTRYNUM
+     11680**DCL     11947<<ASSIGN  11961<<ASSIGN
+KY$CTX.STATUSW
+     11608**DCL     11610--REDEF   11618--REDEF   11632--REDEF   11646--REDEF   11660--REDEF
+KY$CTX.TIMEOUT
+     11679**DCL     11948<<ASSIGN  11962<<ASSIGN
+KY$CTX.VDIENB
+     11746**DCL     11752--REDEF
+KYC$CHECK_STATUS
+     11758**DCL-ENT 11923--CALL
+KYK$OPCON
+     11757**DCL-ENT 11944--CALL    11950--CALL    11955--CALL    11970--CALL    11974--CALL
+PL6.E3A0      #002=KYN$IUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:44 Page:57   
+KYP$PROCESS
+     11760**DCL-ENT 11964--CALL
+KYS$IUR_SCHED
+     11759**DCL-ENT 11929--CALL    11951--CALL
+KY_IUR_CALLED
+     11577**DCL     11963<<ASSIGN  11965<<ASSIGN
+KY_STT_URP.REQSTATS.DSPMSK
+     11103**DCL     11109--REDEF
+KY_STT_URP.REQSTATS.SLCMSK
+     11144**DCL     11151--REDEF
+KY_STT_URP.USRSTT.INPINTCNT
+     11173**DCL     11920<<ASSIGN  11920>>ASSIGN
+
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:58   
+      320        1        /*M* KYN$OUR_HNDLR -         OUTPUT DEVICE SPECIFIC CONTROLLER */
+      321        2        /*T***********************************************************/
+      322        3        /*T*                                                         */
+      323        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      324        5        /*T*                                                         */
+      325        6        /*T***********************************************************/
+      326        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      327        8               ECI=0,DIN=7,CSU=3,AND      */
+      328        9        /*
+      329       10
+      330       11          E X T E R N A L    I N T E R F A C E    D E S C R I P T I O N
+      331       12
+      332       13          First, some things that are 'known' about the device handler:
+      333       14          The only information that the handler uses to determine what it
+      334       15        is to do is found in
+      335       16             KY$CTX.DVC_STATE      - the Software device state
+      336       17             KY$CTX.Q.OUTPUT$  - Location of next I/O command.
+      337       18             KY$CTX.RTRYNUM    - Number of times thes I/O has been retried
+      338       19             KY$CTX.STATUSW    - Actual Hardware Status Word
+      339       20
+      340       21          It can only be invoked from either the routine detecting a timer
+      341       22        runnout for a BUSY device, or by an interrupt from some device.
+      342       23          KYN$OUR_HNDLR is always entered at at least the interrupt level,
+      343       24        it has one parameter, that being the Context,  and really the only
+      344       25        cause for invokation is to process an interrupt.
+      345       26          There are two different routines that the handler can talk with
+      346       27        directly.
+      347       28           KYS$OUR_SCHED, which is told if the last queue'd item was or
+      348       29            was not printed.  And, asked to print another record.
+      349       30           And the Operator Messages Manager, which can be told that it is
+      350       31            time to send some message to the operator, or perhaps that it
+      351       32            is time to stop sending messages to the operator.
+      352       33
+      353       34        */
+      354       35        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:59   
+      355       36        /*
+      356       37                  I N T E R N A L   O V E R V I E W
+      357       38
+      358       39        This routine will almost certainly be one of the most complicated.
+      359       40        Virtually all of the rest of the routines fall into the 'DO This
+      360       41        Because I told you' class.  But this baby has to make quite a few
+      361       42        decisions based on information available to it about what the rest
+      362       43        of the world is currently trying to do.  And with that information
+      363       44        it must decide how best to carry on operations.
+      364       45
+      365       46        In the normal I/O completed interrupt case, where the status says
+      366       47        that that I/O was successful, then the actions are quite straight
+      367       48        forward..  Just do the checking, and whatever else is required to
+      368       49        get the next I/O going.  I.E. call KYS$OUR_SCHED.  It is the cases
+      369       50        where all did not go so well that things get a little strange.
+      370       51
+      371       52        But read on, and you will see what I mean.
+      372       53
+      373       54           DO CASE ON KY$CTX.DVC_STATE   - The software device state
+      374       55           CASE IDLE
+      375       56            This interrupt only one thing.  There is no information that is
+      376       57             currently being printed.  So all we have to do is to keep track
+      377       58             of whether or not the device is online.
+      378       59
+      379       60           CASE OFFLINE
+      380       61            This interrupt means one of two things.  If the device is back
+      381       62             then the device state should become idle.  Otherwise, there
+      382       63             is no change required.
+      383       64
+      384       65           CASE RDYWAIT
+      385       66            When an interrupt occurs while in the RDYWAIT state, we
+      386       67             will have told the operator that the device needs some
+      387       68             attention.  And we are now waiting for the device to be
+      388       69             put back on line such that we can continue with normal
+      389       70             processing.  When the device becomes available we can
+      390       71             simply continue as if there had not been any interruption.
+      391       72
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:60   
+      392       73           CASE OPWAIT_ON
+      393       74            This interrupt only one thing.  We have a ready device, but we
+      394       75             need to wait for an operator keyin.
+      395       76
+      396       77           CASE OPWAIT_OFF
+      397       78            This interrupt is the partner to OPWAIT_ON.  If the device is
+      398       79             available the device state should switch.
+      399       80
+      400       81           CASE UNINITIALIZED
+      401       82            Ignore it.  Just an interrupt from the device, it should
+      402       83             not happen.  But it's not worth errorlogging.
+      403       84
+      404       85           CASE BUSY
+      405       86            Here is the case we've all been waiting for.  Because this
+      406       87             is the state that we want to be in 95% of the time that we
+      407       88             are called.  If we get an interrupt in the BUSY state, that
+      408       89             should be because an I/O has just been completed.  Verify
+      409       90             that that is indeed what has happened, and if the I/O did
+      410       91             complete successfully then the I/O process can continue to
+      411       92             start the next one.  If the last issued I/O did not finish
+      412       93             successfully, then take whatever action is required such
+      413       94             that the world does not come to a screaming halt.
+      414       95
+      415       96        */
+      416       97        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:61   
+      417       98        /*P* NAME: KYN$OUR_HNDLR               Device specific event driver */
+      418       99
+      419      100        KYN$OUR_HNDLR: PROC( KY$CTX );
+      420      101
+      421      102        %INCLUDE GH_HARDWARE_M;
+      422      200        %INCLUDE LCP_6;
+      423     4479        %INCLUDE KL_AFCN_C;
+      424     4580        %INCLUDE KL_MACRO_C;
+      425     7932        %INCLUDE K_ID_E;
+      426     7982        %K#ENTID_E;
+      427     8001        %K#LYRID_E;
+      428     8008        %INCLUDE KY_URP_M;
+      429     8303        %INCLUDE KY_SUBS_C;
+      430     8392        %INCLUDE KV_GLBCNS_E;                   /* VDI equates */
+      431     8733        %INCLUDE KV_PRMID_E;
+      432     8907        %INCLUDE KV$GLB;
+      433     9326        %INCLUDE KV$GLBCTX;
+      434     9771        %INCLUDE KV$PRM;
+      435     9984        %INCLUDE KH$STT;
+      436    10014        %INCLUDE OC_SUBS_C;
+      437    10745        %INCLUDE KV_GLB_M;
+      438    10867        %INCLUDE KY_DATA_R;
+      439    11662        /**/
+      440    11663        %KY$CTX;
+      441    11840        %KY$REC;
+      442    11879        /**/
+      443    11880    1          DCL KYK$OPCON ENTRY(2);
+      444    11881    1          DCL KYC$CHECK_STATUS ENTRY(1);
+      445    11882    1          DCL KYS$OUR_SCHED ENTRY(1) ALTRET;
+      446    11883        /**/
+      447    11884        %KV_PRMID_E;
+      448    12040        /**/
+      449    12041        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:62   
+      450    12042
+      451    12043
+      452    12044    1          KY_STT_URP.USRSTT.OTPINTCNT = KY_STT_URP.USRSTT.OTPINTCNT + 1;
+      453    12045        /*%TRACE(WHEREAT = 11,INPUT$="KY$CTX.Q.INPUT$");*/
+      454    12046    1          KY$CTX.RESCHEDULE.INTERRUPT = '0'B;
+      455    12047    1          CALL KYC$CHECK_STATUS ( KY$CTX );
+      456    12048        /*
+      457    12049           DO CASE ON KY$CTX.DVC_STATE   - The software device state
+      458    12050           CASE IDLE
+      459    12051            This interrupt only one thing.  There is no information that is
+      460    12052             currently being printed.  So all we have to do is to keep track
+      461    12053             of whether or not the device is online.
+      462    12054
+      463    12055           CASE OFFLINE
+      464    12056            This interrupt is the partner to IDLE.  If the device is back
+      465    12057             then the device state should become idle.  Otherwise, there
+      466    12058             is no change required.
+      467    12059        */
+      468    12060
+      469    12061    2          DO CASE ( KY$CTX.DVC_STATE );
+      470    12062    2             CASE ( %KY#ST_IDLE,
+      471    12063    2             %KY#ST_OFFLINE );
+      472    12064    2                IF ( KY$CTX.DVC_STATUS = %KY#DVC_READY ) THEN
+      473    12065    2                   KY$CTX.DVC_STATE = %KY#ST_IDLE;
+      474    12066    2                ELSE
+      475    12067    2                   KY$CTX.DVC_STATE = %KY#ST_OFFLINE;
+      476    12068        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:63   
+      477    12069        /*
+      478    12070           CASE OPWAIT_ON
+      479    12071            This interrupt only one thing.  We have a ready device, but we
+      480    12072             need to wait for an operator keyin.
+      481    12073
+      482    12074           CASE OPWAIT_OFF
+      483    12075            This interrupt is the partner to OPWAIT_ON.  If the device is
+      484    12076             available the device state should switch.
+      485    12077        */
+      486    12078    2             CASE ( %KY#ST_OPWAIT_ON,
+      487    12079    2                      %KY#ST_OPWAIT_OFF );
+      488    12080    2                IF ( KY$CTX.DVC_STATUS = %KY#DVC_READY ) THEN
+      489    12081    2                   KY$CTX.DVC_STATE = %KY#ST_OPWAIT_ON;
+      490    12082    2                ELSE
+      491    12083    2                   KY$CTX.DVC_STATE = %KY#ST_OPWAIT_OFF;
+      492    12084        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:64   
+      493    12085        /*
+      494    12086           CASE RDYWAIT
+      495    12087            When an interrupt occurs while in the RDYWAIT state, we
+      496    12088             will have told the operator that the device needs some
+      497    12089             attention.  And we are now waiting for the device to be
+      498    12090             put back on line such that we can continue with normal
+      499    12091             processing.  When the device becomes available we can
+      500    12092             simply continue as if there had not been any interruption.
+      501    12093
+      502    12094            Is the device available?
+      503    12095            YES:
+      504    12096              Tell the operator message routine that the device is now
+      505    12097               available, and it can stop bitching to the operator.
+      506    12098              Call KYS$OUR_SCHED
+      507    12099            NO:
+      508    12100              Call OPCON since the operator message may need to be changed
+      509    12101        */
+      510    12102    2             CASE ( %KY#ST_RDYWAIT );
+      511    12103    2                CALL KYK$OPCON(KY$CTX,OC_STTM);
+      512    12104    2                IF ( KY$CTX.DVC_STATUS = %KY#DVC_READY ) THEN
+      513    12105    3                   DO;
+      514    12106    3                      KY$CTX.RTRYNUM = 0;
+      515    12107    3                      KY$CTX.DVC_STATE = %KY#ST_IDLE;
+      516    12108    3                      CALL KYS$OUR_SCHED ( KY$CTX ) ALTRET( NACKED );
+      517    12109    3                   END;
+      518    12110    2                ELSE
+      519    12111    2                   CALL KYK$OPCON (KY$CTX,OC_WRTM);
+      520    12112        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:65   
+      521    12113        /*
+      522    12114           CASE UNINITIALIZED
+      523    12115            Ignore it.  Just an interrupt from the device, it should
+      524    12116             not happen.  But it's not worth errorlogging.
+      525    12117        */
+      526    12118    2             CASE ( %KY#ST_NONINIT );
+      527    12119
+      528    12120        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:66   
+      529    12121        /*
+      530    12122           CASE BUSY
+      531    12123            What is important here is to determine if the last issue'd
+      532    12124             I/O was completed successfully.  This can be fairly easily
+      533    12125             checked ( fortunately ).
+      534    12126            Note that be definition the only way that the device state
+      535    12127             can be 'Busy' is if the item being pointed at by Q_OUTPUT$
+      536    12128             is a printable item.  I.E. not an 'Output Marker.'
+      537    12129
+      538    12130            Is the device still available?
+      539    12131             YES:
+      540    12132               Mark the KY$REC as having been printed.
+      541    12133               Maintain the size of data actually printed.
+      542    12134               Call KYS$OUR_SCHED
+      543    12135             NO:
+      544    12136               Not good, this means that it isn't possible to tell if
+      545    12137                the last I/O really finished or not.  So, muck with the
+      546    12138                entry in the queue to remove the strictly spacing, but
+      547    12139                not top-of-form, information.
+      548    12140               Increment KY$CTX.RTRYNUM.
+      549    12141               Is KY$CTX.RTRYNUM > 10?
+      550    12142                YES:
+      551    12143                  Tell operator that after going thru a retry cycle it
+      552    12144                   was not possible to successfully complete an I/O
+      553    12145                   to the device.  Request that the operator indicate
+      554    12146                   whether to RETRY, or PROCEED with the device.
+      555    12147                  DVC_STATE  <=  OPWAIT
+      556    12148                NO:
+      557    12149                  Tell operator that the device isn't available, give
+      558    12150                   as much information as is in the status word.
+      559    12151                  DVC_STATE  <=  RDYWAIT
+      560    12152        */
+      561    12153    2             CASE( %KY#ST_BUSY );
+      562    12154    2                IF ( KY$CTX.DVC_STATUS = %KY#DVC_READY ) THEN
+      563    12155    3                   DO;
+      564    12156    3                      KY$CTX.Q.OUTPUT$ -> KY$REC.PRINTED = '1'B;
+      565    12157    3                      KY$CTX.RTRYNUM = 0;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:67   
+      566    12158    3                      KY$CTX.TIMEOUT = %KY#DEV_TIMEOUT_CNT;
+             12158                               /* we got the interrupt, but who's counting*/
+      567    12159    3                      KY$CTX.DVC_STATE = %KY#ST_IDLE;
+      568    12160    3                      CALL KYS$OUR_SCHED ( KY$CTX ) ALTRET( NACKED );
+      569    12161    3                   END;
+      570    12162    2                ELSE
+      571    12163    3                   DO;
+      572    12164    3                      KY$CTX.Q.OUTPUT$ -> KY$REC.SPACE_N = 0;
+      573    12165    3                      KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+      574    12166    3                      CALL KYK$OPCON( KY$CTX, OC_WRTM );
+      575    12167    3                   END;
+      576    12168    2          END;                             /* CASE */
+      577    12169
+      578    12170    1          RETURN;
+      579    12171
+      580    12172    1   NACKED: ;
+      581    12173    1          KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+      582    12174    1          KY$CTX.DVC_STATUS = %KY#DVC_MANUAL;
+      583    12175    1          CALL KYK$OPCON( KY$CTX,OC_WRTM );
+      584    12176    1          RETURN;
+      585    12177    1   END KYN$OUR_HNDLR;
+      586    12178        %EOD;
+
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:68   
+--  Include file information  --
+
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYN$OUR_HNDLR.
+
+   Procedure KYN$OUR_HNDLR requires 206 words for executable code.
+   Procedure KYN$OUR_HNDLR requires 10 words of local(AUTO) storage.
+
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:69   
+
+ Object Unit name= KYN$OUR_HNDLR                              File name= KYN$INTRPT.:E05TOU
+ UTS= JUL 30 '97 02:45:35.40 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   206     CE  KYN$OUR_HNDLR
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  KYN$OUR_HNDLR
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 KYC$CHECK_STATUS
+         yes           Std       2 KYK$OPCON
+ yes     yes           Std       1 KYS$OUR_SCHED
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KY_STT_URP                       r    G$ROS$
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:70   
+
+
+      320        1        /*M* KYN$OUR_HNDLR -         OUTPUT DEVICE SPECIFIC CONTROLLER */
+      321        2        /*T***********************************************************/
+      322        3        /*T*                                                         */
+      323        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      324        5        /*T*                                                         */
+      325        6        /*T***********************************************************/
+      326        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      327        8               ECI=0,DIN=7,CSU=3,AND      */
+      328        9        /*
+      329       10
+      330       11          E X T E R N A L    I N T E R F A C E    D E S C R I P T I O N
+      331       12
+      332       13          First, some things that are 'known' about the device handler:
+      333       14          The only information that the handler uses to determine what it
+      334       15        is to do is found in
+      335       16             KY$CTX.DVC_STATE      - the Software device state
+      336       17             KY$CTX.Q.OUTPUT$  - Location of next I/O command.
+      337       18             KY$CTX.RTRYNUM    - Number of times thes I/O has been retried
+      338       19             KY$CTX.STATUSW    - Actual Hardware Status Word
+      339       20
+      340       21          It can only be invoked from either the routine detecting a timer
+      341       22        runnout for a BUSY device, or by an interrupt from some device.
+      342       23          KYN$OUR_HNDLR is always entered at at least the interrupt level,
+      343       24        it has one parameter, that being the Context,  and really the only
+      344       25        cause for invokation is to process an interrupt.
+      345       26          There are two different routines that the handler can talk with
+      346       27        directly.
+      347       28           KYS$OUR_SCHED, which is told if the last queue'd item was or
+      348       29            was not printed.  And, asked to print another record.
+      349       30           And the Operator Messages Manager, which can be told that it is
+      350       31            time to send some message to the operator, or perhaps that it
+      351       32            is time to stop sending messages to the operator.
+      352       33
+      353       34        */
+      354       35        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:71   
+      355       36        /*
+      356       37                  I N T E R N A L   O V E R V I E W
+      357       38
+      358       39        This routine will almost certainly be one of the most complicated.
+      359       40        Virtually all of the rest of the routines fall into the 'DO This
+      360       41        Because I told you' class.  But this baby has to make quite a few
+      361       42        decisions based on information available to it about what the rest
+      362       43        of the world is currently trying to do.  And with that information
+      363       44        it must decide how best to carry on operations.
+      364       45
+      365       46        In the normal I/O completed interrupt case, where the status says
+      366       47        that that I/O was successful, then the actions are quite straight
+      367       48        forward..  Just do the checking, and whatever else is required to
+      368       49        get the next I/O going.  I.E. call KYS$OUR_SCHED.  It is the cases
+      369       50        where all did not go so well that things get a little strange.
+      370       51
+      371       52        But read on, and you will see what I mean.
+      372       53
+      373       54           DO CASE ON KY$CTX.DVC_STATE   - The software device state
+      374       55           CASE IDLE
+      375       56            This interrupt only one thing.  There is no information that is
+      376       57             currently being printed.  So all we have to do is to keep track
+      377       58             of whether or not the device is online.
+      378       59
+      379       60           CASE OFFLINE
+      380       61            This interrupt means one of two things.  If the device is back
+      381       62             then the device state should become idle.  Otherwise, there
+      382       63             is no change required.
+      383       64
+      384       65           CASE RDYWAIT
+      385       66            When an interrupt occurs while in the RDYWAIT state, we
+      386       67             will have told the operator that the device needs some
+      387       68             attention.  And we are now waiting for the device to be
+      388       69             put back on line such that we can continue with normal
+      389       70             processing.  When the device becomes available we can
+      390       71             simply continue as if there had not been any interruption.
+      391       72
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:72   
+      392       73           CASE OPWAIT_ON
+      393       74            This interrupt only one thing.  We have a ready device, but we
+      394       75             need to wait for an operator keyin.
+      395       76
+      396       77           CASE OPWAIT_OFF
+      397       78            This interrupt is the partner to OPWAIT_ON.  If the device is
+      398       79             available the device state should switch.
+      399       80
+      400       81           CASE UNINITIALIZED
+      401       82            Ignore it.  Just an interrupt from the device, it should
+      402       83             not happen.  But it's not worth errorlogging.
+      403       84
+      404       85           CASE BUSY
+      405       86            Here is the case we've all been waiting for.  Because this
+      406       87             is the state that we want to be in 95% of the time that we
+      407       88             are called.  If we get an interrupt in the BUSY state, that
+      408       89             should be because an I/O has just been completed.  Verify
+      409       90             that that is indeed what has happened, and if the I/O did
+      410       91             complete successfully then the I/O process can continue to
+      411       92             start the next one.  If the last issued I/O did not finish
+      412       93             successfully, then take whatever action is required such
+      413       94             that the world does not come to a screaming halt.
+      414       95
+      415       96        */
+      416       97        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:73   
+      417       98        /*P* NAME: KYN$OUR_HNDLR               Device specific event driver */
+      418       99
+      419      100        KYN$OUR_HNDLR: PROC( KY$CTX );
+
+    100   0 000000  D380 0000 0000  xent KYN$OUR_HNDLR   LNJ,B5   X6A_AUTO_1
+          0 000003       000A 0001                       DC       10,1
+
+      420      101
+      421      102        %INCLUDE GH_HARDWARE_M;
+      422      200        %INCLUDE LCP_6;
+      423     4479        %INCLUDE KL_AFCN_C;
+      424     4580        %INCLUDE KL_MACRO_C;
+      425     7932        %INCLUDE K_ID_E;
+      426     7982        %K#ENTID_E;
+      427     8001        %K#LYRID_E;
+      428     8008        %INCLUDE KY_URP_M;
+      429     8303        %INCLUDE KY_SUBS_C;
+      430     8392        %INCLUDE KV_GLBCNS_E;                   /* VDI equates */
+      431     8733        %INCLUDE KV_PRMID_E;
+      432     8907        %INCLUDE KV$GLB;
+      433     9326        %INCLUDE KV$GLBCTX;
+      434     9771        %INCLUDE KV$PRM;
+      435     9984        %INCLUDE KH$STT;
+      436    10014        %INCLUDE OC_SUBS_C;
+      437    10745        %INCLUDE KV_GLB_M;
+      438    10867        %INCLUDE KY_DATA_R;
+      439    11662        /**/
+      440    11663        %KY$CTX;
+      441    11840        %KY$REC;
+      442    11879        /**/
+      443    11880    1          DCL KYK$OPCON ENTRY(2);
+      444    11881    1          DCL KYC$CHECK_STATUS ENTRY(1);
+      445    11882    1          DCL KYS$OUR_SCHED ENTRY(1) ALTRET;
+      446    11883        /**/
+      447    11884        %KV_PRMID_E;
+      448    12040        /**/
+      449    12041        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:74   
+      450    12042
+      451    12043
+      452    12044    1          KY_STT_URP.USRSTT.OTPINTCNT = KY_STT_URP.USRSTT.OTPINTCNT + 1;
+
+  12044   0 000005  8A80 0000 0017  xsym                 INC      KY_STT_URP+23
+          0 000008  8E80 0000 0016  xsym                 CAD      KY_STT_URP+22
+
+      453    12045        /*%TRACE(WHEREAT = 11,INPUT$="KY$CTX.Q.INPUT$");*/
+      454    12046    1          KY$CTX.RESCHEDULE.INTERRUPT = '0'B;
+
+  12046   0 00000B  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 00000D  8846 0021                            LBF,'4000'X       33,B6
+          0 00000F       4000
+
+      455    12047    1          CALL KYC$CHECK_STATUS ( KY$CTX );
+
+  12047   0 000010  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          0 000012  CBF0 0100                            LAB,B4   256,IMO
+          0 000014  E380 0000 0000  xent                 LNJ,B6   KYC$CHECK_STATUS
+          0 000017       0001                            DC       s:12061,PREL
+
+      456    12048        /*
+      457    12049           DO CASE ON KY$CTX.DVC_STATE   - The software device state
+      458    12050           CASE IDLE
+      459    12051            This interrupt only one thing.  There is no information that is
+      460    12052             currently being printed.  So all we have to do is to keep track
+      461    12053             of whether or not the device is online.
+      462    12054
+      463    12055           CASE OFFLINE
+      464    12056            This interrupt is the partner to IDLE.  If the device is back
+      465    12057             then the device state should become idle.  Otherwise, there
+      466    12058             is no change required.
+      467    12059        */
+      468    12060
+      469    12061    2          DO CASE ( KY$CTX.DVC_STATE );
+
+  12061   0 000018  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:75   
+          0 00001A  B2C6 0004                            LLH,R3   4,B6
+          0 00001C  3D07                                 CMV,R3   7
+          0 00001D  0281 0093                            BGE      s:12170,PREL
+          0 00001F  A830 0000 0025  00                   LDR,R2   s:12061+13,R3
+          0 000022  83A0 0000 002C  00                   JMP      s:12064,R2
+          0 000025       0085                            DC       s:12170,PREL
+          0 000026       0000                            DC       s:12064,PREL
+          0 000027       001E                            DC       s:12103,PREL
+          0 000028       000F                            DC       s:12080,PREL
+          0 000029       0052                            DC       s:12154,PREL
+          0 00002A       000F                            DC       s:12080,PREL
+          0 00002B       0000                            DC       s:12064,PREL
+
+      470    12062    2             CASE ( %KY#ST_IDLE,
+
+      471    12063    2             %KY#ST_OFFLINE );
+      472    12064    2                IF ( KY$CTX.DVC_STATUS = %KY#DVC_READY ) THEN
+
+  12064   0 00002C  82C6 0004                            LB,'00FF'X        4,B6
+  12064   0 00002E       00FF
+          0 00002F  0501 0006                            BBT      s:12067,PREL
+
+      473    12065    2                   KY$CTX.DVC_STATE = %KY#ST_IDLE;
+
+  12065   0 000031  6C01                                 LDV,R6   1
+          0 000032  E7C6 0004                            STH,R6   4,B6
+          0 000034  0F81 007C                            B        s:12170,PREL
+
+      474    12066    2                ELSE
+      475    12067    2                   KY$CTX.DVC_STATE = %KY#ST_OFFLINE;
+
+  12067   0 000036  6C06                                 LDV,R6   6
+          0 000037  E7C6 0004                            STH,R6   4,B6
+          0 000039  0F81 0077                            B        s:12170,PREL
+
+      476    12068        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:76   
+      477    12069        /*
+      478    12070           CASE OPWAIT_ON
+      479    12071            This interrupt only one thing.  We have a ready device, but we
+      480    12072             need to wait for an operator keyin.
+      481    12073
+      482    12074           CASE OPWAIT_OFF
+      483    12075            This interrupt is the partner to OPWAIT_ON.  If the device is
+      484    12076             available the device state should switch.
+      485    12077        */
+      486    12078    2             CASE ( %KY#ST_OPWAIT_ON,
+
+      487    12079    2                      %KY#ST_OPWAIT_OFF );
+      488    12080    2                IF ( KY$CTX.DVC_STATUS = %KY#DVC_READY ) THEN
+
+  12080   0 00003B  82C6 0004                            LB,'00FF'X        4,B6
+  12080   0 00003D       00FF
+          0 00003E  0501 0006                            BBT      s:12083,PREL
+
+      489    12081    2                   KY$CTX.DVC_STATE = %KY#ST_OPWAIT_ON;
+
+  12081   0 000040  6C05                                 LDV,R6   5
+          0 000041  E7C6 0004                            STH,R6   4,B6
+          0 000043  0F81 006D                            B        s:12170,PREL
+
+      490    12082    2                ELSE
+      491    12083    2                   KY$CTX.DVC_STATE = %KY#ST_OPWAIT_OFF;
+
+  12083   0 000045  6C03                                 LDV,R6   3
+          0 000046  E7C6 0004                            STH,R6   4,B6
+          0 000048  0F81 0068                            B        s:12170,PREL
+
+      492    12084        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:77   
+      493    12085        /*
+      494    12086           CASE RDYWAIT
+      495    12087            When an interrupt occurs while in the RDYWAIT state, we
+      496    12088             will have told the operator that the device needs some
+      497    12089             attention.  And we are now waiting for the device to be
+      498    12090             put back on line such that we can continue with normal
+      499    12091             processing.  When the device becomes available we can
+      500    12092             simply continue as if there had not been any interruption.
+      501    12093
+      502    12094            Is the device available?
+      503    12095            YES:
+      504    12096              Tell the operator message routine that the device is now
+      505    12097               available, and it can stop bitching to the operator.
+      506    12098              Call KYS$OUR_SCHED
+      507    12099            NO:
+      508    12100              Call OPCON since the operator message may need to be changed
+      509    12101        */
+      510    12102    2             CASE ( %KY#ST_RDYWAIT );
+
+      511    12103    2                CALL KYK$OPCON(KY$CTX,OC_STTM);
+
+  12103   0 00004A  DBF0 0001                            LAB,B5   1,IMO
+          0 00004C  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 00004E  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 000050  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 000052  CBF0 0200                            LAB,B4   512,IMO
+          0 000054  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 000057       0001                            DC       s:12104,PREL
+
+      512    12104    2                IF ( KY$CTX.DVC_STATUS = %KY#DVC_READY ) THEN
+
+  12104   0 000058  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 00005A  82C6 0004                            LB,'00FF'X        4,B6
+          0 00005C       00FF
+          0 00005D  0501 0010                            BBT      s:12111,PREL
+
+      513    12105    3                   DO;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:78   
+
+      514    12106    3                      KY$CTX.RTRYNUM = 0;
+
+  12106   0 00005F  87C6 000C                            CLH      12,B6
+
+      515    12107    3                      KY$CTX.DVC_STATE = %KY#ST_IDLE;
+
+  12107   0 000061  6C01                                 LDV,R6   1
+          0 000062  E7C6 0004                            STH,R6   4,B6
+
+      516    12108    3                      CALL KYS$OUR_SCHED ( KY$CTX ) ALTRET( NACKED );
+
+  12108   0 000064  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          0 000066  CBF0 0100                            LAB,B4   256,IMO
+          0 000068  E380 0000 0000  xent                 LNJ,B6   KYS$OUR_SCHED
+          0 00006B       0049                            DC       s:12165,PREL
+
+      517    12109    3                   END;
+
+  12109   0 00006C  0F81 0044                            B        s:12170,PREL
+
+      518    12110    2                ELSE
+      519    12111    2                   CALL KYK$OPCON (KY$CTX,OC_WRTM);
+
+  12111   0 00006E  DBF0 0002                            LAB,B5   2,IMO
+          0 000070  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 000072  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 000074  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 000076  CBF0 0200                            LAB,B4   512,IMO
+          0 000078  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 00007B       0001                            DC       s:12111+14,PREL
+          0 00007C  0F81 0034                            B        s:12170,PREL
+
+      520    12112        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:79   
+      521    12113        /*
+      522    12114           CASE UNINITIALIZED
+      523    12115            Ignore it.  Just an interrupt from the device, it should
+      524    12116             not happen.  But it's not worth errorlogging.
+      525    12117        */
+      526    12118    2             CASE ( %KY#ST_NONINIT );
+
+      527    12119
+      528    12120        %EJECT;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:80   
+      529    12121        /*
+      530    12122           CASE BUSY
+      531    12123            What is important here is to determine if the last issue'd
+      532    12124             I/O was completed successfully.  This can be fairly easily
+      533    12125             checked ( fortunately ).
+      534    12126            Note that be definition the only way that the device state
+      535    12127             can be 'Busy' is if the item being pointed at by Q_OUTPUT$
+      536    12128             is a printable item.  I.E. not an 'Output Marker.'
+      537    12129
+      538    12130            Is the device still available?
+      539    12131             YES:
+      540    12132               Mark the KY$REC as having been printed.
+      541    12133               Maintain the size of data actually printed.
+      542    12134               Call KYS$OUR_SCHED
+      543    12135             NO:
+      544    12136               Not good, this means that it isn't possible to tell if
+      545    12137                the last I/O really finished or not.  So, muck with the
+      546    12138                entry in the queue to remove the strictly spacing, but
+      547    12139                not top-of-form, information.
+      548    12140               Increment KY$CTX.RTRYNUM.
+      549    12141               Is KY$CTX.RTRYNUM > 10?
+      550    12142                YES:
+      551    12143                  Tell operator that after going thru a retry cycle it
+      552    12144                   was not possible to successfully complete an I/O
+      553    12145                   to the device.  Request that the operator indicate
+      554    12146                   whether to RETRY, or PROCEED with the device.
+      555    12147                  DVC_STATE  <=  OPWAIT
+      556    12148                NO:
+      557    12149                  Tell operator that the device isn't available, give
+      558    12150                   as much information as is in the status word.
+      559    12151                  DVC_STATE  <=  RDYWAIT
+      560    12152        */
+      561    12153    2             CASE( %KY#ST_BUSY );
+
+      562    12154    2                IF ( KY$CTX.DVC_STATUS = %KY#DVC_READY ) THEN
+
+  12154   0 00007E  82C6 0004                            LB,'00FF'X        4,B6
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:81   
+  12154   0 000080       00FF
+          0 000081  0501 0019                            BBT      s:12164,PREL
+
+      563    12155    3                   DO;
+
+      564    12156    3                      KY$CTX.Q.OUTPUT$ -> KY$REC.PRINTED = '1'B;
+
+  12156   0 000083  DCC6 0014                            LDB,B5   20,B6
+          0 000085  8945 0001                            LBT,'8000'X       1,B5
+          0 000087       8000
+
+      565    12157    3                      KY$CTX.RTRYNUM = 0;
+
+  12157   0 000088  87C6 000C                            CLH      12,B6
+
+      566    12158    3                      KY$CTX.TIMEOUT = %KY#DEV_TIMEOUT_CNT;
+             12158                               /* we got the interrupt, but who's counting*/
+
+  12158   0 00008A  6C12                                 LDV,R6   18
+          0 00008B  EAC6 000B                            SRM,R6,'00FF'X    11,B6
+          0 00008D       00FF
+
+      567    12159    3                      KY$CTX.DVC_STATE = %KY#ST_IDLE;
+
+  12159   0 00008E  5C01                                 LDV,R5   1
+          0 00008F  D7C6 0004                            STH,R5   4,B6
+
+      568    12160    3                      CALL KYS$OUR_SCHED ( KY$CTX ) ALTRET( NACKED );
+
+  12160   0 000091  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          0 000093  CBF0 0100                            LAB,B4   256,IMO
+          0 000095  E380 0000 0000  xent                 LNJ,B6   KYS$OUR_SCHED
+          0 000098       001C                            DC       s:12165,PREL
+
+      569    12161    3                   END;
+
+  12161   0 000099  0F81 0017                            B        s:12170,PREL
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:82   
+
+      570    12162    2                ELSE
+      571    12163    3                   DO;
+
+      572    12164    3                      KY$CTX.Q.OUTPUT$ -> KY$REC.SPACE_N = 0;
+
+  12164   0 00009B  DCC6 0014                            LDB,B5   20,B6
+          0 00009D  8845 0001                            LBF,'00FF'X       1,B5
+          0 00009F       00FF
+
+      573    12165    3                      KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+
+  12165   0 0000A0  6C02                                 LDV,R6   2
+          0 0000A1  E7C6 0004                            STH,R6   4,B6
+
+      574    12166    3                      CALL KYK$OPCON( KY$CTX, OC_WRTM );
+
+  12166   0 0000A3  DBF0 0002                            LAB,B5   2,IMO
+          0 0000A5  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 0000A7  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 0000A9  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 0000AB  CBF0 0200                            LAB,B4   512,IMO
+          0 0000AD  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 0000B0       0001                            DC       s:12170,PREL
+
+      575    12167    3                   END;
+
+      576    12168    2          END;                             /* CASE */
+
+      577    12169
+      578    12170    1          RETURN;
+
+  12170   0 0000B1  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+  12165   0                              NACKED          null
+      579    12171
+      580    12172    1   NACKED: ;
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:83   
+      581    12173    1          KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+
+  12173   0 0000B4  6C02                 NACKED          LDV,R6   2
+          0 0000B5  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 0000B7  E7C6 0004                            STH,R6   4,B6
+
+      582    12174    1          KY$CTX.DVC_STATUS = %KY#DVC_MANUAL;
+
+  12174   0 0000B9  5C07                                 LDV,R5   7
+          0 0000BA  DAC6 0004                            SRM,R5,'00FF'X    4,B6
+          0 0000BC       00FF
+
+      583    12175    1          CALL KYK$OPCON( KY$CTX,OC_WRTM );
+
+  12175   0 0000BD  DBF0 0002                            LAB,B5   2,IMO
+          0 0000BF  DFC7 0008                            STB,B5   @KY$CTX+4,AUTO
+          0 0000C1  EFC7 0006                            STB,B6   @KY$CTX+2,AUTO
+          0 0000C3  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          0 0000C5  CBF0 0200                            LAB,B4   512,IMO
+          0 0000C7  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 0000CA       0001                            DC       s:12176,PREL
+
+      584    12176    1          RETURN;
+
+  12176   0 0000CB  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      585    12177    1   END KYN$OUR_HNDLR;
+      586    12178        %EOD;
+
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:84   
+--  Include file information  --
+
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYN$OUR_HNDLR.
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:85   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @KY$CTX                   *0-0-0/w STRC(608)   r     1 KY$CTX
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(672)   r     1 KY_STT_URP
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w ASTR(80)    r     1 KY$REC
+
+
+   Procedure KYN$OUR_HNDLR requires 206 words for executable code.
+   Procedure KYN$OUR_HNDLR requires 10 words of local(AUTO) storage.
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:86   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:87   
+          MINI XREF LISTING
+
+KV_STT.REQSTATS.DSPMSK
+     11538**DCL     11544--REDEF
+KV_STT.REQSTATS.SLCMSK
+     11579**DCL     11586--REDEF
+KY$CTX
+     11674**DCL       100--PROC    12047<>CALL    12103<>CALL    12108<>CALL    12111<>CALL    12160<>CALL
+     12166<>CALL    12175<>CALL
+KY$CTX.DEFRD.STATUSW
+     11816**DCL     11818--REDEF
+KY$CTX.DVC_STATE
+     11677**DCL     12061>>DOCASE  12065<<ASSIGN  12067<<ASSIGN  12081<<ASSIGN  12083<<ASSIGN  12107<<ASSIGN
+     12159<<ASSIGN  12165<<ASSIGN  12173<<ASSIGN
+KY$CTX.DVC_STATUS
+     11678**DCL     12064>>IF      12080>>IF      12104>>IF      12154>>IF      12174<<ASSIGN
+KY$CTX.MODE
+     11765**DCL     11773--REDEF
+KY$CTX.Q.OUTPUT$
+     11780**DCL     12156>>ASSIGN  12164>>ASSIGN
+KY$CTX.RESCHEDULE.INTERRUPT
+     11825**DCL     12046<<ASSIGN
+KY$CTX.RTRYNUM
+     11764**DCL     12106<<ASSIGN  12157<<ASSIGN
+KY$CTX.STATUSW
+     11692**DCL     11694--REDEF   11702--REDEF   11716--REDEF   11730--REDEF   11744--REDEF
+KY$CTX.TIMEOUT
+     11763**DCL     12158<<ASSIGN
+KY$CTX.VDIENB
+     11830**DCL     11836--REDEF
+KY$REC.PRINTED
+     11868**DCL     12156<<ASSIGN
+KY$REC.RECSIZE
+     11867**DCL     11877--IMP-SIZ
+PL6.E3A0      #003=KYN$OUR_HNDLR File=KYN$INTRPT.:E05TSI                         WED 07/30/97 02:45 Page:88   
+KY$REC.SPACE_N
+     11873**DCL     12164<<ASSIGN
+KY$REC.TXTARRAY
+     11876**DCL     11877--REDEF
+KYC$CHECK_STATUS
+     11881**DCL-ENT 12047--CALL
+KYK$OPCON
+     11880**DCL-ENT 12103--CALL    12111--CALL    12166--CALL    12175--CALL
+KYS$OUR_SCHED
+     11882**DCL-ENT 12108--CALL    12160--CALL
+KY_STT_URP.REQSTATS.DSPMSK
+     11187**DCL     11193--REDEF
+KY_STT_URP.REQSTATS.SLCMSK
+     11228**DCL     11235--REDEF
+KY_STT_URP.USRSTT.OTPINTCNT
+     11257**DCL     12044<<ASSIGN  12044>>ASSIGN
+NACKED
+     12165**LABEL   12108--CALLALT 12160--CALLALT
+
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:89   
+      587        1        /*M* KYN$ENABLE - routine to do all GHH$LEV calls for URP */
+      588        2        /*T***********************************************************/
+      589        3        /*T*                                                         */
+      590        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      591        5        /*T*                                                         */
+      592        6        /*T***********************************************************/
+      593        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      594        8               ECI=0,DIN=7,CSU=3,AND      */
+      595        9        KYN$ENABLE: PROC;
+      596       10        /**/
+      597       11        %INCLUDE GH_HARDWARE_M;
+      598      109        %INCLUDE LCP_6;
+      599     4388        %INCLUDE KY_SCODE_C;
+      600     4402        %VLP_SCODE ( FPTN = U_ILGINTCNT, FCG = KY, MID = N, ERR# = S$KY_ILGINTCNT, STCLASS =
+              4402            CONSTANT);
+      601     4463        %INCLUDE KL_AFCN_C;
+      602     4564        %INCLUDE KL_MACRO_C;
+      603     7916        %INCLUDE K_ID_E;
+      604     7966        %K#ENTID_E;
+      605     7985        %K#LYRID_E;
+      606     7992        %INCLUDE KV$GLB;
+      607     8411        %INCLUDE KV$GLBCTX;
+      608     8856        %INCLUDE KV$PRM;
+      609     9069        %INCLUDE KV_PRMID_E;
+      610     9243        %INCLUDE KV_GLBCNS_E;
+      611     9584        %INCLUDE KY_URP_M;
+      612     9879        %INCLUDE KY_SUBS_C;
+      613     9968        %INCLUDE KH$STT;
+      614     9998        %INCLUDE KV_GLB_M;
+      615    10120        %INCLUDE KY_DATA_R;
+      616    10915        %INCLUDE KH_SCREECH_M;
+      617    10926        %INCLUDE KH_MACRO_C;
+      618    11669        %INCLUDE KHC_MAC_C;
+      619    11710        %INCLUDE KL_CONTROL_C;
+      620    12090        %KH$CTLTBL(FPTN=KH$CTLTBL,STCLASS="BASED(KH_CTLTBL$)");
+      621    12302    1          DCL ONEWORD UBIN BASED;
+      622    12303    1          DCL KH_CTLTBL$ PTR SYMREF;
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:90   
+      623    12304        /**/
+      624    12305    1          DCL KHI$ENABLE ENTRY;
+      625    12306    1          DCL KHI$DISABLE ENTRY(1);
+      626    12307    1          DCL KHD$SCREECH ENTRY(1);
+      627    12308        /**/
+      628    12309    1          DCL INT_LEV UBIN;
+      629    12310        /**/
+      630    12311        %EJECT;
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:91   
+      631    12312    1          IF KY_DISABLE_CNT=1 AND NOT KY_INTFLG THEN
+      632    12313    1             CALL KHI$ENABLE;
+      633    12314    1          KY_DISABLE_CNT = KY_DISABLE_CNT - 1;
+      634    12315    1          IF KY_DISABLE_CNT < 0 THEN
+      635    12316                   /*S* SCREECH_CODE: KYN-S$KY_ILGINTCNT
+      636    12317                        MESSAGE: something is wrong with UNITRECs int count */
+      637    12318                  %KH$SCREECH(COD = U_ILGINTCNT);
+      638    12322    1          RETURN;
+      639    12323    1   KYN$DISABLE: ENTRY;
+      640    12324    1          IF KY_DISABLE_CNT < 0 THEN
+      641    12325                  %KH$SCREECH(COD = U_ILGINTCNT);
+      642    12329    1          IF KY_DISABLE_CNT = 0 AND NOT KY_INTFLG THEN
+      643    12330    2             DO;
+      644    12331    2                INT_LEV = KY_INT_LEV;
+      645    12332    2                CALL KHI$DISABLE(INT_LEV);
+      646    12333    2             END;                          /* IF */
+      647    12334    1          KY_DISABLE_CNT = KY_DISABLE_CNT + 1;
+      648    12335    1          RETURN;
+      649    12336    1   END KYN$ENABLE;
+
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:92   
+--  Include file information  --
+
+   KL_CONTROL_C.:E05TOU  is referenced.
+   KHC_MAC_C.:E05TOU  is referenced.
+   KH_MACRO_C.:E05TOU  is referenced.
+   KH_SCREECH_M.:E05TOU  is referenced.
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   KY_SCODE_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYN$ENABLE.
+
+   Procedure KYN$ENABLE requires 94 words for executable code.
+   Procedure KYN$ENABLE requires 8 words of local(AUTO) storage.
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:93   
+
+    No errors detected in file KYN$INTRPT.:E05TSI    .
+
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:94   
+
+ Object Unit name= KYN$ENABLE                                 File name= KYN$INTRPT.:E05TOU
+ UTS= JUL 30 '97 02:46:21.52 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0  RoData even  UTS      3      3  KYN$ENABLE
+    1   Proc  even  none    94     5E  KYN$ENABLE
+    2  RoData even  none     2      2  KYN$ENABLE
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        0  KYN$ENABLE
+     1     2A                  yes      Std        0  KYN$DISABLE
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       0 KHI$ENABLE
+         yes           Std       1 KHD$SCREECH
+         yes           Std       1 KHI$DISABLE
+                       nStd      0 X6A_AUTO_0
+                       nStd      0 X6A_ARET
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:95   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KY_INT_LEV                            KY_DISABLE_CNT                        KY_INTFLG
+     KH_CTLTBL$                       r    G$ROS$
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:96   
+
+
+      587        1        /*M* KYN$ENABLE - routine to do all GHH$LEV calls for URP */
+      588        2        /*T***********************************************************/
+      589        3        /*T*                                                         */
+      590        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      591        5        /*T*                                                         */
+      592        6        /*T***********************************************************/
+      593        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      594        8               ECI=0,DIN=7,CSU=3,AND      */
+      595        9        KYN$ENABLE: PROC;
+
+      9   1 000000  D380 0000 0000  xent KYN$ENABLE      LNJ,B5   X6A_AUTO_0
+          1 000003       0008 0000                       DC       8,0
+
+      596       10        /**/
+      597       11        %INCLUDE GH_HARDWARE_M;
+      598      109        %INCLUDE LCP_6;
+      599     4388        %INCLUDE KY_SCODE_C;
+      600     4402       %VLP_SCODE ( FPTN = U_ILGINTCNT, FCG = KY, MID = N, ERR# = S$KY_ILGINTCNT, STCLASS =
+              4402            CONSTANT);
+      601     4463        %INCLUDE KL_AFCN_C;
+      602     4564        %INCLUDE KL_MACRO_C;
+      603     7916        %INCLUDE K_ID_E;
+      604     7966        %K#ENTID_E;
+      605     7985        %K#LYRID_E;
+      606     7992        %INCLUDE KV$GLB;
+      607     8411        %INCLUDE KV$GLBCTX;
+      608     8856        %INCLUDE KV$PRM;
+      609     9069        %INCLUDE KV_PRMID_E;
+      610     9243        %INCLUDE KV_GLBCNS_E;
+      611     9584        %INCLUDE KY_URP_M;
+      612     9879        %INCLUDE KY_SUBS_C;
+      613     9968        %INCLUDE KH$STT;
+      614     9998        %INCLUDE KV_GLB_M;
+      615    10120        %INCLUDE KY_DATA_R;
+      616    10915        %INCLUDE KH_SCREECH_M;
+      617    10926        %INCLUDE KH_MACRO_C;
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:97   
+      618    11669        %INCLUDE KHC_MAC_C;
+      619    11710        %INCLUDE KL_CONTROL_C;
+      620    12090        %KH$CTLTBL(FPTN=KH$CTLTBL,STCLASS="BASED(KH_CTLTBL$)");
+      621    12302    1          DCL ONEWORD UBIN BASED;
+      622    12303    1          DCL KH_CTLTBL$ PTR SYMREF;
+      623    12304        /**/
+      624    12305    1          DCL KHI$ENABLE ENTRY;
+      625    12306    1          DCL KHI$DISABLE ENTRY(1);
+      626    12307    1          DCL KHD$SCREECH ENTRY(1);
+      627    12308        /**/
+      628    12309    1          DCL INT_LEV UBIN;
+      629    12310        /**/
+      630    12311        %EJECT;
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:98   
+      631    12312    1          IF KY_DISABLE_CNT=1 AND NOT KY_INTFLG THEN
+
+  12312   1 000005  E800 0000 0000  xsym                 LDR,R6   KY_DISABLE_CNT
+          1 000008  6D01                                 CMV,R6   1
+          1 000009  0981 000C                            BNE      s:12314,PREL
+          1 00000B  8980 0000 0000  xsym                 CMZ      KY_INTFLG
+          1 00000E  0801 0007                            BAL      s:12314,PREL
+
+      632    12313    1             CALL KHI$ENABLE;
+
+  12313   1 000010  CBF0 0000                            LAB,B4   0,IMO
+          1 000012  E380 0000 0000  xent                 LNJ,B6   KHI$ENABLE
+          1 000015       0001                            DC       s:12314,PREL
+
+      633    12314    1          KY_DISABLE_CNT = KY_DISABLE_CNT - 1;
+
+  12314   1 000016  8880 0000 0000  xsym                 DEC      KY_DISABLE_CNT
+
+      634    12315    1          IF KY_DISABLE_CNT < 0 THEN
+
+  12315   1 000019  E800 0000 0000  xsym                 LDR,R6   KY_DISABLE_CNT
+          1 00001C  6881 000A                            BGEZ,R6  s:12322,PREL
+
+      635    12316                   /*S* SCREECH_CODE: KYN-S$KY_ILGINTCNT
+      636    12317                        MESSAGE: something is wrong with UNITRECs int count */
+      637    12318                  %KH$SCREECH(COD = U_ILGINTCNT);
+
+  12320   1 00001E  BB80 0000 0000  02                   LAB,B3   0
+          1 000021  CBF0 0100                            LAB,B4   256,IMO
+          1 000023  E380 0000 0000  xent                 LNJ,B6   KHD$SCREECH
+          1 000026       0001                            DC       s:12322,PREL
+
+      638    12322    1          RETURN;
+
+  12322   1 000027  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      639    12323    1   KYN$DISABLE: ENTRY;
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:99   
+
+  12323   1 00002A  D380 0000 0000  xent KYN$DISABLE     LNJ,B5   X6A_AUTO_0
+          1 00002D       0008 0000                       DC       8,0
+
+      640    12324    1          IF KY_DISABLE_CNT < 0 THEN
+
+  12324   1 00002F  E800 0000 0000  xsym                 LDR,R6   KY_DISABLE_CNT
+          1 000032  6881 000A                            BGEZ,R6  s:12329,PREL
+
+      641    12325                  %KH$SCREECH(COD = U_ILGINTCNT);
+
+  12327   1 000034  BB80 0000 0000  02                   LAB,B3   0
+          1 000037  CBF0 0100                            LAB,B4   256,IMO
+          1 000039  E380 0000 0000  xent                 LNJ,B6   KHD$SCREECH
+          1 00003C       0001                            DC       s:12329,PREL
+
+      642    12329    1          IF KY_DISABLE_CNT = 0 AND NOT KY_INTFLG THEN
+
+  12329   1 00003D  E800 0000 0000  xsym                 LDR,R6   KY_DISABLE_CNT
+          1 000040  6981 0017                            BNEZ,R6  s:12334,PREL
+          1 000042  8980 0000 0000  xsym                 CMZ      KY_INTFLG
+          1 000045  0801 0012                            BAL      s:12334,PREL
+
+      643    12330    2             DO;
+
+      644    12331    2                INT_LEV = KY_INT_LEV;
+
+  12331   1 000047  D800 0000 0000  xsym                 LDR,R5   KY_INT_LEV
+          1 00004A  DF47 0004                            STR,R5   INT_LEV,AUTO
+
+      645    12332    2                CALL KHI$DISABLE(INT_LEV);
+
+  12332   1 00004C  EBC7 0004                            LAB,B6   INT_LEV,AUTO
+          1 00004E  EFC7 0006                            STB,B6   INT_LEV+2,AUTO
+          1 000050  BBC7 0006                            LAB,B3   INT_LEV+2,AUTO
+          1 000052  CBF0 0100                            LAB,B4   256,IMO
+          1 000054  E380 0000 0000  xent                 LNJ,B6   KHI$DISABLE
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:100  
+          1 000057       0001                            DC       s:12334,PREL
+
+      646    12333    2             END;                          /* IF */
+
+      647    12334    1          KY_DISABLE_CNT = KY_DISABLE_CNT + 1;
+
+  12334   1 000058  8A80 0000 0000  xsym                 INC      KY_DISABLE_CNT
+
+      648    12335    1          RETURN;
+
+  12335   1 00005B  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      649    12336    1   END KYN$ENABLE;
+
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:101  
+--  Include file information  --
+
+   KL_CONTROL_C.:E05TOU  is referenced.
+   KHC_MAC_C.:E05TOU  is referenced.
+   KH_MACRO_C.:E05TOU  is referenced.
+   KH_SCREECH_M.:E05TOU  is referenced.
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   KY_SCODE_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYN$ENABLE.
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:102  
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData KYN$ENABLE
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(48)    r     1 U_ILGINTCNT
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w UBIN(16)    r     1 INT_LEV
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 KH_CTLTBL$                 0-0-0/w SBIN(16)    r     1 KY_DISABLE_CNT
+     0-0-0/b BIT         r     1 KY_INTFLG                  0-0-0/w UBIN(16)    r     1 KY_INT_LEV
+
+
+   Procedure KYN$ENABLE requires 94 words for executable code.
+   Procedure KYN$ENABLE requires 8 words of local(AUTO) storage.
+
+    No errors detected in file KYN$INTRPT.:E05TSI    .
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:103  
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #004=KYN$ENABLE File=KYN$INTRPT.:E05TSI                            WED 07/30/97 02:46 Page:104  
+          MINI XREF LISTING
+
+INT_LEV
+     12309**DCL     12331<<ASSIGN  12332<>CALL
+KHD$SCREECH
+     12307**DCL-ENT 12320--CALL    12327--CALL
+KHI$DISABLE
+     12306**DCL-ENT 12332--CALL
+KHI$ENABLE
+     12305**DCL-ENT 12313--CALL
+KH_CTLTBL$
+     12303**DCL     12107--IMP-PTR
+KV_STT.REQSTATS.DSPMSK
+     10791**DCL     10797--REDEF
+KV_STT.REQSTATS.SLCMSK
+     10832**DCL     10839--REDEF
+KY_DISABLE_CNT
+     10912**DCL     12312>>IF      12314<<ASSIGN  12314>>ASSIGN  12315>>IF      12324>>IF      12329>>IF
+     12334<<ASSIGN  12334>>ASSIGN
+KY_INTFLG
+     10913**DCL     12312>>IF      12329>>IF
+KY_INT_LEV
+     10912**DCL     12331>>ASSIGN
+KY_STT_URP.REQSTATS.DSPMSK
+     10440**DCL     10446--REDEF
+KY_STT_URP.REQSTATS.SLCMSK
+     10481**DCL     10488--REDEF
+U_ILGINTCNT
+      4429**DCL     12320<>CALL    12327<>CALL

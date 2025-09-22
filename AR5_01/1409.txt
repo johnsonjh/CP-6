@@ -1,0 +1,954 @@
+VERSION E05
+
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:1    
+        1        1        /*M* KYK$KEYIN  Handles all URP-directed KEYINs */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+        8        8               ECI=0,DIN=7,CSU=3,AND      */
+        9        9        KYK$KEYIN: PROC(KY$CTX,KEYIN);
+       10       10        /*D* NAME:        KYK$KEYIN
+       11       11             PURPOSE:     To handle KEYINs sent to URP devices
+       12       12             CALL:        CALL KYK$KEYIN (KY$CTX,KEYIN);
+       13       13                             where: KY$CTX - context block for the KEYINed device
+       14       14                                    KEYIN - Value specifying which KEYIN
+       15       15             DESCRIPTION: KYK$KEYIN first DISABLEs to the URP device interrupt
+       16       16                          level. If the target device is not expecting a KEYIN,
+       17       17                          the KEYIN will be ignored,
+       18       18                          otherwise, the KEYIN is processed as follows:
+       19       19
+       20       20                          o Stop the current timed message
+       21       21                          o Zero the RETRY count
+       22       22                          o Change the STATE to IDLE if currently in OPWAIT_ON.
+       23       23                            Otherwise change the STATE to RDYWAIT and put out
+       24       24                            a new timed message.
+       25       25
+       26       26                          PROCEED KEYIN:
+       27       27                             o Set the PRINTED bit for each remaing record
+       28       28                               in the queue for output devices, or
+       29       29                               set the BUF_VALID bit for input devices
+       30       30                             o Call the appropriate scheduler. The output unit
+       31       31                               record scheduler is not called unless the new
+       32       32                               state is IDLE.
+       33       33                               RDYWAIT. Otherwise cancel timed msg,
+       34       34                               set state to IDLE and call the appropriate
+       35       35                               scheduler
+       36       36
+       37       37                          RETRY KEYIN:
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:2    
+       38       38                             o Call the appropriate scheduler. The output unit
+       39       39                               record scheduler is not called unless the new
+       40       40                               state is IDLE.
+       41       41
+       42       42                          Finally, ENABLE back to the previous level and RETURN.
+       43       43        */
+       44       44        %INCLUDE GH_HARDWARE_M;
+       45      142        %INCLUDE KY_URP_M;
+       46      437        %INCLUDE KY_SUBS_C;
+       47      526        %INCLUDE KH$STT;
+       48      556        %INCLUDE OC_SUBS_C;
+       49     1287        %INCLUDE KV_GLBCNS_E;
+       50     1628        /**/
+       51     1629        %KY$CTX;
+       52     1806    1          DCL KEYIN UBIN WORD;
+       53     1807        /**/
+       54     1808    1          DCL OUTPUT$ PTR;
+       55     1809    1          DCL SIZE UBIN WORD;
+       56     1810        %KY$REC (STCLASS="BASED(OUTPUT$)");
+       57     1849        %KY$OUTMRK (STCLASS="BASED(OUTPUT$)");
+       58     1866        /**/
+       59     1867        %KV_USR_EVT_ID_E;
+       60     1887        %KV_USR_FNC_E;
+       61     1903        /**/
+       62     1904    1          DCL KYN$ENABLE ENTRY;
+       63     1905    1          DCL KYN$DISABLE ENTRY;
+       64     1906    1          DCL KYK$OPCON ENTRY(2);
+       65     1907    1          DCL KYS$IUR_SCHED ENTRY(2);
+       66     1908    1          DCL KYS$OUR_SCHED ENTRY(1) ALTRET;
+       67     1909    1          DCL KYP$PROCESS ENTRY(1);
+       68     1910        /**/
+       69     1911        %EJECT;
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:3    
+       70     1912    1          CALL KYN$DISABLE;
+       71     1913    1          IF KY$CTX.DVC_STATE=%KY#ST_OPWAIT_ON
+       72     1914    1             OR KY$CTX.DVC_STATE=%KY#ST_OPWAIT_OFF
+       73     1915    1             OR KY$CTX.DVC_STATE=%KY#ST_RDYWAIT THEN
+       74     1916    2             DO;
+       75     1917    2                CALL KYK$OPCON(KY$CTX,OC_STTM);
+       76     1918    2                KY$CTX.RTRYNUM = 0;
+       77     1919    2                IF KY$CTX.DVC_STATE=%KY#ST_OPWAIT_ON AND
+       78     1920    2                   KY$CTX.DVCTYP ~= %KY#TYP_CR THEN
+       79     1921    2                   KY$CTX.DVC_STATE=%KY#ST_IDLE;
+       80     1922    2                ELSE
+       81     1923    3                   DO;
+       82     1924    3                      KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+       83     1925    3                      CALL KYK$OPCON(KY$CTX,OC_WRTM);
+       84     1926    3                   END;
+       85     1927    3                DO CASE(KY$CTX.DVCTYP);
+       86     1928    3                   CASE(%KY#TYP_LP,%KY#TYP_CP);
+       87     1929    3                      IF KEYIN=KEY_PROCEED# THEN
+       88     1930    4                         DO;
+       89     1931    4                            KY$CTX.Q.OUTPUT$->KY$REC.PRINTED='1'B;
+       90     1932    4                         END;              /* IF KEYIN = PROCEED                 */
+       91     1933    3                      IF KY$CTX.DVC_STATE=%KY#ST_IDLE THEN
+       92     1934    3                         CALL KYS$OUR_SCHED(KY$CTX) ALTRET(GO_RDYWAIT);
+       93     1935    3                   CASE(%KY#TYP_CR);
+       94     1936    3                      IF KEYIN=KEY_PROCEED# THEN
+       95     1937    3                         CALL KYP$PROCESS(KY$CTX);
+       96     1938    3                      ELSE
+       97     1939    3                         CALL KYS$IUR_SCHED(KY$CTX,%KY#READ);
+       98     1940    3                END;
+       99     1941    3                DO WHILE('0'B);
+      100     1942    3   GO_RDYWAIT:     KY$CTX.DVC_STATE=%KY#ST_RDYWAIT;
+      101     1943    3                   CALL KYK$OPCON(KY$CTX,OC_WRTM);
+      102     1944    3                END;
+      103     1945    2             END;
+      104     1946    1          CALL KYN$ENABLE;
+      105     1947    1          RETURN;
+      106     1948    1   END KYK$KEYIN;
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:4    
+      107     1949        %EOD;
+
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:5    
+--  Include file information  --
+
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYK$KEYIN.
+
+   Procedure KYK$KEYIN requires 177 words for executable code.
+   Procedure KYK$KEYIN requires 16 words of local(AUTO) storage.
+
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:6    
+
+ Object Unit name= KYK$KEYIN                                  File name= KYK$KEYIN.:E05TOU
+ UTS= JUL 30 '97 02:42:33.68 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   177     B1  KYK$KEYIN
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        2  KYK$KEYIN
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       0 KYN$DISABLE
+         yes           Std       2 KYK$OPCON
+ yes     yes           Std       1 KYS$OUR_SCHED
+         yes           Std       1 KYP$PROCESS
+         yes           Std       2 KYS$IUR_SCHED
+         yes           Std       0 KYN$ENABLE
+                       nStd      0 X6A_AUTO_2
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+r    G$ROS$
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:7    
+
+
+        1        1        /*M* KYK$KEYIN  Handles all URP-directed KEYINs */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+        8        8               ECI=0,DIN=7,CSU=3,AND      */
+        9        9        KYK$KEYIN: PROC(KY$CTX,KEYIN);
+
+      9   0 000000  D380 0000 0000  xent KYK$KEYIN       LNJ,B5   X6A_AUTO_2
+          0 000003       0010 0002                       DC       16,2
+
+       10       10        /*D* NAME:        KYK$KEYIN
+       11       11             PURPOSE:     To handle KEYINs sent to URP devices
+       12       12             CALL:        CALL KYK$KEYIN (KY$CTX,KEYIN);
+       13       13                             where: KY$CTX - context block for the KEYINed device
+       14       14                                    KEYIN - Value specifying which KEYIN
+       15       15             DESCRIPTION: KYK$KEYIN first DISABLEs to the URP device interrupt
+       16       16                          level. If the target device is not expecting a KEYIN,
+       17       17                          the KEYIN will be ignored,
+       18       18                          otherwise, the KEYIN is processed as follows:
+       19       19
+       20       20                          o Stop the current timed message
+       21       21                          o Zero the RETRY count
+       22       22                          o Change the STATE to IDLE if currently in OPWAIT_ON.
+       23       23                            Otherwise change the STATE to RDYWAIT and put out
+       24       24                            a new timed message.
+       25       25
+       26       26                          PROCEED KEYIN:
+       27       27                             o Set the PRINTED bit for each remaing record
+       28       28                               in the queue for output devices, or
+       29       29                               set the BUF_VALID bit for input devices
+       30       30                             o Call the appropriate scheduler. The output unit
+       31       31                               record scheduler is not called unless the new
+       32       32                               state is IDLE.
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:8    
+       33       33                               RDYWAIT. Otherwise cancel timed msg,
+       34       34                               set state to IDLE and call the appropriate
+       35       35                               scheduler
+       36       36
+       37       37                          RETRY KEYIN:
+       38       38                             o Call the appropriate scheduler. The output unit
+       39       39                               record scheduler is not called unless the new
+       40       40                               state is IDLE.
+       41       41
+       42       42                          Finally, ENABLE back to the previous level and RETURN.
+       43       43        */
+       44       44        %INCLUDE GH_HARDWARE_M;
+       45      142        %INCLUDE KY_URP_M;
+       46      437        %INCLUDE KY_SUBS_C;
+       47      526        %INCLUDE KH$STT;
+       48      556        %INCLUDE OC_SUBS_C;
+       49     1287        %INCLUDE KV_GLBCNS_E;
+       50     1628        /**/
+       51     1629        %KY$CTX;
+       52     1806    1          DCL KEYIN UBIN WORD;
+       53     1807        /**/
+       54     1808    1          DCL OUTPUT$ PTR;
+       55     1809    1          DCL SIZE UBIN WORD;
+       56     1810        %KY$REC (STCLASS="BASED(OUTPUT$)");
+       57     1849        %KY$OUTMRK (STCLASS="BASED(OUTPUT$)");
+       58     1866        /**/
+       59     1867        %KV_USR_EVT_ID_E;
+       60     1887        %KV_USR_FNC_E;
+       61     1903        /**/
+       62     1904    1          DCL KYN$ENABLE ENTRY;
+       63     1905    1          DCL KYN$DISABLE ENTRY;
+       64     1906    1          DCL KYK$OPCON ENTRY(2);
+       65     1907    1          DCL KYS$IUR_SCHED ENTRY(2);
+       66     1908    1          DCL KYS$OUR_SCHED ENTRY(1) ALTRET;
+       67     1909    1          DCL KYP$PROCESS ENTRY(1);
+       68     1910        /**/
+       69     1911        %EJECT;
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:9    
+       70     1912    1          CALL KYN$DISABLE;
+
+   1912   0 000005  CBF0 0000                            LAB,B4   0,IMO
+          0 000007  E380 0000 0000  xent                 LNJ,B6   KYN$DISABLE
+          0 00000A       0001                            DC       s:1913,PREL
+
+       71     1913    1          IF KY$CTX.DVC_STATE=%KY#ST_OPWAIT_ON
+
+   1913   0 00000B  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 00000D  E2C6 0004                            LLH,R6   4,B6
+          0 00000F  6D05                                 CMV,R6   5
+          0 000010  0901 0007                            BE       s:1917,PREL
+          0 000012  6D03                                 CMV,R6   3
+          0 000013  0901 0004                            BE       s:1917,PREL
+          0 000015  6D02                                 CMV,R6   2
+          0 000016  0981 0091                            BNE      s:1946,PREL
+
+       72     1914    1             OR KY$CTX.DVC_STATE=%KY#ST_OPWAIT_OFF
+       73     1915    1             OR KY$CTX.DVC_STATE=%KY#ST_RDYWAIT THEN
+       74     1916    2             DO;
+
+       75     1917    2                CALL KYK$OPCON(KY$CTX,OC_STTM);
+
+   1917   0 000018  DBF0 0001                            LAB,B5   1,IMO
+          0 00001A  DFC7 000E                            STB,B5   OUTPUT$+6,AUTO
+          0 00001C  EFC7 000C                            STB,B6   OUTPUT$+4,AUTO
+          0 00001E  BBC7 000C                            LAB,B3   OUTPUT$+4,AUTO
+          0 000020  CBF0 0200                            LAB,B4   512,IMO
+          0 000022  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 000025       0001                            DC       s:1918,PREL
+
+       76     1918    2                KY$CTX.RTRYNUM = 0;
+
+   1918   0 000026  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 000028  87C6 000C                            CLH      12,B6
+
+       77     1919    2                IF KY$CTX.DVC_STATE=%KY#ST_OPWAIT_ON AND
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:10   
+
+   1919   0 00002A  E2C6 0004                            LLH,R6   4,B6
+          0 00002C  6D05                                 CMV,R6   5
+          0 00002D  0981 000B                            BNE      s:1924,PREL
+          0 00002F  D2C6 000B                            LLH,R5   11,B6
+          0 000031  5D03                                 CMV,R5   3
+          0 000032  0901 0006                            BE       s:1924,PREL
+
+       78     1920    2                   KY$CTX.DVCTYP ~= %KY#TYP_CR THEN
+       79     1921    2                   KY$CTX.DVC_STATE=%KY#ST_IDLE;
+
+   1921   0 000034  4C01                                 LDV,R4   1
+          0 000035  C7C6 0004                            STH,R4   4,B6
+          0 000037  0F81 0012                            B        s:1927,PREL
+
+       80     1922    2                ELSE
+       81     1923    3                   DO;
+
+       82     1924    3                      KY$CTX.DVC_STATE = %KY#ST_RDYWAIT;
+
+   1924   0 000039  5C02                                 LDV,R5   2
+          0 00003A  D7C6 0004                            STH,R5   4,B6
+
+       83     1925    3                      CALL KYK$OPCON(KY$CTX,OC_WRTM);
+
+   1925   0 00003C  DBF0 0002                            LAB,B5   2,IMO
+          0 00003E  DFC7 000E                            STB,B5   OUTPUT$+6,AUTO
+          0 000040  EFC7 000C                            STB,B6   OUTPUT$+4,AUTO
+          0 000042  BBC7 000C                            LAB,B3   OUTPUT$+4,AUTO
+          0 000044  CBF0 0200                            LAB,B4   512,IMO
+          0 000046  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 000049       0001                            DC       s:1927,PREL
+
+       84     1926    3                   END;
+
+       85     1927    3                DO CASE(KY$CTX.DVCTYP);
+
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:11   
+   1927   0 00004A  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 00004C  B2C6 000B                            LLH,R3   11,B6
+          0 00004E  3D04                                 CMV,R3   4
+          0 00004F  0281 0043                            BGE      s:1941,PREL
+          0 000051  A830 0000 0057  00                   LDR,R2   s:1927+13,R3
+          0 000054  83A0 0000 005B  00                   JMP      s:1929,R2
+          0 000057       0038                            DC       s:1941,PREL
+          0 000058       0000                            DC       s:1929,PREL
+          0 000059       0000                            DC       s:1929,PREL
+          0 00005A       001A                            DC       s:1936,PREL
+
+       86     1928    3                   CASE(%KY#TYP_LP,%KY#TYP_CP);
+
+       87     1929    3                      IF KEYIN=KEY_PROCEED# THEN
+
+   1929   0 00005B  DCC7 0006                            LDB,B5   @KEYIN,AUTO
+          0 00005D  E805                                 LDR,R6   ,B5
+          0 00005E  6D14                                 CMV,R6   20
+          0 00005F  0981 0006                            BNE      s:1933,PREL
+
+       88     1930    4                         DO;
+
+       89     1931    4                            KY$CTX.Q.OUTPUT$->KY$REC.PRINTED='1'B;
+
+   1931   0 000061  CCC6 0014                            LDB,B4   20,B6
+          0 000063  8944 0001                            LBT,'8000'X       1,B4
+          0 000065       8000
+
+       90     1932    4                         END;              /* IF KEYIN = PROCEED                 */
+
+       91     1933    3                      IF KY$CTX.DVC_STATE=%KY#ST_IDLE THEN
+
+   1933   0 000066  E2C6 0004                            LLH,R6   4,B6
+          0 000068  6D01                                 CMV,R6   1
+          0 000069  0981 0029                            BNE      s:1941,PREL
+
+       92     1934    3                         CALL KYS$OUR_SCHED(KY$CTX) ALTRET(GO_RDYWAIT);
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:12   
+
+   1934   0 00006B  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          0 00006D  CBF0 0100                            LAB,B4   256,IMO
+          0 00006F  E380 0000 0000  xent                 LNJ,B6   KYS$OUR_SCHED
+          0 000072       0023                            DC       s:1942,PREL
+          0 000073  0F81 001F                            B        s:1941,PREL
+
+       93     1935    3                   CASE(%KY#TYP_CR);
+
+       94     1936    3                      IF KEYIN=KEY_PROCEED# THEN
+
+   1936   0 000075  DCC7 0006                            LDB,B5   @KEYIN,AUTO
+          0 000077  E805                                 LDR,R6   ,B5
+          0 000078  6D14                                 CMV,R6   20
+          0 000079  0981 000B                            BNE      s:1939,PREL
+
+       95     1937    3                         CALL KYP$PROCESS(KY$CTX);
+
+   1937   0 00007B  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          0 00007D  CBF0 0100                            LAB,B4   256,IMO
+          0 00007F  E380 0000 0000  xent                 LNJ,B6   KYP$PROCESS
+          0 000082       0001                            DC       s:1937+8,PREL
+          0 000083  0F81 000F                            B        s:1941,PREL
+
+       96     1938    3                      ELSE
+       97     1939    3                         CALL KYS$IUR_SCHED(KY$CTX,%KY#READ);
+
+   1939   0 000085  CBF0 0002                            LAB,B4   2,IMO
+          0 000087  CFC7 000E                            STB,B4   OUTPUT$+6,AUTO
+          0 000089  EFC7 000C                            STB,B6   OUTPUT$+4,AUTO
+          0 00008B  BBC7 000C                            LAB,B3   OUTPUT$+4,AUTO
+          0 00008D  CBF0 0200                            LAB,B4   512,IMO
+          0 00008F  E380 0000 0000  xent                 LNJ,B6   KYS$IUR_SCHED
+          0 000092       0001                            DC       s:1941,PREL
+
+       98     1940    3                END;
+
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:13   
+       99     1941    3                DO WHILE('0'B);
+
+   1941   0 000093  0F81 0014                            B        s:1946,PREL
+
+      100     1942    3   GO_RDYWAIT:     KY$CTX.DVC_STATE=%KY#ST_RDYWAIT;
+
+   1942   0 000095  6C02                 GO_RDYWAIT      LDV,R6   2
+          0 000096  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 000098  E7C6 0004                            STH,R6   4,B6
+
+      101     1943    3                   CALL KYK$OPCON(KY$CTX,OC_WRTM);
+
+   1943   0 00009A  DBF0 0002                            LAB,B5   2,IMO
+          0 00009C  DFC7 000E                            STB,B5   OUTPUT$+6,AUTO
+          0 00009E  EFC7 000C                            STB,B6   OUTPUT$+4,AUTO
+          0 0000A0  BBC7 000C                            LAB,B3   OUTPUT$+4,AUTO
+          0 0000A2  CBF0 0200                            LAB,B4   512,IMO
+          0 0000A4  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          0 0000A7       0001                            DC       s:1946,PREL
+
+      102     1944    3                END;
+
+      103     1945    2             END;
+
+      104     1946    1          CALL KYN$ENABLE;
+
+   1946   0 0000A8  CBF0 0000                            LAB,B4   0,IMO
+          0 0000AA  E380 0000 0000  xent                 LNJ,B6   KYN$ENABLE
+          0 0000AD       0001                            DC       s:1947,PREL
+
+      105     1947    1          RETURN;
+
+   1947   0 0000AE  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      106     1948    1   END KYK$KEYIN;
+      107     1949        %EOD;
+
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:14   
+--  Include file information  --
+
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYK$KEYIN.
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:15   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w PTR         r     1 @KEYIN                     4-0-0/w PTR         r     1 @KY$CTX
+    *0-0-0/w UBIN(16)    r     1 KEYIN                     *0-0-0/w STRC(608)   r     1 KY$CTX
+     8-0-0/w PTR         r     1 OUTPUT$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w ASTR(80)    r     1 KY$REC
+
+
+   Procedure KYK$KEYIN requires 177 words for executable code.
+   Procedure KYK$KEYIN requires 16 words of local(AUTO) storage.
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:16   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:17   
+          MINI XREF LISTING
+
+GO_RDYWAIT
+      1942**LABEL    1934--CALLALT
+KEYIN
+      1806**DCL         9--PROC     1929>>IF       1936>>IF
+KY$CTX
+      1640**DCL         9--PROC     1917<>CALL     1925<>CALL     1934<>CALL     1937<>CALL     1939<>CALL
+      1943<>CALL
+KY$CTX.DEFRD.STATUSW
+      1782**DCL      1784--REDEF
+KY$CTX.DVCTYP
+      1728**DCL      1919>>IF       1927>>DOCASE
+KY$CTX.DVC_STATE
+      1643**DCL      1913>>IF       1913>>IF       1913>>IF       1919>>IF       1921<<ASSIGN   1924<<ASSIGN
+      1933>>IF       1942<<ASSIGN
+KY$CTX.MODE
+      1731**DCL      1739--REDEF
+KY$CTX.Q.OUTPUT$
+      1746**DCL      1931>>ASSIGN
+KY$CTX.RTRYNUM
+      1730**DCL      1918<<ASSIGN
+KY$CTX.STATUSW
+      1658**DCL      1660--REDEF    1668--REDEF    1682--REDEF    1696--REDEF    1710--REDEF
+KY$CTX.VDIENB
+      1796**DCL      1802--REDEF
+KY$REC.PRINTED
+      1838**DCL      1931<<ASSIGN
+KY$REC.RECSIZE
+      1837**DCL      1847--IMP-SIZ
+KY$REC.TXTARRAY
+      1846**DCL      1847--REDEF
+KYK$OPCON
+      1906**DCL-ENT  1917--CALL     1925--CALL     1943--CALL
+PL6.E3A0      #001=KYK$KEYIN File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:18   
+KYN$DISABLE
+      1905**DCL-ENT  1912--CALL
+KYN$ENABLE
+      1904**DCL-ENT  1946--CALL
+KYP$PROCESS
+      1909**DCL-ENT  1937--CALL
+KYS$IUR_SCHED
+      1907**DCL-ENT  1939--CALL
+KYS$OUR_SCHED
+      1908**DCL-ENT  1934--CALL
+OUTPUT$
+      1808**DCL      1834--IMP-PTR  1860--IMP-PTR
+
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:19   
+      108        1        /*M* KYK$OPCON  Handle operator communications. Send or stop operator messages. */
+      109        2        /*T***********************************************************/
+      110        3        /*T*                                                         */
+      111        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      112        5        /*T*                                                         */
+      113        6        /*T***********************************************************/
+      114        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      115        8               ECI=0,DIN=7,CSU=3,AND      */
+      116        9        KYK$OPCON: PROC(KY$CTX,FNC);
+      117       10        /*D* NAME:        KYK$OPCON
+      118       11             PURPOSE:     To send or stop an operator message.
+      119       12             CALL:        CALL KYK$OPCON (KY$CTX,FNC);
+      120       13                             where: KY$CTX - Context block of the device on whose
+      121       14                                              behalf this message exists,
+      122       15                                    FNC - The function that KEYIN is to perform.
+      123       16                                          Options are Write, Write timed, or Stop
+      124       17                                          timed message.  EQUs for these functions
+      125       18                                          are KH_CNSFNC_? in KH_KYN_C.
+      126       19             DESCRIPTION: KYK$OPCON uses the parameters passed to fill in a
+      127       20                          KL_KEYMES structure.  This structure is than sent to
+      128       21                          the HOST via Handler Common.
+      129       22        */
+      130       23        %INCLUDE LCP_6;
+      131     4302        %INCLUDE KL_MACRO_C;
+      132     7654        %INCLUDE KY_URP_M;
+      133     7949        %INCLUDE KY_SUBS_C;
+      134     8038        %INCLUDE KHA_FNC_E;
+      135     8138        %INCLUDE KL_AFCN_C;
+      136     8239        %INCLUDE KV_GLBCNS_E;
+      137     8580        %INCLUDE OC_SUBS_C;
+      138     9311        /**/
+      139     9312        %KV_USR_EVT_ID_E;
+      140     9332        %KV_USR_FNC_E;
+      141     9348        /**/
+      142     9349        %KY$CTX;
+      143     9526    1          DCL FNC UBIN WORD;
+      144     9527    1          DCL 1 CHANNEL ALIGNED STATIC,
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:20   
+      145     9528    1                 2 CHAN UBIN(10) UNAL,
+      146     9529    1                 2 * BIT(6) UNAL INIT('0'B);
+      147     9530    1          DCL CHANNEL_R REDEF CHANNEL UBIN WORD;
+      148     9531        /**/
+      149     9532        %KL_KEYMES (FPTN=KY_KEYMES,STCLASS=STATIC,NPARMS=2,TYPE_INIT="1*0",SIZE_INIT="2*0",
+              9532            LAST=",");
+      150     9671    1                 2 STATUS UBIN WORD UNAL,
+      151     9672    1                 2 STATE UBIN WORD UNAL;
+      152     9673        %B$TERMINAL_ID (FPTN=TERMID,STCLASS=STATIC);
+      153     9702        %VLP_ERRCODE (FPTN=ERRCODE,STCLASS=STATIC);
+      154     9748        /**/
+      155     9749    1          DCL KHA$DVCADM ENTRY(6) ALTRET;
+      156     9750        /**/
+      157     9751        %EJECT;
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:21   
+      158     9752    1          KY_KEYMES.CADDR = M_DEVC;
+      159     9753    1          KY_KEYMES.CNSFNC = FNC;
+      160     9754    2          DO CASE(FNC);
+      161     9755    2             CASE(OC_STTM);
+      162     9756                      /*N* WHAT DO I DO? */
+      163     9757    2             CASE(OC_WRTM);
+      164     9758    2                KY_KEYMES.MSG# = URPS_STATUS_MSG#;
+      165     9759    2             CASE(OC_WR);
+      166     9760                      /*N* ??????*/
+      167     9761    2          END;                             /* DO CASE                            */
+      168     9762    1          KY_KEYMES.STATUS = KY$CTX.DVC_STATUS;
+      169     9763    1          KY_KEYMES.STATE = KY$CTX.DVC_STATE;
+      170     9764    1          CHANNEL.CHAN = KY$CTX.CHAN;
+      171     9765    1          TERMID.TERM.CHANNEL = CHANNEL_R;
+      172     9766    1          TERMID.LEV = 1;
+      173     9767    1          KY_KEYMES.TERMID = TERMID;
+      174     9768    1          CALL KHA$DVCADM(%KHA_FNC_DVCERR,ERRCODE,TERMID,,VECTOR(KY_KEYMES));
+      175     9769    1          RETURN;
+      176     9770    1   END KYK$OPCON;
+
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:22   
+--  Include file information  --
+
+   OC_SUBS_C.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   KHA_FNC_E.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure KYK$OPCON.
+
+   Procedure KYK$OPCON requires 151 words for executable code.
+   Procedure KYK$OPCON requires 18 words of local(AUTO) storage.
+
+    No errors detected in file KYK$KEYIN.:E05TSI    .
+
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:23   
+
+ Object Unit name= KYK$OPCON                                  File name= KYK$KEYIN.:E05TOU
+ UTS= JUL 30 '97 02:42:49.56 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Data  even  none    28     1C  KYK$OPCON
+    1  RoData even  UTS      3      3  KYK$OPCON
+    2   Proc  even  none   151     97  KYK$OPCON
+    3  RoData even  none     3      3  KYK$OPCON
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes            yes      Std        2  KYK$OPCON
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       6 KHA$DVCADM
+                       nStd      0 X6A_AUTO_2
+                       nStd      0 X6B_BLR
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+r    G$ROS$
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:24   
+
+
+      108        1        /*M* KYK$OPCON  Handle operator communications. Send or stop operator messages. */
+      109        2        /*T***********************************************************/
+      110        3        /*T*                                                         */
+      111        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      112        5        /*T*                                                         */
+      113        6        /*T***********************************************************/
+      114        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      115        8               ECI=0,DIN=7,CSU=3,AND      */
+      116        9        KYK$OPCON: PROC(KY$CTX,FNC);
+
+      9   2 000000  D380 0000 0000  xent KYK$OPCON       LNJ,B5   X6A_AUTO_2
+          2 000003       0012 0002                       DC       18,2
+
+      117       10        /*D* NAME:        KYK$OPCON
+      118       11             PURPOSE:     To send or stop an operator message.
+      119       12             CALL:        CALL KYK$OPCON (KY$CTX,FNC);
+      120       13                             where: KY$CTX - Context block of the device on whose
+      121       14                                              behalf this message exists,
+      122       15                                    FNC - The function that KEYIN is to perform.
+      123       16                                          Options are Write, Write timed, or Stop
+      124       17                                          timed message.  EQUs for these functions
+      125       18                                          are KH_CNSFNC_? in KH_KYN_C.
+      126       19             DESCRIPTION: KYK$OPCON uses the parameters passed to fill in a
+      127       20                          KL_KEYMES structure.  This structure is than sent to
+      128       21                          the HOST via Handler Common.
+      129       22        */
+      130       23        %INCLUDE LCP_6;
+      131     4302        %INCLUDE KL_MACRO_C;
+      132     7654        %INCLUDE KY_URP_M;
+      133     7949        %INCLUDE KY_SUBS_C;
+      134     8038        %INCLUDE KHA_FNC_E;
+      135     8138        %INCLUDE KL_AFCN_C;
+      136     8239        %INCLUDE KV_GLBCNS_E;
+      137     8580        %INCLUDE OC_SUBS_C;
+      138     9311        /**/
+      139     9312        %KV_USR_EVT_ID_E;
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:25   
+      140     9332        %KV_USR_FNC_E;
+      141     9348        /**/
+      142     9349        %KY$CTX;
+      143     9526    1          DCL FNC UBIN WORD;
+      144     9527    1          DCL 1 CHANNEL ALIGNED STATIC,
+      145     9528    1                 2 CHAN UBIN(10) UNAL,
+      146     9529    1                 2 * BIT(6) UNAL INIT('0'B);
+      147     9530    1          DCL CHANNEL_R REDEF CHANNEL UBIN WORD;
+      148     9531        /**/
+      149     9532        %KL_KEYMES (FPTN=KY_KEYMES,STCLASS=STATIC,NPARMS=2,TYPE_INIT="1*0",SIZE_INIT="2*0",
+              9532            LAST=",");
+      150     9671    1                 2 STATUS UBIN WORD UNAL,
+      151     9672    1                 2 STATE UBIN WORD UNAL;
+      152     9673        %B$TERMINAL_ID (FPTN=TERMID,STCLASS=STATIC);
+      153     9702        %VLP_ERRCODE (FPTN=ERRCODE,STCLASS=STATIC);
+      154     9748        /**/
+      155     9749    1          DCL KHA$DVCADM ENTRY(6) ALTRET;
+      156     9750        /**/
+      157     9751        %EJECT;
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:26   
+      158     9752    1          KY_KEYMES.CADDR = M_DEVC;
+
+   9752   2 000005  AB80 0000 0000  01                   LAB,B2   0
+          2 000008  2C00                                 LDV,R2   0
+          2 000009  6C12                                 LDV,R6   18
+          2 00000A  BB80 0000 0000  00                   LAB,B3   CHANNEL
+          2 00000D  3C30                                 LDV,R3   48
+          2 00000E  7C12                                 LDV,R7   18
+          2 00000F  D380 0000 0000  xent                 LNJ,B5   X6B_BLR
+
+      159     9753    1          KY_KEYMES.CNSFNC = FNC;
+
+   9753   2 000012  ECC7 0006                            LDB,B6   @FNC,AUTO
+          2 000014  E806                                 LDR,R6   ,B6
+          2 000015  EA80 0000 0004  00                   SRM,R6,'00FF'X    KY_KEYMES+3
+          2 000018       00FF
+
+      160     9754    2          DO CASE(FNC);
+
+   9754   2 000019  B806                                 LDR,R3   ,B6
+          2 00001A  3D03                                 CMV,R3   3
+          2 00001B  0281 0011                            BGE      s:9762,PREL
+          2 00001D  A830 0000 0023  02                   LDR,R2   s:9754+10,R3
+          2 000020  83A0 0000 0026  02                   JMP      s:9758,R2
+          2 000023       0007                            DC       s:9762,PREL
+          2 000024       0007                            DC       s:9762,PREL
+          2 000025       0000                            DC       s:9758,PREL
+
+      161     9755    2             CASE(OC_STTM);
+
+      162     9756                      /*N* WHAT DO I DO? */
+      163     9757    2             CASE(OC_WRTM);
+
+      164     9758    2                KY_KEYMES.MSG# = URPS_STATUS_MSG#;
+
+   9758   2 000026  E870 00AC                            LDR,R6   172,IMO
+          2 000028  EF00 0000 0002  00                   STR,R6   KY_KEYMES+1
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:27   
+          2 00002B  0F81 0001                            B        s:9762,PREL
+
+      165     9759    2             CASE(OC_WR);
+
+      166     9760                      /*N* ??????*/
+      167     9761    2          END;                             /* DO CASE                            */
+
+      168     9762    1          KY_KEYMES.STATUS = KY$CTX.DVC_STATUS;
+
+   9762   2 00002D  DCC7 0004                            LDB,B5   @KY$CTX,AUTO
+          2 00002F  F845 0004                            LDR,R7   4,B5
+          2 000031  F570 00FF                            AND,R7   255,IMO
+          2 000033  6C00                                 LDV,R6   0
+          2 000034  7090                                 DOL,R7   16
+          2 000035  8D47 0008                            SDI      @FNC+2,AUTO
+          2 000037  ABC7 0008                            LAB,B2   @FNC+2,AUTO
+          2 000039  2C00                                 LDV,R2   0
+          2 00003A  6C20                                 LDV,R6   32
+          2 00003B  BB80 0000 000F  00                   LAB,B3   KY_KEYMES+14
+          2 00003E  3C08                                 LDV,R3   8
+          2 00003F  7C10                                 LDV,R7   16
+          2 000040  D380 0000 0000  xent                 LNJ,B5   X6B_BLR
+
+      169     9763    1          KY_KEYMES.STATE = KY$CTX.DVC_STATE;
+
+   9763   2 000043  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          2 000045  F2C6 0004                            LLH,R7   4,B6
+          2 000047  6C00                                 LDV,R6   0
+          2 000048  7090                                 DOL,R7   16
+          2 000049  8D47 0008                            SDI      @FNC+2,AUTO
+          2 00004B  ABC7 0008                            LAB,B2   @FNC+2,AUTO
+          2 00004D  2C00                                 LDV,R2   0
+          2 00004E  6C20                                 LDV,R6   32
+          2 00004F  BB80 0000 0010  00                   LAB,B3   KY_KEYMES+15
+          2 000052  3C08                                 LDV,R3   8
+          2 000053  7C10                                 LDV,R7   16
+          2 000054  D380 0000 0000  xent                 LNJ,B5   X6B_BLR
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:28   
+
+      170     9764    1          CHANNEL.CHAN = KY$CTX.CHAN;
+
+   9764   2 000057  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          2 000059  E846 000A                            LDR,R6   10,B6
+          2 00005B  EA80 0000 0000  00                   SRM,R6,'FFC0'X    CHANNEL
+          2 00005E       FFC0
+
+      171     9765    1          TERMID.TERM.CHANNEL = CHANNEL_R;
+
+   9765   2 00005F  D800 0000 0000  00                   LDR,R5   CHANNEL
+          2 000062  DF00 0000 0013  00                   STR,R5   TERMID+1
+
+      172     9766    1          TERMID.LEV = 1;
+
+   9766   2 000065  6C01                                 LDV,R6   1
+          2 000066  EA80 0000 0012  00                   SRM,R6,'00FF'X    TERMID
+          2 000069       00FF
+
+      173     9767    1          KY_KEYMES.TERMID = TERMID;
+
+   9767   2 00006A  AB80 0000 0000  00                   LAB,B2   CHANNEL
+          2 00006D  2C24                                 LDV,R2   36
+          2 00006E  6C10                                 LDV,R6   16
+          2 00006F  BB80 0000 0000  00                   LAB,B3   CHANNEL
+          2 000072  3C0A                                 LDV,R3   10
+          2 000073  0008                                 MMM
+
+      174     9768    1          CALL KHA$DVCADM(%KHA_FNC_DVCERR,ERRCODE,TERMID,,VECTOR(KY_KEYMES));
+
+   9768   2 000074  DBF0 0017                            LAB,B5   23,IMO
+          2 000076  CB80 0000 0000  03                   LAB,B4   0
+          2 000079  CFC7 0010                            STB,B4   @FNC+10,AUTO
+          2 00007B  BB80 0000 0000                       LAB,B3   0
+          2 00007E  BFC7 000E                            STB,B3   @FNC+8,AUTO
+          2 000080  AB80 0000 0012  00                   LAB,B2   TERMID
+          2 000083  AFC7 000C                            STB,B2   @FNC+6,AUTO
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:29   
+          2 000085  9B80 0000 001A  00                   LAB,B1   ERRCODE
+          2 000088  9FC7 000A                            STB,B1   @FNC+4,AUTO
+          2 00008A  DFC7 0008                            STB,B5   @FNC+2,AUTO
+          2 00008C  BBC7 0008                            LAB,B3   @FNC+2,AUTO
+          2 00008E  CBF0 0500                            LAB,B4   1280,IMO
+          2 000090  E380 0000 0000  xent                 LNJ,B6   KHA$DVCADM
+          2 000093       0001                            DC       s:9769,PREL
+
+      175     9769    1          RETURN;
+
+   9769   2 000094  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      176     9770    1   END KYK$OPCON;
+
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:30   
+--  Include file information  --
+
+   OC_SUBS_C.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   KHA_FNC_E.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure KYK$OPCON.
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:31   
+
+ **** Variables and constants ****
+
+  ****  Section 000  Data  KYK$OPCON
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(16)    r     1 CHANNEL                    0-0-0/w UBIN(16)    r     1 CHANNEL_R
+    1A-0-0/w STRC(32)    r     1 ERRCODE                    1-0-0/w STRC(264)   r     1 KY_KEYMES
+    12-0-0/c STRC(128)   r     1 TERMID
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w PTR         r     1 @FNC                       4-0-0/w PTR         r     1 @KY$CTX
+    *0-0-0/w UBIN(16)    r     1 FNC                       *0-0-0/w STRC(608)   r     1 KY$CTX
+
+
+   Procedure KYK$OPCON requires 151 words for executable code.
+   Procedure KYK$OPCON requires 18 words of local(AUTO) storage.
+
+    No errors detected in file KYK$KEYIN.:E05TSI    .
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:32   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:33   
+          MINI XREF LISTING
+
+CHANNEL
+      9527**DCL      9530--REDEF
+CHANNEL.CHAN
+      9528**DCL      9764<<ASSIGN
+CHANNEL_R
+      9530**DCL      9765>>ASSIGN
+ERRCODE
+      9716**DCL      9768<>CALL
+FNC
+      9526**DCL         9--PROC     9753>>ASSIGN   9754>>DOCASE
+KHA$DVCADM
+      9749**DCL-ENT  9768--CALL
+KY$CTX
+      9360**DCL         9--PROC
+KY$CTX.CHAN
+      9446**DCL      9764>>ASSIGN
+KY$CTX.DEFRD.STATUSW
+      9502**DCL      9504--REDEF
+KY$CTX.DVC_STATE
+      9363**DCL      9763>>ASSIGN
+KY$CTX.DVC_STATUS
+      9364**DCL      9762>>ASSIGN
+KY$CTX.MODE
+      9451**DCL      9459--REDEF
+KY$CTX.STATUSW
+      9378**DCL      9380--REDEF    9388--REDEF    9402--REDEF    9416--REDEF    9430--REDEF
+KY$CTX.VDIENB
+      9516**DCL      9522--REDEF
+KY_KEYMES
+      9551**DCL      9768--CALL
+KY_KEYMES.CADDR
+      9575**DCL      9752<<ASSIGN
+PL6.E3A0      #002=KYK$OPCON File=KYK$KEYIN.:E05TSI                              WED 07/30/97 02:42 Page:34   
+KY_KEYMES.CNSFNC
+      9605**DCL      9753<<ASSIGN
+KY_KEYMES.MSG#
+      9560**DCL      9758<<ASSIGN
+KY_KEYMES.STATE
+      9672**DCL      9763<<ASSIGN
+KY_KEYMES.STATUS
+      9671**DCL      9762<<ASSIGN
+KY_KEYMES.TERMID
+      9631**DCL      9767<<ASSIGN
+KY_KEYMES.TERMID.TERM
+      9633**DCL      9642--REDEF
+TERMID
+      9687**DCL      9767>>ASSIGN   9768<>CALL
+TERMID.LEV
+      9691**DCL      9766<<ASSIGN
+TERMID.TERM
+      9691**DCL      9700--REDEF
+TERMID.TERM.CHANNEL
+      9697**DCL      9765<<ASSIGN

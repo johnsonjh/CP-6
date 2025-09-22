@@ -1,0 +1,309 @@
+/*M*    make_read:c --    Routines to read and parse the Makefile */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <b$jit_c.h>
+extern struct b_jit *B$JIT$;   /* Should be in <b$jit_c.h>! */
+#include "MAKE_Cc13"
+#include "MAKE_Cc14"
+ 
+extern void crash();
+extern void MakeCommand();
+extern char *ExpandMacros();
+extern FILE *Makefile;
+char *plural();
+ 
+char *CONST English[] = { "No", "One", "Two", "Three", "Four",
+           "Five", "Six", "Seven", "Eight", "Nine", "Ten"};
+ 
+CONST char LS_fmt[]          = "%6d: %s\n";
+CONST char LS_fmt_1st[]      = "%6d: %1.*s\n";
+CONST char LS_fmt_cnt[]      = "     +: %1.*s\n";
+ 
+static int RecLSroom = 0, RecLen = 0;
+static char *BigRecBuf = 0;
+static int   BigRecSize = 0;
+       int   MakeRecs   = 0;
+ 
+extern char    *TargetBuf;
+extern unsigned TargetBufSize;
+ 
+CONST int  BreakTable[] = {
+/* 1 2 3 4 5 6 7 8 9 * 1 2 3 4 5 6 7 8 9 * 1 2 3 4 5 6 7 8 9 * 1 2 */
+   1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+   1,1,1,0,0,1,0,1,1,1,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,
+   1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,
+   1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,
+ 
+   2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+   1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+   1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+   1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+ 
+ 
+/*F*    NAME:          ReadMake(int LS_flag, int LS_width, int VB_flag)
+        PURPOSE:       To read a makefile.
+        DESCRIPTION:
+           The Makefile variable is a file pointer to the stream
+           that is open to the makefile to process.  Each record
+           in the makefile is read, any macros are expanded by the
+           "ExpandMacros" function and the command is processed by
+           the "MakeCommand" function.
+ 
+           When the end of the makefile is read, the temporary buffers
+           allocated for macro processing and record input are
+           released, and the number of errors encountered in the
+           makefile is printed (if verbose is specified) and also
+           returned to the calling program.
+ 
+*/
+ 
+int
+ReadMake(LS_flag,LS_width,VB_flag)  {
+ 
+char buf[512];   /*  Sufficient to hold input records */
+char *b;
+char *MakeFileRecord();
+ 
+  RecLSroom = LS_width - 8;
+  RecLSroom = (RecLSroom > 20)? RecLSroom : 20;
+  MakeRecs = 0;
+ 
+  while ( InputRec = MakeFileRecord(buf, sizeof(buf), LS_flag))  {
+     b = ExpandMacros(InputRec, (InputRecLen = RecLen)  );
+     if (b)
+        MakeCommand( b, MacRecLen, VB_flag );
+     };
+ 
+  if (LS_flag || VB_flag)
+     printf("\n %s Error%s and %s Warning%s in Makefile\n",
+           plural(Errors,0),plural(Errors,1),
+           plural(Warnings,0),plural(Warnings,1));
+  if (BigRecSize) free(BigRecBuf), BigRecBuf = 0, BigRecSize = 0;
+  if (TargetBufSize) free(TargetBuf), TargetBufSize = 0;
+  MakeRecs = 0;
+  return Errors;
+}
+ 
+ 
+/*D*    NAME:    plural
+        PURPOSE: To return an "s" if the word should be plural or
+                 return "NO" or a formatted number given an integer.
+*/
+ 
+char *plural(v,flg)   int v; int flg;
+{
+  static last = 0;
+  static char buf[5][15];
+  char *rs = (v < 11) ? English[v] : "";
+ 
+  if (flg) {
+     if (v == 1) rs = "";
+        else rs = "s";
+     }
+  else if (v > 10)  {
+     rs = buf[last++];
+     sprintf(rs,"%d",v);
+     if (last > 5)  last = 0;
+     }
+  return rs;
+}
+ 
+ 
+/*D*    NAME:    PrintSegment
+        PURPOSE: To print a record, possibly breaking it in a "nice"
+                 place if it is too long for one output line.
+        DESCRIPTION:
+           The arguments are:
+ 
+           room  -- maximum number of chars to print from buf
+           buf   -- pointer to the text to print and/or break
+           wp    -- index from args (0) to position to insert the
+                    trunction position (precision of %s format).
+           fmt   -- printf output format
+           args  -- arguments to printf
+ 
+           The result of this function is the actual number of
+           characters that were printed.
+*/
+int PrintSegment(room,buf,wp,fmt,args,a,b,c,d,e,f,g)
+  char *buf;
+  char *fmt;
+{
+  int len = 0, got = 0, spec = 0, ct;
+  char  altb[512];
+  int *arglist = &args;
+  char **cplist = (char **) arglist;
+ 
+  while(len < room && buf[len]) {
+     ct = BreakTable[ buf[len++] ];
+     if ( ct == 1) got = len;
+     else if (ct == 2) spec++;
+     }
+ 
+  if (len <= room) got = room = len;
+  if (!got) got = room;
+  arglist[wp] = got;
+  if (spec)   {
+     char *cp;
+     memcpy(altb, buf, got);
+     altb[got] = 0;
+     cplist[wp+1] = altb;
+     while ( cp = strchr(altb, 128) )
+        *cp = '$';
+     }
+  printf(fmt,args,a,b,c,d,e,f,g);
+  return got;
+}
+ 
+/*D*    NAME:    PrintRecord
+        PURPOSE: To print an input record.
+        DESCRIPTION:
+           The parameters to this function are:
+ 
+           buf      -- the record to print (terminating "\n" removed)
+           bsize    -- length of the record read
+           RecNo    -- the record number
+*/
+int PrintRecord(buf, bsize, RecNo)
+  char *buf;
+  int bsize;
+  int RecNo;
+{
+ 
+  if (bsize > RecLSroom)  {
+     char *b = buf;
+     int  rem = bsize, ps = 0;
+ 
+     ps = PrintSegment(RecLSroom,buf,1,LS_fmt_1st,RecNo,1,b);
+     b += ps;
+     rem -= ps;
+     while (rem > RecLSroom) {
+        ps = PrintSegment(RecLSroom,b,0,LS_fmt_cnt,0,b);
+        b += ps, rem -= ps;
+        }
+     printf(LS_fmt_cnt,RecLSroom,b);
+     }
+     else printf(LS_fmt,RecNo,buf);
+  return 1;
+}
+ 
+ 
+/*D*    NAME:    MakeFileRecord
+        PURPOSE: To return a pointer to a complete makefile record.
+*/
+ 
+char *
+MakeFileRecord(buf, bsize, LS_flag)
+  char *buf;
+  int   bsize;
+  int   LS_flag;
+{
+  int   RecStart = -1;
+  int   l;
+  int cont  = 1;
+  char *rs;
+ 
+  RecLen = 0;
+  if (BigRecBuf) BigRecBuf[0] = 0;
+  while (cont)   {
+     if (!fgets(buf, bsize, Makefile))   {
+        if (!InputNo) return NULL;  /* EOF on main file */
+        fclose(Makefile);
+        if (file_table[InputNo].ifdepth!=file_table[InputNo-1].ifdepth)
+           warning("\"%s\" line %d: endif statement missing before EOF\n",
+              file_table[InputNo].fid,  file_table[InputNo].recno);
+        Makefile = file_table[--InputNo].strm;
+        continue;
+        }
+     l = strlen(buf);
+ 
+     if ('\n' != buf[l-1])   {
+        if (RecStart < 0) RecStart = RecLen;
+        AddRecordSegment(buf,l);
+        }
+     else  {     /**  end-of-record located    **/
+        buf[--l] = 0;  /* remove newline */
+        MakeRecs++;
+        file_table[InputNo].recno++;
+        if (RecLen)    AddRecordSegment(buf, l);
+ 
+        if (LS_flag)
+           if (RecStart < 0)
+              PrintRecord(buf, l, MakeRecs);
+           else PrintRecord(BigRecBuf+RecStart, RecLen-RecStart, MakeRecs);
+        rs = (RecLen) ? BigRecBuf+RecLen-1 : buf+l-1;
+        if (*rs == '\\')   {  /* Continued Record */
+           *rs = 0, l--;
+           if (!RecLen)
+              AddRecordSegment(buf, l);
+           else RecLen--;
+           RecStart = RecLen;
+           }
+        else cont = 0;
+        }
+     }  /* of while (cont)   */
+ 
+  if (!RecLen)   {
+     RecLen = l;
+     rs = buf;
+     }
+  else rs = BigRecBuf;
+  if  (B$JIT$->active.jit)  {
+     char cb[120];
+     static int cci = 1;
+     if (cci) {
+        memset(B$JIT$->ccbuf, ' ', sizeof(B$JIT$->ccbuf));
+        cci = 0;
+        }
+     sprintf(cb,"make Record=%d %s", MakeRecs, file_table[InputNo].fid);
+     memcpy(B$JIT$->ccbuf, cb, strlen(cb));
+     }
+  return rs;
+}
+ 
+ 
+AddRecordSegment(buf, bsize)
+  char *buf;
+  int  bsize;
+{
+  if (!BigRecBuf || BigRecSize < (RecLen + bsize))  {
+     if (!(BigRecBuf = (char*)realloc(BigRecBuf,(BigRecSize+=1024))))
+        crash("Out of Memory: AddRecordSegment");
+     BigRecBuf[RecLen] = 0;
+     }
+  strcat(BigRecBuf,buf);
+  RecLen += bsize;
+}
+ 
+ 
+warning(fmt,args,a,b,c,d,e,f)
+  char *fmt;
+{
+  printf(fmt,args,a,b,c,d,e,f);
+  Warnings++;
+}
+ 
+void
+error(fmt, args,a,b,c,d,e,f)
+  char  *fmt;
+{
+  printf(fmt,args,a,b,c,d,e,f);
+  Errors++;
+}
+ 
+void
+crash(fmt, args,a,b,c,d,e,f)
+  char  *fmt;
+{
+  printf("\n\n***  ABORT: ");
+  printf(fmt,args,a,b,c,d,e,f);
+  printf("\n");
+  exit(8);
+}
+ 

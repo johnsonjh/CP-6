@@ -1,0 +1,1500 @@
+VERSION E05
+
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:1    
+        1        1        /*M*     PSF$FEPSTATS - HANDLE ASYNC EVENTS - STATS MSGS FROM FEPS */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR,PLM=3,AND=Y,ENI=0,SDI=3,MCL=10,CSI=0,ECI=0 */
+        8        8        /*F* NAME:          PSF$FEPSTATS
+        9        9             PURPOSE:       Handle read complete events on HLPCG
+       10       10             DESCRIPTION:   As statistics messages come in from the feps, pack them
+       11       11                            into the corresponding part of the structure.
+       12       12        */
+       13       13        /*D* NAME:          PSF$FEPSTATS
+       14       14             CALL:          Async entry from nowait read complete event.
+       15       15             INPUT:         Expect a message in PS_HLPCGBUF
+       16       16             OUTPUT:        Stats tables updated.
+       17       17             DESCRIPTION:   Get the station name and ars out of the dcb.  Use the
+       18       18                            station name to get the index into the user table.  Get
+       19       19                            the node number of this fep out of the user table call
+       20       20                            COMPRESS to compress the buffer from 8 of 9 to 32
+       21       21                            of 36 (i.e. each word gets packed to the right with the
+       22       22                            4 fill bits ending up as bits 0-3).  This subroutine
+       23       23                            does an altret if a complete buffer was not sent.  If a
+       24       24                            complete buffer was sent, the buffer address is
+       25       25                            returned.  COMPRESS returns a stats msg type.
+       26       26                            Perform a do case on this.  Call routines that moves
+       27       27                            the data from the compressed buffer into the right
+       28       28                            stats buffer.
+       29       29        */
+       30       30        PSF$FEPSTATS: PROC ASYNC;
+       31       31
+       32       32        /*        RECORD THE STATS FROM THE
+       33       33                  THE L6 FEPS                             */
+       34       34
+       35       35
+       36       36        %INCLUDE CP_6;
+       37      117        %INCLUDE CP_6_SUBS;
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:2    
+       38      657        %INCLUDE B_ERRORS_C;
+       39     1784        %INCLUDE PS_DATA_R;
+       40     7080        %INCLUDE PS_PERR_C;
+       41     7111
+       42     7112        %F$DCB;
+       43     7169
+       44     7170        %VLP_STATION (FPTN=FEC_STA,
+       45     7171                  MSGTYP='$$$$',
+       46     7172                  STCLASS=STATIC);
+       47     7199
+       48     7200    1   DCL B$TCB$ PTR SYMREF;
+       49     7201        %B$TCB(STCLASS="BASED(B$TCB$)");
+       50     7204        %B$NWIO;
+       51     7289
+       52     7290        %INCLUDE PS_FEP_E;
+       53     7774        %PS_FEPSTATS;
+       54     7984
+       55     7985        %KL_REQSTATS(STCLASS="BASED(HLPCGBUF$)");
+       56     8278    1   DCL HLPCGBUF$ PTR CONSTANT INIT(ADDR(PS_HLPCGBUF));
+       57     8279    1   DCL XUR$ERRCNVRT ENTRY(2);
+       58     8280
+       59     8281    1   DCL PSE$GRIPE ENTRY(5);
+       60     8282    1   DCL PSF$GETBUF ENTRY(5);
+       61     8283    1   DCL PSA$BLURTFEP ENTRY;
+       62     8284    1   DCL FEP$ PTR STATIC;
+       63     8285    1   DCL STRUCT$ PTR;
+       64     8286    1   DCL FEPNO UBIN;
+       65     8287    1   DCL UBIN_(0:0) UBIN BASED;
+       66     8288    1   DCL NEED_LEVEL UBIN;
+       67     8289    1   DCL WORDS UBIN;
+       68     8290    1   DCL ERRCODE BIT(36);
+       69     8291    1   DCL VEC VECTOR;
+       70     8292        %EJECT;
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:3    
+       71     8293        /* BEGIN PSF$FEPSTATS */
+       72     8294
+       73     8295    1      IF B$TCB.STK$->B$NWIO.ERR.CODE = %E$DACTR
+       74     8296    1        AND NOT DCBADDR(DCBNUM(M$HLPCG))->F$DCB.FCD#
+       75     8297    1      THEN RETURN;          /* We aborted read by closing the DCB; ignore error. */
+       76     8298
+       77     8299    2      IF B$TCB.STK$->B$NWIO.ERR ~= '0'B THEN DO;
+       78     8300    2         CALL PSE$GRIPE(B$TCB.STK$->B$NWIO.ERR, SERIOUS#);
+       79     8301    3         CALL M$CLRSTK WHENALTRETURN DO; END;
+       80     8302    2         UNWIND TO PS_BAILOUT;
+       81     8303    2      END;
+       82     8304
+       83     8305    1      WORDS = B$TCB.STK$->B$NWIO.ARS / 4;
+       84     8306    1      FEPNO = PS_HLPCGBUF.NODE_NUM;
+       85     8307    1      CALL XUR$ERRCNVRT (PS_HLPCGBUF.ERRCODE,ERRCODE);
+       86     8308    1      PS_HLPCGBUF.ERRCODE = ERRCODE;
+       87     8309
+       88     8310    2      IF WORDS < SIZEW(KL_REQSTATS) THEN DO;
+       89     8311    2         CALL PSE$GRIPE( E$PS_BAD_HLPCG_MESSAGE, WARNING#);
+       90     8312    2         GOTO READ_AGAIN;
+       91     8313    2      END;
+       92     8314
+       93     8315    1   GOT_ONE:                           /* A convenient place for a breakpoint */
+       94     8316
+       95     8317    1      IF PS_USED_FEP_SIZE > 0
+       96     8318    1      THEN FEP$->PS_FEPSTATS.FINAL = '0'B;
+       97     8319
+       98     8320    1      CALL PSF$GETBUF(PS_FEP$,PS_FEP_SIZE,PS_USED_FEP_SIZE,FEP$,WORDS);
+       99     8321
+      100     8322    1      FEP$->PS_FEPSTATS = KL_REQSTATS;
+      101     8323    1      FEP$->PS_FEPSTATS.FINAL = '1'B;
+      102     8324    1      FEP$->PS_FEPSTATS.WORDS = WORDS;
+      103     8325
+      104     8326    1      CALL COMPRESS(FEP$->PS_FEPSTATS.DISP,
+      105     8327    1        HLPCGBUF$->UBIN_(%KL_REQSTATS_DSPMSK#),
+      106     8328    1        WORDS-%KL_REQSTATS_DSPMSK#);
+      107     8329
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:4    
+      108     8330    2      IF PS_FEP_DEBUG THEN DO;
+      109     8331    2         HLPCGBUF$->PS_FEPSTATS = FEP$ ->PS_FEPSTATS;
+      110     8332    2         CALL PSA$BLURTFEP;
+      111     8333    2      END;
+      112     8334
+      113     8335    1      IF PS_HLPCGBUF.HANDLER = 'BABOON ' /*N* Temporary */
+      114     8336    2      THEN DO;
+      115     8337    2         FEP$->PS_FEPSTATS.DISP.BITS(%KH#ENTID_MONITOR) = '1'B;
+      116     8338    2         FEP$->PS_FEPSTATS.HANDLER = FEP$->PS_FEPSTATS.FEPNAME;
+      117     8339    2      END;
+      118     8340
+      119     8341    1      IF FEP$->PS_FEPSTATS.HANDLER = '?       '
+      120     8342    2      THEN DO; /* Buffer is bogus, shoot it and leave it hanging here
+      121     8343                       as a warning to the others. */
+      122     8344    2         FEP$->PS_FEPSTATS.DISP = '0'B;
+      123     8345    2         FEP$->PS_FEPSTATS.SLCT = '0'B;
+      124     8346    2      END;
+      125     8347
+      126     8348    1      PS_FEP_STATUS(FEPNO) = %FEP_INCOMPLETE#;
+      127     8349
+      128     8350    2      IF PS_HLPCGBUF.ERRCODE ~= '0'B THEN DO;
+      129     8351    2         IF (PS_FEP_DISP_FLAGS.DISP(0)=PS_FEP_DISP_FLAGS.DISP(FEPNO)
+      130     8352    2           AND PS_FEP_DISP_FLAGS.DISP(0) OR PS_FEP_LOG_FLAGS.DISP(0)
+      131     8353    2           AND PS_FEP_LOG_FLAGS.DISP(0)=PS_FEP_LOG_FLAGS.DISP(FEPNO))
+      132     8354    2           AND (PS_HLPCGBUF.ERRCODE.ERR# = %E$NOFE
+      133     8355    2           OR PS_HLPCGBUF.ERRCODE.ERR# = %E$NODENA)
+      134     8356    3         THEN DO;
+      135     8357                   /* Dont gripe if we asked for an infinite number of feps
+      136     8358                      and only a finite number of feps are available. */
+      137     8359    3         END;
+      138     8360    3         ELSE DO;
+      139     8361    3            IF PS_HLPCGBUF.FEPNAME=' '
+      140     8362    3            THEN CALL BINCHAR(SUBSTR(PS_HLPCGBUF.FEPNAME,0,2),FEPNO);
+      141     8363    3            IF PS_HLPCGBUF.HANDLER='?' THEN VEC = VECTOR(NIL);
+      142     8364    3            ELSE VEC = VECTOR(PS_HLPCGBUF.HANDLER);
+      143     8365    3            CALL PSE$GRIPE(%E$PS_FEP_ERROR, WARNING#,
+      144     8366    3              VECTOR(PS_HLPCGBUF.FEPNAME), VEC);
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:5    
+      145     8367    3            CALL PSE$GRIPE(PS_HLPCGBUF.ERRCODE, WARNING#);
+      146     8368    3         END;
+      147     8369    2         PS_FEP_STATUS(FEPNO) = %FEP_ABSENT#;
+      148     8370    2      END;
+      149     8371
+      150     8372        /*
+      151     8373                 NOW SEND FOR THE NEXT STATS RECORD FROM THE COMGROUP
+      152     8374        */
+      153     8375    1   READ_AGAIN:
+      154     8376    1      PS_HLPCGBUF.HANDLER = '?';
+      155     8377    1      PS_NEED_READ_HLPCG = %YES#;
+      156     8378    1      RETURN;
+      157     8379
+      158     8380        %EJECT;
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:6    
+      159     8381        /***************************************************************
+      160     8382        *
+      161     8383        *        COMPRESS
+      162     8384        *
+      163     8385        **************************************************************/
+      164     8386
+      165     8387        /*D* NAME:          COMPRESS
+      166     8388
+      167     8389             CALL:          Call COMPRESS(NEW,OLD,WORDS);
+      168     8390
+      169     8391             INPUT:         OLD - buffer containing data to be munged.
+      170     8392                            WORDS - length in words of the data.
+      171     8393
+      172     8394             OUTPUT:        NEW - data compressed to host format.
+      173     8395
+      174     8396             DESCRIPTION:   Move data from the HLPCG input buffer to its right place,
+      175     8397                            while compressing the data from FEP bytes to host words.
+      176     8398                            The compression (by bits) is: 1-8-1-8-1-8-1-8 to 4-8-8-8-8.
+      177     8399
+      178     8400        */
+      179     8401    1   COMPRESS: PROC(NEWBUF, OLDBUF, WORDS);
+      180     8402
+      181     8403    2   DCL WORDS UBIN WORD;
+      182     8404
+      183     8405    2   DCL 1 OLDBUF(0:0) ALIGNED,
+      184     8406    2          2 DBYTE0 UBIN(9) UNAL,
+      185     8407    2          2 DBYTE1 UBIN(9) UNAL,
+      186     8408    2          2 DBYTE2 UBIN(9) UNAL,
+      187     8409    2          2 DBYTE3 UBIN(9) UNAL;
+      188     8410
+      189     8411    2   DCL 1 NEWBUF(0:0) ALIGNED,
+      190     8412    2          2 * UBIN(4) UNAL,
+      191     8413    2          2 DBYTE0 UBIN(8) UNAL,
+      192     8414    2          2 DBYTE1 UBIN(8) UNAL,
+      193     8415    2          2 DBYTE2 UBIN(8) UNAL,
+      194     8416    2          2 DBYTE3 UBIN(8) UNAL;
+      195     8417
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:7    
+      196     8418    2   DCL IX UBIN;
+      197     8419
+      198     8420    3      DO IX = 0 TO WORDS-1;
+      199     8421    3         NEWBUF(IX) = '0'B;
+      200     8422    3         NEWBUF.DBYTE0(IX) = OLDBUF.DBYTE0(IX);
+      201     8423    3         NEWBUF.DBYTE1(IX) = OLDBUF.DBYTE1(IX);
+      202     8424    3         NEWBUF.DBYTE2(IX) = OLDBUF.DBYTE2(IX);
+      203     8425    3         NEWBUF.DBYTE3(IX) = OLDBUF.DBYTE3(IX);
+      204     8426
+      205     8427    3      END;
+      206     8428
+      207     8429
+      208     8430    2      RETURN;
+      209     8431    2   END COMPRESS;
+      210     8432    1   END;
+      211     8433        %EOD;
+
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:8    
+--  Include file information  --
+
+   PS_FEP_E.:E05TOU  is referenced.
+   PS_PERR_C.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   P_FEP_M.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   XU_FORMAT_C.:E05TOU  is referenced.
+   PM_BUCKET_C.:E05TOU  is referenced.
+   PS_SUBS_C.:E05TOU  is referenced.
+   PS_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure PSF$FEPSTATS.
+
+   Procedure PSF$FEPSTATS requires 231 words for executable code.
+   Procedure PSF$FEPSTATS requires 24 words of local(AUTO) storage.
+
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:9    
+
+ Object Unit name= PSF$FEPSTATS                               File name= PSF$FEPSTATS.:E05TOU
+ UTS= JUL 30 '97 04:34:44.32 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   DCB   even  none     0      0  M$UC
+    1   DCB   even  none     0      0  M$LO
+    2   DCB   even  none     0      0  M$DO
+    3   DCB   even  none     0      0  M$SI
+    4   DCB   even  none     0      0  F$LOG
+    5   DCB   even  none     0      0  M$ME
+    6   DCB   even  none     0      0  M$HLPCG
+    7  RtLbCm even  none    30     36  PS_FDS
+    8  RtLbCm even  none    32     40  PS_SELECT_RPN
+    9  RtLbCm even  none    17     21  PS_STATS_RPN
+   10  RtLbCm even  none    34     42  PS_STATS_BUCKET
+   11   Data  even  none     9     11  PSF$FEPSTATS
+   12  RoData even  UTS      5      5  PSF$FEPSTATS
+   13   Proc  even  none   231    347  PSF$FEPSTATS
+   14  RoData even  none    25     31  PSF$FEPSTATS
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+    13      0   yes            yes     Async       0  PSF$FEPSTATS
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:10   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       5 PSE$GRIPE
+         yes           Std       0 PSA$BLURTFEP
+         yes           Std       2 XUR$ERRCNVRT
+         yes           Std       5 PSF$GETBUF
+                       nStd      0 X66_AAUTO
+                       nStd      0 X66_AARET
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_AAUNWIND
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     M$UC                                  M$LO                                  M$DO
+     M$SI                                  F$LOG                                 M$ME
+     M$HLPCG                               PS_FEP$                               PS_FEP_SIZE
+     PS_FEP_DISP_FLAGS                     PS_FEP_LOG_FLAGS                      PS_FEP_DEBUG
+     PS_BAILOUT                            PS_BUFFER                             PS_STATS$
+     PS_NEED_READ_HLPCG                    PS_USED_FEP_SIZE                      PS_HLPCGBUF
+     PS_FEP_STATUS                         B$TCB$                                B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     NULLSID                               ISSID                                 ROSID
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:11   
+
+
+        1        1        /*M*     PSF$FEPSTATS - HANDLE ASYNC EVENTS - STATS MSGS FROM FEPS */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR,PLM=3,AND=Y,ENI=0,SDI=3,MCL=10,CSI=0,ECI=0 */
+        8        8        /*F* NAME:          PSF$FEPSTATS
+        9        9             PURPOSE:       Handle read complete events on HLPCG
+       10       10             DESCRIPTION:   As statistics messages come in from the feps, pack them
+       11       11                            into the corresponding part of the structure.
+       12       12        */
+       13       13        /*D* NAME:          PSF$FEPSTATS
+       14       14             CALL:          Async entry from nowait read complete event.
+       15       15             INPUT:         Expect a message in PS_HLPCGBUF
+       16       16             OUTPUT:        Stats tables updated.
+       17       17             DESCRIPTION:   Get the station name and ars out of the dcb.  Use the
+       18       18                            station name to get the index into the user table.  Get
+       19       19                            the node number of this fep out of the user table call
+       20       20                            COMPRESS to compress the buffer from 8 of 9 to 32
+       21       21                            of 36 (i.e. each word gets packed to the right with the
+       22       22                            4 fill bits ending up as bits 0-3).  This subroutine
+       23       23                            does an altret if a complete buffer was not sent.  If a
+       24       24                            complete buffer was sent, the buffer address is
+       25       25                            returned.  COMPRESS returns a stats msg type.
+       26       26                            Perform a do case on this.  Call routines that moves
+       27       27                            the data from the compressed buffer into the right
+       28       28                            stats buffer.
+       29       29        */
+       30       30        PSF$FEPSTATS: PROC ASYNC;
+
+     30 13 000000   000000 700200 xent  PSF$FEPSTATS TSX0  ! X66_AAUTO
+        13 000001   000030 000000                    ZERO    24,0
+
+       31       31
+       32       32        /*        RECORD THE STATS FROM THE
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:12   
+       33       33                  THE L6 FEPS                             */
+       34       34
+       35       35
+       36       36        %INCLUDE CP_6;
+       37      117        %INCLUDE CP_6_SUBS;
+       38      657        %INCLUDE B_ERRORS_C;
+       39     1784        %INCLUDE PS_DATA_R;
+       40     7080        %INCLUDE PS_PERR_C;
+       41     7111
+       42     7112        %F$DCB;
+       43     7169
+       44     7170        %VLP_STATION (FPTN=FEC_STA,
+       45     7171                  MSGTYP='$$$$',
+       46     7172                  STCLASS=STATIC);
+       47     7199
+       48     7200    1   DCL B$TCB$ PTR SYMREF;
+       49     7201        %B$TCB(STCLASS="BASED(B$TCB$)");
+       50     7204        %B$NWIO;
+       51     7289
+       52     7290        %INCLUDE PS_FEP_E;
+       53     7774        %PS_FEPSTATS;
+       54     7984
+       55     7985        %KL_REQSTATS(STCLASS="BASED(HLPCGBUF$)");
+       56     8278    1   DCL HLPCGBUF$ PTR CONSTANT INIT(ADDR(PS_HLPCGBUF));
+       57     8279    1   DCL XUR$ERRCNVRT ENTRY(2);
+       58     8280
+       59     8281    1   DCL PSE$GRIPE ENTRY(5);
+       60     8282    1   DCL PSF$GETBUF ENTRY(5);
+       61     8283    1   DCL PSA$BLURTFEP ENTRY;
+       62     8284    1   DCL FEP$ PTR STATIC;
+       63     8285    1   DCL STRUCT$ PTR;
+       64     8286    1   DCL FEPNO UBIN;
+       65     8287    1   DCL UBIN_(0:0) UBIN BASED;
+       66     8288    1   DCL NEED_LEVEL UBIN;
+       67     8289    1   DCL WORDS UBIN;
+       68     8290    1   DCL ERRCODE BIT(36);
+       69     8291    1   DCL VEC VECTOR;
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:13   
+       70     8292        %EJECT;
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:14   
+       71     8293        /* BEGIN PSF$FEPSTATS */
+       72     8294
+       73     8295    1      IF B$TCB.STK$->B$NWIO.ERR.CODE = %E$DACTR
+
+   8295 13 000002   000000 470400 xsym               LDP0    B$TCB$
+        13 000003   000001 471500                    LDP1    1,,PR0
+        13 000004   100102 236100                    LDQ     66,,PR1
+        13 000005   377770 376007                    ANQ     131064,DL
+        13 000006   000150 116007                    CMPQ    104,DL
+        13 000007   000020 601000 13                 TNZ     s:8299
+        13 000010   000000 236007 xsym               LDQ     M$HLPCG,DL
+        13 000011   000000 473400 14                 LDP3    0
+        13 000012   300000 474500                    LDP4    0,,PR3
+        13 000013   400000 475506                    LDP5    0,QL,PR4
+        13 000014   500031 236100                    LDQ     25,,PR5
+        13 000015   020000 316007                    CANQ    8192,DL
+        13 000016   000020 601000 13                 TNZ     s:8299
+
+       74     8296    1        AND NOT DCBADDR(DCBNUM(M$HLPCG))->F$DCB.FCD#
+       75     8297    1      THEN RETURN;          /* We aborted read by closing the DCB; ignore error. */
+
+   8297 13 000017   000000 702200 xent               TSX2  ! X66_AARET
+
+       76     8298
+       77     8299    2      IF B$TCB.STK$->B$NWIO.ERR ~= '0'B THEN DO;
+
+   8299 13 000020   100102 235100                    LDA     66,,PR1
+        13 000021   000041 600000 13                 TZE     s:8305
+
+       78     8300    2         CALL PSE$GRIPE(B$TCB.STK$->B$NWIO.ERR, SERIOUS#);
+
+   8300 13 000022   000001 236000 14                 LDQ     1
+        13 000023   200023 756100                    STQ     IX+3,,AUTO
+        13 000024   100102 633500                    EPPR3   66,,PR1
+        13 000025   200022 453500                    STP3    IX+2,,AUTO
+        13 000026   200022 630500                    EPPR0   IX+2,,AUTO
+        13 000027   000020 631400 xsym               EPPR1   B_VECTNIL+16
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:15   
+        13 000030   000000 701000 xent               TSX1    PSE$GRIPE
+        13 000031   000000 011000                    NOP     0
+
+       79     8301    3         CALL M$CLRSTK WHENALTRETURN DO; END;
+
+   8301 13 000032   410013 713400                    CLIMB   alt,+4107
+        13 000033   000000 401760                    pmme    nvectors=0
+        13 000034   000036 702000 13                 TSX2    s:8302
+        13 000035   000036 710000 13                 TRA     s:8302
+
+       80     8302    2         UNWIND TO PS_BAILOUT;
+
+   8302 13 000036   000000 237200 xsym               LDAQ  ! PS_BAILOUT
+        13 000037   000000 700200 xent               TSX0  ! X66_AAUNWIND
+        13 000040   000000 000200                    ZERO    0,128
+
+       81     8303    2      END;
+       82     8304
+       83     8305    1      WORDS = B$TCB.STK$->B$NWIO.ARS / 4;
+
+   8305 13 000041   100105 236100                    LDQ     69,,PR1
+        13 000042   000002 772000                    QRL     2
+        13 000043   200007 756100                    STQ     WORDS,,AUTO
+
+       84     8306    1      FEPNO = PS_HLPCGBUF.NODE_NUM;
+
+   8306 13 000044   000000 236000 xsym               LDQ     PS_HLPCGBUF
+        13 000045   000022 772000                    QRL     18
+        13 000046   000777 376007                    ANQ     511,DL
+        13 000047   200005 756100                    STQ     FEPNO,,AUTO
+
+       85     8307    1      CALL XUR$ERRCNVRT (PS_HLPCGBUF.ERRCODE,ERRCODE);
+
+   8307 13 000050   200010 631500                    EPPR1   ERRCODE,,AUTO
+        13 000051   200023 451500                    STP1    IX+3,,AUTO
+        13 000052   000002 236000 14                 LDQ     2
+        13 000053   200022 756100                    STQ     IX+2,,AUTO
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:16   
+        13 000054   200022 630500                    EPPR0   IX+2,,AUTO
+        13 000055   000020 631400 xsym               EPPR1   B_VECTNIL+16
+        13 000056   000000 701000 xent               TSX1    XUR$ERRCNVRT
+        13 000057   000000 011000                    NOP     0
+
+       86     8308    1      PS_HLPCGBUF.ERRCODE = ERRCODE;
+
+   8308 13 000060   200010 236100                    LDQ     ERRCODE,,AUTO
+        13 000061   000001 756000 xsym               STQ     PS_HLPCGBUF+1
+
+       87     8309
+       88     8310    2      IF WORDS < SIZEW(KL_REQSTATS) THEN DO;
+
+   8310 13 000062   200007 235100                    LDA     WORDS,,AUTO
+        13 000063   000012 115007                    CMPA    10,DL
+        13 000064   000072 603000 13                 TRC     GOT_ONE
+
+       89     8311    2         CALL PSE$GRIPE( E$PS_BAD_HLPCG_MESSAGE, WARNING#);
+
+   8311 13 000065   000003 630400 14                 EPPR0   3
+        13 000066   000020 631400 xsym               EPPR1   B_VECTNIL+16
+        13 000067   000000 701000 xent               TSX1    PSE$GRIPE
+        13 000070   000000 011000                    NOP     0
+
+       90     8312    2         GOTO READ_AGAIN;
+
+   8312 13 000071   000275 710000 13                 TRA     READ_AGAIN
+
+       91     8313    2      END;
+       92     8314
+       93     8315    1   GOT_ONE:                           /* A convenient place for a breakpoint */
+       94     8316
+       95     8317    1      IF PS_USED_FEP_SIZE > 0
+
+   8317 13 000072   000000 235000 xsym  GOT_ONE      LDA     PS_USED_FEP_SIZE
+        13 000073   000077 600000 13                 TZE     s:8320
+
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:17   
+       96     8318    1      THEN FEP$->PS_FEPSTATS.FINAL = '0'B;
+
+   8318 13 000074   000010 470400 11                 LDP0    FEP$
+        13 000075   000031 236000 xsym               LDQ     B_VECTNIL+25
+        13 000076   000000 356100                    ANSQ    0,,PR0
+
+       97     8319
+       98     8320    1      CALL PSF$GETBUF(PS_FEP$,PS_FEP_SIZE,PS_USED_FEP_SIZE,FEP$,WORDS);
+
+   8320 13 000077   200007 630500                    EPPR0   WORDS,,AUTO
+        13 000100   200026 450500                    STP0    IX+6,,AUTO
+        13 000101   000006 237000 14                 LDAQ    6
+        13 000102   200024 757100                    STAQ    IX+4,,AUTO
+        13 000103   000010 237000 14                 LDAQ    8
+        13 000104   200022 757100                    STAQ    IX+2,,AUTO
+        13 000105   200022 630500                    EPPR0   IX+2,,AUTO
+        13 000106   000023 631400 xsym               EPPR1   B_VECTNIL+19
+        13 000107   000000 701000 xent               TSX1    PSF$GETBUF
+        13 000110   000000 011000                    NOP     0
+
+       99     8321
+      100     8322    1      FEP$->PS_FEPSTATS = KL_REQSTATS;
+
+   8322 13 000111   000000 470400 12                 LDP0    HLPCGBUF$
+        13 000112   000010 471400 11                 LDP1    FEP$
+        13 000113   000100 100500                    MLR     fill='000'O
+        13 000114   000000 000050                    ADSC9   0,,PR0                   cn=0,n=40
+        13 000115   100000 000050                    ADSC9   0,,PR1                   cn=0,n=40
+
+      101     8323    1      FEP$->PS_FEPSTATS.FINAL = '1'B;
+
+   8323 13 000116   000010 471400 11                 LDP1    FEP$
+        13 000117   400000 236003                    LDQ     -131072,DU
+        13 000120   100000 256100                    ORSQ    0,,PR1
+
+      102     8324    1      FEP$->PS_FEPSTATS.WORDS = WORDS;
+
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:18   
+   8324 13 000121   000010 471400 11                 LDP1    FEP$
+        13 000122   200007 235100                    LDA     WORDS,,AUTO
+        13 000123   100002 755100                    STA     2,,PR1
+
+      103     8325
+      104     8326    1      CALL COMPRESS(FEP$->PS_FEPSTATS.DISP,
+
+   8326 13 000124   200007 235100                    LDA     WORDS,,AUTO
+        13 000125   000010 135007                    SBLA    8,DL
+        13 000126   200027 755100                    STA     IX+7,,AUTO
+        13 000127   200027 631500                    EPPR1   IX+7,,AUTO
+        13 000130   200017 451500                    STP1    @OLDBUF+1,,AUTO
+        13 000131   000000 236000 12                 LDQ     HLPCGBUF$
+        13 000132   000010 036003                    ADLQ    8,DU
+        13 000133   200016 756100                    STQ     @NEWBUF+1,,AUTO
+        13 000134   000010 236000 11                 LDQ     FEP$
+        13 000135   000010 036003                    ADLQ    8,DU
+        13 000136   200015 756100                    STQ     VEC+3,,AUTO
+        13 000137   000304 701000 13                 TSX1    COMPRESS
+        13 000140   000000 011000                    NOP     0
+
+      105     8327    1        HLPCGBUF$->UBIN_(%KL_REQSTATS_DSPMSK#),
+      106     8328    1        WORDS-%KL_REQSTATS_DSPMSK#);
+      107     8329
+      108     8330    2      IF PS_FEP_DEBUG THEN DO;
+
+   8330 13 000141   000000 234000 xsym               SZN     PS_FEP_DEBUG
+        13 000142   000153 605000 13                 TPL     s:8335
+
+      109     8331    2         HLPCGBUF$->PS_FEPSTATS = FEP$ ->PS_FEPSTATS;
+
+   8331 13 000143   000010 470400 11                 LDP0    FEP$
+        13 000144   000000 471400 12                 LDP1    HLPCGBUF$
+        13 000145   000100 100500                    MLR     fill='000'O
+        13 000146   000000 000050                    ADSC9   0,,PR0                   cn=0,n=40
+        13 000147   100000 000050                    ADSC9   0,,PR1                   cn=0,n=40
+
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:19   
+      110     8332    2         CALL PSA$BLURTFEP;
+
+   8332 13 000150   000002 631400 xsym               EPPR1   B_VECTNIL+2
+        13 000151   000000 701000 xent               TSX1    PSA$BLURTFEP
+        13 000152   000000 011000                    NOP     0
+
+      111     8333    2      END;
+
+      112     8334
+      113     8335    1      IF PS_HLPCGBUF.HANDLER = 'BABOON ' /*N* Temporary */
+
+   8335 13 000153   040000 106400                    CMPC    fill='040'O
+        13 000154   000006 000010 xsym               ADSC9   PS_HLPCGBUF+6            cn=0,n=8
+        13 000155   000001 000007 12                 ADSC9   HLPCGBUF$+1              cn=0,n=7
+        13 000156   000166 601000 13                 TNZ     s:8341
+
+      114     8336    2      THEN DO;
+
+      115     8337    2         FEP$->PS_FEPSTATS.DISP.BITS(%KH#ENTID_MONITOR) = '1'B;
+
+   8337 13 000157   000010 470400 11                 LDP0    FEP$
+        13 000160   100000 236007                    LDQ     32768,DL
+        13 000161   000010 256100                    ORSQ    8,,PR0
+
+      116     8338    2         FEP$->PS_FEPSTATS.HANDLER = FEP$->PS_FEPSTATS.FEPNAME;
+
+   8338 13 000162   000010 470400 11                 LDP0    FEP$
+        13 000163   040100 100500                    MLR     fill='040'O
+        13 000164   000004 000010                    ADSC9   4,,PR0                   cn=0,n=8
+        13 000165   000006 000010                    ADSC9   6,,PR0                   cn=0,n=8
+
+      117     8339    2      END;
+
+      118     8340
+      119     8341    1      IF FEP$->PS_FEPSTATS.HANDLER = '?       '
+
+   8341 13 000166   000010 470400 11                 LDP0    FEP$
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:20   
+        13 000167   040000 106500                    CMPC    fill='040'O
+        13 000170   000006 000010                    ADSC9   6,,PR0                   cn=0,n=8
+        13 000171   000003 000010 12                 ADSC9   HLPCGBUF$+3              cn=0,n=8
+        13 000172   000176 601000 13                 TNZ     s:8348
+
+      120     8342    2      THEN DO; /* Buffer is bogus, shoot it and leave it hanging here
+
+      121     8343                       as a warning to the others. */
+      122     8344    2         FEP$->PS_FEPSTATS.DISP = '0'B;
+
+   8344 13 000173   000010 450100                    STZ     8,,PR0
+
+      123     8345    2         FEP$->PS_FEPSTATS.SLCT = '0'B;
+
+   8345 13 000174   000010 470400 11                 LDP0    FEP$
+        13 000175   000011 450100                    STZ     9,,PR0
+
+      124     8346    2      END;
+
+      125     8347
+      126     8348    1      PS_FEP_STATUS(FEPNO) = %FEP_INCOMPLETE#;
+
+   8348 13 000176   200005 235100                    LDA     FEPNO,,AUTO
+        13 000177   000005 101400                    MRL     fill='000'O
+        13 000200   000010 000004 xsym               ADSC9   B_VECTNIL+8              cn=0,n=4
+        13 000201   000000 000001 xsym               ADSC9   PS_FEP_STATUS,A          cn=0,n=1
+
+      127     8349
+      128     8350    2      IF PS_HLPCGBUF.ERRCODE ~= '0'B THEN DO;
+
+   8350 13 000202   000001 236000 xsym               LDQ     PS_HLPCGBUF+1
+        13 000203   000275 600000 13                 TZE     READ_AGAIN
+
+      129     8351    2         IF (PS_FEP_DISP_FLAGS.DISP(0)=PS_FEP_DISP_FLAGS.DISP(FEPNO)
+
+   8351 13 000204   000002 735000                    ALS     2
+        13 000205   000000 236000 xsym               LDQ     PS_FEP_DISP_FLAGS
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:21   
+        13 000206   000000 116005 xsym               CMPQ    PS_FEP_DISP_FLAGS,AL
+        13 000207   000212 601000 13                 TNZ     s:8351+6
+        13 000210   000000 116003                    CMPQ    0,DU
+        13 000211   000221 601000 13                 TNZ     s:8351+13
+        13 000212   000000 235000 xsym               LDA     PS_FEP_LOG_FLAGS
+        13 000213   000230 600000 13                 TZE     s:8361
+        13 000214   200005 235100                    LDA     FEPNO,,AUTO
+        13 000215   000002 735000                    ALS     2
+        13 000216   000000 236000 xsym               LDQ     PS_FEP_LOG_FLAGS
+        13 000217   000000 116005 xsym               CMPQ    PS_FEP_LOG_FLAGS,AL
+        13 000220   000230 601000 13                 TNZ     s:8361
+        13 000221   000001 236000 xsym               LDQ     PS_HLPCGBUF+1
+        13 000222   377770 376007                    ANQ     131064,DL
+        13 000223   023050 116007                    CMPQ    9768,DL
+        13 000224   000227 600000 13                 TZE     s:8359
+        13 000225   023070 116007                    CMPQ    9784,DL
+        13 000226   000230 601000 13                 TNZ     s:8361
+
+      130     8352    2           AND PS_FEP_DISP_FLAGS.DISP(0) OR PS_FEP_LOG_FLAGS.DISP(0)
+      131     8353    2           AND PS_FEP_LOG_FLAGS.DISP(0)=PS_FEP_LOG_FLAGS.DISP(FEPNO))
+      132     8354    2           AND (PS_HLPCGBUF.ERRCODE.ERR# = %E$NOFE
+      133     8355    2           OR PS_HLPCGBUF.ERRCODE.ERR# = %E$NODENA)
+      134     8356    3         THEN DO;
+
+      135     8357                   /* Dont gripe if we asked for an infinite number of feps
+      136     8358                      and only a finite number of feps are available. */
+      137     8359    3         END;
+
+   8359 13 000227   000271 710000 13                 TRA     s:8369
+
+      138     8360    3         ELSE DO;
+
+      139     8361    3            IF PS_HLPCGBUF.FEPNAME=' '
+
+   8361 13 000230   040000 106400                    CMPC    fill='040'O
+        13 000231   000004 000010 xsym               ADSC9   PS_HLPCGBUF+4            cn=0,n=8
+        13 000232   000035 000001 xsym               ADSC9   B_VECTNIL+29             cn=0,n=1
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:22   
+        13 000233   000242 601000 13                 TNZ     s:8363
+
+      140     8362    3            THEN CALL BINCHAR(SUBSTR(PS_HLPCGBUF.FEPNAME,0,2),FEPNO);
+
+   8362 13 000234   200005 235100                    LDA     FEPNO,,AUTO
+        13 000235   000044 773000                    LRL     36
+        13 000236   200022 757100                    STAQ    IX+2,,AUTO
+        13 000237   000000 301500                    BTD
+        13 000240   200022 000010                    NDSC9   IX+2,,AUTO               cn=0,s=lsgnf,sf=0,n=8
+        13 000241   000004 030002 xsym               NDSC9   PS_HLPCGBUF+4            cn=0,s=nosgn,sf=0,n=2
+
+      141     8363    3            IF PS_HLPCGBUF.HANDLER='?' THEN VEC = VECTOR(NIL);
+
+   8363 13 000242   040000 106400                    CMPC    fill='040'O
+        13 000243   000006 000010 xsym               ADSC9   PS_HLPCGBUF+6            cn=0,n=8
+        13 000244   000012 000001 14                 ADSC9   10                       cn=0,n=1
+        13 000245   000251 601000 13                 TNZ     s:8364
+
+   8363 13 000246   000014 237000 14                 LDAQ    12
+        13 000247   200012 757100                    STAQ    VEC,,AUTO
+        13 000250   000253 710000 13                 TRA     s:8365
+
+      142     8364    3            ELSE VEC = VECTOR(PS_HLPCGBUF.HANDLER);
+
+   8364 13 000251   000016 237000 14                 LDAQ    14
+        13 000252   200012 757100                    STAQ    VEC,,AUTO
+
+      143     8365    3            CALL PSE$GRIPE(%E$PS_FEP_ERROR, WARNING#,
+
+   8365 13 000253   200012 631500                    EPPR1   VEC,,AUTO
+        13 000254   200025 451500                    STP1    IX+5,,AUTO
+        13 000255   000022 236000 14                 LDQ     18
+        13 000256   200024 756100                    STQ     IX+4,,AUTO
+        13 000257   000024 237000 14                 LDAQ    20
+        13 000260   200022 757100                    STAQ    IX+2,,AUTO
+        13 000261   200022 630500                    EPPR0   IX+2,,AUTO
+        13 000262   000022 631400 xsym               EPPR1   B_VECTNIL+18
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:23   
+        13 000263   000000 701000 xent               TSX1    PSE$GRIPE
+        13 000264   000000 011000                    NOP     0
+
+      144     8366    3              VECTOR(PS_HLPCGBUF.FEPNAME), VEC);
+      145     8367    3            CALL PSE$GRIPE(PS_HLPCGBUF.ERRCODE, WARNING#);
+
+   8367 13 000265   000026 630400 14                 EPPR0   22
+        13 000266   000020 631400 xsym               EPPR1   B_VECTNIL+16
+        13 000267   000000 701000 xent               TSX1    PSE$GRIPE
+        13 000270   000000 011000                    NOP     0
+
+      146     8368    3         END;
+
+      147     8369    2         PS_FEP_STATUS(FEPNO) = %FEP_ABSENT#;
+
+   8369 13 000271   200005 235100                    LDA     FEPNO,,AUTO
+        13 000272   000005 101400                    MRL     fill='000'O
+        13 000273   000004 000004 xsym               ADSC9   B_VECTNIL+4              cn=0,n=4
+        13 000274   000000 000001 xsym               ADSC9   PS_FEP_STATUS,A          cn=0,n=1
+
+      148     8370    2      END;
+
+      149     8371
+      150     8372        /*
+      151     8373                 NOW SEND FOR THE NEXT STATS RECORD FROM THE COMGROUP
+      152     8374        */
+      153     8375    1   READ_AGAIN:
+      154     8376    1      PS_HLPCGBUF.HANDLER = '?';
+
+   8376 13 000275   000012 235000 14    READ_AGAIN   LDA     10
+        13 000276   000035 236000 xsym               LDQ     B_VECTNIL+29
+        13 000277   000006 755000 xsym               STA     PS_HLPCGBUF+6
+        13 000300   000007 756000 xsym               STQ     PS_HLPCGBUF+7
+
+      155     8377    1      PS_NEED_READ_HLPCG = %YES#;
+
+   8377 13 000301   400000 236003                    LDQ     -131072,DU
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:24   
+        13 000302   000000 756000 xsym               STQ     PS_NEED_READ_HLPCG
+
+      156     8378    1      RETURN;
+
+   8378 13 000303   000000 702200 xent               TSX2  ! X66_AARET
+
+      157     8379
+      158     8380        %EJECT;
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:25   
+      159     8381        /***************************************************************
+      160     8382        *
+      161     8383        *        COMPRESS
+      162     8384        *
+      163     8385        **************************************************************/
+      164     8386
+      165     8387        /*D* NAME:          COMPRESS
+      166     8388
+      167     8389             CALL:          Call COMPRESS(NEW,OLD,WORDS);
+      168     8390
+      169     8391             INPUT:         OLD - buffer containing data to be munged.
+      170     8392                            WORDS - length in words of the data.
+      171     8393
+      172     8394             OUTPUT:        NEW - data compressed to host format.
+      173     8395
+      174     8396             DESCRIPTION:   Move data from the HLPCG input buffer to its right place,
+      175     8397                            while compressing the data from FEP bytes to host words.
+      176     8398                            The compression (by bits) is: 1-8-1-8-1-8-1-8 to 4-8-8-8-8.
+      177     8399
+      178     8400        */
+      179     8401    1   COMPRESS: PROC(NEWBUF, OLDBUF, WORDS);
+
+   8401 13 000304   200014 741300       COMPRESS     STX1  ! VEC+2,,AUTO
+
+      180     8402
+      181     8403    2   DCL WORDS UBIN WORD;
+      182     8404
+      183     8405    2   DCL 1 OLDBUF(0:0) ALIGNED,
+      184     8406    2          2 DBYTE0 UBIN(9) UNAL,
+      185     8407    2          2 DBYTE1 UBIN(9) UNAL,
+      186     8408    2          2 DBYTE2 UBIN(9) UNAL,
+      187     8409    2          2 DBYTE3 UBIN(9) UNAL;
+      188     8410
+      189     8411    2   DCL 1 NEWBUF(0:0) ALIGNED,
+      190     8412    2          2 * UBIN(4) UNAL,
+      191     8413    2          2 DBYTE0 UBIN(8) UNAL,
+      192     8414    2          2 DBYTE1 UBIN(8) UNAL,
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:26   
+      193     8415    2          2 DBYTE2 UBIN(8) UNAL,
+      194     8416    2          2 DBYTE3 UBIN(8) UNAL;
+      195     8417
+      196     8418    2   DCL IX UBIN;
+      197     8419
+      198     8420    3      DO IX = 0 TO WORDS-1;
+
+   8420 13 000305   200020 450100                    STZ     IX,,AUTO
+        13 000306   000341 710000 13                 TRA     s:8427+3
+
+      199     8421    3         NEWBUF(IX) = '0'B;
+
+   8421 13 000307   200015 470500                    LDP0    @NEWBUF,,AUTO
+        13 000310   200020 720100                    LXL0    IX,,AUTO
+        13 000311   000000 450110                    STZ     0,X0,PR0
+
+      200     8422    3         NEWBUF.DBYTE0(IX) = OLDBUF.DBYTE0(IX);
+
+   8422 13 000312   200016 471500                    LDP1    @OLDBUF,,AUTO
+        13 000313   100000 236110                    LDQ     0,X0,PR1
+        13 000314   000003 772000                    QRL     3
+        13 000315   000000 676110                    ERQ     0,X0,PR0
+        13 000316   037700 376003                    ANQ     16320,DU
+        13 000317   000000 656110                    ERSQ    0,X0,PR0
+
+      201     8423    3         NEWBUF.DBYTE1(IX) = OLDBUF.DBYTE1(IX);
+
+   8423 13 000320   100000 236110                    LDQ     0,X0,PR1
+        13 000321   000002 772000                    QRL     2
+        13 000322   000000 676110                    ERQ     0,X0,PR0
+        13 000323   000030 376000 14                 ANQ     24
+        13 000324   000000 656110                    ERSQ    0,X0,PR0
+
+      202     8424    3         NEWBUF.DBYTE2(IX) = OLDBUF.DBYTE2(IX);
+
+   8424 13 000325   100000 236110                    LDQ     0,X0,PR1
+        13 000326   000001 772000                    QRL     1
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:27   
+        13 000327   000000 676110                    ERQ     0,X0,PR0
+        13 000330   177400 376007                    ANQ     65280,DL
+        13 000331   000000 656110                    ERSQ    0,X0,PR0
+
+      203     8425    3         NEWBUF.DBYTE3(IX) = OLDBUF.DBYTE3(IX);
+
+   8425 13 000332   100000 236110                    LDQ     0,X0,PR1
+        13 000333   000000 676110                    ERQ     0,X0,PR0
+        13 000334   000377 376007                    ANQ     255,DL
+        13 000335   000000 656110                    ERSQ    0,X0,PR0
+
+      204     8426
+      205     8427    3      END;
+
+   8427 13 000336   200020 235100                    LDA     IX,,AUTO
+        13 000337   000001 035007                    ADLA    1,DL
+        13 000340   200020 755100                    STA     IX,,AUTO
+        13 000341   200017 470500                    LDP0    @WORDS,,AUTO
+        13 000342   200020 236100                    LDQ     IX,,AUTO
+        13 000343   000000 116100                    CMPQ    0,,PR0
+        13 000344   000307 602000 13                 TNC     s:8421
+
+      206     8428
+      207     8429
+      208     8430    2      RETURN;
+
+   8430 13 000345   200014 221300                    LDX1  ! VEC+2,,AUTO
+        13 000346   000001 702211                    TSX2  ! 1,X1
+      209     8431    2   END COMPRESS;
+      210     8432    1   END;
+      211     8433        %EOD;
+
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:28   
+--  Include file information  --
+
+   PS_FEP_E.:E05TOU  is referenced.
+   PS_PERR_C.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   P_FEP_M.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   XU_FORMAT_C.:E05TOU  is referenced.
+   PM_BUCKET_C.:E05TOU  is referenced.
+   PS_SUBS_C.:E05TOU  is referenced.
+   PS_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure PSF$FEPSTATS.
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:29   
+
+ **** Variables and constants ****
+
+  ****  Section 011  Data  PSF$FEPSTATS
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    10-0-0/w PTR         r     1 FEP$
+
+  ****  Section 012 RoData PSF$FEPSTATS
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 HLPCGBUF$
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    15-0-0/w PTR         r     1 @NEWBUF                   16-0-0/w PTR         r     1 @OLDBUF
+    17-0-0/w PTR         r     1 @WORDS                    10-0-0/b BIT         r     1 ERRCODE
+     5-0-0/w UBIN        r     1 FEPNO                     20-0-0/w UBIN        r     1 IX
+    *0-0-0/w STRC        r     1 NEWBUF(0:0)               *0-0-0/w STRC        r     1 OLDBUF(0:0)
+    12-0-0/d VECT        r     1 VEC                        7-0-0/w UBIN        r     1 WORDS
+    *0-0-0/w UBIN        r     1 WORDS
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$TCB$                     0-0-0/d REMB        r     1 PS_BAILOUT
+     0-0-0/c CHAR(140)   r     1 PS_BUFFER                  0-0-0/w PTR         r     1 PS_FEP$
+     0-0-0/w BIT         r     1 PS_FEP_DEBUG
+     0-0-0/w STRC(144)   r     1 PS_FEP_DISP_FLAGS(0:99)
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:30   
+     0-0-0/w STRC(144)   r     1 PS_FEP_LOG_FLAGS(0:99)
+     0-0-0/w UBIN        r     1 PS_FEP_SIZE
+     0-0-0/c UBIN(9)     r     1 PS_FEP_STATUS(0:99)
+     0-0-0/w STRC(14760) r     1 PS_HLPCGBUF                0-0-0/b BIT         r     1 PS_NEED_READ_HLPCG
+     0-0-0/w PTR         r     1 PS_STATS$                  0-0-0/w UBIN        r     1 PS_USED_FEP_SIZE
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(2880)  r     1 B$NWIO                     0-0-0/w STRC(144)   r     1 B$TCB
+     0-0-0/d ASTR(3528)  r     1 F$DCB                      0-0-0/w STRC(360)   r     1 KL_REQSTATS
+     0-0-0N  NULL        r     1 M$HLPCG                    0-0-0N  NULL        r     1 M$LO
+     0-0-0/w STRC(360)   r     1 PS_FEPSTATS                0-0-0/c ASTR(9)     r     1 TEXTC
+     0-0-0/w UBIN        r     1 UBIN_(0:0)
+
+
+   Procedure PSF$FEPSTATS requires 231 words for executable code.
+   Procedure PSF$FEPSTATS requires 24 words of local(AUTO) storage.
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:31   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:32   
+          MINI XREF LISTING
+
+B$NWIO.ARS
+      7214**DCL      8305>>ASSIGN
+B$NWIO.CGPARM.MSGIDXT
+      7238**DCL      7241--REDEF
+B$NWIO.CODE
+      7207**DCL      7207--REDEF    7208--REDEF    7208--REDEF
+B$NWIO.ERR
+      7208**DCL      8299>>IF       8300<>CALL
+B$NWIO.ERR.CODE
+      7209**DCL      8295>>IF
+B$NWIO.ERR.ERR#
+      7209**DCL      7209--REDEF
+B$NWIO.EVID
+      7208**DCL      7208--REDEF    7208--REDEF
+B$TCB.STK$
+      7202**DCL      8295>>IF       8299>>IF       8300>>CALL     8305>>ASSIGN
+B$TCB$
+      7200**DCL      7202--IMP-PTR  8295>>IF       8299>>IF       8300>>CALL     8305>>ASSIGN
+COMPRESS
+      8401**PROC     8326--CALL
+ERRCODE
+      8290**DCL      8307<>CALL     8308>>ASSIGN
+F$DCB.ACTPOS
+      7145**DCL      7145--REDEF
+F$DCB.ARS#
+      7119**DCL      7119--REDEF
+F$DCB.ATTR
+      7138**DCL      7139--REDEF
+F$DCB.BORROW
+      7153**DCL      7153--REDEF    7153--REDEF    7153--REDEF
+F$DCB.DCBNAME.L
+      7167**DCL      7167--IMP-SIZ
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:33   
+F$DCB.EOMCHAR#
+      7123**DCL      7123--REDEF
+F$DCB.FCD#
+      7132**DCL      8295>>IF
+F$DCB.FLDID
+      7148**DCL      7148--REDEF
+F$DCB.FORM$
+      7142**DCL      7142--REDEF
+F$DCB.FSECT
+      7158**DCL      7158--REDEF
+F$DCB.FSN#
+      7135**DCL      7135--REDEF    7135--REDEF    7136--REDEF
+F$DCB.HEADER$
+      7141**DCL      7141--REDEF
+F$DCB.IXTNSIZE#
+      7139**DCL      7139--REDEF
+F$DCB.LASTSTA$
+      7128**DCL      7128--REDEF
+F$DCB.LVL
+      7154**DCL      7154--REDEF
+F$DCB.NAME#.C
+      7129**DCL      7129--REDEF
+F$DCB.NOEOF
+      7151**DCL      7151--REDEF
+F$DCB.NRECS#
+      7140**DCL      7140--REDEF
+F$DCB.NRECX
+      7159**DCL      7159--REDEF
+F$DCB.OHDR
+      7151**DCL      7151--REDEF
+F$DCB.ORG#
+      7134**DCL      7134--REDEF
+F$DCB.PRECNO
+      7157**DCL      7157--REDEF
+F$DCB.RCSZ
+      7163**DCL      7163--REDEF
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:34   
+F$DCB.RES#
+      7130**DCL      7130--REDEF
+F$DCB.SETX
+      7142**DCL      7142--REDEF
+F$DCB.TAB$
+      7142**DCL      7142--REDEF
+F$DCB.TDA
+      7156**DCL      7157--REDEF
+F$DCB.WSN#
+      7130**DCL      7130--REDEF
+FEC_STA.MSGIDXT
+      7194**DCL      7197--REDEF
+FEP$
+      8284**DCL      8318>>ASSIGN   8320<>CALL     8322>>ASSIGN   8323>>ASSIGN   8324>>ASSIGN   8326>>CALL
+      8331>>ASSIGN   8337>>ASSIGN   8338>>ASSIGN   8338>>ASSIGN   8341>>IF       8344>>ASSIGN   8345>>ASSIGN
+FEPNO
+      8286**DCL      8306<<ASSIGN   8348>>ASSIGN   8351>>IF       8351>>IF       8362>>CALLBLT  8369>>ASSIGN
+HLPCGBUF$
+      8278**DCL      8137--IMP-PTR  8322>>ASSIGN   8326>>CALL     8331>>ASSIGN
+IX IN PROCEDURE COMPRESS
+      8418**DCL      8420<<DOINDEX  8421>>ASSIGN   8422>>ASSIGN   8422>>ASSIGN   8423>>ASSIGN   8423>>ASSIGN
+      8424>>ASSIGN   8424>>ASSIGN   8425>>ASSIGN   8425>>ASSIGN
+KL_REQSTATS
+      8137**DCL      8310--IF       8322>>ASSIGN
+KL_REQSTATS.DSPMSK
+      8226**DCL      8232--REDEF
+KL_REQSTATS.SLCMSK
+      8267**DCL      8274--REDEF
+M$CLRSTK
+       103**DCL-ENT  8301--CALL
+M$HLPCG
+      1792**DCL      8295--IF
+NEWBUF IN PROCEDURE COMPRESS
+      8411**DCL      8401--PROC     8421<<ASSIGN
+NEWBUF.DBYTE0 IN PROCEDURE COMPRESS
+      8413**DCL      8422<<ASSIGN
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:35   
+NEWBUF.DBYTE1 IN PROCEDURE COMPRESS
+      8414**DCL      8423<<ASSIGN
+NEWBUF.DBYTE2 IN PROCEDURE COMPRESS
+      8415**DCL      8424<<ASSIGN
+NEWBUF.DBYTE3 IN PROCEDURE COMPRESS
+      8416**DCL      8425<<ASSIGN
+OLDBUF IN PROCEDURE COMPRESS
+      8405**DCL      8401--PROC
+OLDBUF.DBYTE0 IN PROCEDURE COMPRESS
+      8406**DCL      8422>>ASSIGN
+OLDBUF.DBYTE1 IN PROCEDURE COMPRESS
+      8407**DCL      8423>>ASSIGN
+OLDBUF.DBYTE2 IN PROCEDURE COMPRESS
+      8408**DCL      8424>>ASSIGN
+OLDBUF.DBYTE3 IN PROCEDURE COMPRESS
+      8409**DCL      8425>>ASSIGN
+PSA$BLURTFEP
+      8283**DCL-ENT  8332--CALL
+PSE$GRIPE
+      8281**DCL-ENT  8300--CALL     8311--CALL     8365--CALL     8367--CALL
+PSF$GETBUF
+      8282**DCL-ENT  8320--CALL
+PS_BAILOUT
+      6613**DCL      8302>>UNWIND
+PS_BUFFER
+      6615**DCL      6650--DCLINIT  6652--DCLINIT
+PS_COLLECT.CALCNT
+      6770**DCL      6770--REDEF
+PS_COLLECT.USRSRV
+      6767**DCL      6768--REDEF
+PS_FEP$
+      6195**DCL      8320<>CALL
+PS_FEPSTATS
+      7794**DCL      8322<<ASSIGN   8331<<ASSIGN   8331>>ASSIGN
+PS_FEPSTATS.DISP
+      7905**DCL      8326<>CALL     8344<<ASSIGN
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:36   
+PS_FEPSTATS.DISP.BITS
+      7913**DCL      8337<<ASSIGN
+PS_FEPSTATS.DISP.MASK
+      7910**DCL      7913--REDEF
+PS_FEPSTATS.FEPNAME
+      7849**DCL      8338>>ASSIGN
+PS_FEPSTATS.FINAL
+      7798**DCL      8318<<ASSIGN   8323<<ASSIGN
+PS_FEPSTATS.HANDLER
+      7850**DCL      8338<<ASSIGN   8341>>IF
+PS_FEPSTATS.SLCT
+      7971**DCL      8345<<ASSIGN
+PS_FEPSTATS.SLCT.MASK
+      7976**DCL      7979--REDEF
+PS_FEPSTATS.WORDS
+      7847**DCL      8324<<ASSIGN
+PS_FEP_DEBUG
+      6609**DCL      8330>>IF
+PS_FEP_DISP_FLAGS.DISP
+      6265**DCL      8351>>IF       8351>>IF       8351>>IF
+PS_FEP_LOG_FLAGS.DISP
+      6398**DCL      8351>>IF       8351>>IF       8351>>IF
+PS_FEP_SIZE
+      6198**DCL      8320<>CALL
+PS_FEP_STATUS
+      7079**DCL      8348<<ASSIGN   8369<<ASSIGN
+PS_HLPCGBUF
+      6938**DCL      8278--DCLINIT
+PS_HLPCGBUF.DSPMSK
+      7027**DCL      7033--REDEF
+PS_HLPCGBUF.ERRCODE
+      6970**DCL      8307<>CALL     8308<<ASSIGN   8350>>IF       8367<>CALL
+PS_HLPCGBUF.ERRCODE.ERR#
+      6998**DCL      8351>>IF       8351>>IF
+PS_HLPCGBUF.FEPNAME
+      7008**DCL      8361>>IF       8362<<CALLBLT  8365--CALL
+PL6.E3A0      #001=PSF$FEPSTATS File=PSF$FEPSTATS.:E05TSI                        WED 07/30/97 04:34 Page:37   
+PS_HLPCGBUF.HANDLER
+      7014**DCL      8335>>IF       8363>>IF       8364--ASSIGN   8376<<ASSIGN
+PS_HLPCGBUF.NODE_NUM
+      6951**DCL      8306>>ASSIGN
+PS_HLPCGBUF.SLCMSK
+      7068**DCL      7075--REDEF
+PS_NEED_READ_HLPCG
+      6784**DCL      8377<<ASSIGN
+PS_OLD_COLLECT.CALCNT
+      6774**DCL      6775--REDEF
+PS_OLD_COLLECT.USRSRV
+      6772**DCL      6772--REDEF
+PS_STATS$
+      6776**DCL      6778--IMP-PTR
+PS_USED_FEP_SIZE
+      6784**DCL      8317>>IF       8320<>CALL
+READ_AGAIN
+      8376**LABEL    8312--GOTO
+TEXTC.LEN
+      6780**DCL      6780--IMP-SIZ
+UBIN_
+      8287**DCL      8326<>CALL
+VEC
+      8291**DCL      8363<<ASSIGN   8364<<ASSIGN   8365<>CALL
+WORDS
+      8289**DCL      8305<<ASSIGN   8310>>IF       8320<>CALL     8324>>ASSIGN   8326>>CALL
+WORDS IN PROCEDURE COMPRESS
+      8403**DCL      8401--PROC     8420>>DOINDEX
+XUR$ERRCNVRT
+      8279**DCL-ENT  8307--CALL
+
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:38   
+      212        1        /*T***********************************************************/
+      213        2        /*T*                                                         */
+      214        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      215        4        /*T*                                                         */
+      216        5        /*T***********************************************************/
+      217        6        PSF$GETBUF: PROC (SEG$,SEGSIZE,USED,PTR$,WORDS);
+      218        7
+      219        8    1   DCL SEG$ PTR;
+      220        9    1   DCL SEGSIZE UBIN;
+      221       10    1   DCL USED UBIN;
+      222       11    1   DCL PTR$ PTR;
+      223       12    1   DCL WORDS UBIN;
+      224       13
+      225       14
+      226       15        %INCLUDE CP_6;
+      227       96        %INCLUDE CP_6_SUBS;
+      228      636        %INCLUDE PS_DATA_R;
+      229     5932    1   DCL PSM$NEWSEG ENTRY (2);
+      230     5933    1   DCL PSM$GROWSEG ENTRY (2);
+      231     5934
+      232     5935        /* BEGIN PSF$GETBUF */
+      233     5936
+      234     5937    1      IF USED+WORDS > SEGSIZE THEN
+      235     5938    1         IF SEGSIZE = 0
+      236     5939    1         THEN CALL PSM$NEWSEG(SEG$,WORDS);
+      237     5940    1         ELSE CALL PSM$GROWSEG(SEG$,(WORDS+USED)-SEGSIZE);
+      238     5941
+      239     5942    1      PTR$ = PINCRW(SEG$, /*(prev)*/ USED);
+      240     5943    1      USED = USED  + WORDS;
+      241     5944    1      IF SEGSIZE < USED THEN SEGSIZE=USED;
+      242     5945
+      243     5946    1      RETURN;
+      244     5947    1   END PSF$GETBUF;
+
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:39   
+--  Include file information  --
+
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   P_FEP_M.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   XU_FORMAT_C.:E05TOU  is referenced.
+   PM_BUCKET_C.:E05TOU  is referenced.
+   PS_SUBS_C.:E05TOU  is referenced.
+   PS_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure PSF$GETBUF.
+
+   Procedure PSF$GETBUF requires 49 words for executable code.
+   Procedure PSF$GETBUF requires 14 words of local(AUTO) storage.
+
+    No errors detected in file PSF$FEPSTATS.:E05TSI    .
+
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:40   
+
+ Object Unit name= PSF$GETBUF                                 File name= PSF$FEPSTATS.:E05TOU
+ UTS= JUL 30 '97 04:35:30.64 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   DCB   even  none     0      0  M$UC
+    1   DCB   even  none     0      0  M$LO
+    2   DCB   even  none     0      0  M$DO
+    3   DCB   even  none     0      0  M$SI
+    4   DCB   even  none     0      0  F$LOG
+    5   DCB   even  none     0      0  M$ME
+    6   DCB   even  none     0      0  M$HLPCG
+    7  RtLbCm even  none    30     36  PS_FDS
+    8  RtLbCm even  none    32     40  PS_SELECT_RPN
+    9  RtLbCm even  none    17     21  PS_STATS_RPN
+   10  RtLbCm even  none    34     42  PS_STATS_BUCKET
+   11   Proc  even  none    49     61  PSF$GETBUF
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+    11      0   yes            yes      Std        5  PSF$GETBUF
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:41   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       2 PSM$NEWSEG
+         yes           Std       2 PSM$GROWSEG
+                       nStd      0 X66_AUTO_5
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     M$UC                                  M$LO                                  M$DO
+     M$SI                                  F$LOG                                 M$ME
+     M$HLPCG                               PS_BUFFER                             PS_STATS$
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     NULLSID                               ISSID
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:42   
+
+
+      212        1        /*T***********************************************************/
+      213        2        /*T*                                                         */
+      214        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      215        4        /*T*                                                         */
+      216        5        /*T***********************************************************/
+      217        6        PSF$GETBUF: PROC (SEG$,SEGSIZE,USED,PTR$,WORDS);
+
+      6 11 000000   000000 700200 xent  PSF$GETBUF   TSX0  ! X66_AUTO_5
+        11 000001   000016 000005                    ZERO    14,5
+
+      218        7
+      219        8    1   DCL SEG$ PTR;
+      220        9    1   DCL SEGSIZE UBIN;
+      221       10    1   DCL USED UBIN;
+      222       11    1   DCL PTR$ PTR;
+      223       12    1   DCL WORDS UBIN;
+      224       13
+      225       14
+      226       15        %INCLUDE CP_6;
+      227       96        %INCLUDE CP_6_SUBS;
+      228      636        %INCLUDE PS_DATA_R;
+      229     5932    1   DCL PSM$NEWSEG ENTRY (2);
+      230     5933    1   DCL PSM$GROWSEG ENTRY (2);
+      231     5934
+      232     5935        /* BEGIN PSF$GETBUF */
+      233     5936
+      234     5937    1      IF USED+WORDS > SEGSIZE THEN
+
+   5937 11 000002   200005 470500                    LDP0    @USED,,AUTO
+        11 000003   200007 471500                    LDP1    @WORDS,,AUTO
+        11 000004   000000 236100                    LDQ     0,,PR0
+        11 000005   100000 036100                    ADLQ    0,,PR1
+        11 000006   200004 473500                    LDP3    @SEGSIZE,,AUTO
+        11 000007   300000 116100                    CMPQ    0,,PR3
+        11 000010   000040 602000 11                 TNC     s:5942
+        11 000011   000040 600000 11                 TZE     s:5942
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:43   
+
+      235     5938    1         IF SEGSIZE = 0
+
+   5938 11 000012   300000 235100                    LDA     0,,PR3
+        11 000013   000024 601000 11                 TNZ     s:5940
+
+      236     5939    1         THEN CALL PSM$NEWSEG(SEG$,WORDS);
+
+   5939 11 000014   200007 236100                    LDQ     @WORDS,,AUTO
+        11 000015   200003 235100                    LDA     @SEG$,,AUTO
+        11 000016   200012 757100                    STAQ    @WORDS+3,,AUTO
+        11 000017   200012 630500                    EPPR0   @WORDS+3,,AUTO
+        11 000020   000020 631400 xsym               EPPR1   B_VECTNIL+16
+        11 000021   000000 701000 xent               TSX1    PSM$NEWSEG
+        11 000022   000000 011000                    NOP     0
+        11 000023   000040 710000 11                 TRA     s:5942
+
+      237     5940    1         ELSE CALL PSM$GROWSEG(SEG$,(WORDS+USED)-SEGSIZE);
+
+   5940 11 000024   100000 236100                    LDQ     0,,PR1
+        11 000025   000000 036100                    ADLQ    0,,PR0
+        11 000026   300000 136100                    SBLQ    0,,PR3
+        11 000027   200012 756100                    STQ     @WORDS+3,,AUTO
+        11 000030   200012 634500                    EPPR4   @WORDS+3,,AUTO
+        11 000031   200015 454500                    STP4    @WORDS+6,,AUTO
+        11 000032   200003 236100                    LDQ     @SEG$,,AUTO
+        11 000033   200014 756100                    STQ     @WORDS+5,,AUTO
+        11 000034   200014 630500                    EPPR0   @WORDS+5,,AUTO
+        11 000035   000020 631400 xsym               EPPR1   B_VECTNIL+16
+        11 000036   000000 701000 xent               TSX1    PSM$GROWSEG
+        11 000037   000000 011000                    NOP     0
+
+      238     5941
+      239     5942    1      PTR$ = PINCRW(SEG$, /*(prev)*/ USED);
+
+   5942 11 000040   200005 470500                    LDP0    @USED,,AUTO
+        11 000041   000000 720100                    LXL0    0,,PR0
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:44   
+        11 000042   200003 471500                    LDP1    @SEG$,,AUTO
+        11 000043   100000 473500                    LDP3    0,,PR1
+        11 000044   300000 634510                    EPPR4   0,X0,PR3
+        11 000045   200006 475500                    LDP5    @PTR$,,AUTO
+        11 000046   500000 454500                    STP4    0,,PR5
+
+      240     5943    1      USED = USED  + WORDS;
+
+   5943 11 000047   200007 473500                    LDP3    @WORDS,,AUTO
+        11 000050   000000 236100                    LDQ     0,,PR0
+        11 000051   300000 036100                    ADLQ    0,,PR3
+        11 000052   000000 756100                    STQ     0,,PR0
+
+      241     5944    1      IF SEGSIZE < USED THEN SEGSIZE=USED;
+
+   5944 11 000053   200004 474500                    LDP4    @SEGSIZE,,AUTO
+        11 000054   400000 116100                    CMPQ    0,,PR4
+        11 000055   000060 602000 11                 TNC     s:5946
+        11 000056   000060 600000 11                 TZE     s:5946
+
+   5944 11 000057   400000 756100                    STQ     0,,PR4
+
+      242     5945
+      243     5946    1      RETURN;
+
+   5946 11 000060   000000 702200 xent               TSX2  ! X66_ARET
+      244     5947    1   END PSF$GETBUF;
+
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:45   
+--  Include file information  --
+
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   P_FEP_M.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   XU_FORMAT_C.:E05TOU  is referenced.
+   PM_BUCKET_C.:E05TOU  is referenced.
+   PS_SUBS_C.:E05TOU  is referenced.
+   PS_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure PSF$GETBUF.
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:46   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w PTR         r     1 @PTR$                      3-0-0/w PTR         r     1 @SEG$
+     4-0-0/w PTR         r     1 @SEGSIZE                   5-0-0/w PTR         r     1 @USED
+     7-0-0/w PTR         r     1 @WORDS                    *0-0-0/w PTR         r     1 PTR$
+    *0-0-0/w PTR         r     1 SEG$                      *0-0-0/w UBIN        r     1 SEGSIZE
+    *0-0-0/w UBIN        r     1 USED                      *0-0-0/w UBIN        r     1 WORDS
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/c CHAR(140)   r     1 PS_BUFFER                  0-0-0/w PTR         r     1 PS_STATS$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0N  NULL        r     1 M$LO                       0-0-0/c ASTR(9)     r     1 TEXTC
+
+
+   Procedure PSF$GETBUF requires 49 words for executable code.
+   Procedure PSF$GETBUF requires 14 words of local(AUTO) storage.
+
+    No errors detected in file PSF$FEPSTATS.:E05TSI    .
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:47   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:48   
+          MINI XREF LISTING
+
+PSM$GROWSEG
+      5933**DCL-ENT  5940--CALL
+PSM$NEWSEG
+      5932**DCL-ENT  5939--CALL
+PS_BUFFER
+      5467**DCL      5502--DCLINIT  5504--DCLINIT
+PS_COLLECT.CALCNT
+      5622**DCL      5622--REDEF
+PS_COLLECT.USRSRV
+      5619**DCL      5620--REDEF
+PS_HLPCGBUF.DSPMSK
+      5879**DCL      5885--REDEF
+PS_HLPCGBUF.SLCMSK
+      5920**DCL      5927--REDEF
+PS_OLD_COLLECT.CALCNT
+      5626**DCL      5627--REDEF
+PS_OLD_COLLECT.USRSRV
+      5624**DCL      5624--REDEF
+PS_STATS$
+      5628**DCL      5630--IMP-PTR
+PTR$
+        11**DCL         6--PROC     5942<<ASSIGN
+SEG$
+         8**DCL         6--PROC     5939<>CALL     5940<>CALL     5942>>ASSIGN
+SEGSIZE
+         9**DCL         6--PROC     5937>>IF       5938>>IF       5940>>CALL     5944>>IF       5944<<ASSIGN
+TEXTC.LEN
+      5632**DCL      5632--IMP-SIZ
+USED
+        10**DCL         6--PROC     5937>>IF       5940>>CALL     5942>>ASSIGN   5943<<ASSIGN   5943>>ASSIGN
+      5944>>IF       5944>>ASSIGN
+WORDS
+PL6.E3A0      #002=PSF$GETBUF File=PSF$FEPSTATS.:E05TSI                          WED 07/30/97 04:35 Page:49   
+        12**DCL         6--PROC     5937>>IF       5939<>CALL     5940>>CALL     5943>>ASSIGN

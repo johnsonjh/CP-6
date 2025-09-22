@@ -1,0 +1,643 @@
+/*M* MIDGET_SIc3 (parse:c) -- Misc parsing & utility functions */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+/*P*    NAME:     MIDGET_SIc3
+        PURPOSE:  This file contains parsing and general utility type
+                  functions.
+        DESCRIPTION:
+            "Parsing" here means anything involved in looking for the
+            dependencies of a given source file.  Checks, Conversions,
+            Searching, Output file I/O, etc.  Along with this stuff, we
+            have the general utility type functions in here also, such
+            as break handling, etc.
+               1)  md3_CheckForReal ()
+               2)  md3_ConvertSourceName ()
+               3)  md3_ConvertIncludeName ()
+               4)  md3_PutInOutRecord ()
+               5)  md3_PutIncludeName ()
+               6)  md3_PutSourceFileName ()
+               7)  md3_PutFlushStuff ()
+               8)  md3_CheckAnsiInclude ()
+               9)  md3_CheckLibraryInclude ()
+              10)  md3_SearchForInclude ()
+              11)  md3_TestOpen ()
+              12)  md3_SetupBreak ()
+              13)  md3_BreakHandler ()
+*/
+/********************************************************************/
+ 
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <signal.h>
+#include <time.h>
+#include <SEAGULL.h>
+ 
+#include "MIDGET1:h"
+ 
+ 
+#pragma LIST EJECT
+/*
+======================================================================
+                        PARSING  FUNCTIONS
+======================================================================
+*/
+/*D*  NAME:    md3_CheckForReal (char *pos_start)
+      PURPOSE: function to determine if the include found in a record is
+               a valid/real one; syntax, etc.
+      INPUT:   pos_start   is a pointer to the character that begins the
+                           include literal
+      OUTPUT:  if it is real, we return the position of the file name
+               if not, return null
+*/
+ 
+ 
+char *
+md3_CheckForReal( char *pos_start)
+{
+   char *location = NULL;
+   char *real_include;
+   char garbage[12];
+   char tmp_buf[9];
+   static char name[40];
+ 
+ 
+   if (md_info.opt.cc)  {
+      real_include = strstr( pos_start, "#include");
+   }
+   else if (md_info.opt.pl6)  {
+      tmp_buf[8] = '\0';
+      strncpy( tmp_buf, pos_start, 8);
+      real_include = strstr( StringToUpper ( tmp_buf), "%INCLUDE");
+   }
+   else if (md_info.opt.fortran)  {
+      tmp_buf[8] = '\0';
+      strncpy( tmp_buf, pos_start, 8);
+      real_include = strstr( StringToUpper ( tmp_buf), "INCLUDE");
+   }
+ 
+   /* if we are OK, grab the file name from the string */
+   if (real_include)  {
+      if (sscanf( pos_start, "%s %s", garbage, name) == 2)
+         location = name;
+   }
+ 
+return( location);
+}  /*end md3_CheckForReal ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_ConvertSourceName (char *source_name)
+      PURPOSE: modify a given source file name into the correct format for
+               a MAKE file object name.  (ie. blotto:c  =>  blotto.o)
+      INPUT:   source_name    pointer to given source file name
+      OUTPUT:  return pointer to new name, after conversion is finished
+*/
+ 
+char *
+md3_ConvertSourceName( char *source_name)
+{
+   char new_name[32];
+   char tmp_buf[PathNameLen];
+   char compiler_type;
+   char *tmp;
+   char *colon;
+   char *period;
+ 
+ 
+   StripNewline ( source_name);
+   /* see if account specified first */
+   strcpy( tmp_buf, source_name);
+   if (period = strchr( tmp_buf, '.') )
+      *period = '\0';  /* make it end-o-string now */
+ 
+   /* look for a ":x" at the end of the name */
+   if (colon = strchr( tmp_buf, ':') )  {
+      tmp = colon;
+      compiler_type = tolower( *(++tmp));
+      if (md_info.opt.cc)  {
+         if (compiler_type == 'c')  {
+            *colon = '.';
+            *tmp   = 'o';
+         }
+      }  /*end if C*/
+      if (md_info.opt.pl6)  {
+         if ((compiler_type == 'p') || (compiler_type == '6'))  {
+            *colon = '.';
+            *tmp   = 'o';
+            *(tmp+1) = '\0';   /* *N* ??? */
+         }
+      }  /*end if PL-6*/
+      if (compiler_type == 'h')  {  /* include file */
+         *colon = '.';
+         *tmp   = 'h';
+      }  /*end if :h (include file)*/
+   }  /*end if colon*/
+   else  {
+      strcat( tmp_buf, ".o\0");
+   }
+ 
+   /* we should have the file name munged now... */
+   strcpy( new_name, tmp_buf);
+/* strcat( new_name, "    :  ");   */
+ 
+return( new_name);
+}  /*end md3_ConvertSourceName ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_ConvertIncludeName (char *include_name, char *source_file)
+      PURPOSE: modify a given include file name into the correct format for
+               a MAKE file dependency name.  (ie. incl:h  =>  incl.h)
+      INPUT:   include_name   is a pointer to the given include file name
+               source_file    is a pointer to the source file the include
+                              was found in, in case a warning is given
+      OUTPUT:  return a pointer to the new name, after conversion
+*/
+ 
+char *
+md3_ConvertIncludeName( char *include_name, char *source_file)
+{
+   char new_name[32];
+   char tmp_buf[34];
+   char *tmp;
+   char *ansi;
+   char *lib;
+   char *colon;
+   char *quote;
+   char *lessthan;
+   char *greaterthan;
+   char *semi_colon;
+   char *exist;
+#ifdef DEBUG
+   char  ME[] = "md3_ConvertIncludeName";
+#else
+   char *ME = NULL;
+#endif
+ 
+   StripNewline ( include_name);
+   strcpy( tmp_buf, include_name);
+   if (md_info.opt.cc)  {
+      if (quote = strrchr( tmp_buf, '"') )
+         *quote = '\0';
+      else if (greaterthan = strrchr( tmp_buf, '>') )
+         *greaterthan = '\0';
+      else if (md_info.opt.warn)  {
+         Warning ( ME, "%s %s %s\n  %s \"%s\"\n",
+                  "Illegal include file name given ** ", tmp_buf, " **",
+                  "      In Source File: ", source_file);
+      }
+ 
+      if (quote)  {
+         quote = strchr( tmp_buf, '"');
+         tmp = quote+1;
+      }
+      else if (greaterthan)  {
+         lessthan = strchr( tmp_buf, '<');
+         tmp = lessthan+1;
+      }
+      /* do some adjusting of the include name & testing also */
+      if (colon = strrchr( tmp, ':') )
+         *colon = '.';
+      if (ansi = md3_CheckAnsiInclude( tmp) )  {
+         if ((quote) && (md_info.opt.warn))    /* "std?.h" given */
+            Warning ( ME, "%s \"%s\" \n  %s %s\n",
+                  "ANSI Library include header given as: ", tmp,
+                  "      In Source File: ", source_file);
+         return( NULL);    /* throw out ANSI include     */
+      }
+      else if (lib = md3_CheckLibraryInclude( tmp) )  {
+         return( NULL);     /* throw out :LIBRARY include */
+      }  /*end if*/
+   }  /*end if C*/
+   else if ((md_info.opt.pl6) || (md_info.opt.fortran))  {
+      if (semi_colon = strrchr( tmp_buf, ';') )
+         *semi_colon = '\0';
+      if (semi_colon = strrchr( tmp_buf, ',') )
+         *semi_colon = '\0';
+      tmp = tmp_buf;
+      if (lib = md3_CheckLibraryInclude( tmp) )
+         return( NULL);
+      strcat( tmp_buf, ".h\0");
+   }  /*end if PL-6*/
+ 
+   /* we should have the name formatted correctly now.. */
+   if (md_info.opt.test_includes)  {
+      if (exist = md3_SearchForInclude( tmp))  {
+         strcpy( new_name, exist);
+      }
+      else
+         return( NULL);
+   }  /*end if test*/
+   else  {
+      strcpy( new_name, tmp);
+   }  /*end else*/
+ 
+return( new_name);
+}  /*end md3_ConvertIncludeName ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_PutInOutRecord (char *name, char *out_rec)
+      PURPOSE: function to place a string into an output buffer
+      INPUT:   name     is the string to place in the buffer
+               out_rec  is a pointer to the buffer
+      OUTPUT:  if succesful, return OK (0)
+               if not, return SYNTAX  (not room to put string in buf)
+*/
+ 
+int
+md3_PutInOutRecord( char *name, char *out_rec)
+{
+   char tmp_buf[40];
+   int  rec_len;
+   int  out_len;
+ 
+ 
+   strcpy( tmp_buf, name);
+   strcat( tmp_buf, "   \0");
+ 
+   rec_len = strlen( tmp_buf);
+   out_len = strlen( out_rec);
+   if ((rec_len + out_len) > 78)       /* ??? make 80 variable */
+      return( SYNTAX);  /* can not stuff it in */
+   else  {
+      strcat( out_rec, tmp_buf);
+      return( OK);
+   }
+ 
+}  /*end md3_PutInOutRecord ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_PutIncludeName (FILE *ofp, char *name, char *out_rec)
+      PURPOSE: function to place an include file name into the output buffer
+      INPUT:   ofp      is a pointer to the output file
+               name     is a pointer to the include file name
+               out_rec  is a pointer to the output buffer
+      OUTPUT:  if the name can't be placed into the buffer, the buffer
+               is flushed, and then we put the name in the empty buffer
+*/
+ 
+void
+md3_PutIncludeName( FILE *ofp, char *name, char *out_rec)
+{
+   char  source_target[ TARGET_LEN];
+#ifdef DEBUG
+   char  ME[] = "md3_PutIncludeName";
+#else
+   char *ME = NULL;
+#endif
+ 
+   if (!md_info.flag.include)  {
+      md_UTS_COMMENT( *UTS*, source_target);
+      md_info.flag.include = YES;
+   }
+   if (md3_PutInOutRecord( name, out_rec))  {
+      fprintf( ofp, "%s \\\n", out_rec);
+      /* set up the indentation... */
+      strcpy( out_rec, "                                           ");
+      out_rec[md_info.opt.indentation] = '\0';
+ 
+      if (md3_PutInOutRecord( name, out_rec))  {
+         Error ( ME, "%s %s \n %s %s \n",
+            "Could not put Include file name: ", name,
+            "Into the output record, which was: \n", out_rec);
+      }
+   }  /*end if put_rec*/
+return;
+}  /*end md3_PutIncludeName ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_PutSourceFileName (FILE *ofp, char *name, char *out_rec)
+      PURPOSE: function to place a source file name into the output buffer
+      INPUT:   ofp      is a pointer to the output file
+               name     is a pointer to the include file name
+               out_rec  is a pointer to the output buffer
+      OUTPUT:  if the name can't be placed into the buffer, the buffer
+               is flushed, and then we put the name in the empty buffer
+*/
+ 
+void
+md3_PutSourceFileName( FILE *ofp, char *name, char *out_rec)
+{
+   int column;
+   char  target[ TARGET_LEN];
+ 
+ 
+   if (out_rec[0] != '\0')      /* is it full ?*/
+      if (md_info.flag.include)  {
+         if (!md_info.opt.compressed)
+            fprintf( ofp, "%s\n\n", out_rec);
+         else
+            fprintf( ofp, "%s\n", out_rec);
+      }
+      else  {  /* NO dependencies for this file => forget it man */
+         md_TARGET_COMMENT( target);
+      }
+   strcpy( out_rec, name);
+   strcat( out_rec, "                                              ");
+   if (out_rec[md_info.opt.colon_column-2] != ' ')  {
+      column = md_info.opt.colon_column-2;
+      while (out_rec[++column] != ' ')
+         ;  /*nothing*/
+      out_rec[column+2] = ':';
+      out_rec[column+5] = '\0';
+   }
+   else  {
+      out_rec[md_info.opt.colon_column] = ':';
+      out_rec[md_info.opt.colon_column+3] = '\0';
+   }
+#ifdef BUTTHEAD
+   debug_s( "The out_record looks like this--> ", out_rec);
+#endif
+   md_info.flag.source = YES;
+   md_info.flag.include = NO;
+return;
+}  /*end md3_PutSourceFileName ()*/
+ 
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_PutFlushStuff (FILE *ofp, char *out_rec)
+      PURPOSE: function to flush the output buffer at completion of loops
+      INPUT:   ofp      is a pointer to the output file
+               out_rec  is a pointer to the buffer
+      OUTPUT:  the last record is flushed to the file
+               possible ending comment is put out also
+*/
+ 
+void
+md3_PutFlushStuff( FILE *ofp, char *out_rec)
+{
+ 
+   char  target[ TARGET_LEN];
+ 
+   /* flush the last record out of the buffer here ..*/
+   if (md_info.flag.include)  {  /* has @ least 1 dependency, so flush */
+      fprintf( ofp, "%s \n\n", out_rec);
+/*    md_info.flag.AtLeastOneDepend = YES;  */
+   }
+   else  {                    /* has 0 dependencies, so throw it out*/
+      if (out_rec[ 0] != 0)
+         md_TARGET_COMMENT( target);
+   }
+   if (md_info.opt.header)  {  /* && (md_info.flag.AtLeastOneDepend)  */
+      fprintf( ofp, "#    The End.  (of %s generated stuff)\n",TOOLNAME);
+   }
+return;
+}  /*end md3_PutFlushStuff ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_CheckAnsiInclude (char *name)
+      PURPOSE: function to determine if a given name is an ANSI library
+               include file
+      INPUT:   name  is a given include file name (in MAKE format ?.h)
+      OUTPUT:  if ansi, return a pointer to the name
+               if not, return null
+*/
+ 
+char *
+md3_CheckAnsiInclude( char *name)
+{
+   int i;
+#define  NUM_ANSI_LIBS  15
+#define  MAX_NAME_LEN   12
+   char  ANSI_libs[NUM_ANSI_LIBS][MAX_NAME_LEN] = {
+            {"assert.h"},   {"ctype.h"},    {"errno.h"},
+            {"locale.h"},   {"math.h"},     {"setjmp.h"},
+            {"signal.h"},   {"stdarg.h"},   {"stddef.h"},
+            {"stdio.h"},    {"stdlib.h"},   {"string.h"},
+            {"time.h"},     {"float.h"},    {"limits.h"}
+   };
+ 
+ 
+   for (i=0; i<NUM_ANSI_LIBS; i++)
+      if (strcmp( ANSI_libs[i], name) == 0)
+         return( name);    /* IS ANSI library name, so return it */
+   /* end for */
+return( NULL);  /* is NOT ANSI lib, so return NULL */
+}  /*end md3_CheckAnsiInclude ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_CheckLibraryInclude (char *name)
+      PURPOSE: function to determine if a given name is in the :LIBRARY
+               account (ie. a CP-6 library file)
+      INPUT:   name  is a given include file name (in MAKE format ?.h)
+      OUTPUT:  if library file, return a pointer to the name
+               if not, return null
+*/
+ 
+char *
+md3_CheckLibraryInclude( char *name)
+{
+   char include_pathname[PathNameLen];
+   char *period;
+ 
+   strcpy( include_pathname, name);
+   if (period = strrchr( include_pathname, '.') )
+      *period = ':';
+   strcat( include_pathname, ".:LIBRARY\0");
+   if (md3_TestOpen( include_pathname))
+      return( name);
+ 
+   /* now check other library path, if given */
+   if (!md_info.opt.library)
+      return( NULL);
+   if (period = strrchr( include_pathname, '.'))
+      *(period+1) = 0;
+   strcat( include_pathname, md_info.lib_acct);
+   if (md3_TestOpen( include_pathname))
+      return( name);
+   else
+      return( NULL);
+}  /*end md3_CheckLibraryInclude ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_SearchForInclude (char *name_in)
+      PURPOSE: function to test if an include file exists or not
+      INPUT:   name_in  is the guy we are looking for here
+      OUTPUT:  if found somewhere, return a pointer to the name_found
+               if not, return null
+*/
+ 
+char *
+md3_SearchForInclude( char *name_in)
+{
+   char include_name[32];
+   char name_found[PathNameLen];
+   char tmp_name[PathNameLen];
+   int found = FALSE;
+   int i, j;
+   char *period;
+   char *colon;
+#ifdef DEBUG
+   char  ME[] = "md3_SearchForInclude";
+#else
+   char *ME = NULL;
+#endif
+ 
+   strcpy( include_name, name_in);
+   if (period = strrchr( include_name, '.'))    /* maybe ignore .h */
+      *period = ':';
+   i=0;
+   while ( (i <= md_info.opt.include_path) && (!found) )  {
+      j=0;
+      while ( (j <= md_info.prefix_cnt) && (!found) )  {
+         if (j != 0)
+            strcpy( tmp_name, md_info.prefix_str[j]);
+         else
+            tmp_name[0] = '\0';
+         strcat( tmp_name, include_name);
+         if (i != 0)  {
+            strcat( tmp_name, ".\0");
+            strcat( tmp_name, md_info.search_account[i]);
+         }
+         found = md3_TestOpen( tmp_name);
+         ++j;
+      }  /*end while j*/
+      ++i;
+   }  /*end while i*/
+ 
+   if (found)  {
+      strcpy( name_found, tmp_name);
+      if (period = strrchr( name_found, '.'))
+         *period = '\0';
+      if (colon = strrchr( name_found, ':'))    /* maybe put back .h */
+         *colon = '.';
+      return( name_found);
+   }  /*end if found*/
+   else if (md_info.opt.warn)  {  /* NOT FOUND */
+      Warning ( ME, "%s %s %s\n",
+            "Include file \"", name_in, "\" not found!");
+      if ((md_info.opt.include_path) && (md_info.opt.verbose))
+         Warning ( ME, "%s \n",
+            "All include file Search paths were exhausted!");
+      if ((md_info.prefix_cnt) && (md_info.opt.verbose))
+         Warning ( ME, "%s \n",
+            "All given prefixes were exhausted on the attempt!");
+      Warning ( ME, "%s %s \n",
+            name_in, " was not put into dependency file!!");
+   }  /*end else warn*/
+return( NULL);
+}  /*end md3_SearchForIncludes ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_TestOpen (char *file_name)
+      PURPOSE: function to see if a file exists or not, by trying to open it
+      INPUT:   file_name   is the guy we are testing here
+      OUTPUT:  if opened ok, return YES
+               if not, return NO
+*/
+ 
+int
+md3_TestOpen( char *file_name)
+{
+   FILE  *tfp;
+ 
+ 
+   tfp = fopen( file_name, "r sharein");
+   if (tfp == NULL)
+      return( NO);
+   else  {
+      fclose( tfp);
+      return( YES);
+   }
+}  /*end md3_TestOpen ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_SetupBreak ()
+      PURPOSE: called to initialize & prepare for break-key handling
+*/
+ 
+void
+md3_SetupBreak()
+{
+   extern void md3_BreakHandler( int);
+ 
+ 
+   md_info.last_break_time = time( (time_t *)NULL);
+   md_info.breakfp = freopen( "UC", "a", md_info.breakfp);
+   setvbuf( md_info.breakfp, NULL, _IOLBF, 0);
+   signal( SIGINT, md3_BreakHandler);
+return;
+}  /*end md3_SetupBreak ()*/
+ 
+ 
+/*
+----------------------------------------------------------------------
+*/
+/*D*  NAME:    md3_BreakHandler ()
+      PURPOSE: ASYNCronously called when the break key is hit, it will
+               give the user some info on where we are it in MIDGET
+*/
+ 
+void
+md3_BreakHandler( int sig)
+{
+   time_t  this_break_time;
+   double  break_delta;
+#define  MIN_BREAK_DELTA   2
+#define  MAX_BREAK_COUNT  10
+ 
+ 
+   sig ;
+   this_break_time = time( (time_t *)NULL);
+   ++md_info.break_count;
+   break_delta = difftime( this_break_time, md_info.last_break_time);
+   if ((break_delta < MIN_BREAK_DELTA) && (md_info.break_count > 1))  {
+      printf( "<break>\n");
+      exit( 0);
+   }
+   else if (break_delta > MIN_BREAK_DELTA)  {
+      md_info.break_count = 1;
+   }
+   md_info.last_break_time = this_break_time;
+ 
+   if (!md_info.flag.table_built)  {
+      fprintf( md_info.breakfp, "Building Target hash table... \n");
+      return;
+   }
+   else if (md_info.source_file)  {
+      fprintf( md_info.breakfp, "Source File: %s ", md_info.source_file);
+      if (md_info.update_path[ 0] != 0)
+         fprintf( md_info.breakfp, "Update Path: %s ", md_info.update_path);
+      fprintf( md_info.breakfp, "\n");
+   }
+ 
+   signal( SIGINT, md3_BreakHandler);
+return;
+}  /*end md3_BreakHandler ()*/

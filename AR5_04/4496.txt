@@ -1,0 +1,594 @@
+/*M* DRAWL - Trash an include file sufficiently for BOS */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*P*
+NAME: DRAWL
+PURPOSE:
+    DRAWL pre-preprocesses an include file so that it may be fed through
+    PREPPY such that the result will be edible by BOS. Neat huh? Mostly
+    the purpose of this program is to avoid implementing the entire
+    preprocessor within BOS.
+DESCRIPTION:
+    The SI fid is expected to be an include file containing macro definitions.
+    The OU fid is output by the program and will contain some preprocessor
+    directives, a munged version of the SI fid and invocations of all macros
+    contained in the SI fid in alpha order. This file is to be used as input
+    to the XEQ file DRAWL_XEQ which will eventually output the TEXT source
+    for draws of the structures.
+*/
+
+%EJECT;
+/*F*
+NAME: DRAWL
+PURPOSE:
+    This is the main program for DRAWL. It reads the source file and does the
+    required processing upon it.
+DESCRIPTION:
+    The objective is to munge the source include file such that, when the
+    resulting file is fed to Preppy, the listing from Preppy will be (with
+    a little editting) usable by BOS. This mostly means getting Preppy to
+    do all the preprocessor expressions. The tricky part is to get Preppy
+    to make its results back into macros so that BOS can recognize them.
+    This part is handled by %TEXTCHARing the macro invocation inside the
+    macro so that Preppy is fooled into putting it back.
+*/
+
+%EJECT;
+DRAWL: PROC MAIN ALTRET;
+
+ /* CP6 Includes */
+
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B_ERRORS_C;
+
+ /* DCBs */
+
+DCL M$SI DCB;
+DCL M$OU DCB;
+DCL M$DO DCB;
+
+ /* System stuff */
+
+%F$DCB;
+
+DCL B$TCB$ PTR SYMREF READONLY;
+%B$TCB;
+%B$ALT;
+
+ /* FPTs */
+
+%FPT_OPEN( FPTN=FPT_OPEN_SI, STCLASS=CONSTANT, DCB=M$SI, FUN=IN );
+
+%FPT_READ( FPTN=FPT_READ_SI, STCLASS=CONSTANT, DCB=M$SI, BUF=BUF_SI );
+
+%FPT_CLOSE( FPTN=FPT_CLOSE_SI, STCLASS=CONSTANT, DCB=M$SI, DISP=SAVE );
+
+%FPT_OPEN( FPTN=FPT_OPEN_OU, STCLASS=CONSTANT, DCB=M$OU, ORG=KEYED, ACS=DIRECT );
+
+%FPT_WRITE( FPTN=FPT_WRITE_OU, STCLASS=STATIC, DCB=M$OU, BUF=BUF_OU );
+
+%FPT_CLOSE( FPTN=FPT_CLOSE_OU, STCLASS=CONSTANT, DCB=M$OU, DISP=SAVE );
+
+%FPT_GDS( FPTN=FPT_GDS, STCLASS=CONSTANT, RESULTS=SEGMENT_, SEGSIZE=1024 );
+
+ /* Structures */
+
+DCL 1 McLIST ALIGNED BASED,
+      2 NEXT$ PTR,
+      2 ID,
+        3 L UBIN BYTE CALIGNED,
+        3 C CHAR(McLIST.ID.L) CALIGNED;
+
+ /* Search Tables */
+
+DCL SR_NON_BLANK(0:511) UBIN BYTE UNAL CONSTANT INIT(1*32,0,1*0);
+DCL SR_DELIM(0:511) CHAR(1) CALIGNED CONSTANT
+ INIT(BINASC(0)*34,'"',BINASC(0)*4,'''','(',')',BINASC(0)*2,',',BINASC(0)*2,'/',BINASC(0)*11,';',BINASC(0)*0 );
+DCL SR_DELIM_B(0:511) CHAR(1) CALIGNED CONSTANT
+ INIT(BINASC(0)*32,' ',BINASC(0),'"',BINASC(0)*4,'''','(',')',BINASC(0)*2,',',BINASC(0)*2,'/',BINASC(0)*11,';',BINASC(0)*0 );
+
+ /* Local Data */
+
+DCL SEGMENT_ VECTOR STATIC;
+
+DCL McLIST$ PTR;
+DCL McNEXT$ PTR;
+DCL McMAX$ PTR;
+DCL McLEVEL SBIN;
+
+DCL BUF_SI CHAR(255) STATIC;
+DCL ARS_SI SBIN;
+DCL BUF_OU CHAR(255) STATIC;
+DCL ARS_OU SBIN;
+DCL 1 KEY_OU ALIGNED,
+      2 L UBIN BYTE CALIGNED,
+      2 K UBIN(27) CALIGNED;
+DCL KEY_INCR SBIN;
+DCL I SBIN;
+DCL J SBIN;
+DCL K SBIN;
+DCL T SBIN;
+DCL BREAK_POINT SBIN;
+
+%EJECT;
+/*D*
+    Open the SI fid and the OU fid.
+*/
+
+    CALL M$OPEN( FPT_OPEN_SI );
+
+    CALL M$OPEN( FPT_OPEN_OU );
+    KEY_OU.L = 3;
+
+/*D*
+    Initialize memory for the macro name table.
+*/
+
+    SEGMENT_ = VECTOR(NIL);
+    CALL M$GDS( FPT_GDS );
+    McLIST$ = ADDR(NIL);
+    McNEXT$ = VBASE(SEGMENT_);
+    McMAX$ = PINCRC( VBASE(SEGMENT_), VBOUND(SEGMENT_) + 1 );
+
+/*D*
+    Initialize the OU file with the necessary preprocessor directives.
+*/
+
+    KEY_OU.K = 1;
+    KEY_INCR = 1;
+    CALL WRITELN( '%SET LISTDIR=''0''B;', 18 );
+    CALL WRITELN( '%SET LISTINC=''0''B;', 18 );
+    CALL WRITELN( '%SET LISTMAC=''1''B;', 18 );
+    CALL WRITELN( '%SET LISTEXP=''1''B;', 18 );
+    CALL WRITELN( '%SET LISTSUB=''0''B;', 18 );
+    CALL WRITELN( '%SET LISTCOM=''0''B;', 18 );
+
+/*D*
+    Read the SI file, munge it and write it out. Remember all macro names
+    as we pass them. Skip %LSET LIST???.
+*/
+
+    McLEVEL = 0;
+
+    DO WHILE '1'B;
+
+        CALL READLN ALTRET( EOF_SI );
+
+        CALL SEARCH( I, T, SR_NON_BLANK, SUBSTR( BUF_SI, 0, ARS_SI ) ) ALTRET( SKIP_REC );
+
+        IF SUBSTR( BUF_SI, I, 1 ) ~= '%'
+        THEN DO;
+            IF McLEVEL = 0
+            THEN
+                GOTO SKIP_REC;
+            END;
+        ELSE DO;
+            I = I + 1;
+            CALL SEARCH( J, T, SR_DELIM_B, SUBSTR( BUF_SI, 0, ARS_SI ), I );
+
+            DO SELECT SUBSTR( BUF_SI, I, J - I );
+            SELECT 'MACRO';
+                McLEVEL = McLEVEL + 1;
+                IF McLEVEL = 1
+                THEN DO;
+                    I = J;
+                    CALL McDEF ALTRET( ALT );
+                    GOTO SKIP_REC;
+                    END;
+
+            SELECT 'MEND';
+                McLEVEL = McLEVEL - 1;
+                IF McLEVEL < 0
+                THEN
+                    ALTRETURN;
+                IF McLEVEL = 0
+                THEN DO;
+                    CALL CT;
+                    END;
+
+            SELECT 'LSET';
+                IF McLEVEL = 0
+                THEN
+                    GOTO SKIP_REC;
+
+                IF SUBSTR( BUF_SI, I, 9 ) = 'LSET LIST'
+                THEN DO;
+                    DO SELECT SUBSTR( BUF_SI, I+9, 3 );
+                    SELECT( 'DIR','COM','SUB','MAC','EXP','INC');
+                        GOTO SKIP_REC;
+                        END;
+                    END;
+
+            SELECT 'EQU';
+                DO CASE McLEVEL;
+                CASE 0;
+                    GOTO SKIP_REC;
+                CASE 1;
+                    CALL CT;
+                    GOTO SKIP_REC;
+                    END;
+
+            SELECT 'INCLUDE';
+                GOTO SKIP_REC;
+
+                END;
+            END;
+
+        CALL WRITELN( BUF_SI, ARS_SI );
+
+SKIP_REC: ;
+        END;
+
+EOF_SI: ;
+
+/*D*
+    Generate invocations of all the macros encountered.
+*/
+
+    CALL McINVOKE;
+
+/*D*
+    Close DCBs.
+*/
+
+    CALL M$CLOSE( FPT_CLOSE_OU );
+    CALL M$CLOSE( FPT_CLOSE_SI );
+
+    RETURN;
+
+ALT: ;
+    ALTRETURN;
+%EJECT;
+/*I*
+NAME: READLN
+PURPOSE: Get an input line from the SI fid.
+DESCRIPTION:
+    Just read the next line from the SI file. Set ARS_SI appropriately.
+    If end of file, ALTRETURN;
+*/
+
+READLN: PROC ALTRET;
+
+DCL I SBIN;
+DCL T SBIN;
+
+READ_ONE: ;
+    BUF_SI = ' ';
+    CALL M$READ( FPT_READ_SI ) ALTRET( BETTER_BE_EOF );
+
+    ARS_SI = DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+    BREAK_POINT = 0;
+    CALL SEARCH( I, T, SR_NON_BLANK, SUBSTR(BUF_SI,0,ARS_SI) ) ALTRET(READ_ONE);
+
+    RETURN;
+
+BETTER_BE_EOF: ;
+    IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# = %E$EOF
+    THEN
+        ALTRETURN;
+
+    CALL M$MERC;
+
+END READLN;
+%EJECT;
+/*I*
+NAME: WRITELN
+PURPOSE: Puke out a line to the OU fid.
+DESCRIPTION:
+    If the P_TEXT parameter is passed, stuff it into the buffer and write
+    it out. If not, assume that ARS_OU and BUF_OU are correct and write
+    ARS_OU characters of BUF_OU.
+    If the P_KEY parameter is specified, use it. If not, use the key in
+    KEY_OU and, when finished, increment it by KEY_INCR.
+*/
+
+WRITELN: PROC( P_TEXT, P_LEN, P_KEY );
+
+DCL P_TEXT CHAR(P_LEN) CALIGNED PARAM;
+DCL P_LEN SBIN PARAM;
+DCL 1 P_KEY ALIGNED PARAM,
+      2 L UBIN BYTE CALIGNED,
+      2 K UBIN(27) CALIGNED;
+
+    IF ADDR(P_TEXT) ~= ADDR(NIL)
+    THEN DO;
+        ARS_OU = P_LEN;
+        SUBSTR( BUF_OU, 0, ARS_OU ) = P_TEXT;
+        END;
+
+    IF ADDR(P_KEY) ~= ADDR(NIL)
+    THEN
+        FPT_WRITE_OU.KEY_ = VECTOR( P_KEY );
+    ELSE
+        FPT_WRITE_OU.KEY_ = VECTOR( KEY_OU );
+
+    IF ARS_OU = 0
+    THEN DO;
+        SUBSTR( BUF_OU, 0, 1 ) = ' ';
+        ARS_OU = 1;
+        END;
+
+    FPT_WRITE_OU.BUF_.BOUND = ARS_OU - 1;
+    CALL M$WRITE( FPT_WRITE_OU );
+
+    IF ADDR(P_KEY) ~= ADDR(NIL)
+    THEN
+        P_KEY.K = P_KEY.K + KEY_INCR;
+    ELSE
+        KEY_OU.K = KEY_OU.K + KEY_INCR;
+
+    BUF_OU = ' ';
+
+END WRITELN;
+%EJECT;
+/*I*
+NAME: McDEF
+PURPOSE: Handle a macro definition.
+DESCRIPTION:
+    Copy the macro definition lines to the OU fid twice. The first copy is
+    just a straight copy.
+    The second set is enclosed in a %CHARTEXT function. The two copies are
+    done simultaneously by the careful choice of keys for the lines.
+*/
+
+McDEF: PROC ALTRET;
+
+DCL J SBIN;
+DCL T SBIN;
+DCL LAST_BREAK SBIN;
+DCL PAREN_LEVEL SBIN;
+DCL 1 KEY_CT ALIGNED,
+      2 L UBIN BYTE CALIGNED,
+      2 K UBIN(27) CALIGNED;
+
+    KEY_OU.K = ( ( KEY_OU.K / 1000 ) * 1000 ) + 1000;
+    KEY_CT = KEY_OU;
+    KEY_CT.K = KEY_CT.K + 1000;
+    KEY_INCR = 1;
+
+FIND_McNAME: ;
+    CALL SEARCH( I, T, SR_NON_BLANK, SUBSTR( BUF_SI, , ARS_SI ), I )
+    WHENALTRETURN DO;
+        CALL WRITELN( BUF_SI, ARS_SI );
+        CALL CT( KEY_CT );
+        CALL READLN;
+        I = 0;
+        GOTO FIND_McNAME;
+        END;
+
+    CALL INSERT( BUF_OU, , , SUBSTR( BUF_SI, , I ), 'T$W$', SUBSTR( BUF_SI, I, ARS_SI - I ) );
+    BUF_SI = BUF_OU;
+    ARS_SI = ARS_SI + 4;
+
+    CALL SEARCH( J, T, SR_DELIM, SUBSTR( BUF_SI, , ARS_SI ), I );
+    CALL McSTUFF( SUBSTR( BUF_SI, I ), J - I ) ALTRET( OOPS );
+
+    PAREN_LEVEL = 0;
+    DO WHILE '1'B;
+NEXT_LINE: ;
+        IF J = ARS_SI
+        THEN DO;
+            CALL WRITELN( BUF_SI, ARS_SI );
+            CALL CT( KEY_CT );
+            CALL READLN ALTRET( OOPS );
+            I = 0;
+            LAST_BREAK = 0;
+            END;
+
+        CALL SEARCH( J, T, SR_DELIM, SUBSTR( BUF_SI, , ARS_SI ), I ) ALTRET( NEXT_LINE );
+        I = J + 1;
+
+        IF J > 80 AND BREAK_POINT = 0
+        THEN
+            BREAK_POINT = LAST_BREAK;
+
+        DO SELECT SUBSTR( BUF_SI, J, 1 );
+        SELECT ';';
+            IF PAREN_LEVEL = 0
+            THEN
+                GOTO DONE;
+        SELECT ',';
+            LAST_BREAK = J;
+        SELECT '(';
+            PAREN_LEVEL = PAREN_LEVEL + 1;
+            LAST_BREAK = J;
+        SELECT ')';
+            PAREN_LEVEL = PAREN_LEVEL - 1;
+            LAST_BREAK = J;
+        SELECT '"';
+            LAST_BREAK = J;
+            DO UNTIL SUBSTR( BUF_SI, I, 1 ) ~= '"';
+                CALL INDEX( I, '"', SUBSTR( BUF_SI, 0, ARS_SI ), J+1 ) ALTRET( OOPS );
+                I = I + 1;
+                J = I;
+                END;
+        SELECT '''';
+            LAST_BREAK = J;
+            DO UNTIL SUBSTR( BUF_SI, I, 1 ) ~= '''';
+                CALL INDEX( I, '''', SUBSTR( BUF_SI, 0, ARS_SI ), J+1 ) ALTRET( OOPS );
+                I = I + 1;
+                J = I;
+                END;
+        SELECT '/';
+            IF SUBSTR( BUF_SI, I, 1 ) = '*'
+            THEN DO;
+                LAST_BREAK = J;
+                CALL INDEX( I, '*/', SUBSTR( BUF_SI,0, ARS_SI ), J+2 );
+
+                DO WHILE I = ARS_SI;
+                    CALL WRITELN( BUF_SI, ARS_SI );
+                    CALL CT( KEY_CT );
+                    CALL READLN ALTRET( OOPS );
+                    LAST_BREAK = 0;
+                    CALL INDEX( I, '*/', SUBSTR( BUF_SI, 0, ARS_SI ) );
+                    END;
+                I = I + 2;
+                J = I;
+                LAST_BREAK = I;
+                END;
+            END;
+        END;
+
+DONE: ;
+    CALL WRITELN( BUF_SI, ARS_SI );
+    CALL CT( KEY_CT );
+
+    KEY_OU.K = ( ( KEY_CT.K / 1000 ) * 1000 ) + 1000;
+
+    RETURN;
+
+OOPS: ;
+    ALTRETURN;
+
+END McDEF;
+%EJECT;
+/*I*
+NAME: McSTUFF
+PURPOSE: Add a macro name to the sorted list.
+DESCRIPTION:
+    Just keep a singly linked, alpha sorted list of the macros invoked.
+*/
+
+McSTUFF: PROC( P_NAME, P_LEN ) ALTRET;
+
+DCL P_NAME CHAR(P_LEN) CALIGNED;
+DCL P_LEN SBIN;
+
+DCL NEW$ PTR;
+DCL LAST$ PTR;
+DCL NEXT$ PTR;
+
+    NEW$ = PINCRW( McNEXT$, ( ( ( P_LEN + 5 ) + 3 ) / 4 ) );
+    IF NEW$ > McMAX$
+    THEN DO;
+        CALL M$GDS( FPT_GDS ) ALTRET( OOPS );
+        McMAX$ = PINCRC( VBASE(SEGMENT_), VBOUND(SEGMENT_) );
+        END;
+
+    McNEXT$->McLIST.ID.L = P_LEN;
+    McNEXT$->McLIST.ID.C = P_NAME;
+
+    LAST$ = ADDR(NIL);
+    NEXT$ = McLIST$;
+    DO WHILE NEXT$ ~= ADDR(NIL);
+        IF NEXT$->McLIST.ID.C < McNEXT$->McLIST.ID.C
+        THEN DO;
+            LAST$ = NEXT$;
+            NEXT$ = NEXT$->McLIST.NEXT$;
+            END;
+        ELSE DO;
+            NEXT$ = ADDR(NIL);
+            END;
+        END;
+
+    IF LAST$ = ADDR(NIL)
+    THEN DO;
+        McNEXT$->McLIST.NEXT$ = McLIST$;
+        McLIST$ = McNEXT$;
+        END;
+    ELSE DO;
+        McNEXT$->McLIST.NEXT$ = LAST$->McLIST.NEXT$;
+        LAST$->McLIST.NEXT$ = McNEXT$;
+        END;
+
+    McNEXT$ = NEW$;
+
+    RETURN;
+
+OOPS: ;
+    ALTRETURN;
+
+END McSTUFF;
+%EJECT;
+/*I*
+NAME: CT
+PURPOSE: Put a CHARTEXT function around the contents of BUF_SI
+DESCRIPTION:
+    This would be easy except for a couple of minor details.
+    1. All "'"s need to be doubled for the CHARTEXT function to operate.
+    2. Some of the lines become too long when the function is added and must
+       be wrapped into two lines, each with a CHARTEXT function around it.
+       Of course, this must be intelligent wrapping or the result will
+       no longer work.
+*/
+
+CT: PROC( P_KEY );
+
+DCL 1 P_KEY ALIGNED PARAM,
+      2 L UBIN BYTE CALIGNED,
+      2 K UBIN(27) CALIGNED;
+DCL I SBIN;
+DCL J SBIN;
+DCL Q BIT(1);
+
+    I = 0;
+    J = 0;
+    IF BREAK_POINT = 0
+    THEN
+        BREAK_POINT = ARS_SI;
+
+    SUBSTR( BUF_OU, 0, 11 ) = '%CHARTEXT(''';
+    ARS_OU = 11;
+
+    DO UNTIL I = ARS_SI;
+        CALL INDEX( I, '''', SUBSTR(BUF_SI, 0, BREAK_POINT ), J )
+        WHENRETURN DO;
+            I = I + 1;
+            Q = '1'B;
+            END;
+        WHENALTRETURN DO;
+            Q = '0'B;
+            END;
+        SUBSTR( BUF_OU, ARS_OU, I - J ) = SUBSTR( BUF_SI, J, I - J );
+        ARS_OU = ARS_OU + ( I - J );
+        J = I;
+        IF Q
+        THEN DO;
+            SUBSTR( BUF_OU, ARS_OU, 1 ) = '''';
+            ARS_OU = ARS_OU + 1;
+            END;
+        ELSE DO;
+            SUBSTR( BUF_OU, ARS_OU, 2 ) = ''')';
+            ARS_OU = ARS_OU + 2;
+            CALL WRITELN( , , P_KEY );
+            IF BREAK_POINT ~= ARS_SI
+            THEN DO;
+                SUBSTR( BUF_OU, 0, 11 ) = '%CHARTEXT(''';
+                ARS_OU = 11;
+                BREAK_POINT = ARS_SI;
+                END;
+            END;
+        END;
+
+END CT;
+%EJECT;
+/*I*
+NAME: McINVOKE
+PURPOSE: Generate the invocation of all the macros.
+DESCRIPTION:
+    The ordered list of macro names is traversed and each one is turned
+    into a macro invocation.
+*/
+
+McINVOKE: PROC;
+
+DCL NEXT$ PTR;
+
+    NEXT$ = McLIST$;
+    KEY_OU.K = 90000000;
+    KEY_INCR = 1000;
+
+    DO WHILE NEXT$ ~= ADDR(NIL);
+        CALL INSERT( BUF_OU, , , '%', NEXT$->McLIST.ID.C, '(STCLASS=STATIC);' );
+        ARS_OU = 1 + NEXT$->McLIST.ID.L + 17;
+        CALL WRITELN;
+        NEXT$ = NEXT$->McLIST.NEXT$;
+        END;
+
+END McINVOKE;
+
+END DRAWL;

@@ -1,0 +1,405 @@
+/*M* CREATOR  -  change the creator of a file as specified */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+ 
+/*         NOTE: must have priv JIT turned on BEFORE invoking this program. */
+/*         See start # 31912 for details of why. */
+/*         Uses JIT privelege to set the FMEFT priv, which SUPER */
+/*         doesn't know about, and nobody can have. */
+ 
+CREATOR:  PROC MAIN;
+ 
+/* - - -   miscellaneous buffers   - - - */
+ 
+DCL ACCT CHAR(8);        /* what we want to change the owner to */
+DCL LOGON CHAR(12);
+DCL OLD_ACCT CHAR(8);    /* what the owner used to be */
+DCL OLD_LOGON CHAR(12);
+ 
+DCL FPARAM_BUF CHAR(4096) STATIC;
+ 
+DCL CODE UBIN;                  /* to tell which part of the FIT we want */
+ 
+DCL BAD_FID CHAR(50) STATIC;    /* the fid we want to change */
+%VLP_SN   (FPTN = PACK);        /* the packset */
+%VLP_NAME (FPTN = WILD_NAME);   /* the wildcarded filename to match */
+%VLP_NAME (FPTN = NEXT_NAME);   /* the the next name produced by NEXTFILE */
+%VLP_ACCT (FPTN = THIS_DIR,     /* the current directory being searched */
+           STCLASS = STATIC);
+ 
+/* - - -   Error stuff - - - */
+ 
+DCL 1 NO_MATCH_MSG STATIC,
+      2 * CHAR(0) INIT ('The owner doesn''t match for '),
+      2 NAME# CHAR(31) INIT(' ');
+ 
+DCL NO_PRIV_MSG CHAR(0) CONSTANT INIT('Either you must turn on JIT priv or this program must be in :SYS (star 31912)');
+ 
+/* - - -   include files - - - */
+ 
+%INCLUDE CP_6;
+%INCLUDE FM$FIT;
+%INCLUDE CREATOR_C61;
+ 
+%INCLUDE B$JIT;
+ 
+/* - - -   some important structures   - - - */
+ 
+DCL B$JIT$ PTR SYMREF;
+ 
+%B$TCB;
+%B$ALT;
+DCL B$TCB$ PTR SYMREF;
+ 
+%FM$FIT;
+DCL FIT$ PTR;
+%CODE04;
+ 
+/* - - -   FPTs   - - - */
+ 
+%FPT_OPEN (
+      DCB = M$SI,
+      SN = PACK,
+      NAME = NEXT_NAME,
+      ACCT = THIS_DIR,
+      FPARAM = FPARAM_BUF,
+      SHARE = NONE,
+      FUN = IN);           /* so the open won't change the dates */
+ 
+%FPT_CLOSE(
+      DCB = M$SI,
+      CHGATT = YES,
+      IFPARAM = FPARAM_BUF);
+ 
+%FPT_WRITE (FPTN = WRITE_NO_MATCH,
+      DCB = M$DO,
+      BUF = NO_MATCH_MSG);
+%FPT_WRITE (FPTN = WRITE_NO_PRIV,
+      DCB = M$DO,
+      BUF = NO_PRIV_MSG);
+ 
+%FPT_EXIT (FPTN = EXIT_ERROR,
+      STEPCC = 2);
+ 
+%FPT_FID (
+      TEXTFID = BAD_FID,
+      ASN = FILE,
+      SN = PACK,
+      NAME = WILD_NAME,
+      ACCT = THIS_DIR);
+DCL FILE UBIN STATIC;
+ 
+/* - - -   DCBs   - - - */
+ 
+%F$DCB;
+DCL M$SI DCB;
+DCL M$DO DCB;
+ 
+/* - - -   ENTRYs   - - - */
+ 
+DCL XSF$LOCCODT ENTRY(2) ALTRET;
+DCL GET_NEXT_FILE ENTRY(7);
+ 
+/* - - -   now the parser stuff   - - - */
+ 
+DCL X$PARSE ENTRY(1) ALTRET;
+%INCLUDE XU_MACRO_C;
+ 
+DCL INVOCATION UBIN WORD SYMREF;  /* the root of the parse tree */
+ 
+DCL OUT$ PTR STATIC;    /* this points to the top of the resultant tree */
+%PARSE$OUT (NAME=OUT,
+      STCLASS = "BASED(OUT$)");
+%PARSE$SYM (NAME=SYM,
+      STCLASS = "BASED(OUT$)");
+ 
+%EQU WORK_AREA_SIZE = 64; /* WORDS */
+%P_PCB(
+      C = YES,   /* no compression */
+      CNTU = NO, /* no continuation */
+      R = INVOCATION,  /* the root */
+      W = WORK_AREA,
+      WSZ = %WORK_AREA_SIZE);
+DCL WORK_AREA(0:%WORK_AREA_SIZE) UBIN WORD STATIC;
+ 
+ 
+/* - - -   Miscellaneous junk   - - - */
+ 
+DCL ERROR BIT(36);
+DCL IX SBIN;
+DCL WILD BIT(1);  /* to remember if this is wild */
+DCL THISF SBIN STATIC INIT (1);
+DCL WILDLEN SBIN;  /* for GET_NEXT_FILE */
+DCL NEXTLEN SBIN;
+ 
+/*------------------------------------------------------------------*/
+ 
+START:
+ 
+/*  - - -   parse the command line   - - -  */
+ 
+P_PCB.TEXT$ = ADDR(SUBSTR(B$JIT$->B$JIT.CCBUF,0,B$JIT$->B$JIT.CCARS));
+P_PCB.NCHARS = B$JIT$->B$JIT.CCARS;
+ 
+CALL X$PARSE (P_PCB);  /* let it die */
+ 
+OUT$ = P_PCB.OUT$->OUT.SUBLK$(0);      /* get the old bad fid */
+BAD_FID = SYM.TEXT;
+OUT$ = P_PCB.OUT$->OUT.SUBLK$(1);      /* get the account  */
+ACCT = SYM.TEXT;
+OUT$ = P_PCB.OUT$->OUT.SUBLK$(2);      /* get the logon name  */
+LOGON = SYM.TEXT;
+ 
+/*  - - -   check for the optional old specs   - - - */
+ 
+IF (P_PCB.OUT$->OUT.NSUBLKS = 5) THEN DO;
+      OUT$ = P_PCB.OUT$->OUT.SUBLK$(3);    /* get the old account */
+      OLD_ACCT = SYM.TEXT;
+      OUT$ = P_PCB.OUT$->OUT.SUBLK$(4);    /* and the old logon name */
+      OLD_LOGON = SYM.TEXT;
+END/*IF*/;
+ 
+/* - - -   break up the old fid into pieces   - - - */
+ 
+PACK.SN#(0) = ' ';
+THIS_DIR.ACCT# = B$JIT.FACCN;   /* use current directory by default */
+CALL M$FID (FPT_FID);     /* let it die */
+IF PACK.SN#(0) = ' ' THEN FPT_OPEN.SN_ = VECTOR(NIL); /* use MAD by default */
+ 
+/*  - - -   turn on the necessary privelege   - - -  */
+ 
+IF (B$JIT.PRIV.ACTIVE & %PR_JIT#) AND       /* JIT priv must be on */
+   (B$JIT.PRIV.AUTH   & %PR_JIT#)  THEN     /* user must have it as well */
+                                            /* even if it's in :SYS */
+      B$JIT.PRIV.ACTIVE = B$JIT.PRIV.ACTIVE | %PR_FMEFT#;
+                                            /* so this magic works */
+ELSE DO;
+      CALL M$WRITE (WRITE_NO_PRIV);
+      CALL M$EXIT (EXIT_ERROR);
+      END;
+ 
+/* - - -   is it wildcarded?   - - - */
+ 
+CALL INDEX (IX, '?', WILD_NAME.NAME#);
+IF (IX < LENGTHC(WILD_NAME.NAME#)) THEN
+  WILD = '1'B;
+ELSE
+  WILD = '0'B;
+ 
+/* - - -   loop through all the matching files   - - - */
+ 
+ERROR = '0'B;
+NEXT_NAME.NAME# = ' ';
+WILDLEN = WILD_NAME.L#;
+ 
+LOOP:
+DO WHILE (ERROR='0'B);
+ 
+/* - - -   get the next (or only) file-name   - - - */
+ 
+  IF (WILD) THEN DO;
+      NEXTLEN = NEXT_NAME.L#;
+      CALL GET_NEXT_FILE ( THIS_DIR,
+                           WILD_NAME.NAME#,
+                           WILDLEN,
+                           NEXT_NAME.NAME#,
+                           NEXTLEN,
+                           THISF,
+                           ERROR);
+      IF (ERROR ~= '0'B) THEN EXIT LOOP;
+      THISF = 0;  /* so that GET_NEXT_FILE will step through the rest */
+      NEXT_NAME.L# = NEXTLEN;
+      END;
+  ELSE DO;
+      NEXT_NAME = WILD_NAME;  /* not wild, so just use it */
+  END /*IF*/;
+ 
+/*  - - -   get the FIT information   - - -  */
+ 
+  CALL M$OPEN (FPT_OPEN);  /* let it die */
+ 
+/*  - - -    get the CODE04 part (containing the dates and creator)   - - - */
+ 
+  FIT$ = ADDR(FPARAM_BUF);
+  CODE = 4;
+ 
+  CALL XSF$LOCCODT (FIT$, CODE);                   /* got to have a CODE04 */
+ 
+/* - - -   is this conditional or not   - - - */
+ 
+  IF ((P_PCB.OUT$->OUT.NSUBLKS = 5) AND               /* if conditional AND */
+      (FIT$->CODE04.CREATOR.ACCT = OLD_ACCT) AND      /* account matches old */
+      (FIT$->CODE04.CREATOR.NAME = OLD_LOGON))  OR    /* AND logon matches OR */
+   (P_PCB.OUT$->OUT.NSUBLKS = 3) THEN DO;             /* unconditional change */
+      FIT$->CODE04.CREATOR.ACCT = ACCT;               /* change the creator */
+      FIT$->CODE04.CREATOR.NAME = LOGON;
+      END/*IF*/;
+  ELSE DO;                                            /* Creator isn't who the*/
+      NO_MATCH_MSG.NAME# = NEXT_NAME.NAME#;
+      CALL M$WRITE (WRITE_NO_MATCH);                  /* user said it was */
+  END /*IF*/;
+ 
+/* - - -    now really change them  - - -  */
+ 
+  FPT_CLOSE.V.DESC = DCBADDR(DCBNUM(M$SI))->F$DCB.DESC; /* get update info */
+  FPT_CLOSE.V.EFTOPER.UPDDESC# = '1'B;                  /* do the update */
+  FPT_CLOSE.V.DESC.BUF# = '1'B;                         /* mark for backup */
+ 
+  CALL M$CLOSE (FPT_CLOSE);
+ 
+ 
+/* - - -   handle non-wildcarded ones   - - - */
+ 
+  IF (NOT WILD) THEN
+      EXIT LOOP;
+ 
+END /*WHILE*/;
+ 
+/* - - -   turn them off, so as not to burn anything   - - - */
+ 
+B$JIT.PRIV.ACTIVE = B$JIT.PRIV.ACTIVE & (~%PR_EXMM#) & (~%PR_FMEFT#);
+ 
+CALL M$EXIT;
+END CREATOR;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*  GET_NEXT_FILE: finds the next file that matches the wildcard */
+ 
+/********************************************************************/
+ 
+GET_NEXT_FILE: PROC(ACCOUNT, PATTERN, PATLEN, NEXTNAME, NEXTLEN, THISF, IOSTAT);
+ 
+/********************************************************************/
+ 
+DCL ACCOUNT CHAR(8);
+DCL PATTERN CHAR(PATLEN);
+DCL PATLEN SBIN;
+DCL NEXTNAME CHAR(31);
+DCL NEXTLEN SBIN;
+DCL THISF SBIN;
+DCL IOSTAT SBIN;
+ 
+/********************************************************************/
+ 
+DCL I SBIN;
+DCL TEST_PATTERN CHAR(31);
+DCL DELS CHAR(31) CONSTANT INIT (%BINASC(127)*0);
+ 
+/********************************************************************/
+ 
+%INCLUDE CP_6;
+%INCLUDE XUW_MACRO_C;
+%INCLUDE XU_PERR_C;
+%INCLUDE B_ERRORS_C;
+ 
+%FPT_OPEN(FPTN=OPEN_NEXTFILE,
+      TEST=YES,
+      NXTF=YES,
+      NAME=FILE_NAME,
+      DCB=F$NEXTFILE,
+      ASN=FILE,
+      FUN=IN);
+%VLP_NAME(FPTN=FILE_NAME,LEN=31);
+DCL F$NEXTFILE DCB;
+%F$DCB(BASED="BASED(DCB$)");
+DCL DCB$ PTR;
+ 
+DCL X$WILDCMP ENTRY(1) ALTRET;               /* Wildcard stuff */
+%XUW_WILDCARD;
+ 
+%B$TCB;
+%B$ALT;
+DCL B$TCB$ PTR SYMREF;
+ 
+/********************************************************************/
+ 
+START:
+ 
+/* - - -   Make the test pattern to tell if we've gone too far   - - - */
+ 
+TEST_PATTERN = PATTERN;
+CALL INDEX (I, '?', PATTERN)
+WHENALTRETURN DO;
+      NEXTNAME = PATTERN;
+      NEXTLEN = PATLEN;
+      IOSTAT = 0;             /* No wildcard = what s/he asked for  */
+      RETURN;
+END/*ALTRETURN*/;
+SUBSTR(TEST_PATTERN,I) = DELS;                 /* which are after everything */
+ 
+/* - - -   where do we start   - - - */
+ 
+IF (NEXTNAME = ' ') THEN DO;                   /* if start is blank, take the */
+      NEXTNAME = SUBSTR(PATTERN, 0, I);        /* start from the pattern */
+      FILE_NAME.L# = I;
+      FILE_NAME.NAME# = NEXTNAME;
+      END;
+ELSE DO;                                       /* non-blank start, take it*/
+      FILE_NAME.L# = NEXTLEN;
+      FILE_NAME.NAME# = NEXTNAME;
+END/*IF*/;
+ 
+OPEN_NEXTFILE.ACCT_ = VECTOR(ACCOUNT);         /* in this account */
+OPEN_NEXTFILE.V.OPER.THISF# = BINBIT(THISF,1); /* Start with this or next */
+NEXTNAME = ' ';
+ 
+XUW_WILDCARD.INPUT_ = VECTOR(NEXTNAME);
+XUW_WILDCARD.PATTERN_ = VECTOR(PATTERN);
+DCB$ = DCBADDR(DCBNUM(F$NEXTFILE));             /* to make debugging easier */
+ 
+DO WHILE (NEXTNAME = ' ');
+      CALL M$OPEN(OPEN_NEXTFILE) ALTRET(BAD_OPEN);
+      NEXTNAME = ' ';
+      NEXTNAME = SUBSTR(F$DCB.NAME#.C,0,F$DCB.NAME#.L);
+      NEXTLEN = F$DCB.NAME#.L;
+ 
+/* - - -   don't go any farther through the directory than necessary   - - - */
+ 
+      IF (SUBSTR(PATTERN,0,1) ~= '?' AND NEXTNAME > TEST_PATTERN) THEN DO;
+         NEXTNAME = DELS;
+         IOSTAT = -1;
+         END;
+      ELSE DO;
+ 
+/* - - -   Now, does it match the pattern   - - - */
+ 
+         IF PATTERN ~= '?' THEN DO;
+ 
+/* - - -   Fix the length so X$WILDCMP will work right   - - - */
+ 
+            XUW_WILDCARD.INPUT_.BOUND = NEXTLEN -1 ;
+ 
+/* - - -   Compare them   - - - */
+ 
+            CALL X$WILDCMP (XUW_WILDCARD)
+            WHENALTRETURN DO;
+               OPEN_NEXTFILE.V.OPER.THISF# = '0'B;  /* Force to next file */
+               FILE_NAME = F$DCB.NAME#;          /* move the name over */
+               NEXTNAME = ' ';                   /* force it to loop again */
+            END/*ALTRETURN*/;
+         END/*IF*/;
+         IOSTAT = 0;
+      END/*IF*/;
+END/*WHILE*/;
+ 
+RETURN;
+ 
+/********************************************************************/
+ 
+BAD_OPEN:
+ 
+NEXTNAME = '*******************************';
+IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE = %E$FDEOF THEN
+      IOSTAT = -1;                            /* End of directory */
+ELSE
+      IOSTAT = BITBIN(B$TCB$->B$TCB.ALT$->B$ALT.ERR);
+RETURN;
+END GET_NEXT_FILE;

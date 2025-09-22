@@ -1,0 +1,883 @@
+/*M* MIG - Munge Index Granules                                               */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* CRT=1,CTI=4,DCI=6,SQB,ECI=3,CSI=3,IPC,DIN=2,SDI=3,MCI=NO                 */
+MIG:    PROC MAIN;
+ 
+  DCL X$WRITE ENTRY(22);
+  DCL X$SORT ENTRY(1) ALTRET;
+  DCL XSF$LOCCODE ENTRY(2) ALTRET;
+  DCL SORT_INPUT ENTRY(2) ALTRET;
+  DCL SORT_OUTPUT ENTRY(2) ALTRET;
+  DCL BREAK_RTN ENTRY;
+ 
+  DCL BREAK_HIT BIT(1) STATIC SYMDEF INIT('0'B);
+  DCL 1 F ALIGNED STATIC,
+         2 ASN_ UBIN(9) ALIGNED,
+         2 RES_ CHAR(4) ALIGNED;
+  DCL GRANULE_BUFFER CHAR(4096) STATIC INIT(' ');
+  DCL FID_BUF CHAR(80) STATIC INIT(' ');
+  DCL WRITE_LO_BUF CHAR(80) STATIC INIT(' ');
+  DCL BUF_FPARAM (0:1023) UBIN STATIC INIT(0*0);
+  DCL B$JIT$ PTR SYMREF;
+  DCL B$TCB$ PTR SYMREF;
+  DCL B$ROS$ PTR SYMREF;
+  DCL MIG_OPTIONS BIT(36) SYMREF;
+  DCL GRANULE_KEY UBIN STATIC INIT(0);
+  DCL FMT_INTRO_KEYED CHAR(0) CONSTANT INIT(
+ 'Keyed file %>A.');
+  DCL FMT_INTRO_INDEXED CHAR(0) CONSTANT INIT(
+ 'Indexed file %>A:  %D indices.');
+  DCL FMT_INTRO_IREL CHAR(0) CONSTANT INIT(
+ 'Irel file %>A:  %D indices.');
+  DCL FMT_TGRANS CHAR(0) CONSTANT INIT(
+ '          Total granules:  %7D                 NGAVAL:  %7D');
+  DCL FMT_IDULGRANS CHAR(0) CONSTANT INIT(
+ '            Index + data:  %7D      UL Index granules:  %7D');
+  DCL FMT_IDGRANS CHAR(0) CONSTANT INIT(
+ '          Index granules:  %7D          Data granules:  %7D');
+  DCL FMT_SLACK CHAR(0) CONSTANT INIT(
+ '     Slack space (words):  %7D                  SPARE:  %7D');
+  DCL FMT_DKEYS CHAR(0) CONSTANT INIT(
+ '                       Number of deleted keys:  %7D');
+  DCL FMT_DSEGS CHAR(0) CONSTANT INIT(
+ '            Number of deleted record segments:  %7D');
+  DCL FMT_DKWORDS CHAR(0) CONSTANT INIT(
+ '            Total deleted index granule words:  %7D');
+  DCL FMT_DDWORDS CHAR(0) CONSTANT INIT(
+ '             Total deleted data granule words:  %7D');
+  DCL FMT_ALTBLD CHAR(0) CONSTANT INIT(
+ '                   Alternate indices need to be rebuilt.');
+  DCL FMT_UNIQUEBLD CHAR(0) CONSTANT INIT(
+ '                   Unique indices need to be rebuilt.');
+  DCL FMT_INC CHAR(0) CONSTANT INIT(
+ '         Alternate index %D is incomplete:  %D records, should be %D.');
+  DCL FMT_AFTER CHAR(0) CONSTANT INIT(
+ 'After simulated rebuild:');
+  DCL FMT_RTOT CHAR(0) CONSTANT INIT(
+ '                Total granules (index + data):  %7D');
+  DCL FMT_RINDEX CHAR(0) CONSTANT INIT(
+ '                               Index granules:  %7D');
+  DCL FMT_RDATA CHAR(0) CONSTANT INIT(
+ '                                Data granules:  %7D');
+  DCL FMT_SAVINGS CHAR(0) CONSTANT INIT(
+ '                                      Savings:  %+D granules (%D%%)');
+  DCL FMT_NOSAVE CHAR(0) CONSTANT INIT(
+ '                                      Savings:  None');
+  DCL FMT_VGREW CHAR(0) CONSTANT INIT(
+ '          The file actually GREW!!  The simulated rebuild may be meaningless.');
+  DCL FMT_VNO CHAR(0) CONSTANT INIT(
+ '          This file is not a good candidate for a rebuild.');
+  DCL FMT_VMAYBENOT CHAR(0) CONSTANT INIT(
+ '          This file may not be a good candidate for a rebuild.');
+  DCL FMT_VMAYBE CHAR(0) CONSTANT INIT(
+ '          This file may be a good candidate for a rebuild.');
+ 
+  DCL M$IN DCB;
+  DCL M$DO DCB;
+  DCL M$LO DCB;
+ 
+  DCL 1 MISEG_LIST (0:0) BASED(MLIST$) CALIGNED,
+         2 ID,
+            3 DA UBIN(26) UNAL,
+            3 GX UBIN(10) UNAL,
+         2 SEGS UBIN(9) CALIGNED;
+  DCL MLIST_INDEX UBIN STATIC SYMDEF INIT(0);
+  DCL MLIST_MAX UBIN STATIC SYMDEF INIT(0);
+  DCL MLIST_AVAIL UBIN;
+  DCL MLIST$ PTR STATIC SYMDEF INIT(ADDR(NIL));
+ 
+  DCL TEMP SBIN;
+  DCL TEMP2 SBIN;
+ 
+  DCL M$IN$ PTR;
+  DCL ALTKEYS$ PTR;        /* Points to FITALTKEYS/IRKEYS structure in ROSEG. */
+  DCL GRAN$ PTR;                        /* Points to granule buffer.          */
+  DCL KEYENT$ PTR;                   /* Points to key entry in index granule. */
+  DCL KEYTBL$ PTR;                   /* Points to key table in index granule. */
+  DCL MISEG$ PTR;                  /* Points to MISEG entry in index granule. */
+ 
+  DCL ALTBLD BIT(1);             /* FITALTKEYS.ALTBLD/IRKEYS.ALTBLD for file. */
+  DCL DETAIL_OP BIT(1);                 /* The DETAIL option was specified.   */
+  DCL EXTENT_OP BIT(1);                 /* The EXTENTS option was specified.  */
+  DCL KEYINDEX UBIN;                    /* Current index being processed.     */
+  DCL KEYMOD UBIN;                      /* Length of current key, in words.   */
+  DCL MINSIZE UBIN;           /* FITALKEYS.MINWRSIZ/IRKEYS.MINSIZE for file. */
+  DCL NEW_MIWORDS UBIN;           /* Number of MISEG words in current record. */
+  DCL NGAVAL UBIN;                      /* CODE03.NGAVAL for file.            */
+  DCL TDA UBIN;           /* Address of topmost UL index gran for this index. */
+  DCL UGRANS UBIN;                      /* CODE03.UGRANS for file.            */
+  DCL UNIQUEBLD BIT(1);    /* FITALTKEYS.UNIQUEBLD/IRKEYS.UNIQUEBLD for file. */
+ 
+  DCL NUM_KEYS UBIN;
+  DCL CUR_DATA_IX UBIN;
+  DCL CUR_INDEX_IX UBIN;
+  DCL CUR_KEYTBL_IX UBIN;
+ 
+  DCL ALT_RECORDS (0:99) UBIN;  /* Number of records on each alternate index. */
+  DCL DELETED_DATA_WORDS UBIN;          /* Total deleted data, in words.      */
+  DCL DELETED_KEYS UBIN;                /* Total number of deleted keys.      */
+  DCL DELETED_KEY_WORDS UBIN;       /* Total number of words of deleted keys. */
+  DCL DELETED_SEGS UBIN;          /* Total number of deleted record segments. */
+  DCL NEW_INDEX_GRANS UBIN;           /* Number of index grans after rebuild. */
+  DCL NEW_DATA_GRANS UBIN;             /* Number of data grans after rebuild. */
+  DCL OLD_INDEX_GRANS (0:99) UBIN;    /* Number of old index grans, by index. */
+  DCL OLD_UL_GRANS UBIN;                /* Number of old UL index grans.      */
+  DCL SLACK_KEY_SPACE UBIN;        /* Number of words of index granule AVAIL. */
+  DCL TOT_INDEX_GRANS (0:99) UBIN;    /* Number of new index grans, by index. */
+  DCL TOT_KEYS (0:99) UBIN;             /* Number of keys, by index.          */
+  DCL TOT_OLD_INDEX_GRANS UBIN;         /* Total number of old index grans.   */
+  DCL TOT_RECORDS UBIN;          /* Number of records in file (CODE03.NRECS). */
+ 
+%CP6$ENTS;
+%INCLUDE MIG_C61;
+%INCLUDE CP_6_SUBS;
+%INCLUDE FM$GRAN;
+%INCLUDE FM$FIT;
+%INCLUDE FM_FIELD_C;
+%INCLUDE FM_DATA_R;
+%INCLUDE B$JIT;
+%INCLUDE XU_MACRO_C;
+%INCLUDE XU_SUBS_C;
+%INCLUDE XU_PERR_C;
+%INCLUDE XU_FORMAT_C;
+%INCLUDE XUG_ENTRY;
+%INCLUDE ZL_MACRO_C;
+%B$TCB;
+%B$ALT;
+%F$DCB(STCLASS="BASED(M$IN$)");
+%FM$GRAN(BASED="BASED(GRAN$)");
+%FM$KEYTBL(BASED="BASED(KEYTBL$)");
+%FM$KEYENT(BASED="BASED(KEYENT$)");
+%FM$IRENT(BASED="BASED(KEYENT$)");
+%FM$MISEG(BASED="BASED(MISEG$)");
+%FM$ULSEG(BASED="BASED(MISEG$)");
+%FITALTKEYS(BASED="BASED(ALTKEYS$)");
+%FMG$IRKEYS(STCLASS="BASED(ALTKEYS$)");
+%CODE02;
+%CODE03;
+%F_FDS(NAME=F_FDS,
+ STCLASS=STATIC,
+ DCB=M$LO,
+ BUF=WRITE_LO_BUF);
+%PARSE$OUT(STCLASS=BASED);
+%PARSE$SYM(STCLASS=BASED);
+%FPT_CLOSE(FPTN=CLOSE_SI,
+ DISP=SAVE,
+ DCB=M$IN);
+%FPT_OPEN(FPTN=OPEN_SI,
+ ACCT=ACCT_SI,
+ ACS=BLOCK,
+ ASN=FILE,
+ DCB=M$IN,
+ FPARAM=BUF_FPARAM,
+ FUN=IN,
+ NAME=NAME_SI,
+ PASS=PASS_SI,
+ SN=SN_SI);
+%FPT_UNFID(FPTN=UNFID_SI,
+ DCB=M$IN,
+ TEXTFID=FID_BUF);
+%FPT_FID(FPTN=FID_SI,
+ ACCT=ACCT_SI,
+ NAME=NAME_SI,
+ PASS=PASS_SI,
+ SN=SN_SI,
+ WSN=WSN_SI,
+ ASN=F.ASN_,
+ RES=F.RES_,
+ TEXTFID=FID_BUF);
+%VLP_ACCT(FPTN=ACCT_SI);
+%VLP_NAME(FPTN=NAME_SI);
+%VLP_PASS(FPTN=PASS_SI);
+%VLP_SN(FPTN=SN_SI);
+%VLP_WSN(FPTN=WSN_SI);
+%FPT_READ(FPTN=READ_GRANULE,
+ BUF=GRANULE_BUFFER,
+ DCB=M$IN,
+ FULL=YES,
+ KEY=GRANULE_KEY,
+ KEYS=YES);
+%FPT_WRITE(FPTN=WRITE_LO,
+ DCB=M$LO,
+ BUF=WRITE_LO_BUF);
+%FPT_PRIV(FPTN=SFMS_PRIV,
+ PRIV=%PR_FMSEC#,
+ AUTH=YES);
+%FPT_INT(FPTN=BREAK,
+ UENTRY=BREAK_RTN);
+%FPT_MONINFO(SITEINFO=VLR_SITEINFO);
+%FPT_GDP(FPTN=GET_MLIST_PAGE,
+ PAGES=1,
+ RESULTS=GDP_VECTOR);
+%FPT_CMDVAR(FPTN=GETSORTSTAT,
+ FUN=FETCH,
+ NAME=SORTSTAT,
+ VALUE=OLDSTAT);
+%FPT_CMDVAR(FPTN=SETSORTSTAT,
+ FUN=STORE,
+ NAME=SORTSTAT,
+ VALUE=SILENTSTAT);
+%FPT_CMDVAR(FPTN=RESTORESTAT,
+ FUN=STORE,
+ NAME=SORTSTAT,
+ VALUE=OLDSTAT);
+%VLR_SITEINFO;
+%VLP_VECTOR(FPTN=GDP_VECTOR);
+%VLP_NAME(FPTN=SORTSTAT,
+ STCLASS=CONSTANT,
+ NAME='SORT$STAT');
+%VLP_NAME(FPTN=OLDSTAT,
+ NAME='                               ');
+%VLP_NAME(FPTN=SILENTSTAT,
+ NAME='SILENT');
+%XUG_INIT(COMMANDS=NO,
+ GOODCMD=YES);
+%XUG_GETCMD(NODES=MIG_OPTIONS);
+%SORT_TABLE(ICE=SORT_INPUT,
+ OCE=SORT_OUTPUT,
+ INSIZ=5,
+ KEYS=ZL_KEYS);
+%ZL_KEYS(N=1);
+%ZL_KEY(LENGTH=4,
+ START=1);
+%EJECT;
+REMEMBER_MISEG: PROC(ID);
+ 
+  DCL 1 ID,
+         2 DA UBIN(26) UNAL,
+         2 GX UBIN(10) UNAL;
+ 
+           IF NEW_MIWORDS = 2 THEN
+              RETURN;
+           IF ID = MISEG_LIST.ID(MLIST_INDEX-1) THEN DO;
+              MISEG_LIST.SEGS(MLIST_INDEX-1) = NEW_MIWORDS / 2;
+              RETURN;
+              END;
+           IF MLIST_INDEX > MLIST_MAX THEN DO;
+              CALL M$GDP(GET_MLIST_PAGE) ALTRET(MON_ERR);
+              MLIST_AVAIL = MLIST_AVAIL + GDP_VECTOR.W1.VSIZE# + 1;
+              MLIST_MAX = (MLIST_AVAIL / 5) - 1;
+              END;
+           MISEG_LIST.ID(MLIST_INDEX) = ID;
+           MISEG_LIST.SEGS(MLIST_INDEX) = NEW_MIWORDS / 2;
+           MLIST_INDEX = MLIST_INDEX + 1;
+           RETURN;
+ 
+MON_ERR:   ;
+           XUG_GETCMD.USE_EPOS# = %NO#;
+           XUG_GETCMD.DCB_PARAM# = DCBNUM(M$DO);
+           XUG_GETCMD.ERRDCB# = B$TCB$->B$TCB.ALT$->B$ALT.DCB#;
+           XUG_GETCMD.ERR_CODE = B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+           CALL XUG$ERRMSG(XUG_GETCMD) WHENALTRETURN DO; END;
+           CALL M$EXIT;
+ 
+   END REMEMBER_MISEG;
+%EJECT;
+SORT_MLIST: PROC ALTRET;
+ 
+  DCL HAD_STAT BIT(1);
+ 
+           CALL M$CMDVAR(GETSORTSTAT) WHENRETURN DO;
+              HAD_STAT = '1'B;
+              END;
+           WHENALTRETURN DO;
+              HAD_STAT = '0'B;
+              END;
+           CALL M$CMDVAR(SETSORTSTAT);
+           CALL X$SORT(SORT_TABLE) ALTRET(SORT_ERR);
+           IF HAD_STAT THEN
+              CALL M$CMDVAR(RESTORESTAT);
+           RETURN;
+ 
+SORT_ERR:  ALTRETURN;
+ 
+   END SORT_MLIST;
+%EJECT;
+GET_MISEG: PROC(FOUND,ID,SEGS);
+ 
+  DCL FOUND BIT(1);
+  DCL 1 ID,
+         2 DA UBIN(26) UNAL,
+         2 GX UBIN(10) UNAL;
+  DCL SEGS UBIN;
+  DCL LOW UBIN;
+  DCL HIGH UBIN;
+  DCL MID UBIN;
+  DCL TEMP UBIN;
+ 
+           IF MLIST_INDEX = 0 THEN DO;
+              FOUND = '0'B;
+              RETURN;
+              END;
+           LOW = 0;
+           HIGH = MLIST_INDEX - 1;
+           MID = HIGH / 2;
+           DO UNTIL (TEMP = MID);
+              TEMP = MID;
+              IF ID < MISEG_LIST.ID(MID) THEN
+                 HIGH = MID;
+              ELSE
+                 IF ID > MISEG_LIST.ID(MID) THEN
+                    LOW = MID;
+                 ELSE DO;
+                    FOUND = '1'B;
+                    SEGS = MISEG_LIST.SEGS(MID);
+                    RETURN;
+                    END;
+              MID = (LOW + HIGH) / 2;
+              END;
+           FOUND = '0'B;
+           RETURN;
+ 
+   END GET_MISEG;
+%EJECT;
+ADD_KEY:   PROC;
+ 
+           IF CUR_KEYTBL_IX > 279 OR CUR_INDEX_IX + KEYMOD > 1024 - F$DCB.SPARE# THEN DO;
+              NEW_INDEX_GRANS = NEW_INDEX_GRANS + 1;
+              CUR_INDEX_IX = 75;
+              CUR_KEYTBL_IX = 1;
+              END;
+           CUR_KEYTBL_IX = CUR_KEYTBL_IX + 1;
+           CUR_INDEX_IX = CUR_INDEX_IX + KEYMOD;
+           TOT_KEYS(KEYINDEX) = TOT_KEYS(KEYINDEX) + 1;
+           RETURN;
+ 
+   END ADD_KEY;
+%EJECT;
+ADD_SEG:   PROC;
+ 
+  DCL 1 LAST_ID STATIC,
+         2 DA UBIN(26) UNAL,
+         2 GX UBIN(10) UNAL;
+  DCL TEMP UBIN;
+ 
+           IF FM$MISEG.FAK THEN DO;     /* Set up for first segment.          */
+              LAST_ID.DA = FM$MISEG.GDA;
+              LAST_ID.GX = FM$MISEG.GX;
+              IF CUR_INDEX_IX + 2 > 1024 - F$DCB.SPARE# THEN DO;
+                 NEW_INDEX_GRANS = NEW_INDEX_GRANS + 1;
+                 CUR_INDEX_IX = 75 + KEYMOD;
+                 CUR_KEYTBL_IX = 2;
+                 END;
+              CUR_INDEX_IX = CUR_INDEX_IX + 2;
+              NEW_MIWORDS = 2;
+              TEMP = (CUR_DATA_IX + 3) / 4;
+              CUR_DATA_IX = TEMP * 4;   /* Get data index to next word.       */
+              IF CUR_DATA_IX + MINSIZE > 4096 THEN DO;
+                 NEW_DATA_GRANS = NEW_DATA_GRANS + 1;
+                 CUR_DATA_IX = 8;
+                 END;
+              END;
+           IF CUR_DATA_IX + FM$MISEG.GACTB > 4096 THEN DO;
+              NEW_DATA_GRANS = NEW_DATA_GRANS + 1;
+              CUR_DATA_IX = 8 + (FM$MISEG.GACTB - (4096 - CUR_DATA_IX));
+              IF CUR_INDEX_IX + 2 > 1024 - F$DCB.SPARE# THEN DO;
+                 NEW_INDEX_GRANS = NEW_INDEX_GRANS + 1;
+                 CUR_INDEX_IX = 75 + KEYMOD + NEW_MIWORDS;
+                 CUR_KEYTBL_IX = 2;
+                 END;
+              CUR_INDEX_IX = CUR_INDEX_IX + 2;
+              NEW_MIWORDS = NEW_MIWORDS + 2;
+              END;
+           ELSE
+              CUR_DATA_IX = CUR_DATA_IX + FM$MISEG.GACTB;
+           CALL REMEMBER_MISEG(LAST_ID);
+           RETURN;
+ 
+   END ADD_SEG;
+%EJECT;
+ADD_MISEG: PROC;
+ 
+  DCL 1 ID,
+         2 DA UBIN(26) UNAL,
+         2 GX UBIN(10) UNAL;
+  DCL FOUND BIT(1);
+  DCL SEGS UBIN;
+  DCL IND1 UBIN;
+ 
+           ID.DA = FM$MISEG.GDA;
+           ID.GX = FM$MISEG.GX;
+           CALL GET_MISEG(FOUND,ID,SEGS);
+           IF NOT FOUND THEN
+              SEGS = 1;
+           DO IND1 = 1 TO SEGS;
+              IF CUR_INDEX_IX + 2 > 1024 - F$DCB.SPARE# THEN DO;
+                 NEW_INDEX_GRANS = NEW_INDEX_GRANS + 1;
+                 CUR_INDEX_IX = 75;
+                 CUR_KEYTBL_IX = 2;
+                 END;
+              CUR_INDEX_IX = CUR_INDEX_IX + 2;
+              END;
+           RETURN;
+ 
+   END ADD_MISEG;
+%EJECT;
+DO_MISEGS: PROC(NUM,DELETED);
+ 
+  DCL NUM UBIN;
+  DCL DELETED BIT(1);
+  DCL IND1 UBIN;
+ 
+           DO IND1 = 1 TO NUM;
+              IF KEYINDEX = 0 THEN
+                 IF DELETED THEN
+                    DELETED_DATA_WORDS = DELETED_DATA_WORDS + FM$MISEG.GSIZ;
+                 ELSE
+                    CALL ADD_SEG;
+              ELSE
+                 IF FM$MISEG.FAK THEN DO;
+                    ALT_RECORDS(KEYINDEX-1) = ALT_RECORDS(KEYINDEX-1) + 1;
+                    CALL ADD_MISEG;
+                    END;
+              MISEG$ = PINCRW(MISEG$,2);
+              END;
+ 
+   END DO_MISEGS;
+%EJECT;
+PROCESS_INDEX: PROC;
+ 
+  DCL IND1 UBIN;
+  DCL IND2 UBIN;
+  DCL LAST_KEY_DELETED BIT(1);
+  DCL FIRST_GRAN BIT(1);
+  DCL NUM_MISEGS UBIN;
+  DCL NEXTX UBIN;
+  DCL THISX UBIN;
+ 
+           LAST_KEY_DELETED = '0'B;
+           FIRST_GRAN = '1'B;
+           DO WHILE(FM$GRAN.FLINK >= FM_FRZERO);
+              GRANULE_KEY = FM$GRAN.FLINK - FM_FRZERO;
+              CALL M$READ(READ_GRANULE);
+              OLD_INDEX_GRANS(KEYINDEX) = OLD_INDEX_GRANS(KEYINDEX) + 1;
+              SLACK_KEY_SPACE = SLACK_KEY_SPACE + FM$GRAN.AVAIL;
+              KEYTBL$ = PINCRW(GRAN$,FM$GRAN.FCEX);
+              IF FM$KEYTBL(1) > 75 AND NOT FIRST_GRAN THEN DO;
+                 NUM_MISEGS = (FM$KEYTBL(1) - 75) / 2;
+                 IF LAST_KEY_DELETED THEN
+                    DELETED_SEGS = DELETED_SEGS + NUM_MISEGS;
+                 MISEG$ = PINCRW(GRAN$,75);
+                 CALL DO_MISEGS(NUM_MISEGS,LAST_KEY_DELETED);
+                 END;
+              DO IND1 = 1 TO FM$GRAN.KEYCNT;
+                 THISX = FM$KEYTBL(IND1);
+                 IF IND1 >= FM$KEYTBL(0) THEN
+                    THISX = THISX + 512;
+                 KEYENT$ = PINCRW(GRAN$,THISX);
+                 IF IND1+1 > FM$GRAN.KEYCNT THEN
+                    NEXTX = FM$GRAN.NAVX;
+                 ELSE DO;
+                    NEXTX = FM$KEYTBL(IND1+1);
+                    IF IND1+1 >= FM$KEYTBL(0) THEN
+                       NEXTX = NEXTX + 512;
+                    END;
+                 IF F$DCB.ORG# = %IREL# THEN
+                    KEYMOD = (FM$IRENT.KLB + 4) / 4;
+                 ELSE
+                    KEYMOD = (FM$KEYENT.KLB + 4) / 4;
+                 NUM_MISEGS = ((NEXTX - THISX) - KEYMOD) / 2;
+                 IF FM$KEYENT.D THEN DO;
+                    DELETED_KEYS = DELETED_KEYS + 1;
+                    DELETED_KEY_WORDS = DELETED_KEY_WORDS + NUM_MISEGS + KEYMOD;
+                    DELETED_SEGS = DELETED_SEGS + NUM_MISEGS;
+                    LAST_KEY_DELETED = '1'B;
+                    END;
+                 ELSE DO;
+                    CALL ADD_KEY;
+                    LAST_KEY_DELETED = '0'B;
+                    END;
+                 MISEG$ = PINCRW(KEYENT$,KEYMOD);
+                 FM$MISEG.FAK = '1'B;
+                 CALL DO_MISEGS(NUM_MISEGS,FM$KEYENT.D);
+                 END;
+              END;
+           RETURN;
+ 
+   END PROCESS_INDEX;
+%EJECT;
+COUNT_UL_GRANS: PROC;
+ 
+  DCL OLD_BLINK UBIN;
+  DCL THISX UBIN;
+ 
+           IF TDA = 0 THEN
+              RETURN;
+           DO WHILE('1'B);
+              GRANULE_KEY = TDA - FM_FRZERO;
+              CALL M$READ(READ_GRANULE);
+              OLD_UL_GRANS = OLD_UL_GRANS + 1;
+              OLD_BLINK = FM$GRAN.BLINK;
+              DO WHILE(FM$GRAN.FLINK ~= 0 AND NOT FM$GRAN.ENDLVL);
+                 GRANULE_KEY = FM$GRAN.FLINK - FM_FRZERO;
+                 CALL M$READ(READ_GRANULE);
+                 OLD_UL_GRANS = OLD_UL_GRANS + 1;
+                 END;
+              FM$GRAN.BLINK = OLD_BLINK;
+              DO WHILE(FM$GRAN.BLINK ~= 0);
+                 GRANULE_KEY = FM$GRAN.BLINK - FM_FRZERO;
+                 CALL M$READ(READ_GRANULE);
+                 OLD_UL_GRANS = OLD_UL_GRANS + 1;
+                 END;
+              IF FM$GRAN.LVL = 1 THEN
+                 RETURN;
+              KEYTBL$ = PINCRW(GRAN$,FM$GRAN.FCEX);
+              THISX = FM$KEYTBL(1);
+              IF THISX >= FM$KEYTBL(0) THEN
+                 THISX = THISX + 512;
+              KEYENT$ = PINCRW(GRAN$,THISX);
+              IF F$DCB.ORG# = %IREL# THEN
+                 THISX = (FM$IRENT.KLB + 4) / 4;
+              ELSE
+                 THISX = (FM$KEYENT.KLB + 4) / 4;
+              MISEG$ = PINCRW(KEYENT$,THISX);
+              TDA = FM$ULSEG.DA;
+              END;
+ 
+   END COUNT_UL_GRANS;
+%EJECT;
+OPTIONS:   PROC ALTRET;
+ 
+  DCL IND UBIN;
+ 
+           CALL INDEX1R(IND,')',B$JIT.CCBUF,B$JIT.CCARS) WHENALTRETURN DO;
+              IND = B$JIT.CCARS + 1;
+              END;
+           WRITE_LO_BUF = SUBSTR(B$JIT.CCBUF,B$JIT.CCDISP+1,IND-B$JIT.CCDISP-1);
+           XUG_GETCMD.TEXT_ = VECTOR(WRITE_LO_BUF);
+           CALL XUG$GETCMD(XUG_GETCMD) ALTRET(ERR);
+           DO IND = 0 TO XUG_GETCMD.OUT$->OUT$BLK.NSUBLKS - 1;
+              DO CASE(XUG_GETCMD.OUT$->OUT$BLK.SUBLK$(IND)->OUT$BLK.CODE);
+                 CASE(%SHARE_OP#);
+                    IF (XUG_GETCMD.OUT$->OUT$BLK.SUBLK$(IND)->OUT$BLK.NSUBLKS > 0) THEN
+                    DO CASE(XUG_GETCMD.OUT$->OUT$BLK.SUBLK$(IND)->OUT$BLK.SUBLK$(0)->OUT$BLK.CODE);
+                       CASE(%SHARE_ALL#);
+                          OPEN_SI.V.SHARE# = %ALL#;
+                       CASE(%SHARE_IN#);
+                          OPEN_SI.V.SHARE# = %IN#;
+                       CASE(%SHARE_NONE#);
+                          OPEN_SI.V.SHARE# = %NONE#;
+                       END;
+                    ELSE
+                       OPEN_SI.V.SHARE# = %ALL#;
+                 CASE(%DETAIL_OP#);
+                    DETAIL_OP = '1'B;
+                    WRITE_LO_BUF = 'The DETAIL option is not yet implemented.';
+                    CALL M$WRITE(WRITE_LO);
+                 CASE(%EXTENT_OP#);
+                    EXTENT_OP = '1'B;
+                    WRITE_LO_BUF = 'The EXTENT option is not yet implemented.';
+                    CALL M$WRITE(WRITE_LO);
+                 END;
+              END;
+           RETURN;
+ 
+ERR:       ALTRETURN;
+ 
+   END OPTIONS;
+%EJECT;
+OPEN_FILE: PROC;
+ 
+  DCL FIT$ PTR;
+  DCL CODE$ PTR;
+  DCL TEMP UBIN;
+ 
+           CALL M$UNFID(UNFID_SI) ALTRET(MON_ERR);
+           CALL M$FID(FID_SI) ALTRET(MON_ERR);
+           IF F.ASN_ = %FILE# OR F.ASN_ = %TAPE# THEN
+              OPEN_SI.V.ASN# = F.ASN_;
+           CALL M$OPEN(OPEN_SI) ALTRET(MON_ERR);
+           IF F$DCB.ORG# ~= %KEYED# AND F$DCB.ORG# ~= %INDEXED# AND F$DCB.ORG# ~= %IREL# THEN DO;
+              CALL M$CLOSE(CLOSE_SI);
+              WRITE_LO_BUF = 'Must be a Keyed, Indexed, or IREL file!';
+              CALL M$WRITE(WRITE_LO);
+              CALL M$EXIT;
+              END;
+           IF F$DCB.ACS# = %SEQUEN# THEN DO;
+              WRITE_LO_BUF = 'Can''t run MIG on a compressed or shared file!';
+              CALL M$WRITE(WRITE_LO);
+              CALL M$EXIT;
+              END;
+           TEMP = 3;                    /* Need CODE03 for UGRANS and NGAVAL. */
+           FIT$ = ADDR(BUF_FPARAM);
+           IF OPEN_SI.V.ACS# = %BLOCK# THEN
+              IF FIT$->FM$GRAN.HDR THEN
+                 FIT$ = PINCRW(FIT$,5);
+              ELSE
+                 FIT$ = PINCRW(FIT$,2);
+           CODE$ = FIT$;
+           CALL XSF$LOCCODE(CODE$,TEMP) WHENALTRETURN DO;
+              WRITE_LO_BUF = 'I can''t seem to find the CODE03 for this file!?!';
+              CALL M$EXIT;
+              END;
+           UGRANS = CODE$->CODE03.UGRANS;
+           NGAVAL = CODE$->CODE03.NGAVAL;
+           TOT_RECORDS = CODE$->CODE03.NRECS;
+           CODE$ = FIT$;
+           TEMP = 2;         /* Need CODE02 to count upper-level index grans. */
+           CALL XSF$LOCCODE(CODE$,TEMP) WHENALTRETURN DO;
+              WRITE_LO_BUF = 'I can''t seem to find the CODE02 for this file!?!';
+              CALL M$EXIT;
+              END;
+           TDA = CODE$->CODE02.TDA;
+           RETURN;
+ 
+MON_ERR:   ;
+           XUG_GETCMD.USE_EPOS# = %NO#;
+           XUG_GETCMD.DCB_PARAM# = DCBNUM(M$DO);
+           XUG_GETCMD.ERRDCB# = B$TCB$->B$TCB.ALT$->B$ALT.DCB#;
+           XUG_GETCMD.ERR_CODE = B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+           CALL XUG$ERRMSG(XUG_GETCMD) WHENALTRETURN DO; END;
+           CALL M$EXIT;
+ 
+   END OPEN_FILE;
+%EJECT;
+ 
+           M$IN$ = DCBADDR(DCBNUM(M$IN));
+           CALL M$INT(BREAK) ALTRET(MON_ERR);
+           CALL XUG$INIT(XUG_GETCMD,XUG_INIT);
+           IF B$JIT.CCDISP < B$JIT.CCARS THEN
+              CALL OPTIONS ALTRET(XUG_ERR);
+           IF NOT(B$JIT$->B$JIT.PRIV.ACTIVE & %PR_FMSEC#) THEN
+              CALL M$SPRIV(SFMS_PRIV) WHENALTRETURN DO;
+                 OPEN_SI.V.ACS# = %UBLOCK#;
+                 END;
+           CALL OPEN_FILE;              /* Open the file.                     */
+           CALL M$GDP(GET_MLIST_PAGE);  /* Get a page for the MISEG list.     */
+           MLIST$ = GDP_VECTOR.PTR$;
+           MLIST_AVAIL = GDP_VECTOR.W1.VSIZE# + 1;
+           MLIST_MAX = (MLIST_AVAIL / 5) - 1;
+           MLIST_INDEX = 0;             /* Initialize some stuff.             */
+           DELETED_KEYS = 0;
+           DELETED_SEGS = 0;
+           DELETED_KEY_WORDS = 0;
+           DELETED_DATA_WORDS = 0;
+           NEW_INDEX_GRANS = 0;
+           NEW_DATA_GRANS = 0;
+           OLD_UL_GRANS = 0;
+           SLACK_KEY_SPACE = 0;
+           DO KEYINDEX = 0 TO 99;
+              ALT_RECORDS(KEYINDEX) = 0;
+              OLD_INDEX_GRANS(KEYINDEX) = 0;
+              TOT_KEYS(KEYINDEX) = 0;
+              END;
+           IF (F$DCB.ORG# = %INDEXED# OR F$DCB.ORG# = %IREL#) AND
+               F$DCB.ALTKEYX ~= 0 THEN DO;
+              ALTKEYS$ = PINCRW(B$ROS$,F$DCB.ALTKEYX);
+              IF F$DCB.ORG# = %INDEXED# THEN DO;
+                 NUM_KEYS = FITALTKEYS.NUMENTS;
+                 MINSIZE = FITALTKEYS.MINWRSIZ;
+                 UNIQUEBLD = FITALTKEYS.UNIQUEBLD;
+                 ALTBLD = FITALTKEYS.ALTBLD;
+                 END;
+              ELSE DO;
+                 NUM_KEYS = IRKEYS.NKEYS;
+                 MINSIZE = IRKEYS.MINSIZE;
+                 UNIQUEBLD = IRKEYS.UNIQUEBLD;
+                 ALTBLD = IRKEYS.ALTBLD;
+                 END;
+              END;
+           ELSE DO;
+              NUM_KEYS = 1;
+              MINSIZE = 0;
+              ALTBLD = '0'B;
+              UNIQUEBLD = '0'B;
+              END;
+           GRAN$ = ADDR(GRANULE_BUFFER);
+           GRANULE_KEY = 0;
+           CALL M$READ(READ_GRANULE);
+           CUR_DATA_IX = 8;
+           CUR_INDEX_IX = FM$GRAN.FCEX + SIZEW(FM$KEYTBL);
+           CUR_KEYTBL_IX = 1;
+           KEYINDEX = 0;
+           FM$GRAN.FLINK = FM_FRZERO;
+           CALL PROCESS_INDEX;       /* Do primary index (may be only index). */
+           IF CUR_DATA_IX > 8 THEN
+              NEW_DATA_GRANS = NEW_DATA_GRANS + 1;
+           IF CUR_INDEX_IX > 75 THEN
+              NEW_INDEX_GRANS = NEW_INDEX_GRANS + 1;
+           CUR_INDEX_IX = 75;
+           CUR_KEYTBL_IX = 1;
+           TOT_INDEX_GRANS(0) = NEW_INDEX_GRANS;
+           TOT_OLD_INDEX_GRANS = OLD_INDEX_GRANS(0);
+           CALL COUNT_UL_GRANS;         /* Count UL index grans.              */
+           IF (F$DCB.ORG# = %INDEXED# OR F$DCB.ORG# = %IREL#) AND
+               F$DCB.ALTKEYX ~= 0 THEN DO;
+              IF UNIQUEBLD OR ALTBLD THEN
+                 EXIT;
+              CALL SORT_MLIST ALTRET(MON_ERR);
+              DO KEYINDEX = 1 TO NUM_KEYS - 1;
+                 TOT_INDEX_GRANS(KEYINDEX) = NEW_INDEX_GRANS;
+                 IF F$DCB.ORG# = %INDEXED# THEN DO;
+                    FM$GRAN.FLINK = FITALTKEYS.K.FDA(KEYINDEX);
+                    TDA = FITALTKEYS.K.TDA(KEYINDEX);
+                    END;
+                 ELSE DO;
+                    FM$GRAN.FLINK = IRKEYS.K.FDA(KEYINDEX);
+                    TDA = IRKEYS.K.TDA(KEYINDEX);
+                    END;
+                 CALL PROCESS_INDEX;
+                 IF CUR_INDEX_IX > 75 THEN
+                    NEW_INDEX_GRANS = NEW_INDEX_GRANS + 1;
+                 CUR_INDEX_IX = 75;
+                 TOT_INDEX_GRANS(KEYINDEX) = NEW_INDEX_GRANS - TOT_INDEX_GRANS(KEYINDEX);
+                 TOT_OLD_INDEX_GRANS = TOT_OLD_INDEX_GRANS + OLD_INDEX_GRANS(KEYINDEX);
+                 CALL COUNT_UL_GRANS;   /* Count UL index grans.              */
+                 END;
+              END;
+           CALL M$CLOSE(CLOSE_SI);
+           TEMP = UGRANS + NGAVAL;
+           DO CASE(F$DCB.ORG#);
+              CASE(%KEYED#);
+                 CALL X$WRITE(F_FDS,VECTOR(FMT_INTRO_KEYED),VECTOR(FID_BUF));
+              CASE(%INDEXED#);
+                 CALL X$WRITE(F_FDS,VECTOR(FMT_INTRO_INDEXED),VECTOR(FID_BUF),VECTOR(NUM_KEYS));
+              CASE(%IREL#);
+                 CALL X$WRITE(F_FDS,VECTOR(FMT_INTRO_IREL),VECTOR(FID_BUF),VECTOR(NUM_KEYS));
+              END;
+           WRITE_LO_BUF = ' ';
+           CALL M$WRITE(WRITE_LO);
+           CALL X$WRITE(F_FDS,VECTOR(FMT_TGRANS),VECTOR(UGRANS),VECTOR(NGAVAL));
+           TEMP = UGRANS - OLD_UL_GRANS;
+           CALL X$WRITE(F_FDS,VECTOR(FMT_IDULGRANS),VECTOR(TEMP),VECTOR(OLD_UL_GRANS));
+           TEMP = TEMP - TOT_OLD_INDEX_GRANS;
+           CALL X$WRITE(F_FDS,VECTOR(FMT_IDGRANS),VECTOR(TOT_OLD_INDEX_GRANS),VECTOR(TEMP));
+           CALL X$WRITE(F_FDS,VECTOR(FMT_SLACK),VECTOR(SLACK_KEY_SPACE),VECTOR(F$DCB.SPARE#));
+           WRITE_LO_BUF = ' ';
+           CALL M$WRITE(WRITE_LO);
+           CALL X$WRITE(F_FDS,VECTOR(FMT_DKEYS),VECTOR(DELETED_KEYS));
+           CALL X$WRITE(F_FDS,VECTOR(FMT_DSEGS),VECTOR(DELETED_SEGS));
+           CALL X$WRITE(F_FDS,VECTOR(FMT_DKWORDS),VECTOR(DELETED_KEY_WORDS));
+           CALL X$WRITE(F_FDS,VECTOR(FMT_DDWORDS),VECTOR(DELETED_DATA_WORDS));
+           WRITE_LO_BUF = ' ';
+           CALL M$WRITE(WRITE_LO);
+           TEMP = 0;
+           IF ALTBLD OR UNIQUEBLD THEN DO;
+              IF ALTBLD THEN
+                 CALL X$WRITE(F_FDS,VECTOR(FMT_ALTBLD));
+              IF UNIQUEBLD THEN
+                 CALL X$WRITE(F_FDS,VECTOR(FMT_UNIQUEBLD));
+              TEMP = 1;
+              END;
+           IF F$DCB.ORG# = %INDEXED# OR F$DCB.ORG# = %IREL# THEN DO;
+              DO KEYINDEX = 1 TO NUM_KEYS - 1;
+                 IF TOT_RECORDS ~= ALT_RECORDS(KEYINDEX - 1) THEN DO;
+                    CALL X$WRITE(F_FDS,VECTOR(FMT_INC),VECTOR(KEYINDEX),VECTOR(ALT_RECORDS(KEYINDEX-1)),VECTOR(TOT_RECORDS));
+                    TEMP = 1;
+                    END;
+                 END;
+              END;
+           IF TEMP = 1 THEN DO;
+              WRITE_LO_BUF = ' ';
+              CALL M$WRITE(WRITE_LO);
+              END;
+           CALL X$WRITE(F_FDS,VECTOR(FMT_AFTER));
+           WRITE_LO_BUF = ' ';
+           CALL M$WRITE(WRITE_LO);
+           TEMP = NEW_INDEX_GRANS + NEW_DATA_GRANS;
+           CALL X$WRITE(F_FDS,VECTOR(FMT_RTOT),VECTOR(TEMP));
+           CALL X$WRITE(F_FDS,VECTOR(FMT_RINDEX),VECTOR(NEW_INDEX_GRANS));
+           CALL X$WRITE(F_FDS,VECTOR(FMT_RDATA),VECTOR(NEW_DATA_GRANS));
+           TEMP = (UGRANS - OLD_UL_GRANS) - TEMP;
+           TEMP2 = ((TEMP * 1000) / (UGRANS - OLD_UL_GRANS)) / 10;
+           IF TEMP > 0 THEN
+              CALL X$WRITE(F_FDS,VECTOR(FMT_SAVINGS),VECTOR(TEMP),VECTOR(TEMP2));
+           ELSE
+              CALL X$WRITE(F_FDS,VECTOR(FMT_NOSAVE));
+           WRITE_LO_BUF = ' ';
+           CALL M$WRITE(WRITE_LO);
+           IF TEMP < 0 THEN
+              CALL X$WRITE(F_FDS,VECTOR(FMT_VGREW));
+           ELSE
+              IF TEMP = 0 THEN
+                 CALL X$WRITE(F_FDS,VECTOR(FMT_VNO));
+              ELSE
+                 IF TEMP2 <= 25 THEN
+                    CALL X$WRITE(F_FDS,VECTOR(FMT_VMAYBENOT));
+                 ELSE
+                    IF TEMP2 >= 75 THEN
+                       CALL X$WRITE(F_FDS,VECTOR(FMT_VMAYBE));
+           CALL M$EXIT;
+ 
+MON_ERR:   ;
+           XUG_GETCMD.USE_EPOS# = %NO#;
+           XUG_GETCMD.DCB_PARAM# = DCBNUM(M$DO);
+           XUG_GETCMD.ERRDCB# = B$TCB$->B$TCB.ALT$->B$ALT.DCB#;
+           XUG_GETCMD.ERR_CODE = B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+           CALL XUG$ERRMSG(XUG_GETCMD) WHENALTRETURN DO; END;
+           CALL M$EXIT;
+ 
+XUG_ERR:   ;
+           XUG_GETCMD.USE_EPOS# = %NO#;
+           XUG_GETCMD.DCB_PARAM# = DCBNUM(M$DO);
+           XUG_GETCMD.ERRDCB# = DCBNUM(NIL);
+           XUG_GETCMD.ERR_CODE = XUG_GETCMD.ERR#;
+           CALL XUG$ERRMSG(XUG_GETCMD) WHENALTRETURN DO; END;
+           CALL M$EXIT;
+ 
+END MIG;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+SORT_INPUT: PROC(RECORD,SIZE) ALTRET;
+ 
+  DCL RECORD CHAR(5);
+  DCL SIZE UBIN;
+ 
+  DCL MISEG_LIST (0:0) CHAR(5) BASED(MLIST$);
+  DCL MLIST$ PTR SYMREF;
+  DCL MLIST_INDEX UBIN SYMREF;
+  DCL MY_INDEX UBIN STATIC INIT(0);
+ 
+        IF MY_INDEX = MLIST_INDEX THEN
+           ALTRETURN;
+        RECORD = MISEG_LIST(MY_INDEX);
+        SIZE = 5;
+        MY_INDEX = MY_INDEX + 1;
+        RETURN;
+ 
+END SORT_INPUT;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+SORT_OUTPUT: PROC(RECORD,SIZE) ALTRET;
+ 
+  DCL RECORD CHAR(5);
+  DCL SIZE UBIN;
+ 
+  DCL MISEG_LIST (0:0) CHAR(5) BASED(MLIST$);
+  DCL MLIST$ PTR SYMREF;
+  DCL MLIST_INDEX UBIN SYMREF;
+  DCL MY_INDEX UBIN STATIC INIT(0);
+ 
+        IF SIZE = 0 THEN
+           RETURN;
+        MISEG_LIST(MY_INDEX) = RECORD;
+        MY_INDEX = MY_INDEX + 1;
+        RETURN;
+ 
+END SORT_OUTPUT;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+BREAK_RTN: PROC;
+ 
+  DCL BREAK_HIT BIT(1) SYMREF;
+ 
+        BREAK_HIT = '1'B;
+        RETURN;
+ 
+END BREAK_RTN;

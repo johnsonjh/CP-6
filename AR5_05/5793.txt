@@ -1,0 +1,368 @@
+/*M* PASSWORD                                                */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+/**********************************************************************/
+/*F*   NAME:   PASSWORD
+       PURPOSE: The PASSWORD command is utilized by a user to create,
+               delete, or modify his logon password. Security is enforced
+               by requiring the old passwprd to be specified before the new
+               password is entered.
+       DESCRIPTION: The user's record is read from the :HLP file
+               and the old password, if specified by the user, is compared
+               with the current password. If it matches, the new password
+               is stored in the :HLP record. If a new password is not specified,
+               the old password in the :HLP record is reset.
+       REFERENCE: Programmers Reference Manual
+*/
+/*D*   NAME:   PASSWORD
+       CALL:   CALL PASSWORD
+       INTERFACE: RDHLP,WRHLP
+       INPUT:  None
+       OUTPUT: modified :HLP record
+       DESCRIPTION: The :HLP record is read in and a determination made if the
+               old password is  specified on the PASSWORD command.
+               If the old password is  specified, it is compared with the
+               :HLP   password. If the passwords are the same, the modification
+               or resetting of the password in :HLP is permitted.
+               Establishing a new password without specifying the old
+               password is permitted if one does not already exist. If a new
+               password is not specified, the old password in :HLP is
+               reset. Password scrambling is performed for all passwords.
+*/
+/***********************************************************************/
+/**/
+ 
+PASSWORD: PROC MAIN;
+ 
+%INCLUDE B_ERRORS_C;
+%INCLUDE B$JIT;
+%INCLUDE CP_6;
+  %B$ALT;
+%B$TCB (STCLASS="BASED(B$TCB$)");
+  %F$DCB;
+%INCLUDE CP_6_SUBS;
+%INCLUDE CP_MACROS_C;
+%INCLUDE CP_SUBS_C;
+%INCLUDE CP_PERR_C;
+%INCLUDE XU_MACRO_C;
+%INCLUDE XU_PERR_C;
+%INCLUDE B$ROSEG ;
+%INCLUDE B_STRINGS_C;
+%INCLUDE B_MACROS_C;
+%INCLUDE AS_SUPER_C;
+%INCLUDE KL_SUPER_C;
+%INCLUDE NK_VFC_C;
+ 
+DCL RWBUF CHAR(80) STATIC INIT(' ');
+DCL CCBUF CHAR(256) STATIC INIT(' ');
+DCL CCARS UBIN WORD STATIC;
+DCL BLANKS CHAR(1) CONSTANT INIT(' ');
+DCL 1 NO_GOOD_MESS CONSTANT,
+      2 VFC CHAR(1) INIT(%VFC_TRANSITION1),
+      2 MESS CHAR(0) INIT('  Password does not match the New password.');
+DCL 1 PASSWORD_NOT_CHANGED_MESS CONSTANT,
+      2 VFC CHAR(1) INIT(%VFC_TRANSITION1),
+      2 MESS CHAR(0) INIT('  Password was not changed');
+DCL OLDPASSWORD CHAR(8) ALIGNED;                         /*Old password*/
+DCL NEWPASSWORD CHAR(8) ALIGNED;                         /*New password*/
+DCL NEWPASSWORD_2 CHAR(8) ALIGNED;                       /*New password second try*/
+DCL OLDPASSWORD_PROMPT CHAR(0) CONSTANT INIT('Old password, CR = none -> ');
+DCL NEWPASSWORD_PROMPT CHAR(0) CONSTANT INIT('New password, CR = none -> ');
+DCL NEWPASSWORD_2_PROMPT CHAR(0) CONSTANT INIT('Verify password, CR = none -> ');
+DCL PROMPT_VEC_ VECTOR STATIC SYMDEF;
+DCL DCB# UBIN WORD;
+DCL I UBIN WORD;
+DCL ERR_CODE BIT(36);
+DCL M$PASS DCB;
+DCL BLK$ PTR;                                            /*Parse output block ptr*/
+DCL TEMP$ PTR;
+%EQU YES = '1'B;
+%EQU NO = '0'B;
+DCL SET_ESC_E BIT(1) STATIC INIT('0'B);
+DCL DONE BIT(1) STATIC INIT('0'B);
+DCL PASSWORD_GOOD BIT(1) STATIC INIT('0'B);
+DCL PASSWORD_CHANGED BIT(1) STATIC INIT('0'B);
+%P_PCB(NAME=P_PCB,STCLASS=STATIC);
+DCL PASSWORD_ BIT(36) SYMREF;
+DCL OLDPASSWD BIT(36) SYMREF;
+/***** External routines *****/
+DCL WRITEMSGE ENTRY(5);
+DCL RDHLP ENTRY(1) ALTRET;
+DCL WRHLP ENTRY(1) ALTRET;
+DCL BREAK ENTRY ASYNC;
+DCL ASZ$SCRAMBLE ENTRY(1);
+DCL XUG$INIT ENTRY(2) ALTRET;
+DCL XUG$GETCMD ENTRY(1) ALTRET;
+/***** Auto Structures *****/
+%AS_USERS(STR_NAME=AS_USERS,STCLASS=AUTO);
+/***** Based structures *****/
+%TEXTC;
+%B$EXCFR;
+%AS_USERS (STR_NAME=AS$USERS,STCLASS=BASED);
+%PLIST;
+%PARSE$OUT (NAME=P$B);
+%PARSE$SYM (NAME=P$S);
+DCL B$JIT$ PTR SYMREF;
+DCL B$TCB$ PTR SYMREF;
+DCL REMEM_PASSWORD_ABORT_ADDR REMEMBER STATIC SYMDEF;
+DCL HLP_SZ UBIN WORD STATIC SYMDEF;
+DCL BREAK_IN_PROGRESS BIT(1) STATIC SYMDEF INIT('0'B);
+DCL 1 USERS_KEY ALIGNED STATIC SYMDEF,
+       2 CNT UBIN(9) UNAL,
+       2 TXT CHAR(20);
+/*         Fpts                                  */
+%FPT_CLOSE (FPTN=FPT_CLOSE,
+      STCLASS=STATIC,
+      DISP=SAVE);
+%FPT_WRITE (FPTN=FPT_WRITE_NOGOOD,
+      STCLASS=STATIC,
+      DCB=M$UC,
+      BUF=NO_GOOD_MESS,
+      VFC=YES);
+%FPT_EXIT (FPTN=FPT_EXIT,
+      STCLASS=STATIC);
+%FPT_INT (FPTN=FPT_INT,
+      STCLASS=CONSTANT,
+      UENTRY=BREAK);
+%VLP_NAME (FPTN=PASSWORD_NAME,
+      LEN=8,
+      NAME='PASSWORD');
+%VLP_ACCT (FPTN=XSIACCT,
+      ACCT=':XSI');
+%XUG_INIT (NAME=XUG_INIT,
+      STCLASS=STATIC,
+      COMMANDS=NO,
+      PCB=P_PCB,
+      PROCNAME=PASSWORD_NAME,
+      PROCACCT=XSIACCT);
+%XUG_GETCMD (NAME=GET_CMD,
+      STCLASS=STATIC,
+      INDCB=M$UC,
+      NODES=PASSWORD_);
+%VLP_TRMCTL (FPTN=VLP_TRMCTL,
+      STCLASS=STATIC);
+%FPT_TRMCTL (FPTN=FPT_TRMCTL,
+      STCLASS=STATIC,
+      TRMCTL=VLP_TRMCTL);
+%KL_DREC (NAME=KL_DREC,
+      STCLASS="STATIC SYMDEF",
+      LAST=",");
+%KL_FEBLK (NAME=KL$FEBLK,
+      RCNT=31,
+      LVL=2);
+%VLP_NAME (FPTN=COLONHLP,
+      STCLASS="CONSTANT SYMDEF",
+      LEN=4,
+      NAME=':HLP');
+%VLP_ACCT (FPTN=COLONSYS,
+      STCLASS="CONSTANT SYMDEF",
+      ACCT=':SYS');
+/***** error codes *****/
+%ERR_CODE (NAME=E_PASSCHNGE,MID#=CPE$IBEXMID,CODE#=E$PASSCHNGE,STCLASS=CONSTANT);
+%ERR_CODE (NAME=E_BADPASS,MID#=CPE$IBEXMID,CODE#=E$BADPASS,STCLASS=CONSTANT);
+%ERR_CODE (NAME=E_XPATOOLNG,MID#=CPX$IBEXMID,CODE#=E$XPATOOLNG,STCLASS=CONSTANT);
+ 
+  CALL M$INT(FPT_INT) WHENALTRETURN DO;
+                                    END;
+  REMEMBER PASSWORD_EXIT IN REMEM_PASSWORD_ABORT_ADDR;
+/*
+  **** Blank out B$JIT.CCBUF
+*/
+  CCBUF = B$JIT.CCBUF;
+  B$JIT.CCBUF = 'PASSWORD';
+  CCARS=B$JIT.CCARS;
+  B$JIT.CCARS=8;
+  DCB# = DCBNUM(M$PASS);
+ 
+IF B$JIT.MODE = %M_INT# THEN
+DO;
+  CALL M$GTRMCTL(FPT_TRMCTL) ALTRET(PASSWORD_ERR);
+  IF VLP_TRMCTL.DISPINPUT#
+    THEN
+      DO;
+        SET_ESC_E = %YES;
+        VLP_TRMCTL.DISPINPUT# = %NO;
+        CALL M$STRMCTL(FPT_TRMCTL) ALTRET(PASSWORD_ERR);
+      END;  /* Then Do */
+END;                /* DO IF INTERACTIVE */
+  GET_CMD.TEXT_ = VECTOR(CCBUF);
+  VBOUND(GET_CMD.TEXT_) = CCARS;
+  CALL XUG$INIT(GET_CMD, XUG_INIT) ALTRET(PASSWORD_ERR);
+  CALL XUG$GETCMD(GET_CMD) ALTRET(PASSWORD_CCBUFF_PARSE_ERR);
+ 
+  BLK$ = GET_CMD.OUT$;
+/*
+  **** Read in users record from :HLP
+*/
+  CALL RDHLP (DCB#) ALTRET(PASSWORD_EXIT);
+/*
+  ****  No option after password infers ... Account is not passworded or
+  ****  User forgot to specify the password.
+*/
+  OLDPASSWORD=' ';
+  NEWPASSWORD=' ';
+  I=0;
+  ERR_CODE='0'B;
+  IF (BLK$->P$B.NSUBLKS>1)
+     THEN DO;
+PASS5:  DO WHILE (I<BLK$->P$B.NSUBLKS);
+           TEMP$=BLK$->P$B.SUBLK$(I);
+PASS10:    DO CASE(TEMP$->P$B.CODE);
+            CASE(2 /*OLD PASSWORD */);
+              OLDPASSWORD=TEMP$->P$S.TEXT;
+/*            CALL CHK_IF_OLD_PASSWD_MATCHES ALTRET(PASSWORD_EXIT); */
+            CASE(3 /*NEW PASSWORD */);
+              NEWPASSWORD=TEMP$->P$S.TEXT;
+            END PASS10;
+           I=I+1;
+        END PASS5;
+               CALL CHK_IF_OLD_PASSWD_MATCHES ALTRET (PASSWORD_EXIT);
+               END;
+     ELSE
+        DO;                                     /* Prompt for Password. */
+GET_PASSWORDS:
+          DONE = %NO;
+          PROMPT_VEC_ = VECTOR(OLDPASSWORD_PROMPT);
+          GET_CMD.PROMPT_ = VECTOR(OLDPASSWORD_PROMPT);
+          GET_CMD.TEXT_ = VECTOR(NIL) ;
+          GET_CMD.NODES$ = ADDR(OLDPASSWD);
+          DO WHILE(NOT DONE);
+            CALL XUG$GETCMD(GET_CMD) ALTRET(PASSWORD_CCBUFF_PARSE_ERR);
+            BLK$ = GET_CMD.OUT$;
+            IF BLK$->P$S.COUNT>8
+              THEN
+                CALL WRITEMSGE(E_XPATOOLNG);
+              ELSE
+                DONE = %YES;
+          END;  /* Do While */
+          OLDPASSWORD=BLK$->P$S.TEXT;
+          CALL CHK_IF_OLD_PASSWD_MATCHES ALTRET(GET_PASSWORDS);
+          PASSWORD_GOOD = %NO;
+          DO WHILE (NOT PASSWORD_GOOD);
+            DONE = %NO;
+            PROMPT_VEC_ = VECTOR(NEWPASSWORD_PROMPT);
+            GET_CMD.PROMPT_ = VECTOR(NEWPASSWORD_PROMPT);
+            DO WHILE(NOT DONE);
+              CALL XUG$GETCMD(GET_CMD) ALTRET(PASSWORD_CCBUFF_PARSE_ERR);
+              BLK$ = GET_CMD.OUT$;
+              IF BLK$->P$S.COUNT>8
+                THEN
+                  CALL WRITEMSGE(E_XPATOOLNG);
+                ELSE
+                  DONE = %YES;
+            END;  /* Do While */
+            NEWPASSWORD=BLK$->P$S.TEXT;
+            DONE = %NO;
+            PROMPT_VEC_ = VECTOR(NEWPASSWORD_2_PROMPT);
+            GET_CMD.PROMPT_ = VECTOR(NEWPASSWORD_2_PROMPT);
+            DO WHILE(NOT DONE);
+              CALL XUG$GETCMD(GET_CMD) ALTRET(PASSWORD_CCBUFF_PARSE_ERR);
+              BLK$ = GET_CMD.OUT$;
+              IF BLK$->P$S.COUNT>8
+                THEN
+                  CALL WRITEMSGE(E_XPATOOLNG);
+                ELSE
+                  DONE = %YES;
+            END;  /* Do While */
+            NEWPASSWORD_2=BLK$->P$S.TEXT;
+            IF NEWPASSWORD ~= NEWPASSWORD_2
+              THEN
+                CALL M$WRITE(FPT_WRITE_NOGOOD) WHENALTRETURN DO;
+                                                END;
+              ELSE
+                PASSWORD_GOOD = %YES;
+          END; /* Do While */
+        END;  /* Else Do */
+/*
+  ****  Scramble the new password ... Assuming its O.K to scramble blanks
+*/
+  CALL ASZ$SCRAMBLE(NEWPASSWORD);                        /*Scramble new password*/
+/*
+  ****  O.K. To modify :HLP .... Reset to blanks if new pass. Wasn't spec'd
+*/
+  KL_DREC.PASSWORD = NEWPASSWORD;
+  CALL WRHLP (DCB#) ALTRET(PASSWORD_EXIT);
+/*
+  **** Close and save :HLP
+*/
+  FPT_CLOSE.V.DCB#=DCB#;
+  CALL M$CLOSE(FPT_CLOSE) ALTRET(PASSWORD_ERR);
+/*E*       ERROR: CPE-E$PASSCHNGE-C
+       MESSAGE: Password change successful
+           DESCRIPTION: The password in the :HLP   file was modified
+                        using the PASSWORD command.
+*/
+  CALL WRITEMSGE(E_PASSCHNGE);
+  PASSWORD_CHANGED=%YES;
+ 
+  DO NEVER;
+PASSWORD_CCBUFF_PARSE_ERR:;
+    ERR_CODE = GET_CMD.ERR#;
+  END;  /* Do While */
+ 
+  DO NEVER;
+PASSWORD_ERR:;
+    ERR_CODE = B$TCB.ALT$ -> B$EXCFR.ERR;
+  END;  /* Do While */
+ 
+  IF ERR_CODE ~= '0'B
+    THEN
+      DO;
+        CALL WRITEMSGE(ERR_CODE);
+        FPT_EXIT.CODE_ = VECTOR(ERR_CODE);
+        IF DCBADDR(DCB#)->F$DCB.FCD#
+          THEN
+            DO;
+                                              /* Close dcb */
+              FPT_CLOSE.V.DCB#=DCB#;
+              CALL M$CLOSE(FPT_CLOSE) WHENALTRETURN DO;
+                                                      END;
+            END;  /* Then Do */
+      END;  /* Then Do */
+ 
+PASSWORD_EXIT:;
+ 
+  IF NOT PASSWORD_CHANGED
+    THEN
+      DO;
+        FPT_WRITE_NOGOOD.BUF_=VECTOR(PASSWORD_NOT_CHANGED_MESS);
+        CALL M$WRITE(FPT_WRITE_NOGOOD) WHENALTRETURN DO;
+                                       END;
+      END;  /* Then Do */
+  IF SET_ESC_E AND B$JIT.MODE = %M_INT#
+    THEN
+      DO;
+        VLP_TRMCTL.DISPINPUT# = %YES#;
+        CALL M$STRMCTL(FPT_TRMCTL) ALTRET(PASSWORD_EXIT);
+       END;  /*  Then Do */
+  CALL M$EXIT(FPT_EXIT);
+%EJECT;
+CHK_IF_OLD_PASSWD_MATCHES: PROC ALTRET;
+ 
+/*
+  ****  Scramble the old password ... Assuming its O.K to scramble blanks
+*/
+  CALL ASZ$SCRAMBLE(OLDPASSWORD);                        /*Scramble old password*/
+/*
+  ****  Check if old password matches password in :HLP
+*/
+  IF OLDPASSWORD ~= KL_DREC.PASSWORD
+ 
+     THEN /* passwords dont match */
+       DO;
+         CALL WRITEMSGE(E_BADPASS);
+         ALTRETURN;
+       END;
+  RETURN;
+ 
+/*E*       ERROR: CPE-E$BADPASS-E
+       MESSAGE: Password supplied doesn't match current password
+           DESCRIPTION: The old password specified on the PASSWORD command
+                        doesn't correspond with the :HLP   password.
+*/
+END   CHK_IF_OLD_PASSWD_MATCHES;
+END   PASSWORD;

@@ -1,0 +1,936 @@
+
+
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=1  
+        1         1             /*
+        2         2              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        3         3              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        4         4              *
+        5         5              */
+        6         6
+        7         7             /*
+        8         8              *  L L G E N
+        9         9              *
+       10        10              *  An Extended LL(1) Parser Generator
+       11        11              *
+       12        12              *  Author : Ceriel J.H. Jacobs
+       13        13              */
+       14        14
+       15        15             /*
+       16        16              * compute.c
+       17        17              * Defines routines to compute FIRST, FOLLOW etc.
+       18        18              * Also checks the continuation grammar from the specified grammar.
+       19        19              */
+       20        20
+       21        21             # include "types:h"
+       22        22             # include "extern:h"
+       23        23             # include "sets:h"
+       24        24             # include "assert:h"
+       25        25             # include "io:h"
+       26        26
+       27        27             # ifndef NORCSID
+       28        28             static string rcsid = "$Header: compute.c,v 2.4 87/03/16 22:26:03 ceriel Exp $
+                               ";
+       29        29             # endif
+       30        30
+       31        31             p_set     get_set();
+       32        32             typedef struct lngth {
+       33        33    1               /* Structure used to compute the shortest possible
+       34        34    1                * length of a terminal production of a rule.
+       35        35    1                * In case of a tie, the second field is used.
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=2  
+       36        36    1                */
+       37        37    1         int cnt;
+       38        38    1         int val;
+       39        39    1        } t_length, *p_length;
+       40        40
+       41        41             /* Defined in this file : */
+       42        42             extern do_compute();
+       43        43             STATIC createsets();
+       44        44             STATIC walk();
+       45        45             STATIC co_trans();
+       46        46             STATIC int nempty();
+       47        47             extern empty();
+       48        48             STATIC int nfirst();
+       49        49             STATIC first();
+       50        50             STATIC int nfollow();
+       51        51             STATIC follow();
+       52        52             STATIC co_dirsymb();
+       53        53             STATIC co_others();
+       54        54             STATIC do_lengthcomp();
+       55        55             STATIC complength();
+       56        56             STATIC add();
+       57        57             STATIC int compare();
+       58        58             STATIC setdefaults();
+       59        59             STATIC do_contains();
+       60        60             STATIC contains();
+       61        61             STATIC int nsafes();
+       62        62             STATIC int do_safes();
+       63        63
+       64        64             do_compute() {
+       65        65    1         /*
+       66        66    1          * Does all the work, by calling other routines (divide and conquer)
+       67        67    1          */
+       68        68    1         register p_nont   p;
+       69        69    1         register p_start st;
+       70        70    1
+       71        71    1         createsets();
+       72        72    1         co_trans(nempty); /* Which nonterminals produce empty? */
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=3  
+       73        73    1         co_trans(nfirst); /* Computes first sets */
+       74        74    1         /*
+       75        75    1          * Compute FOLLOW sets.
+       76        76    1          * First put EOFILE in the follow set of the start nonterminals.
+       77        77    1          */
+       78        78    1         for (st = start; st; st = st->ff_next) {
+       79        79    2            p = &nonterms[st->ff_nont];
+       80        80    2            PUTIN(p->n_follow,0);
+       81        81    2         }
+       82        82    1         co_trans(nfollow);
+       83        83    1         /*
+       84        84    1          * Compute the sets which determine which alternative to choose
+       85        85    1          * in case of a choice
+       86        86    1          */
+       87        87    1         for (p = nonterms; p < maxnt; p++) {
+       88        88    2            co_dirsymb(p->n_follow,p->n_rule);
+       89        89    2         }
+       90        90    1         /*
+       91        91    1          * Compute the minimum length of productions of nonterminals,
+       92        92    1          * and then determine the default choices
+       93        93    1          */
+       94        94    1         do_lengthcomp();
+       95        95    1         /*
+       96        96    1          * Compute the contains sets
+       97        97    1          */
+       98        98    1         for (p = nonterms; p < maxnt; p++) do_contains(p);
+       99        99    1         for (p = nonterms; p < maxnt; p++) contains(p->n_rule, (p_set) 0);
+      100       100    1         /*
+      101       101    1          * Compute the safety of each nonterminal and term.
+      102       102    1          * The safety gives an answer to the question whether a scan is done,
+      103       103    1          * and how it should be handled.
+      104       104    1          */
+      105       105    1         for (p = nonterms; p < maxnt; p++) {
+      106       106    2            /*
+      107       107    2             * Don't know anything yet
+      108       108    2             */
+      109       109    2            setntsafe(p, NOSAFETY);
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=4  
+      110       110    2            setntout(p, NOSAFETY);
+      111       111    2         }
+      112       112    1         for (st = start; st; st = st->ff_next) {
+      113       113    2            /*
+      114       114    2             * But start symbols are called with lookahead done
+      115       115    2             */
+      116       116    2            p = &nonterms[st->ff_nont];
+      117       117    2            setntsafe(p,SCANDONE);
+      118       118    2         }
+      119       119    1         co_trans(nsafes);
+      120       120    1        # ifndef NDEBUG
+      121       121    1         if (debug) {
+      122       122    2            fputs("Safeties:\n", stderr);
+      123       123    2            for (p = nonterms; p < maxnt; p++) {
+      124       124    3               fprintf(stderr, "%s\t%d\t%d\n",
+      125       125    3                  p->n_name,
+      126       126    3                  getntsafe(p),
+      127       127    3                  getntout(p));
+      128       128    3            }
+      129       129    2         }
+      130       130    1        # endif
+      131       131    1        }
+      132       132
+      133       133             STATIC
+      134       134             createsets() {
+      135       135    1         /*
+      136       136    1          * Allocate space for the sets
+      137       137    1          */
+      138       138    1         register p_nont p;
+      139       139    1
+      140       140    1         for (p = nonterms; p < maxnt; p++) {
+      141       141    2            p->n_first = get_set();
+      142       142    2            p->n_follow = get_set();
+      143       143    2            walk(p->n_rule);
+      144       144    2         }
+      145       145    1        }
+      146       146
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=5  
+      147       147             STATIC
+      148       148             walk(p) register p_gram p; {
+      149       149    1         /*
+      150       150    1          * Walk through the grammar rule p, allocating sets
+      151       151    1          */
+      152       152    1
+      153       153    1         for (;;) {
+      154       154    2            switch (g_gettype(p)) {
+      155       155    3              case TERM : {
+      156       156    4               register p_term q;
+      157       157    4
+      158       158    4               q = &terms[g_getcont(p)];
+      159       159    4               q->t_first = get_set();
+      160       160    4               q->t_follow = get_set();
+      161       161    4               walk(q->t_rule);
+      162       162    4               break; }
+      163       163    3              case ALTERNATION : {
+      164       164    4               register p_link l;
+      165       165    4
+      166       166    4               l = &links[g_getcont(p)];
+      167       167    4               l->l_symbs = get_set();
+      168       168    4               l->l_others = get_set();
+      169       169    4               walk(l->l_rule);
+      170       170    4               break; }
+      171       171    3              case EORULE :
+      172       172    3               return;
+      173       173    3            }
+      174       174    2            p++;
+      175       175    2         }
+      176       176    1        }
+      177       177
+      178       178             STATIC
+      179       179             co_trans(fc) int (*fc)(); {
+      180       180    1         register p_nont p;
+      181       181    1         register int change;
+      182       182    1
+      183       183    1         do {
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=6  
+      184       184    2            change = 0;
+      185       185    2            for (p = nonterms; p < maxnt; p++) {
+      186       186    3               if ((*fc)(p)) change = 1;
+      187       187    3            }
+      188       188    2         } while (change);
+      189       189    1        }
+      190       190
+      191       191             STATIC int
+      192       192             nempty(p) register p_nont p; {
+      193       193    1         if (!(p->n_flags & EMPTY) && empty(p->n_rule)) {
+      194       194    2            p->n_flags |= EMPTY;
+      195       195    2            return 1;
+      196       196    2         }
+      197       197    1         return 0;
+      198       198    1        }
+      199       199
+      200       200             empty(p) register p_gram p; {
+      201       201    1         /*
+      202       202    1          * Does the rule pointed to by p produce empty ?
+      203       203    1          */
+      204       204    1
+      205       205    1         for (;;) {
+      206       206    2            switch (g_gettype(p)) {
+      207       207    3              case EORULE :
+      208       208    3               return 1;
+      209       209    3              case TERM :  {
+      210       210    4               register p_term q;
+      211       211    4
+      212       212    4               q = &terms[g_getcont(p)];
+      213       213    4               if (r_getkind(q) == STAR
+      214       214    4                   || r_getkind(q) == OPT
+      215       215    4                   || empty(q->t_rule) ) break;
+      216       216    4               return 0; }
+      217       217    3              case ALTERNATION :
+      218       218    3               if (empty(links[g_getcont(p)].l_rule)) {
+      219       219    4                  return 1;
+      220       220    4               }
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=7  
+      221       221    3               if (g_gettype(p+1) == EORULE) return 0;
+      222       222    3               break;
+      223       223    3              case NONTERM :
+      224       224    3               if (nonterms[g_getnont(p)].n_flags & EMPTY) {
+      225       225    4                  break;
+      226       226    4               }
+      227       227    3               /* Fall through */
+      228       228    3              case LITERAL :
+      229       229    3              case TERMINAL :
+      230       230    3               return 0;
+      231       231    3            }
+      232       232    2            p++;
+      233       233    2         }
+      234       234    1        }
+      235       235
+      236       236             STATIC int
+      237       237             nfirst(p) register p_nont p; {
+      238       238    1         return first(p->n_first, p->n_rule, 0);
+      239       239    1        }
+      240       240
+      241       241             STATIC
+      242       242             first(setp,p,flag) p_set setp; register p_gram p; {
+      243       243    1         /*
+      244       244    1          * Compute the FIRST set of rule p.
+      245       245    1          * If flag = 0, also the first sets for terms and alternations in
+      246       246    1          * the rule p are computed.
+      247       247    1          * The FIRST set is put in setp.
+      248       248    1          * return 1 if the set refered to by "setp" changed
+      249       249    1          */
+      250       250    1         register s; /* Will gather return value */
+      251       251    1         int      noenter;/* when set, unables entering of elements into
+      252       252    1                   * setp. This is necessary to walk through the
+      253       253    1                   * rest of rule p.
+      254       254    1                   */
+      255       255    1
+      256       256    1         s = 0;
+      257       257    1         noenter = 0;
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=8  
+      258       258    1         for (;;) {
+      259       259    2            switch (g_gettype(p)) {
+      260       260    3              case EORULE :
+      261       261    3               return s;
+      262       262    3              case TERM : {
+      263       263    4               register p_term q;
+      264       264    4
+      265       265    4               q = &terms[g_getcont(p)];
+      266       266    4               if (flag == 0) {
+      267       267    5                  if (first(q->t_first,q->t_rule,0))/*nothing*/;
+      268       268    5               }
+      269       269    4               if (!noenter) s |= setunion(setp,q->t_first);
+      270       270    4               p++;
+      271       271    4               if (r_getkind(q) == STAR ||
+      272       272    4                   r_getkind(q) == OPT ||
+      273       273    4                   empty(q->t_rule)) continue;
+      274       274    4               break; }
+      275       275    3              case ALTERNATION : {
+      276       276    4               register p_link l;
+      277       277    4
+      278       278    4               l = &links[g_getcont(p)];
+      279       279    4               if (flag == 0) {
+      280       280    5                  if (first(l->l_symbs,l->l_rule,0))/*nothing*/;
+      281       281    5               }
+      282       282    4               if (noenter == 0) {
+      283       283    5                  s |= setunion(setp,l->l_symbs);
+      284       284    5               }
+      285       285    4               if (g_gettype(p+1) == EORULE) return s;
+      286       286    4               }
+      287       287    3               /* Fall Through */
+      288       288    3              case ACTION :
+      289       289    3               p++;
+      290       290    3               continue;
+      291       291    3              case LITERAL :
+      292       292    3              case TERMINAL :
+      293       293    3               if ((noenter == 0) && !IN(setp,g_getcont(p))) {
+      294       294    4                  s = 1;
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=9  
+      295       295    4                  PUTIN(setp,g_getcont(p));
+      296       296    4               }
+      297       297    3               p++;
+      298       298    3               break;
+      299       299    3              case NONTERM : {
+      300       300    4               register p_nont n;
+      301       301    4
+      302       302    4               n = &nonterms[g_getnont(p)];
+      303       303    4               if (noenter == 0)  {
+      304       304    5                  s |= setunion(setp,n->n_first);
+      305       305    5                  if (ntneeded) NTPUTIN(setp,g_getnont(p));
+      306       306    5               }
+      307       307    4               p++;
+      308       308    4               if (n->n_flags & EMPTY) continue;
+      309       309    4               break; }
+      310       310    3            }
+      311       311    2            if (flag == 0) {
+      312       312    3               noenter = 1;
+      313       313    3               continue;
+      314       314    3            }
+      315       315    2            return s;
+      316       316    2         }
+      317       317    1        }
+      318       318
+      319       319             STATIC int
+      320       320             nfollow(p) register p_nont p; {
+      321       321    1         return follow(p->n_follow, p->n_rule);
+      322       322    1        }
+      323       323
+      324       324             STATIC
+      325       325             follow(setp,p) p_set setp; register p_gram p; {
+      326       326    1         /*
+      327       327    1          * setp is the follow set for the rule p.
+      328       328    1          * Compute the follow sets in the rule p from this set.
+      329       329    1          * Return 1 if a follow set of a nonterminal changed.
+      330       330    1          */
+      331       331    1         register s; /* Will gather return value */
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=10 
+      332       332    1
+      333       333    1         s = 0;
+      334       334    1         for (;;) {
+      335       335    2            switch (g_gettype(p)) {
+      336       336    3              case EORULE :
+      337       337    3               return s;
+      338       338    3              case TERM : {
+      339       339    4               register p_term q;
+      340       340    4
+      341       341    4               q = &terms[g_getcont(p)];
+      342       342    4               if (empty(p+1)) {
+      343       343    5                  /*
+      344       344    5                   * If what follows the term can be empty,
+      345       345    5                   * everything that can follow the whole
+      346       346    5                   * rule can also follow the term
+      347       347    5                   */
+      348       348    5                  s |= setunion(q->t_follow,setp);
+      349       349    5               }
+      350       350    4               /*
+      351       351    4                * Everything that can start the rest of the rule
+      352       352    4                * can follow the term
+      353       353    4                */
+      354       354    4               s |= first(q->t_follow,p+1,1);
+      355       355    4               if (r_getkind(q) == STAR ||
+      356       356    4                   r_getkind(q) == PLUS ||
+      357       357    4                   r_getnum(q) ) {
+      358       358    5                  /*
+      359       359    5                   * If the term involves a repetition
+      360       360    5                   * of possibly more than one,
+      361       361    5                   * everything that can start the term
+      362       362    5                   * can also follow it.
+      363       363    5                   */
+      364       364    5                  s |= follow(q->t_first,q->t_rule);
+      365       365    5               }
+      366       366    4               /*
+      367       367    4                * Now propagate the set computed sofar
+      368       368    4                */
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=11 
+      369       369    4               s |= follow(q->t_follow, q->t_rule);
+      370       370    4               break; }
+      371       371    3              case ALTERNATION :
+      372       372    3               /*
+      373       373    3                * Just propagate setp
+      374       374    3                */
+      375       375    3               s |= follow(setp,links[g_getcont(p)].l_rule);
+      376       376    3               break;
+      377       377    3              case NONTERM : {
+      378       378    4               register p_nont n;
+      379       379    4
+      380       380    4               n = &nonterms[g_getnont(p)];
+      381       381    4               s |= first(n->n_follow,p+1,1);
+      382       382    4               if (empty(p+1)) {
+      383       383    5                  /*
+      384       384    5                   * If the rest of p can produce empty,
+      385       385    5                   * everything that follows p can follow
+      386       386    5                   * the nonterminal
+      387       387    5                   */
+      388       388    5                  s |= setunion(n->n_follow,setp);
+      389       389    5               }
+      390       390    4               break; }
+      391       391    3            }
+      392       392    2            p++;
+      393       393    2         }
+      394       394    1        }
+      395       395
+      396       396             STATIC
+      397       397             co_dirsymb(setp,p) p_set setp; register p_gram p; {
+      398       398    1         /*
+      399       399    1          * Walk the rule p, doing the work for alternations
+      400       400    1          */
+      401       401    1         register p_gram s = 0;
+      402       402    1
+      403       403    1         for (;;) {
+      404       404    2            switch (g_gettype(p)) {
+      405       405    3              case EORULE :
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=12 
+      406       406    3               return;
+      407       407    3              case TERM : {
+      408       408    4               register p_term q;
+      409       409    4
+      410       410    4               q = &terms[g_getcont(p)];
+      411       411    4               co_dirsymb(q->t_follow,q->t_rule);
+      412       412    4               break; }
+      413       413    3              case ALTERNATION : {
+      414       414    4               register p_link l;
+      415       415    4               /*
+      416       416    4                * Save first alternative
+      417       417    4                */
+      418       418    4               if (!s) s = p;
+      419       419    4               l = &links[g_getcont(p)];
+      420       420    4               co_dirsymb(setp,l->l_rule);
+      421       421    4               if (empty(l->l_rule)) {
+      422       422    5                  /*
+      423       423    5                   * If the rule can produce empty, everything
+      424       424    5                   * that follows it can also start it
+      425       425    5                   */
+      426       426    5                  setunion(l->l_symbs,setp);
+      427       427    5               }
+      428       428    4               if (g_gettype(p+1) == EORULE) {
+      429       429    5                  /*
+      430       430    5                   * Every alternation is implemented as a
+      431       431    5                   * choice between two alternatives :
+      432       432    5                   * this one or one of the following.
+      433       433    5                   * The l_others set will contain the starters
+      434       434    5                   * of the other alternatives
+      435       435    5                   */
+      436       436    5                  co_others(s);
+      437       437    5                  return;
+      438       438    5               } }
+      439       439    3            }
+      440       440    2            p++;
+      441       441    2         }
+      442       442    1        }
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=13 
+      443       443
+      444       444             STATIC
+      445       445             co_others(p) register p_gram p; {
+      446       446    1         /*
+      447       447    1          * compute the l_others-sets for the list of alternatives
+      448       448    1          * indicated by p
+      449       449    1          */
+      450       450    1         register p_link l1,l2;
+      451       451    1
+      452       452    1         l1 = &links[g_getcont(p)];
+      453       453    1         p++;
+      454       454    1         l2 = &links[g_getcont(p)];
+      455       455    1         setunion(l1->l_others,l2->l_symbs);
+      456       456    1         if (g_gettype(p+1) != EORULE) {
+      457       457    2            /*
+      458       458    2             * First compute l2->l_others
+      459       459    2             */
+      460       460    2            co_others(p);
+      461       461    2            /*
+      462       462    2             * and then l1->l_others
+      463       463    2             */
+      464       464    2            setunion(l1->l_others,l2->l_others);
+      465       465    2         }
+      466       466    1        }
+      467       467
+      468       468             static p_length length;
+      469       469             # define INFINITY 32767
+      470       470
+      471       471             STATIC
+      472       472             ncomplength(p)
+      473       473              register p_nont p;
+      474       474             {
+      475       475    1         register p_length pl = &length[p - nonterms];
+      476       476    1         int x = pl->cnt;
+      477       477    1
+      478       478    1         pl->cnt = -1;
+      479       479    1         complength(p->n_rule, pl);
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=14 
+      480       480    1         return pl->cnt < INFINITY && x == INFINITY;
+      481       481    1        }
+      482       482
+      483       483             STATIC
+      484       484             do_lengthcomp() {
+      485       485    1         /*
+      486       486    1          * Compute the minimum length of a terminal production for each
+      487       487    1          * nonterminal.
+      488       488    1          * This length consists of two fields: the number of terminals,
+      489       489    1          * and a number that is composed of
+      490       490    1          * - the value of the first terminal
+      491       491    1          * - a crude measure of the number of terms and nonterminals in the
+      492       492    1          *   production of this shortest string.
+      493       493    1          */
+      494       494    1         register p_length pl;
+      495       495    1         register p_nont p;
+      496       496    1         register p_start st;
+"zbl$compute:c.:ZBC3TSI", line 496: (warning) identifier "st" is not used
+      497       497    1         int change = 1;
+"zbl$compute:c.:ZBC3TSI", line 497: (warning) identifier "change" is not used
+      498       498    1         p_mem alloc();
+      499       499    1
+      500       500    1         length = (p_length) alloc((unsigned) (nnonterms * sizeof(*length)));
+      501       501    1         for (pl = &length[nnonterms-1]; pl >= length; pl--) {
+      502       502    2            pl->val = pl->cnt = INFINITY;
+      503       503    2         }
+      504       504    1
+      505       505    1         co_trans(ncomplength);
+      506       506    1
+      507       507    1         pl = length;
+      508       508    1         for (p = nonterms; p < maxnt; p++, pl++) {
+      509       509    2            if (pl->cnt == INFINITY) {
+      510       510    3               p->n_flags |= RECURSIVE;
+      511       511    3            }
+      512       512    2            setdefaults(p->n_rule);
+      513       513    2         }
+      514       514    1         free ((p_mem) length);
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=15 
+      515       515    1        }
+      516       516
+      517       517             STATIC
+      518       518             complength(p,le) register p_gram p; p_length le; {
+      519       519    1         /*
+      520       520    1          * Walk grammar rule p, computing minimum lengths
+      521       521    1          */
+      522       522    1         register p_link l;
+      523       523    1         register p_term q;
+      524       524    1         t_length i;
+      525       525    1         t_length X;
+      526       526    1
+      527       527    1         X.cnt = 0;
+      528       528    1         X.val = 0;
+      529       529    1         for (;;) {
+      530       530    2            switch (g_gettype(p)) {
+      531       531    3              case LITERAL :
+      532       532    3              case TERMINAL :
+      533       533    3               if (!X.cnt) add(&X, 1, g_getcont(p));
+      534       534    3               else add(&X, 1, 0);
+      535       535    3               break;
+      536       536    3              case ALTERNATION :
+      537       537    3
+      538       538    3               X.cnt = INFINITY;
+      539       539    3               X.val = INFINITY;
+      540       540    3               while (g_gettype(p) != EORULE) {
+      541       541    4                  l = &links[g_getcont(p)];
+      542       542    4                  complength(l->l_rule,&i);
+      543       543    4                  if (l->l_flag & DEF) {
+      544       544    5                     X = i;
+      545       545    5                     break;
+      546       546    5                  }
+      547       547    4                  if (compare(&i, &X) < 0) {
+      548       548    5                     X = i;
+      549       549    5                  }
+      550       550    4                  p++;
+      551       551    4               }
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=16 
+      552       552    3               /* Fall through */
+      553       553    3              case EORULE :
+      554       554    3               le->cnt = X.cnt;
+      555       555    3               le->val = X.val;
+      556       556    3               return;
+      557       557    3              case TERM : {
+      558       558    4               register int rep;
+      559       559    4
+      560       560    4               q = &terms[g_getcont(p)];
+      561       561    4               rep = r_getkind(q);
+      562       562    4               if ((q->t_flags&PERSISTENT) ||
+      563       563    4                   rep==FIXED || rep==PLUS) {
+      564       564    5                  complength(q->t_rule,&i);
+      565       565    5                  add(&X, i.cnt, i.val);
+      566       566    5                  if (i.cnt == 0) X.val += ntokens;
+      567       567    5                  if (rep == FIXED && r_getnum(q) > 0) {
+      568       568    6                     for (rep = r_getnum(q) - 1;
+      569       569    6                          rep > 0; rep--) {
+      570       570    7                        add(&X, i.cnt, i.val);
+      571       571    7                     }
+      572       572    6                  }
+      573       573    5               }
+      574       574    4               else {
+      575       575    5                  /* Empty producing term on this path */
+      576       576    5                   X.val += ntokens;
+      577       577    5               }
+      578       578    4               break; }
+      579       579    3              case NONTERM : {
+      580       580    4               int nn = g_getnont(p);
+      581       581    4               register p_length pl = &length[nn];
+      582       582    4               int x = pl->cnt;
+      583       583    4
+      584       584    4               if (x == INFINITY) {
+      585       585    5                  pl->cnt = -1;
+      586       586    5                  complength(nonterms[nn].n_rule,pl);
+      587       587    5                  x = pl->cnt;
+      588       588    5               }
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=17 
+      589       589    4               else if (x == -1) x = INFINITY;
+      590       590    4               add(&X, x, pl->val);
+      591       591    4               if (x == 0) {
+      592       592    5                  /* Empty producing nonterminal */
+      593       593    5                  X.val += ntokens;
+      594       594    5               }}
+      595       595    3            }
+      596       596    2            p++;
+      597       597    2         }
+      598       598    1        }
+      599       599
+      600       600             STATIC
+      601       601             add(a, c, v) register p_length a; {
+      602       602    1
+      603       603    1         if (a->cnt == INFINITY || c == INFINITY) {
+      604       604    2            a->cnt = INFINITY;
+      605       605    2            return;
+      606       606    2         }
+      607       607    1         if (a->cnt == 0) a->val = v;
+      608       608    1         a->cnt += c;
+      609       609    1        }
+      610       610
+      611       611             STATIC int
+      612       612             compare(a, b) register p_length a, b; {
+      613       613    1         if (a->cnt != b->cnt) return a->cnt - b->cnt;
+      614       614    1         return a->val - b->val;
+      615       615    1        }
+      616       616
+      617       617             STATIC
+      618       618             setdefaults(p) register p_gram p; {
+      619       619    1         for (;;) {
+      620       620    2            switch(g_gettype(p)) {
+      621       621    3              case EORULE:
+      622       622    3               return;
+      623       623    3              case TERM:
+      624       624    3               setdefaults(terms[g_getcont(p)].t_rule);
+      625       625    3               break;
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=18 
+      626       626    3              case ALTERNATION: {
+      627       627    4               register p_link l, l1;
+      628       628    4               int temp = 0, temp1;
+      629       629    4               t_length count, i;
+      630       630    4
+      631       631    4               count.cnt = INFINITY;
+      632       632    4               count.val = INFINITY;
+      633       633    4               l1 = &links[g_getcont(p)];
+      634       634    4               do {
+      635       635    5                  l = &links[g_getcont(p)];
+      636       636    5                  complength(l->l_rule,&i);
+      637       637    5                  if (l->l_flag & DEF) temp = 1;
+      638       638    5                  temp1 = compare(&i, &count);
+      639       639    5                  if (temp1 < 0 ||
+      640       640    5                      (temp1 == 0 && l1->l_flag & AVOIDING)) {
+      641       641    6                     l1 = l;
+      642       642    6                     count = i;
+      643       643    6                  }
+      644       644    5                  setdefaults(l->l_rule);
+      645       645    5                  p++;
+      646       646    5               } while (g_gettype(p) != EORULE);
+      647       647    4               if (!temp) {
+      648       648    5                  /* No user specified default */
+      649       649    5                  l1->l_flag |= DEF;
+      650       650    5               }
+      651       651    4               return; }
+      652       652    3            }
+      653       653    2            p++;
+      654       654    2         }
+      655       655    1        }
+      656       656
+      657       657             STATIC
+      658       658             do_contains(n) register p_nont n; {
+      659       659    1         /*
+      660       660    1          * Compute the total set of symbols that nonterminal n can
+      661       661    1          * produce
+      662       662    1          */
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=19 
+      663       663    1
+      664       664    1         if (n->n_contains == 0) {
+      665       665    2            n->n_contains = get_set();
+      666       666    2            contains(n->n_rule,n->n_contains);
+      667       667    2            /*
+      668       668    2             * If the rule can produce empty, delete all symbols that
+      669       669    2             * can follow the rule as well as be in the rule.
+      670       670    2             * This is needed because the contains-set may only contain
+      671       671    2             * symbols that are guaranteed to be eaten by the rule!
+      672       672    2             * Otherwise, the generated parser may loop forever
+      673       673    2             */
+      674       674    2            if (n->n_flags & EMPTY) {
+      675       675    3               setminus(n->n_contains,n->n_follow);
+      676       676    3            }
+      677       677    2            /*
+      678       678    2             * But the symbols that can start the rule are always
+      679       679    2             * eaten
+      680       680    2             */
+      681       681    2            setunion(n->n_contains,n->n_first);
+      682       682    2         }
+      683       683    1        }
+      684       684
+      685       685             STATIC
+      686       686             contains(p,set) register p_gram p; register p_set set; {
+      687       687    1         /*
+      688       688    1          * Does the real computation of the contains-sets
+      689       689    1          */
+      690       690    1
+      691       691    1         for (;;) {
+      692       692    2            switch (g_gettype(p)) {
+      693       693    3              case EORULE :
+      694       694    3               return;
+      695       695    3              case TERM : {
+      696       696    4               register p_term q;
+      697       697    4               int rep;
+      698       698    4
+      699       699    4               q = &terms[g_getcont(p)];
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=20 
+      700       700    4               rep = r_getkind(q);
+      701       701    4               if ((q->t_flags & PERSISTENT) ||
+      702       702    4                   rep == PLUS || rep == FIXED) {
+      703       703    5                  /*
+      704       704    5                   * In these cases, the term belongs to the
+      705       705    5                   * continuation grammar.
+      706       706    5                   * Otherwise, q->t_contains is just
+      707       707    5                   * q->t_first
+      708       708    5                   */
+      709       709    5                  if (!q->t_contains) {
+      710       710    6                      q->t_contains = get_set();
+      711       711    6                  }
+      712       712    5                  contains(q->t_rule,q->t_contains);
+      713       713    5                  if (rep != FIXED || empty(q->t_rule)) {
+      714       714    6                     setminus(q->t_contains,q->t_follow);
+      715       715    6                  }
+      716       716    5                  setunion(q->t_contains,q->t_first);
+      717       717    5               } else {
+      718       718    5                  contains(q->t_rule, (p_set) 0);
+      719       719    5                  q->t_contains = q->t_first;
+      720       720    5               }
+      721       721    4               if (set) setunion(set,q->t_contains);
+      722       722    4               break; }
+      723       723    3              case NONTERM : {
+      724       724    4               register p_nont n;
+      725       725    4
+      726       726    4               n = &nonterms[g_getnont(p)];
+      727       727    4               do_contains(n);
+      728       728    4               if (set) {
+      729       729    5                  setunion(set, n->n_contains);
+      730       730    5                  if (ntneeded) NTPUTIN(set, g_getnont(p));
+      731       731    5               }
+      732       732    4               break; }
+      733       733    3              case ALTERNATION : {
+      734       734    4               register p_link l;
+      735       735    4
+      736       736    4               l = &links[g_getcont(p)];
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=21 
+      737       737    4               contains(l->l_rule,
+      738       738    4                  (l->l_flag & DEF) ? set : (p_set) 0);
+      739       739    4               break; }
+      740       740    3              case LITERAL :
+      741       741    3              case TERMINAL : {
+      742       742    4               register hulp;
+      743       743    4
+      744       744    4               if (set) {
+      745       745    5                  hulp = g_getcont(p);
+      746       746    5                  assert(hulp < ntokens);
+      747       747    5                  PUTIN(set,hulp);
+      748       748    5               }}
+      749       749    3            }
+      750       750    2            p++;
+      751       751    2         }
+      752       752    1        }
+      753       753
+      754       754             STATIC int nsafes(p) register p_nont p; {
+      755       755    1         int   ch;
+      756       756    1         register int i;
+      757       757    1
+      758       758    1         ch = 0;
+      759       759    1         i = getntsafe(p);
+      760       760    1         if (i != NOSAFETY) {
+      761       761    2            i = do_safes(p->n_rule, i, &ch);
+      762       762    2            if (i < SCANDONE) i = SCANDONE;
+      763       763    2            /* After a nonterminal, we only know whether a scan was done
+      764       764    2               or not
+      765       765    2            */
+      766       766    2            if (getntout(p) != i) {
+      767       767    3               ch = 1;
+      768       768    3               setntout(p,i);
+      769       769    3            }
+      770       770    2         }
+      771       771    1         return ch;
+      772       772    1        }
+      773       773
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=22 
+      774       774             STATIC int
+      775       775             do_safes(p,safe,ch) register p_gram p; register int *ch; {
+      776       776    1         /*
+      777       777    1          * Walk the grammar rule, doing the computation described in the
+      778       778    1          * comment of the procedure above this one.
+      779       779    1          */
+      780       780    1         int   retval;
+      781       781    1
+      782       782    1         for (;;) {
+      783       783    2            switch (g_gettype(p)) {
+      784       784    3              case ACTION:
+      785       785    3               p++;
+      786       786    3               continue;
+      787       787    3              case LITERAL:
+      788       788    3              case TERMINAL:
+      789       789    3               safe = NOSCANDONE;
+      790       790    3               break;
+      791       791    3              case TERM : {
+      792       792    4               register p_term q;
+      793       793    4               int i,rep;
+      794       794    4
+      795       795    4               q = &terms[g_getcont(p)];
+      796       796    4               i = r_getnum(q);
+      797       797    4               rep = r_getkind(q);
+      798       798    4               retval = do_safes(q->t_rule,
+      799       799    4                      t_safety(rep,i,q->t_flags&PERSISTENT,safe),ch);
+      800       800    4               settout(q, retval);
+      801       801    4               safe = t_after(rep, i, retval);
+      802       802    4               break; }
+      803       803    3              case ALTERNATION : {
+      804       804    4               register p_link l;
+      805       805    4               register int i, f;
+      806       806    4
+      807       807    4               f = 1;
+      808       808    4               while (g_gettype(p) == ALTERNATION) {
+      809       809    5                  l = &links[g_getcont(p)];
+      810       810    5                  if (safe > SAFE && (l->l_flag & DEF)) {
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=23 
+      811       811    6                     i = do_safes(l->l_rule,SAFESCANDONE,ch);
+      812       812    6                  }
+      813       813    5                  else  i = do_safes(l->l_rule,SAFE,ch);
+      814       814    5                  if (f) retval = i;
+      815       815    5                  else if (i != retval) {
+      816       816    6                     if (i == NOSCANDONE ||
+      817       817    6                         retval == NOSCANDONE) {
+      818       818    7                        retval = SCANDONE;
+      819       819    7                     }
+      820       820    6                     else if (i > retval) retval = i;
+      821       821    6                  }
+      822       822    5                  p++;
+      823       823    5                  f = 0;
+      824       824    5               }
+      825       825    4               return retval; }
+      826       826    3              case NONTERM : {
+      827       827    4               register p_nont n;
+      828       828    4               register int nsafe, osafe;
+      829       829    4
+      830       830    4               n = &nonterms[g_getnont(p)];
+      831       831    4               nsafe = getntsafe(n);
+      832       832    4               osafe = safe;
+      833       833    4               safe = getntout(n);
+      834       834    4               if (safe == NOSAFETY) safe = SCANDONE;
+      835       835    4               if (osafe == nsafe) break;
+      836       836    4               if (nsafe == NOSAFETY) {
+      837       837    5                  *ch = 1;
+      838       838    5                  setntsafe(n, osafe);
+      839       839    5                  break;
+      840       840    5               }
+      841       841    4               if (osafe == NOSCANDONE || nsafe == NOSCANDONE) {
+      842       842    5                  if (nsafe != SCANDONE) {
+      843       843    6                     *ch = 1;
+      844       844    6                     setntsafe(n, SCANDONE);
+      845       845    6                  }
+      846       846    5                  break;
+      847       847    5               }
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=24 
+      848       848    4               if (osafe > nsafe) {
+      849       849    5                  setntsafe(n, osafe);
+      850       850    5                  *ch = 1;
+      851       851    5               }
+      852       852    4               break; }
+      853       853    3              case EORULE :
+      854       854    3               return safe;
+      855       855    3            }
+      856       856    2            p++;
+      857       857    2         }
+      858       858    1        }
+      859       859
+      860       860             t_safety(rep, count, persistent, safety) {
+      861       861    1
+      862       862    1         if (safety == NOSCANDONE) safety = SCANDONE;
+      863       863    1         switch(rep) {
+      864       864    2           default:
+      865       865    2            assert(0);
+      866       866    2           case OPT:
+      867       867    2            if (!persistent || safety < SAFESCANDONE) return SAFE;
+      868       868    2            return SAFESCANDONE;
+      869       869    2           case STAR:
+      870       870    2            if (persistent) return SAFESCANDONE;
+      871       871    2            return SAFE;
+      872       872    2           case PLUS:
+      873       873    2            if (persistent) {
+      874       874    3               if (safety > SAFESCANDONE) return safety;
+      875       875    3               return SAFESCANDONE;
+      876       876    3            }
+      877       877    2            return safety;
+      878       878    2           case FIXED:
+      879       879    2            if (!count) return safety;
+      880       880    2            return SCANDONE;
+      881       881    2         }
+      882       882    1         /* NOTREACHED */
+      883       883    1        }
+      884       884
+CC.C03    File=zbl$compute:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=25 
+      885       885             t_after(rep, count, outsafety) {
+      886       886    1         if (count == 0 && (rep == STAR || rep == PLUS)) {
+      887       887    2            return SAFESCANDONE;
+      888       888    2         }
+      889       889    1         if (rep != FIXED) {
+      890       890    2            if (outsafety <= SAFESCANDONE) return SAFESCANDONE;
+      891       891    2            return SCANDONE;
+      892       892    2         }
+      893       893    1         return outsafety;
+      894       894    1        }
+      895       895
+---  Include file information  ---
+
+   zbl$types:h.:ZBC3TOU. is referenced
+   zbl$extern:h.:ZBC3TOU. is referenced
+   zbl$sets:h.:ZBC3TOU. is referenced
+   zbl$assert:h.:ZBC3TOU. is referenced
+   zbl$io:h.:ZBC3TOU. is referenced
+   stdio:h.:LIB_E05. is referenced
+
+2 warnings were detected in the file zbl$compute:c.:ZBC3TSI

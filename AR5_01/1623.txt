@@ -1,0 +1,2635 @@
+VERSION E05
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:1    
+        1        1        /*M* Level 0 MM routines for allocation of physical pages */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR,PLM=5,IND=5,CTI=5,SDI=5,MCL=10,CSI=0,ECI=0 */
+        8        8
+        9        9        /*F*   NAME:   MMB$GPP  */
+       10       10        /*F*   PURPOSE: To acquire a physical page for either monitor or user */
+       11       11
+       12       12        MMB$GPP: PROC (PPNO , WSQ) ALTRET;
+       13       13        /*
+       14       14        We check to see that the pages held back for the monitor
+       15       15        are available, and then allocate a page. If checking page chains
+       16       16        we do it.
+       17       17             If the user is reged because of no memory and the user breaks
+       18       18             or gets x'ed we will altreturn with out allocating a page.
+       19       19        */
+       20       20    1   DCL PPNO SBIN;                          /* Physical page number               */
+       21       21    1   DCL WSQ UBIN;                           /* WSQ to allocate page for           */
+       22       22    1   DCL TEMP1 SBIN;
+       23       23    1   DCL T1 SBIN;
+       24       24    1   DCL T2 SBIN;
+       25       25
+       26       26
+       27       27
+       28       28        /* Relative priorities of pages retained which are not currently in
+       29       29           use. Smaller numbers imply category is more important. Numbers
+       30       30           should be between 1 and 100. */
+       31       31    1   DCL MM_AUTO_PRIO UBIN SYMREF;
+       32       32    1   DCL MM_CACHE_PRIO UBIN SYMREF;
+       33       33    1   DCL MM_CG_PRIO UBIN SYMREF;
+       34       34    1   DCL SC_MM38 ENTRY CONV(2,0);
+       35       35    1   DCL SC_MM12 ENTRY CONV(2,0);
+       36       36    1   DCL MM0$CHKPCNT ENTRY(3);               /* Page chain validator               */
+       37       37    1   DCL MM0$FINDPG ENTRY(5);
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:2    
+       38       38    1   DCL FMC$RELPG ENTRY ALTRET;
+       39       39    1   DCL MMQ$TRUNCPT ENTRY ALTRET;
+       40       40    1   DCL JSU$FREE_PROC ENTRY ALTRET;
+       41       41    1   DCL SSR$REG ENTRY(3) ALTRET;
+       42       42    1   DCL SSC$SASYNC ENTRY;
+       43       43    1   DCL SSC$SERV ENTRY;
+       44       44    1   DCL SSR$RUE ENTRY(4);
+       45       45    1   DCL MMA$LOCKBP ENTRY;
+       46       46    1   DCL MMA$UNLOCKBP ENTRY;
+       47       47    1   DCL SC_MM10_E ENTRY CONV(2,0);
+       48       48    1   DCL MM_CGQD$ PTR SYMREF READONLY;
+       49       49        /**/
+       50       50    1   DCL B$PPUT$ PTR SYMREF READONLY;
+       51       51    1   DCL B$MONJIT$ PTR SYMREF READONLY;
+       52       52    1   DCL B$JIT$ PTR SYMREF READONLY;
+       53       53    1   DCL B$WSQ0PT$ PTR SYMREF READONLY;
+       54       54        /**/
+       55       55        /**/
+       56       56    1   DCL J_PLOCK SYMREF BIT(72) DALIGNED;
+       57       57    1   DCL S_TIMR UBIN SYMREF;
+       58       58
+       59       59        %INCLUDE B$JIT;               /* CAUTION when using JIT - not always mapped */
+       60      662        %INCLUDE B_SEGIDS_C;                    /* System segid definitions           */
+       61     1201        %INCLUDE MM_DATA_R;                     /* Include all mm data references     */
+       62     1721        %INCLUDE SS_SCHED_C;
+       63     1954        %INCLUDE SS_SCHED_R;
+       64     1997        %INCLUDE FM_CACHE_R;
+       65     2009        %INCLUDE HF_DATA_R;
+       66     2052        %INCLUDE HF_LOCK_C;
+       67     2066        %INCLUDE B$MAP;
+       68     2165        /**/
+       69     2166        %MM$CGQD (STCLASS="BASED(MM_CGQD$)");
+       70     2225        /**/
+       71     2226        %SUB MM$PPUT = B$PPUT$->MM$PPUT;
+       72     2227        /**/
+       73     2228        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:3    
+       74     2229    1   THE_TOP:
+       75     2230    1        CALL MMA$LOCKBP;
+       76     2231    1        IF NOT WSQ = %MONWSQ
+       77     2232    1        THEN
+       78     2233    1             CALL CHKHELD ALTRET (RECOUP);
+       79     2234    1   GET_IT:
+       80     2235        /*
+       81     2236        We grab a page from the free chain. It had better say free.
+       82     2237        Runs locked and bypass.
+       83     2238        */
+       84     2239    1        PPNO = MM_FPPH;
+       85     2240    1        IF PPNO = 0
+       86     2241    2        THEN DO;
+       87     2242    2             GOTO UNLOCK_CHECK;
+       88     2243    2           END;
+       89     2244    1        MM_FPPH = MM$PPUT.PPNO (PPNO);
+       90     2245    1        IF NOT MM$PPUT.FREE (PPNO)
+       91     2246    1        THEN
+       92     2247    1             CALL SC_MM10_E;
+       93     2248    2        ELSE DO;
+       94     2249    2             MM$PPUT (PPNO) = %FALSE;      /*Mark not free and clear link*/
+       95     2250    2             IF MM_FPPH = 0
+       96     2251    2             THEN
+       97     2252    2                  MM_FPPT = 0;
+       98     2253    2             MM_FPPC = MM_FPPC - 1;
+       99     2254    2           END;
+      100     2255    1   UNLOCK_CHECK: CALL MMA$UNLOCKBP;
+      101     2256    1        IF MM_CHKFLG
+      102     2257    1        THEN
+      103     2258    1             CALL MM0$CHKPCNT (MM_FPPH , MM_FPPT , MM_FPPC);
+      104     2259    1        RETURN;
+      105     2260        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:4    
+      106     2261        /*
+      107     2262        If not enough pages are available, we must try to get some back from
+      108     2263        autoshare, comgroup, or I/O cache. The decision is based on
+      109     2264        CONTROL parameters which weight the relative importance.
+      110     2265        */
+      111     2266    1   RECOUP:
+      112     2267    1        CALL RELPG;
+      113     2268    1        CALL CHKHELD ALTRET(REGEM);
+      114     2269    1        GOTO GET_IT;
+      115     2270        /*
+      116     2271        If we couldn't find any after looking around awhile, then we'll just
+      117     2272        wait until someone gives up one we can fight for.
+      118     2273        */
+      119     2274    1   REGEM:
+      120     2275    1        CALL MMA$UNLOCKBP;
+      121     2276    1        CALL SSR$REG (%SS_NC) ALTRET (USER_BREAK);
+      122     2277    1        GOTO THE_TOP;
+      123     2278
+      124     2279        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:5    
+      125     2280        /* We are breaking out of this memory request */
+      126     2281    1   USER_BREAK: ;
+      127     2282        /* Dont altret unless we are getting a page for the user */
+      128     2283    1        IF WSQ < %USERWSQ OR WSQ > %VS3WSQ
+      129     2284    1        THEN
+      130     2285    1             GOTO THE_TOP;
+      131     2286    1        IF (B$JIT.JUNK & %JJ_LDLNK#)
+      132     2287    1        THEN
+      133     2288    1             GOTO THE_TOP;
+      134     2289    1        PPNO=0;
+      135     2290    1        ALTRETURN;
+      136     2291        /*
+      137     2292        */
+      138     2293    1   MMB$RELPG: ENTRY ALTRET;
+      139     2294    1        CALL RELPG1;
+      140     2295    1        CALL MMA$UNLOCKBP;
+      141     2296    1        RETURN;
+      142     2297        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:6    
+      143     2298    1   RELPG: PROC;
+      144     2299    2   DCL FLG BIT(1);
+      145     2300    2        CALL MMA$UNLOCKBP;
+      146     2301    2   RELPG1: ENTRY;
+      147     2302             %LOCK (G=FMC_LOCK);
+      148     2305             %LOCK (G=J_PLOCK);
+      149     2308    2        FLG = '0'B;
+      150     2309    2        IF S_TIMR = 1
+      151     2310    2        THEN FLG = '1'B;
+      152     2311    2        CALL SSC$SASYNC;
+      153     2312    2        TEMP1 = FMC$CACHEPGCNT * MM_CACHE_PRIO;
+      154     2313    2        IF MM$CGQD.FPPC * MM_CG_PRIO < MM$BYP.AUTOP * MM_AUTO_PRIO
+      155     2314    3        THEN DO;
+      156     2315    3             IF MM$BYP.AUTOP * MM_AUTO_PRIO >= TEMP1
+      157     2316    4             THEN DO;
+      158     2317    4                  CALL JSU$FREE_PROC;
+      159     2318    4                  MM_SPTRNC = MM_SPTRNC + 1;
+      160     2319    4                END;
+      161     2320    3             ELSE
+      162     2321    3                  GOTO RELIOC;
+      163     2322    3           END;
+      164     2323    3        ELSE DO;
+      165     2324    3             IF MM$CGQD.FPPC * MM_CG_PRIO >= TEMP1
+      166     2325    3             THEN
+      167     2326    3                  CALL MMQ$TRUNCPT;
+      168     2327    4             ELSE DO;
+      169     2328    4   RELIOC:        CALL FMC$RELPG;
+      170     2329    4                  MM_IOTRNC = MM_IOTRNC + 1;
+      171     2330    4                END;
+      172     2331    3           END;
+      173     2332    2        IF FLG THEN CALL SSC$SERV;
+      174     2333             %UNLOCK (G=J_PLOCK);
+      175     2336             %UNLOCK (G=FMC_LOCK);
+      176     2339    2        CALL MMA$LOCKBP;
+      177     2340    2        RETURN;
+      178     2341    2   END RELPG;
+      179     2342        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:7    
+      180     2343        /*
+      181     2344        Well now, this checks to see that the gauranteed pages for monitor use
+      182     2345        are indeed available.
+      183     2346        Called locked and bypass.
+      184     2347        */
+      185     2348    1   CHKHELD: PROC ALTRET;
+      186     2349
+      187     2350    2        IF MM_RSVP - MM_SPPC + MM_HELD >= MM_FPPC
+      188     2351    2        THEN
+      189     2352    2             ALTRETURN;
+      190     2353    2        RETURN;
+      191     2354    2   END CHKHELD;
+      192     2355        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:8    
+      193     2356        /*F*   NAME:   MMB$FPP                                             */
+      194     2357        /*F*   PURPOSE: To free a previously allocated physical page       */
+      195     2358
+      196     2359    1   MMB$FPP: ENTRY(PPNO) ALTRET;
+      197     2360        /**/
+      198     2361    1        IF PPNO < 4                        /* First four physical pages */
+      199     2362    2        THEN DO;
+      200     2363    2             CALL SC_MM12;
+      201     2364             /*S* SCREECH_CODE: MMB-S$MM12
+      202     2365                  TYPE: SCREECH
+      203     2366                  MESSAGE: Physical page 0-3 cannot be released.
+      204     2367                  REMARKS: Some higher level routine is trying to release
+      205     2368                           a physical page that cannot possibly be free.
+      206     2369                                 */
+      207     2370    2             RETURN;
+      208     2371    2           END;
+      209     2372
+      210     2373    1        CALL MMA$LOCKBP;
+      211     2374
+      212     2375
+      213     2376    1   ADD_2_GOOD:;
+      214     2377    1        IF NOT MM$PPUT.SUSPECT(PPNO)
+      215     2378    2        THEN DO;
+      216     2379    2             MM$PPUT (PPNO) = %FALSE;      /*reset all flags and set tail*/
+      217     2380    2             MM$PPUT.FREE (PPNO) = %TRUE;
+      218     2381    2             IF MM_FPPT = 0
+      219     2382    2             THEN MM_FPPT = PPNO;          /* Set tail if empty chain            */
+      220     2383    2             MM$PPUT.PPNO (PPNO) = MM_FPPH;
+      221     2384    2             MM_FPPH = PPNO;
+      222     2385    2   INC_FPPC: MM_FPPC = MM_FPPC + 1;
+      223     2386        /* Report core available to scheduler if we previously parked someone */
+      224     2387    2             IF S_RQH (%SS_NC/2-%SS_CBF/2) ~= 0 THEN
+      225     2388    3             DO;
+      226     2389    3                  CALL SSR$RUE(%SS_CA);
+      227     2390    3                END;
+      228     2391    2           END;
+      229     2392
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:9    
+      230     2393
+      231     2394    1        ELSE                /* Add page marked as suspect to list of bad pgs     */
+      232     2395    2   ADD_2_BAD: DO;
+      233     2396    2             MM$PPUT (PPNO) = %FALSE;      /*reset all flags and set tail*/
+      234     2397    2             MM$PPUT.BAD(PPNO) = %TRUE;
+      235     2398    2             IF MM_BPPH = 0
+      236     2399    2             THEN MM_BPPH = PPNO;
+      237     2400    2             ELSE MM$PPUT.PPNO(MM_BPPT) = PPNO;
+      238     2401    2             MM_BPPT = PPNO;
+      239     2402    2             MM_BPPC = MM_BPPC + 1;
+      240     2403    2           END;
+      241     2404    1        GOTO UNLOCK_CHECK;
+      242     2405
+      243     2406        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:10   
+      244     2407    1   MMB$FPPONTAIL: ENTRY(PPNO) ALTRET;
+      245     2408        /*F*   NAME:    MMB$FPPONTAIL                                     */
+      246     2409        /*F*   PURPOSE: To free a physical page (see MMB$FPP), but put
+      247     2410                        the page on the tail of the free chain.  This is
+      248     2411                        done when freeing up contigous pages (VSPTs) in
+      249     2412                        order to attempt to keep contigous free pages
+      250     2413                        together. */
+      251     2414    1        IF PPNO < 4                        /* First four physical pages */
+      252     2415    2        THEN DO;
+      253     2416    2             CALL SC_MM12;
+      254     2417    2             RETURN;
+      255     2418    2           END;
+      256     2419        /**/
+      257     2420    1        CALL MMA$LOCKBP;
+      258     2421    1        IF NOT MM$PPUT.SUSPECT(PPNO)
+      259     2422    2        THEN DO;
+      260     2423    2             MM$PPUT (PPNO) = %FALSE;      /*reset all flags and set tail*/
+      261     2424    2   ADD_2_TAIL:
+      262     2425    2             MM$PPUT.FREE (PPNO) = %TRUE;
+      263     2426    2             IF MM_FPPT = 0
+      264     2427    2             THEN MM_FPPH = PPNO;          /* Set head if empty chain            */
+      265     2428    2             ELSE MM$PPUT.PPNO(MM_FPPT) = PPNO; /* Link to prev            */
+      266     2429    2             MM_FPPT = PPNO;               /* Make it the new tail               */
+      267     2430    2             GOTO INC_FPPC;
+      268     2431    2           END;                            /* End of inhibited code              */
+      269     2432    1        GOTO ADD_2_BAD;     /* Add page marked as suspect to list of bad pgs     */
+      270     2433
+      271     2434        /**/
+      272     2435        /**/
+      273     2436        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:11   
+      274     2437        /**/
+      275     2438        /*F*   NAME:   MMB$BADPP                                           */
+      276     2439        /*F*   PURPOSE: To mark a physical memory page as being suspected  */
+      277     2440        /*,*           bad, and to add it immediately to the bad page list */
+      278     2441        /*,*           if it is currently free.                            */
+      279     2442    1   MMB$BADPP: ENTRY(PPNO) ALTRET;
+      280     2443    1        CALL MMA$LOCKBP;
+      281     2444    1        IF NOT MM$PPUT.SUSPECT (PPNO)
+      282     2445    2        THEN DO;
+      283     2446    2             MM$PPUT.SUSPECT(PPNO) = %TRUE;
+      284     2447    2             MM_SUSPECTS = MM_SUSPECTS + 1;
+      285     2448    2           END;
+      286     2449    1        IF MM_FPPH = PPNO
+      287     2450    2        THEN DO;
+      288     2451    2             MM_FPPH = MM$PPUT.PPNO (MM_FPPH);
+      289     2452    2             GOTO BADPP1;
+      290     2453    2           END;
+      291     2454    1        CALL MM0$FINDPG(PPNO,MM_FPPH,MM_FPPT,MM_FPPC,TEMP1);
+      292     2455    1        IF TEMP1 > 0 THEN
+      293     2456    2        DO ;                          /* Its free, so put it on the bad chain    */
+      294     2457    2             MM$PPUT.PPNO(TEMP1) = MM$PPUT.PPNO(PPNO);
+      295     2458    2   BADPP1:
+      296     2459    2             MM_FPPC = MM_FPPC - 1;
+      297     2460    2             GOTO ADD_2_BAD;
+      298     2461    2           END;
+      299     2462    1   UNLOCK: CALL MMA$UNLOCKBP;
+      300     2463    1        RETURN;
+      301     2464        /**/
+      302     2465        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:12   
+      303     2466        /**/
+      304     2467        /*F*   NAME:   MMB$GOODPP                                          */
+      305     2468        /*F*   PURPOSE: To return a page which was on the bad list back to */
+      306     2469        /*,*           the free page chain, presumably after testing has   */
+      307     2470        /*,*           determined that it is in fact a good memory page.   */
+      308     2471    1   MMB$GOODPP: ENTRY(PPNO) ALTRET;
+      309     2472    1        CALL MMA$LOCKBP;
+      310     2473    1        IF PPNO = MM_BPPH
+      311     2474    1        THEN MM_BPPH = MM$PPUT.PPNO(PPNO);
+      312     2475    2        ELSE DO;
+      313     2476    2             CALL MM0$FINDPG(PPNO,MM_BPPH,MM_BPPT,MM_BPPC,TEMP1);
+      314     2477    3             IF TEMP1 = -1 THEN DO;
+      315     2478        /*S*    SCREECH_CODE: MMB-S$MM38                                   */
+      316     2479        /*S*   TYPE: SNAP                                                  */
+      317     2480        /*S*   MESSAGE: Attempt to return bad page which wasn't on bad     */
+      318     2481        /*,*           page list.                                          */
+      319     2482    3                  CALL SC_MM38;
+      320     2483    3                  GOTO UNLOCK;
+      321     2484    3                END;
+      322     2485    2             MM$PPUT.PPNO(TEMP1) = MM$PPUT.PPNO(PPNO);
+      323     2486    2             IF MM_BPPT = PPNO THEN MM_BPPT = TEMP1;
+      324     2487    2           END;
+      325     2488    1        MM_BPPC = MM_BPPC - 1;
+      326     2489    1        MM_SUSPECTS = MM_SUSPECTS - 1;
+      327     2490    1        GOTO ADD_2_GOOD;
+      328     2491        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:13   
+      329     2492        /*F* NAME:     MMB$GNPP
+      330     2493             PURPOSE:  To get N contiguous physical pages in memory
+      331     2494             DESCRIPTION: This routine will try to find N contiguous pages
+      332     2495                          in memory by searching MM$PPUT for N pages in a
+      333     2496                          row which are marked free. It then will
+      334     2497                          remove them from the physical page chain.
+      335     2498              */
+      336     2499    1   MMB$GNPP: ENTRY (PPNO,WSQ) ALTRET;
+      337     2500    1        T1 = PPNO - 1;
+      338     2501    1        IF T1 = 0
+      339     2502    1        THEN
+      340     2503    1             GOTO THE_TOP;                 /* The degenerate case */
+      341     2504
+      342     2505    1   FIND_N_PAGES: ;
+      343     2506    1        CALL MMA$LOCKBP;
+      344     2507    1        CALL GETN
+      345     2508    2        WHENRETURN DO; RETURN; END;
+      346     2509
+      347     2510    1        TEMP1 = T1;
+      348     2511    2        DO WHILE (TEMP1 >= 0);
+      349     2512    2             CALL RELPG1;                  /* If at first you don't succeed */
+      350     2513    2             TEMP1 = TEMP1 - 1;
+      351     2514    2             CALL MMA$UNLOCKBP;
+      352     2515    2           END;
+      353     2516    1        CALL MMA$LOCKBP;
+      354     2517
+      355     2518    1        CALL GETN                          /* . . .                         */
+      356     2519    2        WHENRETURN DO; RETURN; END;
+      357     2520
+      358     2521    1        CALL SSR$REG (%SS_NC)
+      359     2522    2        WHENALTRETURN DO; ALTRETURN; END;  /* If Break / YC */
+      360     2523    1        GOTO FIND_N_PAGES;
+      361     2524
+      362     2525
+      363     2526    1   GETN: PROC ALTRET;
+      364     2527
+      365     2528    2        TEMP1 = 0;                         /* Begining page number to search     */
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:14   
+      366     2529
+      367     2530    3        DO WHILE (TEMP1 < MM_PCORE - T1);  /* Search MM$PPUT        */
+      368     2531
+      369     2532    3             IF MM$PPUT.FREE (TEMP1)
+      370     2533    4             THEN DO;
+      371     2534
+      372     2535    5                  DO T2 = TEMP1 TO TEMP1 + T1; /* Find N in a row       */
+      373     2536    5                       IF NOT MM$PPUT.FREE (T2)
+      374     2537    5                       THEN GOTO KEEP_TRYING;
+      375     2538    5                     END;
+      376     2539    5                  IF HW_WSQ0PT THEN DO;
+      377     2540    5                       IF B$WSQ0PT$->B$MAP.RPN(T2-1)
+      378     2541    5                            - B$WSQ0PT$->B$MAP.RPN(TEMP1)
+      379     2542    5                            ~= T1 THEN GOTO KEEP_TRYING;
+              2542                                     /* Not PHYSICALLY contiguous */
+      380     2543    5                     END;
+      381     2544
+      382     2545        /* Remove the pages from the free page chain */
+      383     2546
+      384     2547    4                  PPNO = TEMP1;            /* Return the first page number */
+      385     2548    4                  T1 = TEMP1 + T1;
+      386     2549    5                  DO TEMP1 = TEMP1 TO T1;
+      387     2550
+      388     2551    5                       IF MM_FPPH = TEMP1
+      389     2552    6                       THEN DO;
+      390     2553    6                            MM_FPPH = MM$PPUT.PPNO (TEMP1);
+      391     2554    6                          END;
+      392     2555    6                       ELSE DO;
+      393     2556    6                            CALL MM0$FINDPG(TEMP1,MM_FPPH,MM_FPPT,MM_FPPC,T2);
+      394     2557    6                            IF T2 > 0      /* Found it  */
+      395     2558    7                            THEN DO;
+      396     2559    7                                 MM$PPUT.PPNO(T2) = MM$PPUT.PPNO(TEMP1);
+      397     2560    7                                 IF MM_FPPT = TEMP1
+      398     2561    7                                 THEN
+      399     2562    7                                      MM_FPPT = T2;
+      400     2563    7                               END;
+      401     2564    6                            ELSE           /* Couldn't find the page */
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:15   
+      402     2565    6                                 CALL SC_MM10_E;
+      403     2566    6                          END;
+      404     2567    5                       MM$PPUT(TEMP1) = '0'B;
+      405     2568    5                       MM_FPPC = MM_FPPC - 1;
+      406     2569    5                     END;
+      407     2570    4                  CALL MMA$UNLOCKBP;
+      408     2571    4                  RETURN;
+      409     2572    4                END;
+      410     2573
+      411     2574    3   KEEP_TRYING:
+      412     2575    3             TEMP1 = TEMP1 + 1;
+      413     2576    3           END;
+      414     2577    2        CALL MMA$UNLOCKBP;
+      415     2578    2        ALTRETURN;
+      416     2579    2   END GETN;
+      417     2580        /*
+      418     2581        */
+      419     2582    1   MMB$RETMEM: ENTRY(PPNO) ALTRET;
+      420     2583        /*F*     NAME:     MMB$RETMEM                            */
+      421     2584        /*F*     PURPOSE: To return a physical page of memory.  This
+      422     2585                          is done when returning a SCU on the DPS8000.
+      423     2586        */
+      424     2587    1        CALL MMA$LOCKBP;
+      425     2588    2        IF (NOT MM$PPUT.STOLEN(PPNO)) AND (MM$PPUT.USER#(PPNO) ~= 511) THEN DO;
+      426     2589    2             CALL MMA$UNLOCKBP;
+      427     2590    2             ALTRETURN;
+      428     2591    2           END;
+      429     2592    1        IF MM_FPPT = 0 THEN CALL SC_MM10_E;
+      430     2593    1        MM$PPUT(PPNO) = %FALSE;
+      431     2594    1        GOTO ADD_2_TAIL;
+      432     2595
+      433     2596    1   END MMB$GPP;
+      434     2597        %EOD;
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:16   
+--  Include file information  --
+
+   B$MAP.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   HF_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   FM_CACHE_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRLD_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRL_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   B_SEGIDS_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+   B$JIT.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure MMB$GPP.
+
+   Procedure MMB$GPP requires 514 words for executable code.
+   Procedure MMB$GPP requires 16 words of local(AUTO) storage.
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:17   
+
+ Object Unit name= MMB$GPP                                    File name= MMB$PMEM.:E05TOU
+ UTS= JUL 30 '97 03:19:51.96 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   514   1002  MMB$GPP
+    1  RoData even  none    15     17  MMB$GPP
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes    yes     yes      Std        2  MMB$GPP
+     0    106          yes     yes      Std        0  MMB$RELPG
+     0    241          yes     yes      Std        1  MMB$FPP
+     0    333          yes     yes      Std        1  MMB$FPPONTAIL
+     0    376          yes     yes      Std        1  MMB$BADPP
+     0    455          yes     yes      Std        1  MMB$GOODPP
+     0    533          yes     yes      Std        2  MMB$GNPP
+     0    745          yes     yes      Std        1  MMB$RETMEM
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:18   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       0 MMA$LOCKBP
+         yes           Std       0 MMA$UNLOCKBP
+ yes     yes           Std       3 SSR$REG
+         yes           Std       5 MM0$FINDPG
+         yes           Std       3 MM0$CHKPCNT
+         yes           Std       4 SSR$RUE
+         yes           Std       1 HFC$UNLOCK
+         yes           Std       1 HFC$LOCK
+ yes     yes           Std       0 JSU$FREE_PROC
+         yes           Std       0 SSC$SERV
+ yes     yes           Std       0 MMQ$TRUNCPT
+         yes           Std       0 SSC$SASYNC
+ yes     yes           Std       0 FMC$RELPG
+                       nStd      0 X66_AUTO_2
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+                       nStd      0 X66_AALT
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:19   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_MM10_E                             SC_MM12                               SC_MM38
+     MM_AUTO_PRIO                          MM_CACHE_PRIO                         MM_CG_PRIO
+r    MM_CGQD$                         r    B$PPUT$                          r    B$JIT$
+r    B$WSQ0PT$                             J_PLOCK                               S_TIMR
+     MM_FPPH                               MM_FPPT                               MM_FPPC
+     MM_SPPC                               MM_BPPH                               MM_BPPT
+     MM_BPPC                               MM_SUSPECTS                      r    MM_BYP$
+     MM_PCORE                              MM_RSVP                               MM_HELD
+     MM_CHKFLG                             MM_SPTRNC                             MM_IOTRNC
+     S_RQH                                 FMC_CACHEPGCNT$                       FMC_LOCK
+     HW_WSQ0PT                             B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ASLENTSID                             ISSID
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:20   
+
+
+        1        1        /*M* Level 0 MM routines for allocation of physical pages */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR,PLM=5,IND=5,CTI=5,SDI=5,MCL=10,CSI=0,ECI=0 */
+        8        8
+        9        9        /*F*   NAME:   MMB$GPP  */
+       10       10        /*F*   PURPOSE: To acquire a physical page for either monitor or user */
+       11       11
+       12       12        MMB$GPP: PROC (PPNO , WSQ) ALTRET;
+
+     12  0 000000   000000 700200 xent  MMB$GPP      TSX0  ! X66_AUTO_2
+         0 000001   000020 000002                    ZERO    16,2
+
+       13       13        /*
+       14       14        We check to see that the pages held back for the monitor
+       15       15        are available, and then allocate a page. If checking page chains
+       16       16        we do it.
+       17       17             If the user is reged because of no memory and the user breaks
+       18       18             or gets x'ed we will altreturn with out allocating a page.
+       19       19        */
+       20       20    1   DCL PPNO SBIN;                          /* Physical page number               */
+       21       21    1   DCL WSQ UBIN;                           /* WSQ to allocate page for           */
+       22       22    1   DCL TEMP1 SBIN;
+       23       23    1   DCL T1 SBIN;
+       24       24    1   DCL T2 SBIN;
+       25       25
+       26       26
+       27       27
+       28       28        /* Relative priorities of pages retained which are not currently in
+       29       29           use. Smaller numbers imply category is more important. Numbers
+       30       30           should be between 1 and 100. */
+       31       31    1   DCL MM_AUTO_PRIO UBIN SYMREF;
+       32       32    1   DCL MM_CACHE_PRIO UBIN SYMREF;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:21   
+       33       33    1   DCL MM_CG_PRIO UBIN SYMREF;
+       34       34    1   DCL SC_MM38 ENTRY CONV(2,0);
+       35       35    1   DCL SC_MM12 ENTRY CONV(2,0);
+       36       36    1   DCL MM0$CHKPCNT ENTRY(3);               /* Page chain validator               */
+       37       37    1   DCL MM0$FINDPG ENTRY(5);
+       38       38    1   DCL FMC$RELPG ENTRY ALTRET;
+       39       39    1   DCL MMQ$TRUNCPT ENTRY ALTRET;
+       40       40    1   DCL JSU$FREE_PROC ENTRY ALTRET;
+       41       41    1   DCL SSR$REG ENTRY(3) ALTRET;
+       42       42    1   DCL SSC$SASYNC ENTRY;
+       43       43    1   DCL SSC$SERV ENTRY;
+       44       44    1   DCL SSR$RUE ENTRY(4);
+       45       45    1   DCL MMA$LOCKBP ENTRY;
+       46       46    1   DCL MMA$UNLOCKBP ENTRY;
+       47       47    1   DCL SC_MM10_E ENTRY CONV(2,0);
+       48       48    1   DCL MM_CGQD$ PTR SYMREF READONLY;
+       49       49        /**/
+       50       50    1   DCL B$PPUT$ PTR SYMREF READONLY;
+       51       51    1   DCL B$MONJIT$ PTR SYMREF READONLY;
+       52       52    1   DCL B$JIT$ PTR SYMREF READONLY;
+       53       53    1   DCL B$WSQ0PT$ PTR SYMREF READONLY;
+       54       54        /**/
+       55       55        /**/
+       56       56    1   DCL J_PLOCK SYMREF BIT(72) DALIGNED;
+       57       57    1   DCL S_TIMR UBIN SYMREF;
+       58       58
+       59       59        %INCLUDE B$JIT;               /* CAUTION when using JIT - not always mapped */
+       60      662        %INCLUDE B_SEGIDS_C;                    /* System segid definitions           */
+       61     1201        %INCLUDE MM_DATA_R;                     /* Include all mm data references     */
+       62     1721        %INCLUDE SS_SCHED_C;
+       63     1954        %INCLUDE SS_SCHED_R;
+       64     1997        %INCLUDE FM_CACHE_R;
+       65     2009        %INCLUDE HF_DATA_R;
+       66     2052        %INCLUDE HF_LOCK_C;
+       67     2066        %INCLUDE B$MAP;
+       68     2165        /**/
+       69     2166        %MM$CGQD (STCLASS="BASED(MM_CGQD$)");
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:22   
+       70     2225        /**/
+       71     2226        %SUB MM$PPUT = B$PPUT$->MM$PPUT;
+       72     2227        /**/
+       73     2228        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:23   
+       74     2229    1   THE_TOP:
+       75     2230    1        CALL MMA$LOCKBP;
+
+   2230  0 000002   000002 631400 xsym  THE_TOP      EPPR1   B_VECTNIL+2
+         0 000003   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000004   000000 011000                    NOP     0
+
+       76     2231    1        IF NOT WSQ = %MONWSQ
+
+   2231  0 000005   200004 470500                    LDP0    @WSQ,,AUTO
+         0 000006   000000 235100                    LDA     0,,PR0
+         0 000007   000001 115007                    CMPA    1,DL
+         0 000010   000013 600000 0                  TZE     GET_IT
+
+       77     2232    1        THEN
+       78     2233    1             CALL CHKHELD ALTRET (RECOUP);
+
+   2233  0 000011   000231 701000 0                  TSX1    CHKHELD
+         0 000012   000054 702000 0                  TSX2    RECOUP
+
+       79     2234    1   GET_IT:
+       80     2235        /*
+       81     2236        We grab a page from the free chain. It had better say free.
+       82     2237        Runs locked and bypass.
+       83     2238        */
+       84     2239    1        PPNO = MM_FPPH;
+
+   2239  0 000013   200003 470500       GET_IT       LDP0    @PPNO,,AUTO
+         0 000014   000000 235000 xsym               LDA     MM_FPPH
+         0 000015   000000 755100                    STA     0,,PR0
+
+       85     2240    1        IF PPNO = 0
+
+   2240  0 000016   000020 601000 0                  TNZ     s:2244
+
+       86     2241    2        THEN DO;
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:24   
+       87     2242    2             GOTO UNLOCK_CHECK;
+
+   2242  0 000017   000042 710000 0                  TRA     UNLOCK_CHECK
+
+       88     2243    2           END;
+       89     2244    1        MM_FPPH = MM$PPUT.PPNO (PPNO);
+
+   2244  0 000020   000000 471400 xsym               LDP1    B$PPUT$
+         0 000021   100000 236105                    LDQ     0,AL,PR1
+         0 000022   777777 376007                    ANQ     -1,DL
+         0 000023   000000 756000 xsym               STQ     MM_FPPH
+
+       90     2245    1        IF NOT MM$PPUT.FREE (PPNO)
+
+   2245  0 000024   000000 235100                    LDA     0,,PR0
+         0 000025   100000 236105                    LDQ     0,AL,PR1
+         0 000026   040000 316003                    CANQ    16384,DU
+         0 000027   000033 601000 0                  TNZ     s:2249
+
+       91     2246    1        THEN
+       92     2247    1             CALL SC_MM10_E;
+
+   2247  0 000030   000000 713400 xsym               CLIMB   SC_MM10_E
+         0 000031   000000 600000 xsid               climb   nvectors=         0
+         0 000032   000042 710000 0                  TRA     UNLOCK_CHECK
+
+       93     2248    2        ELSE DO;
+
+       94     2249    2             MM$PPUT (PPNO) = %FALSE;      /*Mark not free and clear link*/
+
+   2249  0 000033   000000 720100                    LXL0    0,,PR0
+         0 000034   100000 450110                    STZ     0,X0,PR1
+
+       95     2250    2             IF MM_FPPH = 0
+
+   2250  0 000035   000000 235000 xsym               LDA     MM_FPPH
+         0 000036   000040 601000 0                  TNZ     s:2253
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:25   
+
+       96     2251    2             THEN
+       97     2252    2                  MM_FPPT = 0;
+
+   2252  0 000037   000000 450000 xsym               STZ     MM_FPPT
+
+       98     2253    2             MM_FPPC = MM_FPPC - 1;
+
+   2253  0 000040   000001 336007                    LCQ     1,DL
+         0 000041   000000 056000 xsym               ASQ     MM_FPPC
+
+       99     2254    2           END;
+
+      100     2255    1   UNLOCK_CHECK: CALL MMA$UNLOCKBP;
+
+   2255  0 000042   000002 631400 xsym  UNLOCK_CHECK EPPR1   B_VECTNIL+2
+         0 000043   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000044   000000 011000                    NOP     0
+
+      101     2256    1        IF MM_CHKFLG
+
+   2256  0 000045   000000 234000 xsym               SZN     MM_CHKFLG
+         0 000046   000053 605000 0                  TPL     s:2259
+
+      102     2257    1        THEN
+      103     2258    1             CALL MM0$CHKPCNT (MM_FPPH , MM_FPPT , MM_FPPC);
+
+   2258  0 000047   000000 630400 1                  EPPR0   0
+         0 000050   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000051   000000 701000 xent               TSX1    MM0$CHKPCNT
+         0 000052   000000 011000                    NOP     0
+
+      104     2259    1        RETURN;
+
+   2259  0 000053   000000 702200 xent               TSX2  ! X66_ARET
+
+      105     2260        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:26   
+      106     2261        /*
+      107     2262        If not enough pages are available, we must try to get some back from
+      108     2263        autoshare, comgroup, or I/O cache. The decision is based on
+      109     2264        CONTROL parameters which weight the relative importance.
+      110     2265        */
+      111     2266    1   RECOUP:
+      112     2267    1        CALL RELPG;
+
+   2267  0 000054   000116 701000 0     RECOUP       TSX1    RELPG
+         0 000055   000000 011000                    NOP     0
+
+      113     2268    1        CALL CHKHELD ALTRET(REGEM);
+
+   2268  0 000056   000231 701000 0                  TSX1    CHKHELD
+         0 000057   000061 702000 0                  TSX2    REGEM
+
+      114     2269    1        GOTO GET_IT;
+
+   2269  0 000060   000013 710000 0                  TRA     GET_IT
+
+      115     2270        /*
+      116     2271        If we couldn't find any after looking around awhile, then we'll just
+      117     2272        wait until someone gives up one we can fight for.
+      118     2273        */
+      119     2274    1   REGEM:
+      120     2275    1        CALL MMA$UNLOCKBP;
+
+   2275  0 000061   000002 631400 xsym  REGEM        EPPR1   B_VECTNIL+2
+         0 000062   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000063   000000 011000                    NOP     0
+
+      121     2276    1        CALL SSR$REG (%SS_NC) ALTRET (USER_BREAK);
+
+   2276  0 000064   000004 630400 1                  EPPR0   4
+         0 000065   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000066   000000 701000 xent               TSX1    SSR$REG
+         0 000067   000071 702000 0                  TSX2    USER_BREAK
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:27   
+
+      122     2277    1        GOTO THE_TOP;
+
+   2277  0 000070   000002 710000 0                  TRA     THE_TOP
+
+   2256  0 000071                       USER_BREAK   null
+      123     2278
+      124     2279        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:28   
+      125     2280        /* We are breaking out of this memory request */
+      126     2281    1   USER_BREAK: ;
+      127     2282        /* Dont altret unless we are getting a page for the user */
+      128     2283    1        IF WSQ < %USERWSQ OR WSQ > %VS3WSQ
+
+   2283  0 000071   200004 470500                    LDP0    @WSQ,,AUTO
+         0 000072   000000 235100                    LDA     0,,PR0
+         0 000073   000010 115007                    CMPA    8,DL
+         0 000074   000002 602000 0                  TNC     THE_TOP
+         0 000075   000014 115007                    CMPA    12,DL
+         0 000076   000002 603000 0                  TRC     THE_TOP
+
+      129     2284    1        THEN
+      130     2285    1             GOTO THE_TOP;
+      131     2286    1        IF (B$JIT.JUNK & %JJ_LDLNK#)
+
+   2286  0 000077   000000 471400 xsym               LDP1    B$JIT$
+         0 000100   100315 220100                    LDX0    205,,PR1
+         0 000101   000023 360003                    ANX0    19,DU
+         0 000102   000002 601000 0                  TNZ     THE_TOP
+
+      132     2287    1        THEN
+      133     2288    1             GOTO THE_TOP;
+      134     2289    1        PPNO=0;
+
+   2289  0 000103   200003 473500                    LDP3    @PPNO,,AUTO
+         0 000104   300000 450100                    STZ     0,,PR3
+
+      135     2290    1        ALTRETURN;
+
+   2290  0 000105   000000 702200 xent               TSX2  ! X66_AALT
+
+      136     2291        /*
+      137     2292        */
+      138     2293    1   MMB$RELPG: ENTRY ALTRET;
+
+   2293  0 000106   000000 700200 xent  MMB$RELPG    TSX0  ! X66_AUTO_2
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:29   
+         0 000107   000020 000002                    ZERO    16,2
+
+      139     2294    1        CALL RELPG1;
+
+   2294  0 000110   000123 701000 0                  TSX1    RELPG1
+         0 000111   000000 011000                    NOP     0
+
+      140     2295    1        CALL MMA$UNLOCKBP;
+
+   2295  0 000112   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000113   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000114   000000 011000                    NOP     0
+
+      141     2296    1        RETURN;
+
+   2296  0 000115   000000 702200 xent               TSX2  ! X66_ARET
+
+      142     2297        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:30   
+      143     2298    1   RELPG: PROC;
+
+   2298  0 000116   200010 741300       RELPG        STX1  ! T2+1,,AUTO
+
+      144     2299    2   DCL FLG BIT(1);
+      145     2300    2        CALL MMA$UNLOCKBP;
+
+   2300  0 000117   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000120   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000121   000000 011000                    NOP     0
+         0 000122   000124 710000 0                  TRA     s:2303
+
+      146     2301    2   RELPG1: ENTRY;
+
+   2301  0 000123   200010 741300       RELPG1       STX1  ! T2+1,,AUTO
+
+      147     2302             %LOCK (G=FMC_LOCK);
+
+   2303  0 000124   000005 630400 1                  EPPR0   5
+         0 000125   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000126   000000 701000 xent               TSX1    HFC$LOCK
+         0 000127   000000 011000                    NOP     0
+
+      148     2305             %LOCK (G=J_PLOCK);
+
+   2306  0 000130   000006 630400 1                  EPPR0   6
+         0 000131   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000132   000000 701000 xent               TSX1    HFC$LOCK
+         0 000133   000000 011000                    NOP     0
+
+      149     2308    2        FLG = '0'B;
+
+   2308  0 000134   200011 450100                    STZ     FLG,,AUTO
+
+      150     2309    2        IF S_TIMR = 1
+
+   2309  0 000135   000000 235000 xsym               LDA     S_TIMR
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:31   
+         0 000136   000001 115007                    CMPA    1,DL
+         0 000137   000142 601000 0                  TNZ     s:2311
+
+      151     2310    2        THEN FLG = '1'B;
+
+   2310  0 000140   400000 236003                    LDQ     -131072,DU
+         0 000141   200011 756100                    STQ     FLG,,AUTO
+
+      152     2311    2        CALL SSC$SASYNC;
+
+   2311  0 000142   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000143   000000 701000 xent               TSX1    SSC$SASYNC
+         0 000144   000000 011000                    NOP     0
+
+      153     2312    2        TEMP1 = FMC$CACHEPGCNT * MM_CACHE_PRIO;
+
+   2312  0 000145   000000 470400 xsym               LDP0    FMC_CACHEPGCNT$
+         0 000146   000000 236100                    LDQ     0,,PR0
+         0 000147   000000 402000 xsym               MPY     MM_CACHE_PRIO
+         0 000150   200005 756100                    STQ     TEMP1,,AUTO
+
+      154     2313    2        IF MM$CGQD.FPPC * MM_CG_PRIO < MM$BYP.AUTOP * MM_AUTO_PRIO
+
+   2313  0 000151   000000 471400 xsym               LDP1    MM_CGQD$
+         0 000152   100000 236100                    LDQ     0,,PR1
+         0 000153   000000 402000 xsym               MPY     MM_CG_PRIO
+         0 000154   000000 473400 xsym               LDP3    MM_BYP$
+         0 000155   200012 756100                    STQ     FLG+1,,AUTO
+         0 000156   300014 236100                    LDQ     12,,PR3
+         0 000157   000000 402000 xsym               MPY     MM_AUTO_PRIO
+         0 000160   200012 116100                    CMPQ    FLG+1,,AUTO
+         0 000161   000173 604400 0                  TMOZ    s:2324
+
+      155     2314    3        THEN DO;
+
+      156     2315    3             IF MM$BYP.AUTOP * MM_AUTO_PRIO >= TEMP1
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:32   
+   2315  0 000162   300014 236100                    LDQ     12,,PR3
+         0 000163   000000 402000 xsym               MPY     MM_AUTO_PRIO
+         0 000164   200005 116100                    CMPQ    TEMP1,,AUTO
+         0 000165   000203 604000 0                  TMI     RELIOC
+
+      157     2316    4             THEN DO;
+
+      158     2317    4                  CALL JSU$FREE_PROC;
+
+   2317  0 000166   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000167   000000 701000 xent               TSX1    JSU$FREE_PROC
+         0 000170   000000 011000                    NOP     0
+
+      159     2318    4                  MM_SPTRNC = MM_SPTRNC + 1;
+
+   2318  0 000171   000000 054000 xsym               AOS     MM_SPTRNC
+
+      160     2319    4                END;
+
+   2319  0 000172   000207 710000 0                  TRA     s:2332
+
+      161     2320    3             ELSE
+      162     2321    3                  GOTO RELIOC;
+      163     2322    3           END;
+      164     2323    3        ELSE DO;
+
+      165     2324    3             IF MM$CGQD.FPPC * MM_CG_PRIO >= TEMP1
+
+   2324  0 000173   100000 236100                    LDQ     0,,PR1
+         0 000174   000000 402000 xsym               MPY     MM_CG_PRIO
+         0 000175   200005 116100                    CMPQ    TEMP1,,AUTO
+         0 000176   000203 604000 0                  TMI     RELIOC
+
+      166     2325    3             THEN
+      167     2326    3                  CALL MMQ$TRUNCPT;
+
+   2326  0 000177   000002 631400 xsym               EPPR1   B_VECTNIL+2
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:33   
+         0 000200   000000 701000 xent               TSX1    MMQ$TRUNCPT
+         0 000201   000000 011000                    NOP     0
+         0 000202   000207 710000 0                  TRA     s:2332
+
+      168     2327    4             ELSE DO;
+
+      169     2328    4   RELIOC:        CALL FMC$RELPG;
+
+   2328  0 000203   000002 631400 xsym  RELIOC       EPPR1   B_VECTNIL+2
+         0 000204   000000 701000 xent               TSX1    FMC$RELPG
+         0 000205   000000 011000                    NOP     0
+
+      170     2329    4                  MM_IOTRNC = MM_IOTRNC + 1;
+
+   2329  0 000206   000000 054000 xsym               AOS     MM_IOTRNC
+
+      171     2330    4                END;
+
+      172     2331    3           END;
+
+      173     2332    2        IF FLG THEN CALL SSC$SERV;
+
+   2332  0 000207   200011 234100                    SZN     FLG,,AUTO
+         0 000210   000214 605000 0                  TPL     s:2334
+
+   2332  0 000211   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000212   000000 701000 xent               TSX1    SSC$SERV
+         0 000213   000000 011000                    NOP     0
+
+      174     2333             %UNLOCK (G=J_PLOCK);
+
+   2334  0 000214   000006 630400 1                  EPPR0   6
+         0 000215   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000216   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000217   000000 011000                    NOP     0
+
+      175     2336             %UNLOCK (G=FMC_LOCK);
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:34   
+
+   2337  0 000220   000005 630400 1                  EPPR0   5
+         0 000221   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000222   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000223   000000 011000                    NOP     0
+
+      176     2339    2        CALL MMA$LOCKBP;
+
+   2339  0 000224   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000225   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000226   000000 011000                    NOP     0
+
+      177     2340    2        RETURN;
+
+   2340  0 000227   200010 221300                    LDX1  ! T2+1,,AUTO
+         0 000230   000001 702211                    TSX2  ! 1,X1
+
+      178     2341    2   END RELPG;
+      179     2342        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:35   
+      180     2343        /*
+      181     2344        Well now, this checks to see that the gauranteed pages for monitor use
+      182     2345        are indeed available.
+      183     2346        Called locked and bypass.
+      184     2347        */
+      185     2348    1   CHKHELD: PROC ALTRET;
+
+   2348  0 000231   200010 741300       CHKHELD      STX1  ! T2+1,,AUTO
+
+      186     2349
+      187     2350    2        IF MM_RSVP - MM_SPPC + MM_HELD >= MM_FPPC
+
+   2350  0 000232   000000 236000 xsym               LDQ     MM_RSVP
+         0 000233   000000 136000 xsym               SBLQ    MM_SPPC
+         0 000234   000000 036000 xsym               ADLQ    MM_HELD
+         0 000235   000000 116000 xsym               CMPQ    MM_FPPC
+         0 000236   000240 604000 0                  TMI     s:2353
+
+      188     2351    2        THEN
+      189     2352    2             ALTRETURN;
+
+   2352  0 000237   000000 702211                    TSX2  ! 0,X1
+
+      190     2353    2        RETURN;
+
+   2353  0 000240   000001 702211                    TSX2  ! 1,X1
+
+      191     2354    2   END CHKHELD;
+      192     2355        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:36   
+      193     2356        /*F*   NAME:   MMB$FPP                                             */
+      194     2357        /*F*   PURPOSE: To free a previously allocated physical page       */
+      195     2358
+      196     2359    1   MMB$FPP: ENTRY(PPNO) ALTRET;
+
+   2359  0 000241   000000 700200 xent  MMB$FPP      TSX0  ! X66_AUTO_2
+         0 000242   000020 000002                    ZERO    16,2
+
+      197     2360        /**/
+      198     2361    1        IF PPNO < 4                        /* First four physical pages */
+
+   2361  0 000243   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000244   000000 235100                    LDA     0,,PR0
+         0 000245   000004 115007                    CMPA    4,DL
+         0 000246   000252 605000 0                  TPL     s:2373
+
+      199     2362    2        THEN DO;
+
+      200     2363    2             CALL SC_MM12;
+
+   2363  0 000247   000000 713400 xsym               CLIMB   SC_MM12
+         0 000250   000000 600000 xsid               climb   nvectors=         0
+
+      201     2364             /*S* SCREECH_CODE: MMB-S$MM12
+      202     2365                  TYPE: SCREECH
+      203     2366                  MESSAGE: Physical page 0-3 cannot be released.
+      204     2367                  REMARKS: Some higher level routine is trying to release
+      205     2368                           a physical page that cannot possibly be free.
+      206     2369                                 */
+      207     2370    2             RETURN;
+
+   2370  0 000251   000000 702200 xent               TSX2  ! X66_ARET
+
+      208     2371    2           END;
+      209     2372
+      210     2373    1        CALL MMA$LOCKBP;
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:37   
+   2373  0 000252   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000253   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000254   000000 011000                    NOP     0
+
+   2361  0 000255                       ADD_2_GOOD   null
+      211     2374
+      212     2375
+      213     2376    1   ADD_2_GOOD:;
+      214     2377    1        IF NOT MM$PPUT.SUSPECT(PPNO)
+
+   2377  0 000255   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000256   000000 720100                    LXL0    0,,PR0
+         0 000257   000000 471400 xsym               LDP1    B$PPUT$
+         0 000260   100000 234110                    SZN     0,X0,PR1
+         0 000261   000310 604000 0                  TMI     ADD_2_BAD
+
+      215     2378    2        THEN DO;
+
+      216     2379    2             MM$PPUT (PPNO) = %FALSE;      /*reset all flags and set tail*/
+
+   2379  0 000262   000000 720100                    LXL0    0,,PR0
+         0 000263   100000 450110                    STZ     0,X0,PR1
+
+      217     2380    2             MM$PPUT.FREE (PPNO) = %TRUE;
+
+   2380  0 000264   000000 235100                    LDA     0,,PR0
+         0 000265   040000 236003                    LDQ     16384,DU
+         0 000266   100000 256105                    ORSQ    0,AL,PR1
+
+      218     2381    2             IF MM_FPPT = 0
+
+   2381  0 000267   000000 235000 xsym               LDA     MM_FPPT
+         0 000270   000273 601000 0                  TNZ     s:2383
+
+      219     2382    2             THEN MM_FPPT = PPNO;          /* Set tail if empty chain            */
+
+   2382  0 000271   000000 235100                    LDA     0,,PR0
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:38   
+         0 000272   000000 755000 xsym               STA     MM_FPPT
+
+      220     2383    2             MM$PPUT.PPNO (PPNO) = MM_FPPH;
+
+   2383  0 000273   000000 235100                    LDA     0,,PR0
+         0 000274   000000 720000 xsym               LXL0    MM_FPPH
+         0 000275   100000 440105                    SXL0    0,AL,PR1
+
+      221     2384    2             MM_FPPH = PPNO;
+
+   2384  0 000276   000000 235100                    LDA     0,,PR0
+         0 000277   000000 755000 xsym               STA     MM_FPPH
+
+      222     2385    2   INC_FPPC: MM_FPPC = MM_FPPC + 1;
+
+   2385  0 000300   000000 054000 xsym  INC_FPPC     AOS     MM_FPPC
+
+      223     2386        /* Report core available to scheduler if we previously parked someone */
+      224     2387    2             IF S_RQH (%SS_NC/2-%SS_CBF/2) ~= 0 THEN
+
+   2387  0 000301   000001 235000 xsym               LDA     S_RQH+1
+         0 000302   000332 600000 0                  TZE     s:2404
+
+      225     2388    3             DO;
+
+      226     2389    3                  CALL SSR$RUE(%SS_CA);
+
+   2389  0 000303   000010 630400 1                  EPPR0   8
+         0 000304   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000305   000000 701000 xent               TSX1    SSR$RUE
+         0 000306   000000 011000                    NOP     0
+
+      227     2390    3                END;
+
+      228     2391    2           END;
+
+   2391  0 000307   000332 710000 0                  TRA     s:2404
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:39   
+
+      229     2392
+      230     2393
+      231     2394    1        ELSE                /* Add page marked as suspect to list of bad pgs     */
+      232     2395    2   ADD_2_BAD: DO;
+
+   2395  0 000310                       ADD_2_BAD    null
+      233     2396    2             MM$PPUT (PPNO) = %FALSE;      /*reset all flags and set tail*/
+
+   2396  0 000310   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000311   000000 720100                    LXL0    0,,PR0
+         0 000312   000000 471400 xsym               LDP1    B$PPUT$
+         0 000313   100000 450110                    STZ     0,X0,PR1
+
+      234     2397    2             MM$PPUT.BAD(PPNO) = %TRUE;
+
+   2397  0 000314   000000 235100                    LDA     0,,PR0
+         0 000315   200000 236003                    LDQ     65536,DU
+         0 000316   100000 256105                    ORSQ    0,AL,PR1
+
+      235     2398    2             IF MM_BPPH = 0
+
+   2398  0 000317   000000 235000 xsym               LDA     MM_BPPH
+         0 000320   000324 601000 0                  TNZ     s:2400
+
+      236     2399    2             THEN MM_BPPH = PPNO;
+
+   2399  0 000321   000000 235100                    LDA     0,,PR0
+         0 000322   000000 755000 xsym               STA     MM_BPPH
+         0 000323   000327 710000 0                  TRA     s:2401
+
+      237     2400    2             ELSE MM$PPUT.PPNO(MM_BPPT) = PPNO;
+
+   2400  0 000324   000000 720100                    LXL0    0,,PR0
+         0 000325   000000 721000 xsym               LXL1    MM_BPPT
+         0 000326   100000 440111                    SXL0    0,X1,PR1
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:40   
+      238     2401    2             MM_BPPT = PPNO;
+
+   2401  0 000327   000000 235100                    LDA     0,,PR0
+         0 000330   000000 755000 xsym               STA     MM_BPPT
+
+      239     2402    2             MM_BPPC = MM_BPPC + 1;
+
+   2402  0 000331   000000 054000 xsym               AOS     MM_BPPC
+
+      240     2403    2           END;
+
+      241     2404    1        GOTO UNLOCK_CHECK;
+
+   2404  0 000332   000042 710000 0                  TRA     UNLOCK_CHECK
+
+      242     2405
+      243     2406        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:41   
+      244     2407    1   MMB$FPPONTAIL: ENTRY(PPNO) ALTRET;
+
+   2407  0 000333   000000 700200 xent  MMB$FPPONTA* TSX0  ! X66_AUTO_2
+         0 000334   000020 000002                    ZERO    16,2
+
+      245     2408        /*F*   NAME:    MMB$FPPONTAIL                                     */
+      246     2409        /*F*   PURPOSE: To free a physical page (see MMB$FPP), but put
+      247     2410                        the page on the tail of the free chain.  This is
+      248     2411                        done when freeing up contigous pages (VSPTs) in
+      249     2412                        order to attempt to keep contigous free pages
+      250     2413                        together. */
+      251     2414    1        IF PPNO < 4                        /* First four physical pages */
+
+   2414  0 000335   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000336   000000 235100                    LDA     0,,PR0
+         0 000337   000004 115007                    CMPA    4,DL
+         0 000340   000344 605000 0                  TPL     s:2420
+
+      252     2415    2        THEN DO;
+
+      253     2416    2             CALL SC_MM12;
+
+   2416  0 000341   000000 713400 xsym               CLIMB   SC_MM12
+         0 000342   000000 600000 xsid               climb   nvectors=         0
+
+      254     2417    2             RETURN;
+
+   2417  0 000343   000000 702200 xent               TSX2  ! X66_ARET
+
+      255     2418    2           END;
+      256     2419        /**/
+      257     2420    1        CALL MMA$LOCKBP;
+
+   2420  0 000344   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000345   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000346   000000 011000                    NOP     0
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:42   
+      258     2421    1        IF NOT MM$PPUT.SUSPECT(PPNO)
+
+   2421  0 000347   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000350   000000 720100                    LXL0    0,,PR0
+         0 000351   000000 471400 xsym               LDP1    B$PPUT$
+         0 000352   100000 234110                    SZN     0,X0,PR1
+         0 000353   000375 604000 0                  TMI     s:2432
+
+      259     2422    2        THEN DO;
+
+      260     2423    2             MM$PPUT (PPNO) = %FALSE;      /*reset all flags and set tail*/
+
+   2423  0 000354   000000 720100                    LXL0    0,,PR0
+         0 000355   100000 450110                    STZ     0,X0,PR1
+
+      261     2424    2   ADD_2_TAIL:
+      262     2425    2             MM$PPUT.FREE (PPNO) = %TRUE;
+
+   2425  0 000356   200003 470500       ADD_2_TAIL   LDP0    @PPNO,,AUTO
+         0 000357   000000 235100                    LDA     0,,PR0
+         0 000360   000000 471400 xsym               LDP1    B$PPUT$
+         0 000361   040000 236003                    LDQ     16384,DU
+         0 000362   100000 256105                    ORSQ    0,AL,PR1
+
+      263     2426    2             IF MM_FPPT = 0
+
+   2426  0 000363   000000 235000 xsym               LDA     MM_FPPT
+         0 000364   000370 601000 0                  TNZ     s:2428
+
+      264     2427    2             THEN MM_FPPH = PPNO;          /* Set head if empty chain            */
+
+   2427  0 000365   000000 235100                    LDA     0,,PR0
+         0 000366   000000 755000 xsym               STA     MM_FPPH
+         0 000367   000372 710000 0                  TRA     s:2429
+
+      265     2428    2             ELSE MM$PPUT.PPNO(MM_FPPT) = PPNO; /* Link to prev            */
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:43   
+   2428  0 000370   000000 720100                    LXL0    0,,PR0
+         0 000371   100000 440105                    SXL0    0,AL,PR1
+
+      266     2429    2             MM_FPPT = PPNO;               /* Make it the new tail               */
+
+   2429  0 000372   000000 235100                    LDA     0,,PR0
+         0 000373   000000 755000 xsym               STA     MM_FPPT
+
+      267     2430    2             GOTO INC_FPPC;
+
+   2430  0 000374   000300 710000 0                  TRA     INC_FPPC
+
+      268     2431    2           END;                            /* End of inhibited code              */
+      269     2432    1        GOTO ADD_2_BAD;     /* Add page marked as suspect to list of bad pgs     */
+
+   2432  0 000375   000310 710000 0                  TRA     ADD_2_BAD
+
+      270     2433
+      271     2434        /**/
+      272     2435        /**/
+      273     2436        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:44   
+      274     2437        /**/
+      275     2438        /*F*   NAME:   MMB$BADPP                                           */
+      276     2439        /*F*   PURPOSE: To mark a physical memory page as being suspected  */
+      277     2440        /*,*           bad, and to add it immediately to the bad page list */
+      278     2441        /*,*           if it is currently free.                            */
+      279     2442    1   MMB$BADPP: ENTRY(PPNO) ALTRET;
+
+   2442  0 000376   000000 700200 xent  MMB$BADPP    TSX0  ! X66_AUTO_2
+         0 000377   000020 000002                    ZERO    16,2
+
+      280     2443    1        CALL MMA$LOCKBP;
+
+   2443  0 000400   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000401   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000402   000000 011000                    NOP     0
+
+      281     2444    1        IF NOT MM$PPUT.SUSPECT (PPNO)
+
+   2444  0 000403   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000404   000000 720100                    LXL0    0,,PR0
+         0 000405   000000 471400 xsym               LDP1    B$PPUT$
+         0 000406   100000 234110                    SZN     0,X0,PR1
+         0 000407   000414 604000 0                  TMI     s:2449
+
+      282     2445    2        THEN DO;
+
+      283     2446    2             MM$PPUT.SUSPECT(PPNO) = %TRUE;
+
+   2446  0 000410   000000 720100                    LXL0    0,,PR0
+         0 000411   400000 236003                    LDQ     -131072,DU
+         0 000412   100000 256110                    ORSQ    0,X0,PR1
+
+      284     2447    2             MM_SUSPECTS = MM_SUSPECTS + 1;
+
+   2447  0 000413   000000 054000 xsym               AOS     MM_SUSPECTS
+
+      285     2448    2           END;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:45   
+
+      286     2449    1        IF MM_FPPH = PPNO
+
+   2449  0 000414   000000 236000 xsym               LDQ     MM_FPPH
+         0 000415   000000 116100                    CMPQ    0,,PR0
+         0 000416   000423 601000 0                  TNZ     s:2454
+
+      287     2450    2        THEN DO;
+
+      288     2451    2             MM_FPPH = MM$PPUT.PPNO (MM_FPPH);
+
+   2451  0 000417   100000 236106                    LDQ     0,QL,PR1
+         0 000420   777777 376007                    ANQ     -1,DL
+         0 000421   000000 756000 xsym               STQ     MM_FPPH
+
+      289     2452    2             GOTO BADPP1;
+
+   2452  0 000422   000446 710000 0                  TRA     BADPP1
+
+      290     2453    2           END;
+      291     2454    1        CALL MM0$FINDPG(PPNO,MM_FPPH,MM_FPPT,MM_FPPC,TEMP1);
+
+   2454  0 000423   200005 633500                    EPPR3   TEMP1,,AUTO
+         0 000424   200016 453500                    STP3    FLG+5,,AUTO
+         0 000425   000012 237000 1                  LDAQ    10
+         0 000426   200014 757100                    STAQ    FLG+3,,AUTO
+         0 000427   000000 236000 1                  LDQ     0
+         0 000430   200003 235100                    LDA     @PPNO,,AUTO
+         0 000431   200012 757100                    STAQ    FLG+1,,AUTO
+         0 000432   200012 630500                    EPPR0   FLG+1,,AUTO
+         0 000433   000023 631400 xsym               EPPR1   B_VECTNIL+19
+         0 000434   000000 701000 xent               TSX1    MM0$FINDPG
+         0 000435   000000 011000                    NOP     0
+
+      292     2455    1        IF TEMP1 > 0 THEN
+
+   2455  0 000436   200005 235100                    LDA     TEMP1,,AUTO
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:46   
+         0 000437   000451 604400 0                  TMOZ    UNLOCK
+
+      293     2456    2        DO ;                          /* Its free, so put it on the bad chain    */
+
+      294     2457    2             MM$PPUT.PPNO(TEMP1) = MM$PPUT.PPNO(PPNO);
+
+   2457  0 000440   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000441   000000 235100                    LDA     0,,PR0
+         0 000442   000000 471400 xsym               LDP1    B$PPUT$
+         0 000443   100000 720105                    LXL0    0,AL,PR1
+         0 000444   200005 721100                    LXL1    TEMP1,,AUTO
+         0 000445   100000 440111                    SXL0    0,X1,PR1
+
+      295     2458    2   BADPP1:
+      296     2459    2             MM_FPPC = MM_FPPC - 1;
+
+   2459  0 000446   000001 336007       BADPP1       LCQ     1,DL
+         0 000447   000000 056000 xsym               ASQ     MM_FPPC
+
+      297     2460    2             GOTO ADD_2_BAD;
+
+   2460  0 000450   000310 710000 0                  TRA     ADD_2_BAD
+
+      298     2461    2           END;
+      299     2462    1   UNLOCK: CALL MMA$UNLOCKBP;
+
+   2462  0 000451   000002 631400 xsym  UNLOCK       EPPR1   B_VECTNIL+2
+         0 000452   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000453   000000 011000                    NOP     0
+
+      300     2463    1        RETURN;
+
+   2463  0 000454   000000 702200 xent               TSX2  ! X66_ARET
+
+      301     2464        /**/
+      302     2465        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:47   
+      303     2466        /**/
+      304     2467        /*F*   NAME:   MMB$GOODPP                                          */
+      305     2468        /*F*   PURPOSE: To return a page which was on the bad list back to */
+      306     2469        /*,*           the free page chain, presumably after testing has   */
+      307     2470        /*,*           determined that it is in fact a good memory page.   */
+      308     2471    1   MMB$GOODPP: ENTRY(PPNO) ALTRET;
+
+   2471  0 000455   000000 700200 xent  MMB$GOODPP   TSX0  ! X66_AUTO_2
+         0 000456   000020 000002                    ZERO    16,2
+
+      309     2472    1        CALL MMA$LOCKBP;
+
+   2472  0 000457   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000460   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000461   000000 011000                    NOP     0
+
+      310     2473    1        IF PPNO = MM_BPPH
+
+   2473  0 000462   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000463   000000 236100                    LDQ     0,,PR0
+         0 000464   000000 116000 xsym               CMPQ    MM_BPPH
+         0 000465   000473 601000 0                  TNZ     s:2476
+
+      311     2474    1        THEN MM_BPPH = MM$PPUT.PPNO(PPNO);
+
+   2474  0 000466   000000 471400 xsym               LDP1    B$PPUT$
+         0 000467   100000 236106                    LDQ     0,QL,PR1
+         0 000470   777777 376007                    ANQ     -1,DL
+         0 000471   000000 756000 xsym               STQ     MM_BPPH
+         0 000472   000527 710000 0                  TRA     s:2488
+
+      312     2475    2        ELSE DO;
+
+      313     2476    2             CALL MM0$FINDPG(PPNO,MM_BPPH,MM_BPPT,MM_BPPC,TEMP1);
+
+   2476  0 000473   200005 631500                    EPPR1   TEMP1,,AUTO
+         0 000474   200016 451500                    STP1    FLG+5,,AUTO
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:48   
+         0 000475   000014 237000 1                  LDAQ    12
+         0 000476   200014 757100                    STAQ    FLG+3,,AUTO
+         0 000477   000016 236000 1                  LDQ     14
+         0 000500   200003 235100                    LDA     @PPNO,,AUTO
+         0 000501   200012 757100                    STAQ    FLG+1,,AUTO
+         0 000502   200012 630500                    EPPR0   FLG+1,,AUTO
+         0 000503   000023 631400 xsym               EPPR1   B_VECTNIL+19
+         0 000504   000000 701000 xent               TSX1    MM0$FINDPG
+         0 000505   000000 011000                    NOP     0
+
+      314     2477    3             IF TEMP1 = -1 THEN DO;
+
+   2477  0 000506   200005 235100                    LDA     TEMP1,,AUTO
+         0 000507   000027 115000 xsym               CMPA    B_VECTNIL+23
+         0 000510   000514 601000 0                  TNZ     s:2485
+
+      315     2478        /*S*    SCREECH_CODE: MMB-S$MM38                                   */
+      316     2479        /*S*   TYPE: SNAP                                                  */
+      317     2480        /*S*   MESSAGE: Attempt to return bad page which wasn't on bad     */
+      318     2481        /*,*           page list.                                          */
+      319     2482    3                  CALL SC_MM38;
+
+   2482  0 000511   000000 713400 xsym               CLIMB   SC_MM38
+         0 000512   000000 600000 xsid               climb   nvectors=         0
+
+      320     2483    3                  GOTO UNLOCK;
+
+   2483  0 000513   000451 710000 0                  TRA     UNLOCK
+
+      321     2484    3                END;
+      322     2485    2             MM$PPUT.PPNO(TEMP1) = MM$PPUT.PPNO(PPNO);
+
+   2485  0 000514   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000515   000000 235100                    LDA     0,,PR0
+         0 000516   000000 471400 xsym               LDP1    B$PPUT$
+         0 000517   100000 720105                    LXL0    0,AL,PR1
+         0 000520   200005 721100                    LXL1    TEMP1,,AUTO
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:49   
+         0 000521   100000 440111                    SXL0    0,X1,PR1
+
+      323     2486    2             IF MM_BPPT = PPNO THEN MM_BPPT = TEMP1;
+
+   2486  0 000522   000000 236000 xsym               LDQ     MM_BPPT
+         0 000523   000000 116100                    CMPQ    0,,PR0
+         0 000524   000527 601000 0                  TNZ     s:2488
+
+   2486  0 000525   200005 235100                    LDA     TEMP1,,AUTO
+         0 000526   000000 755000 xsym               STA     MM_BPPT
+
+      324     2487    2           END;
+
+      325     2488    1        MM_BPPC = MM_BPPC - 1;
+
+   2488  0 000527   000001 336007                    LCQ     1,DL
+         0 000530   000000 056000 xsym               ASQ     MM_BPPC
+
+      326     2489    1        MM_SUSPECTS = MM_SUSPECTS - 1;
+
+   2489  0 000531   000000 056000 xsym               ASQ     MM_SUSPECTS
+
+      327     2490    1        GOTO ADD_2_GOOD;
+
+   2490  0 000532   000255 710000 0                  TRA     ADD_2_GOOD
+
+      328     2491        %EJECT;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:50   
+      329     2492        /*F* NAME:     MMB$GNPP
+      330     2493             PURPOSE:  To get N contiguous physical pages in memory
+      331     2494             DESCRIPTION: This routine will try to find N contiguous pages
+      332     2495                          in memory by searching MM$PPUT for N pages in a
+      333     2496                          row which are marked free. It then will
+      334     2497                          remove them from the physical page chain.
+      335     2498              */
+      336     2499    1   MMB$GNPP: ENTRY (PPNO,WSQ) ALTRET;
+
+   2499  0 000533   000000 700200 xent  MMB$GNPP     TSX0  ! X66_AUTO_2
+         0 000534   000020 000002                    ZERO    16,2
+
+      337     2500    1        T1 = PPNO - 1;
+
+   2500  0 000535   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000536   000000 235100                    LDA     0,,PR0
+         0 000537   000001 135007                    SBLA    1,DL
+         0 000540   200006 755100                    STA     T1,,AUTO
+
+      338     2501    1        IF T1 = 0
+
+   2501  0 000541   000002 600000 0                  TZE     THE_TOP
+
+   2501  0 000542                       FIND_N_PAGES null
+      339     2502    1        THEN
+      340     2503    1             GOTO THE_TOP;                 /* The degenerate case */
+      341     2504
+      342     2505    1   FIND_N_PAGES: ;
+      343     2506    1        CALL MMA$LOCKBP;
+
+   2506  0 000542   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000543   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000544   000000 011000                    NOP     0
+
+      344     2507    1        CALL GETN
+
+   2507  0 000545   000601 701000 0                  TSX1    GETN
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:51   
+         0 000546   000550 702000 0                  TSX2    s:2510
+
+      345     2508    2        WHENRETURN DO; RETURN; END;
+
+   2508  0 000547   000000 702200 xent               TSX2  ! X66_ARET
+
+      346     2509
+      347     2510    1        TEMP1 = T1;
+
+   2510  0 000550   200006 235100                    LDA     T1,,AUTO
+         0 000551   200005 755100                    STA     TEMP1,,AUTO
+
+      348     2511    2        DO WHILE (TEMP1 >= 0);
+
+   2511  0 000552   000564 604000 0                  TMI     s:2516
+
+      349     2512    2             CALL RELPG1;                  /* If at first you don't succeed */
+
+   2512  0 000553   000123 701000 0                  TSX1    RELPG1
+         0 000554   000000 011000                    NOP     0
+
+      350     2513    2             TEMP1 = TEMP1 - 1;
+
+   2513  0 000555   000001 336007                    LCQ     1,DL
+         0 000556   200005 056100                    ASQ     TEMP1,,AUTO
+
+      351     2514    2             CALL MMA$UNLOCKBP;
+
+   2514  0 000557   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000560   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000561   000000 011000                    NOP     0
+
+      352     2515    2           END;
+
+   2515  0 000562   200005 235100                    LDA     TEMP1,,AUTO
+         0 000563   000553 605000 0                  TPL     s:2512
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:52   
+      353     2516    1        CALL MMA$LOCKBP;
+
+   2516  0 000564   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000565   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000566   000000 011000                    NOP     0
+
+      354     2517
+      355     2518    1        CALL GETN                          /* . . .                         */
+
+   2518  0 000567   000601 701000 0                  TSX1    GETN
+         0 000570   000572 702000 0                  TSX2    s:2521
+
+      356     2519    2        WHENRETURN DO; RETURN; END;
+
+   2519  0 000571   000000 702200 xent               TSX2  ! X66_ARET
+
+      357     2520
+      358     2521    1        CALL SSR$REG (%SS_NC)
+
+   2521  0 000572   000004 630400 1                  EPPR0   4
+         0 000573   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000574   000000 701000 xent               TSX1    SSR$REG
+         0 000575   000577 702000 0                  TSX2    s:2522
+         0 000576   000600 710000 0                  TRA     s:2523
+
+      359     2522    2        WHENALTRETURN DO; ALTRETURN; END;  /* If Break / YC */
+
+   2522  0 000577   000000 702200 xent               TSX2  ! X66_AALT
+
+      360     2523    1        GOTO FIND_N_PAGES;
+
+   2523  0 000600   000542 710000 0                  TRA     FIND_N_PAGES
+
+      361     2524
+      362     2525
+      363     2526    1   GETN: PROC ALTRET;
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:53   
+   2526  0 000601   200010 741300       GETN         STX1  ! T2+1,,AUTO
+
+      364     2527
+      365     2528    2        TEMP1 = 0;                         /* Begining page number to search     */
+
+   2528  0 000602   200005 450100                    STZ     TEMP1,,AUTO
+
+      366     2529
+      367     2530    3        DO WHILE (TEMP1 < MM_PCORE - T1);  /* Search MM$PPUT        */
+
+   2530  0 000603   000734 710000 0                  TRA     s:2576
+
+      368     2531
+      369     2532    3             IF MM$PPUT.FREE (TEMP1)
+
+   2532  0 000604   000000 470400 xsym               LDP0    B$PPUT$
+         0 000605   200005 720100                    LXL0    TEMP1,,AUTO
+         0 000606   000000 236110                    LDQ     0,X0,PR0
+         0 000607   040000 316003                    CANQ    16384,DU
+         0 000610   000733 600000 0                  TZE     KEEP_TRYING
+
+      370     2533    4             THEN DO;
+
+      371     2534
+      372     2535    5                  DO T2 = TEMP1 TO TEMP1 + T1; /* Find N in a row       */
+
+   2535  0 000611   200005 235100                    LDA     TEMP1,,AUTO
+         0 000612   200007 755100                    STA     T2,,AUTO
+         0 000613   000622 710000 0                  TRA     s:2538+1
+
+      373     2536    5                       IF NOT MM$PPUT.FREE (T2)
+
+   2536  0 000614   000000 470400 xsym               LDP0    B$PPUT$
+         0 000615   200007 720100                    LXL0    T2,,AUTO
+         0 000616   000000 236110                    LDQ     0,X0,PR0
+         0 000617   040000 316003                    CANQ    16384,DU
+         0 000620   000733 600000 0                  TZE     KEEP_TRYING
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:54   
+
+      374     2537    5                       THEN GOTO KEEP_TRYING;
+      375     2538    5                     END;
+
+   2538  0 000621   200007 054100                    AOS     T2,,AUTO
+         0 000622   200005 236100                    LDQ     TEMP1,,AUTO
+         0 000623   200006 036100                    ADLQ    T1,,AUTO
+         0 000624   200007 116100                    CMPQ    T2,,AUTO
+         0 000625   000614 605000 0                  TPL     s:2536
+
+      376     2539    5                  IF HW_WSQ0PT THEN DO;
+
+   2539  0 000626   000000 234000 xsym               SZN     HW_WSQ0PT
+         0 000627   000643 605000 0                  TPL     s:2547
+
+      377     2540    5                       IF B$WSQ0PT$->B$MAP.RPN(T2-1)
+
+   2540  0 000630   000000 471400 xsym               LDP1    B$WSQ0PT$
+         0 000631   200005 720100                    LXL0    TEMP1,,AUTO
+         0 000632   100000 236110                    LDQ     0,X0,PR1
+         0 000633   000022 772000                    QRL     18
+         0 000634   200012 756100                    STQ     FLG+1,,AUTO
+         0 000635   200007 721100                    LXL1    T2,,AUTO
+         0 000636   177777 236111                    LDQ     -1,X1,PR1
+         0 000637   000022 772000                    QRL     18
+         0 000640   200012 136100                    SBLQ    FLG+1,,AUTO
+         0 000641   200006 116100                    CMPQ    T1,,AUTO
+         0 000642   000733 601000 0                  TNZ     KEEP_TRYING
+
+      378     2541    5                            - B$WSQ0PT$->B$MAP.RPN(TEMP1)
+      379     2542    5                            ~= T1 THEN GOTO KEEP_TRYING;
+              2542                                     /* Not PHYSICALLY contiguous */
+      380     2543    5                     END;
+
+      381     2544
+      382     2545        /* Remove the pages from the free page chain */
+      383     2546
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:55   
+      384     2547    4                  PPNO = TEMP1;            /* Return the first page number */
+
+   2547  0 000643   200003 471500                    LDP1    @PPNO,,AUTO
+         0 000644   200005 235100                    LDA     TEMP1,,AUTO
+         0 000645   100000 755100                    STA     0,,PR1
+
+      385     2548    4                  T1 = TEMP1 + T1;
+
+   2548  0 000646   200005 236100                    LDQ     TEMP1,,AUTO
+         0 000647   200006 036100                    ADLQ    T1,,AUTO
+         0 000650   200006 756100                    STQ     T1,,AUTO
+
+      386     2549    5                  DO TEMP1 = TEMP1 TO T1;
+
+   2549  0 000651   000723 710000 0                  TRA     s:2569+1
+
+      387     2550
+      388     2551    5                       IF MM_FPPH = TEMP1
+
+   2551  0 000652   000000 236000 xsym               LDQ     MM_FPPH
+         0 000653   200005 116100                    CMPQ    TEMP1,,AUTO
+         0 000654   000663 601000 0                  TNZ     s:2556
+
+      389     2552    6                       THEN DO;
+
+      390     2553    6                            MM_FPPH = MM$PPUT.PPNO (TEMP1);
+
+   2553  0 000655   000000 470400 xsym               LDP0    B$PPUT$
+         0 000656   200005 720100                    LXL0    TEMP1,,AUTO
+         0 000657   000000 236110                    LDQ     0,X0,PR0
+         0 000660   777777 376007                    ANQ     -1,DL
+         0 000661   000000 756000 xsym               STQ     MM_FPPH
+
+      391     2554    6                          END;
+
+   2554  0 000662   000715 710000 0                  TRA     s:2567
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:56   
+      392     2555    6                       ELSE DO;
+
+      393     2556    6                            CALL MM0$FINDPG(TEMP1,MM_FPPH,MM_FPPT,MM_FPPC,T2);
+
+   2556  0 000663   200007 630500                    EPPR0   T2,,AUTO
+         0 000664   200016 450500                    STP0    FLG+5,,AUTO
+         0 000665   000012 237000 1                  LDAQ    10
+         0 000666   200014 757100                    STAQ    FLG+3,,AUTO
+         0 000667   000000 236000 1                  LDQ     0
+         0 000670   200013 756100                    STQ     FLG+2,,AUTO
+         0 000671   200005 631500                    EPPR1   TEMP1,,AUTO
+         0 000672   200012 451500                    STP1    FLG+1,,AUTO
+         0 000673   200012 630500                    EPPR0   FLG+1,,AUTO
+         0 000674   000023 631400 xsym               EPPR1   B_VECTNIL+19
+         0 000675   000000 701000 xent               TSX1    MM0$FINDPG
+         0 000676   000000 011000                    NOP     0
+
+      394     2557    6                            IF T2 > 0      /* Found it  */
+
+   2557  0 000677   200007 235100                    LDA     T2,,AUTO
+         0 000700   000713 604400 0                  TMOZ    s:2565
+
+      395     2558    7                            THEN DO;
+
+      396     2559    7                                 MM$PPUT.PPNO(T2) = MM$PPUT.PPNO(TEMP1);
+
+   2559  0 000701   000000 470400 xsym               LDP0    B$PPUT$
+         0 000702   200005 720100                    LXL0    TEMP1,,AUTO
+         0 000703   000000 721110                    LXL1    0,X0,PR0
+         0 000704   000000 441105                    SXL1    0,AL,PR0
+
+      397     2560    7                                 IF MM_FPPT = TEMP1
+
+   2560  0 000705   000000 236000 xsym               LDQ     MM_FPPT
+         0 000706   200005 116100                    CMPQ    TEMP1,,AUTO
+         0 000707   000715 601000 0                  TNZ     s:2567
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:57   
+      398     2561    7                                 THEN
+      399     2562    7                                      MM_FPPT = T2;
+
+   2562  0 000710   200007 235100                    LDA     T2,,AUTO
+         0 000711   000000 755000 xsym               STA     MM_FPPT
+
+      400     2563    7                               END;
+
+   2563  0 000712   000715 710000 0                  TRA     s:2567
+
+      401     2564    6                            ELSE           /* Couldn't find the page */
+      402     2565    6                                 CALL SC_MM10_E;
+
+   2565  0 000713   000000 713400 xsym               CLIMB   SC_MM10_E
+         0 000714   000000 600000 xsid               climb   nvectors=         0
+
+      403     2566    6                          END;
+
+      404     2567    5                       MM$PPUT(TEMP1) = '0'B;
+
+   2567  0 000715   000000 470400 xsym               LDP0    B$PPUT$
+         0 000716   200005 720100                    LXL0    TEMP1,,AUTO
+         0 000717   000000 450110                    STZ     0,X0,PR0
+
+      405     2568    5                       MM_FPPC = MM_FPPC - 1;
+
+   2568  0 000720   000001 336007                    LCQ     1,DL
+         0 000721   000000 056000 xsym               ASQ     MM_FPPC
+
+      406     2569    5                     END;
+
+   2569  0 000722   200005 054100                    AOS     TEMP1,,AUTO
+         0 000723   200005 236100                    LDQ     TEMP1,,AUTO
+         0 000724   200006 116100                    CMPQ    T1,,AUTO
+         0 000725   000652 604400 0                  TMOZ    s:2551
+
+      407     2570    4                  CALL MMA$UNLOCKBP;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:58   
+
+   2570  0 000726   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000727   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000730   000000 011000                    NOP     0
+
+      408     2571    4                  RETURN;
+
+   2571  0 000731   200010 221300                    LDX1  ! T2+1,,AUTO
+         0 000732   000001 702211                    TSX2  ! 1,X1
+
+      409     2572    4                END;
+      410     2573
+      411     2574    3   KEEP_TRYING:
+      412     2575    3             TEMP1 = TEMP1 + 1;
+
+   2575  0 000733   200005 054100       KEEP_TRYING  AOS     TEMP1,,AUTO
+
+      413     2576    3           END;
+
+   2576  0 000734   000000 236000 xsym               LDQ     MM_PCORE
+         0 000735   200006 136100                    SBLQ    T1,,AUTO
+         0 000736   200005 116100                    CMPQ    TEMP1,,AUTO
+         0 000737   000604 605400 0                  TPNZ    s:2532
+
+      414     2577    2        CALL MMA$UNLOCKBP;
+
+   2577  0 000740   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000741   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000742   000000 011000                    NOP     0
+
+      415     2578    2        ALTRETURN;
+
+   2578  0 000743   200010 221300                    LDX1  ! T2+1,,AUTO
+         0 000744   000000 702211                    TSX2  ! 0,X1
+
+      416     2579    2   END GETN;
+      417     2580        /*
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:59   
+      418     2581        */
+      419     2582    1   MMB$RETMEM: ENTRY(PPNO) ALTRET;
+
+   2582  0 000745   000000 700200 xent  MMB$RETMEM   TSX0  ! X66_AUTO_2
+         0 000746   000020 000002                    ZERO    16,2
+
+      420     2583        /*F*     NAME:     MMB$RETMEM                            */
+      421     2584        /*F*     PURPOSE: To return a physical page of memory.  This
+      422     2585                          is done when returning a SCU on the DPS8000.
+      423     2586        */
+      424     2587    1        CALL MMA$LOCKBP;
+
+   2587  0 000747   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000750   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000751   000000 011000                    NOP     0
+
+      425     2588    2        IF (NOT MM$PPUT.STOLEN(PPNO)) AND (MM$PPUT.USER#(PPNO) ~= 511) THEN DO;
+
+   2588  0 000752   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000753   000000 235100                    LDA     0,,PR0
+         0 000754   000000 471400 xsym               LDP1    B$PPUT$
+         0 000755   100000 236105                    LDQ     0,AL,PR1
+         0 000756   002000 316003                    CANQ    1024,DU
+         0 000757   000771 601000 0                  TNZ     s:2592
+         0 000760   000000 235100                    LDA     0,,PR0
+         0 000761   100000 236105                    LDQ     0,AL,PR1
+         0 000762   000777 376003                    ANQ     511,DU
+         0 000763   000777 116003                    CMPQ    511,DU
+         0 000764   000771 600000 0                  TZE     s:2592
+
+      426     2589    2             CALL MMA$UNLOCKBP;
+
+   2589  0 000765   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000766   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000767   000000 011000                    NOP     0
+
+      427     2590    2             ALTRETURN;
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:60   
+
+   2590  0 000770   000000 702200 xent               TSX2  ! X66_AALT
+
+      428     2591    2           END;
+      429     2592    1        IF MM_FPPT = 0 THEN CALL SC_MM10_E;
+
+   2592  0 000771   000000 235000 xsym               LDA     MM_FPPT
+         0 000772   000775 601000 0                  TNZ     s:2593
+
+   2592  0 000773   000000 713400 xsym               CLIMB   SC_MM10_E
+         0 000774   000000 600000 xsid               climb   nvectors=         0
+
+      430     2593    1        MM$PPUT(PPNO) = %FALSE;
+
+   2593  0 000775   200003 470500                    LDP0    @PPNO,,AUTO
+         0 000776   000000 720100                    LXL0    0,,PR0
+         0 000777   000000 471400 xsym               LDP1    B$PPUT$
+         0 001000   100000 450110                    STZ     0,X0,PR1
+
+      431     2594    1        GOTO ADD_2_TAIL;
+
+   2594  0 001001   000356 710000 0                  TRA     ADD_2_TAIL
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 006000   000000 006000   000000 006000   000000 000100    ...............@
+   1     004   000003 006000   000000 006000   000000 006000   000000 000101    ...............A
+   1     010   000007 006000   000000 000000   000000 006000   000000 006000    ................
+   1     014   000000 006000   000000 006000   000000 006000                    ............
+      432     2595
+      433     2596    1   END MMB$GPP;
+      434     2597        %EOD;
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:61   
+--  Include file information  --
+
+   B$MAP.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   HF_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   FM_CACHE_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRLD_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRL_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   B_SEGIDS_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+   B$JIT.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure MMB$GPP.
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:62   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @PPNO                      4-0-0/w PTR         r     1 @WSQ
+    11-0-0/b BIT         r     1 FLG                       *0-0-0/w SBIN        r     1 PPNO
+     6-0-0/w SBIN        r     1 T1                         7-0-0/w SBIN        r     1 T2
+     5-0-0/w SBIN        r     1 TEMP1                     *0-0-0/w UBIN        r     1 WSQ
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$JIT$                     0-0-0/w PTR         r     1 B$PPUT$
+     0-0-0/w PTR         r     1 B$WSQ0PT$                  0-0-0/w PTR         r     1 FMC_CACHEPGCNT$
+     0-0-0/b BIT (72)    r     1 FMC_LOCK                   0-0-0/w BIT         r     1 HW_WSQ0PT
+     0-0-0/d BIT (72)    r     1 J_PLOCK                    0-0-0/w UBIN        r     1 MM_AUTO_PRIO
+     0-0-0/w SBIN        r     1 MM_BPPC                    0-0-0/w SBIN        r     1 MM_BPPH
+     0-0-0/w SBIN        r     1 MM_BPPT                    0-0-0/w PTR         r     1 MM_BYP$
+     0-0-0/w UBIN        r     1 MM_CACHE_PRIO              0-0-0/w PTR         r     1 MM_CGQD$
+     0-0-0/w UBIN        r     1 MM_CG_PRIO                 0-0-0/b BIT         r     1 MM_CHKFLG
+     0-0-0/w SBIN        r     1 MM_FPPC                    0-0-0/w SBIN        r     1 MM_FPPH
+     0-0-0/w SBIN        r     1 MM_FPPT                    0-0-0/w UBIN        r     1 MM_HELD
+     0-0-0/w SBIN        r     1 MM_IOTRNC                  0-0-0/w SBIN        r     1 MM_PCORE
+     0-0-0/w SBIN        r     1 MM_RSVP                    0-0-0/w SBIN        r     1 MM_SPPC
+     0-0-0/w SBIN        r     1 MM_SPTRNC                  0-0-0/w SBIN        r     1 MM_SUSPECTS
+     0-0-0/w SBIN        r     1 S_RQH(0:5)                 0-0-0/w UBIN        r     1 S_TIMR
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:63   
+     0-0-0/d STRC(8856)  r     1 B$JIT                      0-0-0/w STRC        r     1 B$MAP(0:1023)
+     0-0-0/w SBIN        r     1 FMC$CACHEPGCNT             0-0-0/w STRC(576)   r     1 MM$BYP
+     0-0-0/w STRC(288)   r     1 MM$CGQD
+     0-0-0/w STRC        r     1 MM$PPUT(0:0)
+
+
+   Procedure MMB$GPP requires 514 words for executable code.
+   Procedure MMB$GPP requires 16 words of local(AUTO) storage.
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:64   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:65   
+          MINI XREF LISTING
+
+ADD_2_BAD
+      2395**LABEL    2432--GOTO     2460--GOTO
+ADD_2_GOOD
+      2361**LABEL    2490--GOTO
+ADD_2_TAIL
+      2425**LABEL    2594--GOTO
+B$JIT.CPFLAGS1.SLEAZE
+       480**DCL       480--REDEF
+B$JIT.ERR.MID
+       387**DCL       387--REDEF
+B$JIT.JRESPEAK
+       548**DCL       549--REDEF
+B$JIT.JUNK
+       586**DCL      2286>>IF
+B$JIT.ORIGINATOR_PORT.FROM_CR
+       657**DCL       657--REDEF     658--REDEF
+B$JIT.PNR
+       561**DCL       561--REDEF
+B$JIT.TSLINE
+       655**DCL       656--REDEF
+B$JIT$
+        52**DCL       381--IMP-PTR  2286>>IF
+B$MAP.RPN
+      2108**DCL      2540>>IF       2540>>IF
+B$MAP.SCTRL
+      2109**DCL      2110--REDEF
+B$PPUT$
+        50**DCL      2244>>ASSIGN   2245>>IF       2249>>ASSIGN   2377>>IF       2379>>ASSIGN   2380>>ASSIGN
+      2383>>ASSIGN   2396>>ASSIGN   2397>>ASSIGN   2400>>ASSIGN   2421>>IF       2423>>ASSIGN   2425>>ASSIGN
+      2428>>ASSIGN   2444>>IF       2446>>ASSIGN   2451>>ASSIGN   2457>>ASSIGN   2457>>ASSIGN   2474>>ASSIGN
+      2485>>ASSIGN   2485>>ASSIGN   2532>>IF       2536>>IF       2553>>ASSIGN   2559>>ASSIGN   2559>>ASSIGN
+      2567>>ASSIGN   2588>>IF       2588>>IF       2593>>ASSIGN
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:66   
+B$WSQ0PT$
+        53**DCL      2540>>IF       2540>>IF
+BADPP1
+      2459**LABEL    2452--GOTO
+CHKHELD
+      2348**PROC     2233--CALL     2268--CALL
+FIND_N_PAGES
+      2501**LABEL    2523--GOTO
+FLG IN PROCEDURE RELPG
+      2299**DCL      2308<<ASSIGN   2310<<ASSIGN   2332>>IF
+FMC$CACHEPGCNT
+      2006**DCL      2312>>ASSIGN
+FMC$RELPG
+        38**DCL-ENT  2328--CALL
+FMC_CACHEPGCNT$
+      2006**DCL      2006--IMP-PTR  2006--REDEF    2312>>ASSIGN
+FMC_LOCK
+      2007**DCL      2303<>CALL     2337<>CALL
+GETN
+      2526**PROC     2507--CALL     2518--CALL
+GET_IT
+      2239**LABEL    2269--GOTO
+HFC$LOCK
+      2065**DCL-ENT  2303--CALL     2306--CALL
+HFC$UNLOCK
+      2065**DCL-ENT  2334--CALL     2337--CALL
+HW_WSQ0PT
+      2047**DCL      2539>>IF
+INC_FPPC
+      2385**LABEL    2430--GOTO
+JSU$FREE_PROC
+        40**DCL-ENT  2317--CALL
+J_PLOCK
+        56**DCL      2306<>CALL     2334<>CALL
+KEEP_TRYING IN PROCEDURE GETN
+      2575**LABEL    2537--GOTO     2542--GOTO
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:67   
+MM$BYP.AUTOP
+      1594**DCL      2313>>IF       2315>>IF
+MM$CGQD.FPPC
+      2180**DCL      2313>>IF       2324>>IF
+MM$DESC.BOUND
+      1672**DCL      1673--REDEF
+MM$DESC.FLGS
+      1673**DCL      1673--REDEF
+MM$PPUT
+      1659**DCL      2249<<ASSIGN   2379<<ASSIGN   2396<<ASSIGN   2423<<ASSIGN   2567<<ASSIGN   2593<<ASSIGN
+MM$PPUT.BAD
+      1660**DCL      2397<<ASSIGN
+MM$PPUT.FREE
+      1660**DCL      2245>>IF       2380<<ASSIGN   2425<<ASSIGN   2532>>IF       2536>>IF
+MM$PPUT.PPNO
+      1661**DCL      2244>>ASSIGN   2383<<ASSIGN   2400<<ASSIGN   2428<<ASSIGN   2451>>ASSIGN   2457<<ASSIGN
+      2457>>ASSIGN   2474>>ASSIGN   2485<<ASSIGN   2485>>ASSIGN   2553>>ASSIGN   2559<<ASSIGN   2559>>ASSIGN
+MM$PPUT.STOLEN
+      1660**DCL      2588>>IF
+MM$PPUT.SUSPECT
+      1660**DCL      2377>>IF       2421>>IF       2444>>IF       2446<<ASSIGN
+MM$PPUT.USER#
+      1661**DCL      1661--REDEF    2588>>IF
+MM0$CHKPCNT
+        36**DCL-ENT  2258--CALL
+MM0$FINDPG
+        37**DCL-ENT  2454--CALL     2476--CALL     2556--CALL
+MMA$LOCKBP
+        45**DCL-ENT  2230--CALL     2339--CALL     2373--CALL     2420--CALL     2443--CALL     2472--CALL
+      2506--CALL     2516--CALL     2587--CALL
+MMA$UNLOCKBP
+        46**DCL-ENT  2255--CALL     2275--CALL     2295--CALL     2300--CALL     2462--CALL     2514--CALL
+      2570--CALL     2577--CALL     2589--CALL
+MMQ$TRUNCPT
+        39**DCL-ENT  2326--CALL
+MM_AUTO_PRIO
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:68   
+        31**DCL      2313>>IF       2315>>IF
+MM_BPPC
+      1591**DCL      2402<<ASSIGN   2402>>ASSIGN   2476<>CALL     2488<<ASSIGN   2488>>ASSIGN
+MM_BPPH
+      1590**DCL      2398>>IF       2399<<ASSIGN   2473>>IF       2474<<ASSIGN   2476<>CALL
+MM_BPPT
+      1590**DCL      2400>>ASSIGN   2401<<ASSIGN   2476<>CALL     2486>>IF       2486<<ASSIGN
+MM_BYP$
+      1592**DCL      1592--IMP-PTR  2313>>IF       2315>>IF
+MM_CACHE_PRIO
+        32**DCL      2312>>ASSIGN
+MM_CGQD$
+        48**DCL      2179--IMP-PTR  2313>>IF       2324>>IF
+MM_CG_PRIO
+        33**DCL      2313>>IF       2324>>IF
+MM_CHKFLG
+      1596**DCL      2256>>IF
+MM_FPPC
+      1589**DCL      2253<<ASSIGN   2253>>ASSIGN   2258<>CALL     2350>>IF       2385<<ASSIGN   2385>>ASSIGN
+      2454<>CALL     2459<<ASSIGN   2459>>ASSIGN   2556<>CALL     2568<<ASSIGN   2568>>ASSIGN
+MM_FPPH
+      1589**DCL      2239>>ASSIGN   2244<<ASSIGN   2250>>IF       2258<>CALL     2383>>ASSIGN   2384<<ASSIGN
+      2427<<ASSIGN   2449>>IF       2451<<ASSIGN   2451>>ASSIGN   2454<>CALL     2551>>IF       2553<<ASSIGN
+      2556<>CALL
+MM_FPPT
+      1589**DCL      2252<<ASSIGN   2258<>CALL     2381>>IF       2382<<ASSIGN   2426>>IF       2428>>ASSIGN
+      2429<<ASSIGN   2454<>CALL     2556<>CALL     2560>>IF       2562<<ASSIGN   2592>>IF
+MM_HELD
+      1595**DCL      2350>>IF
+MM_IOTRNC
+      1659**DCL      2329<<ASSIGN   2329>>ASSIGN
+MM_PCORE
+      1594**DCL      2530>>DOWHILE
+MM_RSVP
+      1595**DCL      2350>>IF
+MM_SPPC
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:69   
+      1590**DCL      2350>>IF
+MM_SPTRNC
+      1659**DCL      2318<<ASSIGN   2318>>ASSIGN
+MM_SUSPECTS
+      1591**DCL      2447<<ASSIGN   2447>>ASSIGN   2489<<ASSIGN   2489>>ASSIGN
+PPNO
+        20**DCL        12--PROC     2239<<ASSIGN   2240>>IF       2244>>ASSIGN   2245>>IF       2249>>ASSIGN
+      2289<<ASSIGN   2359--ENTRY    2361>>IF       2377>>IF       2379>>ASSIGN   2380>>ASSIGN   2382>>ASSIGN
+      2383>>ASSIGN   2384>>ASSIGN   2396>>ASSIGN   2397>>ASSIGN   2399>>ASSIGN   2400>>ASSIGN   2401>>ASSIGN
+      2407--ENTRY    2414>>IF       2421>>IF       2423>>ASSIGN   2425>>ASSIGN   2427>>ASSIGN   2428>>ASSIGN
+      2429>>ASSIGN   2442--ENTRY    2444>>IF       2446>>ASSIGN   2449>>IF       2454<>CALL     2457>>ASSIGN
+      2471--ENTRY    2473>>IF       2474>>ASSIGN   2476<>CALL     2485>>ASSIGN   2486>>IF       2499--ENTRY
+      2500>>ASSIGN   2547<<ASSIGN   2582--ENTRY    2588>>IF       2588>>IF       2593>>ASSIGN
+RECOUP
+      2267**LABEL    2233--CALLALT
+REGEM
+      2275**LABEL    2268--CALLALT
+RELIOC IN PROCEDURE RELPG
+      2328**LABEL    2321--GOTO
+RELPG
+      2298**PROC     2267--CALL
+RELPG1 IN PROCEDURE RELPG
+      2301**ENTRY    2294--CALL     2512--CALL
+SC_MM10_E
+        47**DCL-ENT  2247--CALL     2565--CALL     2592--CALL
+SC_MM12
+        35**DCL-ENT  2363--CALL     2416--CALL
+SC_MM38
+        34**DCL-ENT  2482--CALL
+SSC$SASYNC
+        42**DCL-ENT  2311--CALL
+SSC$SERV
+        43**DCL-ENT  2332--CALL
+SSR$REG
+        41**DCL-ENT  2276--CALL     2521--CALL
+SSR$RUE
+PL6.E3A0      #001=MMB$GPP File=MMB$PMEM.:E05TSI                                 WED 07/30/97 03:19 Page:70   
+        44**DCL-ENT  2389--CALL
+S_RQH
+      1981**DCL      2387>>IF
+S_TIMR
+        57**DCL      2309>>IF
+T1
+        23**DCL      2500<<ASSIGN   2501>>IF       2510>>ASSIGN   2530>>DOWHILE  2535>>DOINDEX  2540>>IF
+      2548<<ASSIGN   2548>>ASSIGN   2549>>DOINDEX
+T2
+        24**DCL      2535<<DOINDEX  2536>>IF       2540>>IF       2556<>CALL     2557>>IF       2559>>ASSIGN
+      2562>>ASSIGN
+TEMP1
+        22**DCL      2312<<ASSIGN   2315>>IF       2324>>IF       2454<>CALL     2455>>IF       2457>>ASSIGN
+      2476<>CALL     2477>>IF       2485>>ASSIGN   2486>>ASSIGN   2510<<ASSIGN   2511>>DOWHILE  2513<<ASSIGN
+      2513>>ASSIGN   2528<<ASSIGN   2530>>DOWHILE  2532>>IF       2535>>DOINDEX  2535>>DOINDEX  2540>>IF
+      2547>>ASSIGN   2548>>ASSIGN   2549<<DOINDEX  2549>>DOINDEX  2551>>IF       2553>>ASSIGN   2556<>CALL
+      2559>>ASSIGN   2560>>IF       2567>>ASSIGN   2575<<ASSIGN   2575>>ASSIGN
+THE_TOP
+      2230**LABEL    2277--GOTO     2285--GOTO     2288--GOTO     2503--GOTO
+UNLOCK
+      2462**LABEL    2483--GOTO
+UNLOCK_CHECK
+      2255**LABEL    2242--GOTO     2404--GOTO
+USER_BREAK
+      2256**LABEL    2276--CALLALT
+WSQ
+        21**DCL        12--PROC     2231>>IF       2283>>IF       2283>>IF       2499--ENTRY
+
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:71   
+      435        1        /*T***********************************************************/
+      436        2        /*T*                                                         */
+      437        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      438        4        /*T*                                                         */
+      439        5        /*T***********************************************************/
+      440        6        MMB$RELMEM: PROC(LO_PAGE,HI_PAGE,TOTAL_PAGES) ALTRET;
+      441        7        /*F*     NAME:     MMB$RELMEM                            */
+      442        8        /*F*     PURPOSE: To release a range of physical memory.  This
+      443        9                          is done when releasing a SCU on the DPS8000.
+      444       10        */
+      445       11    1   DCL LO_PAGE UBIN WORD;
+      446       12    1   DCL HI_PAGE UBIN WORD;
+      447       13    1   DCL TOTAL_PAGES UBIN WORD;
+      448       14
+      449       15        %INCLUDE MM_DATA_R;
+      450      535
+      451      536    1   DCL B$PPUT$ PTR SYMREF READONLY;
+      452      537    1   DCL I UBIN WORD;
+      453      538    1   DCL T1 UBIN WORD;
+      454      539    1   DCL T2 UBIN WORD;
+      455      540    1   DCL PRED UBIN WORD;
+      456      541
+      457      542    1   DCL B$WORD UBIN WORD BASED;
+      458      543    1   DCL MMA$LOCKBP ENTRY;
+      459      544    1   DCL MMA$UNLOCKBP ENTRY;
+      460      545        %SUB MM$PPUT = B$PPUT$->MM$PPUT;
+      461      546
+      462      547    1        CALL MMA$LOCKBP;
+      463      548    1        TOTAL_PAGES = 0;
+      464      549    1        T1 = MM_FPPH;
+      465      550    1        T2 = MM_FPPC;
+      466      551    1        PRED = 0;
+      467      552    2        DO I = 0 TO T2;
+      468      553    3             IF T1 >= LO_PAGE AND T1 <=HI_PAGE THEN DO;
+      469      554    3                  IF T1 = MM_FPPH THEN
+      470      555    3                       MM_FPPH = MM$PPUT.PPNO(T1);
+      471      556    3                  ELSE
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:72   
+      472      557    3                       MM$PPUT.PPNO(PRED) = MM$PPUT.PPNO(T1);
+      473      558    3                  IF T1 = MM_FPPT THEN
+      474      559    3                       MM_FPPT = PRED;
+      475      560    3                  MM$PPUT(T1)=%FALSE;
+      476      561    3                  MM$PPUT.STOLEN(T1) = %TRUE;
+      477      562    3                  MM$PPUT.USER#(T1) = 511;
+      478      563    3                  TOTAL_PAGES = TOTAL_PAGES + 1;
+      479      564    3                  MM_FPPC = MM_FPPC - 1;
+      480      565    3                END;
+      481      566    2             ELSE
+      482      567    2                  PRED = T1;
+      483      568    2             IF PRED = 0 THEN
+      484      569    2                  T1 = MM_FPPH;
+      485      570    2             ELSE
+      486      571    2                  T1 = MM$PPUT.PPNO(PRED);
+      487      572    2           END;
+      488      573    1        CALL MMA$UNLOCKBP;
+      489      574    1        RETURN;
+      490      575    1   END MMB$RELMEM;
+
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:73   
+--  Include file information  --
+
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure MMB$RELMEM.
+
+   Procedure MMB$RELMEM requires 74 words for executable code.
+   Procedure MMB$RELMEM requires 10 words of local(AUTO) storage.
+
+    No errors detected in file MMB$PMEM.:E05TSI    .
+
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:74   
+
+ Object Unit name= MMB$RELMEM                                 File name= MMB$PMEM.:E05TOU
+ UTS= JUL 30 '97 03:20:28.16 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none    74    112  MMB$RELMEM
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes    yes     yes      Std        3  MMB$RELMEM
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       0 MMA$LOCKBP
+         yes           Std       0 MMA$UNLOCKBP
+                       nStd      0 X66_AUTO_3
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     MM_FPPH                               MM_FPPT                               MM_FPPC
+r    MM_BYP$                          r    B$PPUT$                               B_VECTNIL
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:75   
+
+
+      435        1        /*T***********************************************************/
+      436        2        /*T*                                                         */
+      437        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      438        4        /*T*                                                         */
+      439        5        /*T***********************************************************/
+      440        6        MMB$RELMEM: PROC(LO_PAGE,HI_PAGE,TOTAL_PAGES) ALTRET;
+
+      6  0 000000   000000 700200 xent  MMB$RELMEM   TSX0  ! X66_AUTO_3
+         0 000001   000012 000003                    ZERO    10,3
+
+      441        7        /*F*     NAME:     MMB$RELMEM                            */
+      442        8        /*F*     PURPOSE: To release a range of physical memory.  This
+      443        9                          is done when releasing a SCU on the DPS8000.
+      444       10        */
+      445       11    1   DCL LO_PAGE UBIN WORD;
+      446       12    1   DCL HI_PAGE UBIN WORD;
+      447       13    1   DCL TOTAL_PAGES UBIN WORD;
+      448       14
+      449       15        %INCLUDE MM_DATA_R;
+      450      535
+      451      536    1   DCL B$PPUT$ PTR SYMREF READONLY;
+      452      537    1   DCL I UBIN WORD;
+      453      538    1   DCL T1 UBIN WORD;
+      454      539    1   DCL T2 UBIN WORD;
+      455      540    1   DCL PRED UBIN WORD;
+      456      541
+      457      542    1   DCL B$WORD UBIN WORD BASED;
+      458      543    1   DCL MMA$LOCKBP ENTRY;
+      459      544    1   DCL MMA$UNLOCKBP ENTRY;
+      460      545        %SUB MM$PPUT = B$PPUT$->MM$PPUT;
+      461      546
+      462      547    1        CALL MMA$LOCKBP;
+
+    547  0 000002   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000003   000000 701000 xent               TSX1    MMA$LOCKBP
+         0 000004   000000 011000                    NOP     0
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:76   
+
+      463      548    1        TOTAL_PAGES = 0;
+
+    548  0 000005   200005 470500                    LDP0    @TOTAL_PAGES,,AUTO
+         0 000006   000000 450100                    STZ     0,,PR0
+
+      464      549    1        T1 = MM_FPPH;
+
+    549  0 000007   000000 235000 xsym               LDA     MM_FPPH
+         0 000010   200007 755100                    STA     T1,,AUTO
+
+      465      550    1        T2 = MM_FPPC;
+
+    550  0 000011   000000 236000 xsym               LDQ     MM_FPPC
+         0 000012   200010 756100                    STQ     T2,,AUTO
+
+      466      551    1        PRED = 0;
+
+    551  0 000013   200011 450100                    STZ     PRED,,AUTO
+
+      467      552    2        DO I = 0 TO T2;
+
+    552  0 000014   200006 450100                    STZ     I,,AUTO
+         0 000015   000103 710000 0                  TRA     s:572+3
+
+      468      553    3             IF T1 >= LO_PAGE AND T1 <=HI_PAGE THEN DO;
+
+    553  0 000016   200003 470500                    LDP0    @LO_PAGE,,AUTO
+         0 000017   200007 236100                    LDQ     T1,,AUTO
+         0 000020   000000 116100                    CMPQ    0,,PR0
+         0 000021   000066 602000 0                  TNC     s:567
+         0 000022   200004 471500                    LDP1    @HI_PAGE,,AUTO
+         0 000023   100000 116100                    CMPQ    0,,PR1
+         0 000024   000026 600000 0                  TZE     s:554
+         0 000025   000066 603000 0                  TRC     s:567
+
+      469      554    3                  IF T1 = MM_FPPH THEN
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:77   
+
+    554  0 000026   000000 116003                    CMPQ    0,DU
+         0 000027   000037 604000 0                  TMI     s:557
+         0 000030   000000 116000 xsym               CMPQ    MM_FPPH
+         0 000031   000037 601000 0                  TNZ     s:557
+
+      470      555    3                       MM_FPPH = MM$PPUT.PPNO(T1);
+
+    555  0 000032   000000 473400 xsym               LDP3    B$PPUT$
+         0 000033   300000 236106                    LDQ     0,QL,PR3
+         0 000034   777777 376007                    ANQ     -1,DL
+         0 000035   000000 756000 xsym               STQ     MM_FPPH
+         0 000036   000043 710000 0                  TRA     s:558
+
+      471      556    3                  ELSE
+      472      557    3                       MM$PPUT.PPNO(PRED) = MM$PPUT.PPNO(T1);
+
+    557  0 000037   000000 473400 xsym               LDP3    B$PPUT$
+         0 000040   300000 720106                    LXL0    0,QL,PR3
+         0 000041   200011 721100                    LXL1    PRED,,AUTO
+         0 000042   300000 440111                    SXL0    0,X1,PR3
+
+      473      558    3                  IF T1 = MM_FPPT THEN
+
+    558  0 000043   200007 236100                    LDQ     T1,,AUTO
+         0 000044   000051 604000 0                  TMI     s:560
+         0 000045   000000 116000 xsym               CMPQ    MM_FPPT
+         0 000046   000051 601000 0                  TNZ     s:560
+
+      474      559    3                       MM_FPPT = PRED;
+
+    559  0 000047   200011 235100                    LDA     PRED,,AUTO
+         0 000050   000000 755000 xsym               STA     MM_FPPT
+
+      475      560    3                  MM$PPUT(T1)=%FALSE;
+
+    560  0 000051   300000 450106                    STZ     0,QL,PR3
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:78   
+
+      476      561    3                  MM$PPUT.STOLEN(T1) = %TRUE;
+
+    561  0 000052   200007 720100                    LXL0    T1,,AUTO
+         0 000053   002000 236003                    LDQ     1024,DU
+         0 000054   300000 256110                    ORSQ    0,X0,PR3
+
+      477      562    3                  MM$PPUT.USER#(T1) = 511;
+
+    562  0 000055   000777 236003                    LDQ     511,DU
+         0 000056   300000 256110                    ORSQ    0,X0,PR3
+
+      478      563    3                  TOTAL_PAGES = TOTAL_PAGES + 1;
+
+    563  0 000057   200005 474500                    LDP4    @TOTAL_PAGES,,AUTO
+         0 000060   400000 235100                    LDA     0,,PR4
+         0 000061   000001 035007                    ADLA    1,DL
+         0 000062   400000 755100                    STA     0,,PR4
+
+      479      564    3                  MM_FPPC = MM_FPPC - 1;
+
+    564  0 000063   000001 336007                    LCQ     1,DL
+         0 000064   000000 056000 xsym               ASQ     MM_FPPC
+
+      480      565    3                END;
+
+    565  0 000065   000067 710000 0                  TRA     s:568
+
+      481      566    2             ELSE
+      482      567    2                  PRED = T1;
+
+    567  0 000066   200011 756100                    STQ     PRED,,AUTO
+
+      483      568    2             IF PRED = 0 THEN
+
+    568  0 000067   200011 235100                    LDA     PRED,,AUTO
+         0 000070   000074 601000 0                  TNZ     s:571
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:79   
+
+      484      569    2                  T1 = MM_FPPH;
+
+    569  0 000071   000000 236000 xsym               LDQ     MM_FPPH
+         0 000072   200007 756100                    STQ     T1,,AUTO
+         0 000073   000100 710000 0                  TRA     s:572
+
+      485      570    2             ELSE
+      486      571    2                  T1 = MM$PPUT.PPNO(PRED);
+
+    571  0 000074   000000 471400 xsym               LDP1    B$PPUT$
+         0 000075   100000 236105                    LDQ     0,AL,PR1
+         0 000076   777777 376007                    ANQ     -1,DL
+         0 000077   200007 756100                    STQ     T1,,AUTO
+
+      487      572    2           END;
+
+    572  0 000100   200006 235100                    LDA     I,,AUTO
+         0 000101   000001 035007                    ADLA    1,DL
+         0 000102   200006 755100                    STA     I,,AUTO
+         0 000103   200010 236100                    LDQ     T2,,AUTO
+         0 000104   200006 116100                    CMPQ    I,,AUTO
+         0 000105   000016 603000 0                  TRC     s:553
+
+      488      573    1        CALL MMA$UNLOCKBP;
+
+    573  0 000106   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000107   000000 701000 xent               TSX1    MMA$UNLOCKBP
+         0 000110   000000 011000                    NOP     0
+
+      489      574    1        RETURN;
+
+    574  0 000111   000000 702200 xent               TSX2  ! X66_ARET
+      490      575    1   END MMB$RELMEM;
+
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:80   
+--  Include file information  --
+
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure MMB$RELMEM.
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:81   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @HI_PAGE                   3-0-0/w PTR         r     1 @LO_PAGE
+     5-0-0/w PTR         r     1 @TOTAL_PAGES              *0-0-0/w UBIN        r     1 HI_PAGE
+     6-0-0/w UBIN        r     1 I                         *0-0-0/w UBIN        r     1 LO_PAGE
+    11-0-0/w UBIN        r     1 PRED                       7-0-0/w UBIN        r     1 T1
+    10-0-0/w UBIN        r     1 T2                        *0-0-0/w UBIN        r     1 TOTAL_PAGES
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$PPUT$                    0-0-0/w PTR         r     1 MM_BYP$
+     0-0-0/w SBIN        r     1 MM_FPPC                    0-0-0/w SBIN        r     1 MM_FPPH
+     0-0-0/w SBIN        r     1 MM_FPPT
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC        r     1 MM$PPUT(0:0)
+
+
+   Procedure MMB$RELMEM requires 74 words for executable code.
+   Procedure MMB$RELMEM requires 10 words of local(AUTO) storage.
+
+    No errors detected in file MMB$PMEM.:E05TSI    .
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:82   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:83   
+          MINI XREF LISTING
+
+B$PPUT$
+       536**DCL       555>>ASSIGN    557>>ASSIGN    557>>ASSIGN    560>>ASSIGN    561>>ASSIGN    562>>ASSIGN
+       571>>ASSIGN
+HI_PAGE
+        12**DCL         6--PROC      553>>IF
+I
+       537**DCL       552<<DOINDEX
+LO_PAGE
+        11**DCL         6--PROC      553>>IF
+MM$DESC.BOUND
+       486**DCL       487--REDEF
+MM$DESC.FLGS
+       487**DCL       487--REDEF
+MM$PPUT
+       473**DCL       560<<ASSIGN
+MM$PPUT.PPNO
+       475**DCL       555>>ASSIGN    557<<ASSIGN    557>>ASSIGN    571>>ASSIGN
+MM$PPUT.STOLEN
+       474**DCL       561<<ASSIGN
+MM$PPUT.USER#
+       475**DCL       475--REDEF     562<<ASSIGN
+MMA$LOCKBP
+       543**DCL-ENT   547--CALL
+MMA$UNLOCKBP
+       544**DCL-ENT   573--CALL
+MM_BYP$
+       406**DCL       406--IMP-PTR
+MM_FPPC
+       403**DCL       550>>ASSIGN    564<<ASSIGN    564>>ASSIGN
+MM_FPPH
+       403**DCL       549>>ASSIGN    554>>IF        555<<ASSIGN    569>>ASSIGN
+MM_FPPT
+PL6.E3A0      #002=MMB$RELMEM File=MMB$PMEM.:E05TSI                              WED 07/30/97 03:20 Page:84   
+       403**DCL       558>>IF        559<<ASSIGN
+PRED
+       540**DCL       551<<ASSIGN    557>>ASSIGN    559>>ASSIGN    567<<ASSIGN    568>>IF        571>>ASSIGN
+T1
+       538**DCL       549<<ASSIGN    553>>IF        553>>IF        554>>IF        555>>ASSIGN    557>>ASSIGN
+       558>>IF        560>>ASSIGN    561>>ASSIGN    562>>ASSIGN    567>>ASSIGN    569<<ASSIGN    571<<ASSIGN
+T2
+       539**DCL       550<<ASSIGN    552>>DOINDEX
+TOTAL_PAGES
+        13**DCL         6--PROC      548<<ASSIGN    563<<ASSIGN    563>>ASSIGN

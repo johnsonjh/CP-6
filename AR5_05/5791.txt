@@ -1,0 +1,1075 @@
+(*$D-$*)
+{*T***********************************************************    }
+{*T*                                                         *    }
+{*T* Copyright (c) Bull HN Information Systems Inc., 1989 }
+{*T*                                                         *    }
+{*T***********************************************************/   }
+{           Bugs corrected by Charles Fischer, Department of         }
+{           Computer Science, University of Wisconsin, Madison.      }
+{                                                                    }
+{           Modified for CDC-6000 Pascal Release 3 by Rick L. Marcus }
+{           University Computer Center, University of Minnesota.     }
+{           30 September 1978.                                       }
+{                                                                    }
+{====================================================================}
+ 
+program pretty(input, output);
+const
+   max_symbol_size = 200;
+   max_stack_size = 100;
+   max_key_length = 10;
+   max_line_size = 104;
+   slofail1 = 30;
+   slofail2 = 48;
+   indent_1 = 3;
+   indent_2 = 1;
+   space_char = ' ';
+ 
+type
+   key_symbol = (prog_sym,  func_sym,   proc_sym,
+                 label_sym, const_sym,  type_sym,    var_sym,
+                 begin_sym, repeat_sym, recordsym,
+                 case_sym,  case_var_sym, of_sym,
+                 for_sym,   while_sym,    with_sym,  do_sym,
+                 if_sym,    then_sym,     else_sym,
+                 end_sym,   until_sym,
+                 becomes,   open_2comment,   open_1comment,
+                 semicolon, colon,        equals,
+                 open_paren,close_paren,  period,
+                 close_2comment, close_1comment,
+                 end_of_file, other_sym );
+ 
+   option = (cr_suppress,
+             cr_before,
+             blank_line_before,
+             d_indent_on_keys,
+             dindent,
+             space_before,
+             space_after,
+             gobble_symbols,
+             indent_by_tab,
+             indent_to_clp,
+             cr_after  );
+ 
+   option_set = set of option;
+   key_sym_set = set of key_symbol;
+   table_entry = record
+                    options_selected : option_set;
+                    dindent_symbols : key_sym_set;
+                    gobble_terminators : key_sym_set
+                 end;
+   option_table = array [ key_symbol ] of table_entry;
+   key = packed array [1..max_key_length] of char;
+   keyword_table = array [prog_sym..until_sym] of key;
+   special_char = packed array [1..2] of char;
+   dbl_chr_set = set of becomes..open_2comment;
+   dblchar_table = array [becomes..open_2comment] of special_char;
+   sglchar_table = array [open_1comment..period] of char;
+   chstring = array [1..max_symbol_size] of char;
+   symbol = record
+               name       : key_symbol;
+               valu       : chstring;
+               length     : integer;
+               spaces_before : integer;
+               crs_before : integer
+            end;
+   symbol_info = @symbol;
+   char_name = (letter, digit, blank, quote,
+                end_of_line, file_mark, other_char );
+   char_info = record
+                  name  : char_name;
+                  valu  : char
+               end;
+   stack_entry = record
+                    indent_symbol : key_symbol;
+                    prev_margin   : integer
+                 end;
+   symbol_stack = array [1..max_stack_size] of stack_entry;
+ 
+var
+   recordseen : boolean;
+   curr_char,
+   next_char : char_info;
+   curr_sym,
+   next_sym : symbol_info;
+   cr_pending : boolean;
+   pp_option : option_table;
+   keyword : keyword_table;
+   dblchars : dbl_chr_set;
+   dblchar : dblchar_table;
+   sglchar : sglchar_table;
+   stack : symbol_stack;
+   top : integer;
+   start_pos,     { starting position of last symbol written }
+   curr_line_pos,
+   curr_margin : integer;
+ 
+ 
+procedure getchar( {updating} var next_char : char_info;
+                    {returning}var curr_char : char_info );
+ 
+begin {getchar}
+   curr_char := next_char;
+   with next_char do
+      begin
+         if eof(input)
+            then
+               name := file_mark
+    else if eoln(input)
+            then
+               name := end_of_line
+    else if ( (input@ in ['a'..'z'])
+            or (input@ in ['A'..'Z'] )
+            or (input@ = '_') )
+            then
+               name := letter
+    else if input@ in ['0'..'9']
+            then
+               name := digit
+    else if input@ = ''''
+            then
+               name := quote
+    else if input@ = space_char
+            then
+               name := blank
+    else name := other_char;
+ 
+         if name in [file_mark,end_of_line]
+            then
+               valu := space_char
+            else
+               valu := input@;
+         if name <> file_mark
+            then get(input);
+      end { with }
+   end; {getchar}
+ 
+   procedure store_next_char({ updating } var length : integer;
+                                          var curr_char,
+                                            next_char : char_info;
+                              {placing in} var valu : chstring );
+   begin { store_next_char }
+      getchar({updating} next_char,
+               {returning} curr_char );
+      if length < max_symbol_size
+         then
+            begin
+               length := length + 1;
+               valu [length] := curr_char.valu;
+         end
+   end; {store_next_char}
+ 
+   procedure skip_spaces({updating} var curr_char,
+                                        next_char : char_info;
+                         {returning} var spaces_before,
+                                        crs_before : integer );
+   begin { skip_spaces }
+      spaces_before := 0;
+      crs_before := 0;
+      while next_char.name in [blank, end_of_line] do
+         begin
+             getchar({updating} next_char,
+                      {returning} curr_char );
+             case curr_char.name of
+                blank  : spaces_before := spaces_before + 1;
+                end_of_line: begin
+                                 crs_before := crs_before + 1;
+                                 spaces_before := 0;
+                             end;
+                end; {case}
+         end; {while}
+   end; {skip_spaces}
+ 
+   procedure get_1comment({updating}
+                          var curr_char,
+                              next_char : char_info;
+                          var name      : key_symbol;
+                          var valu     : chstring;
+                          var length    :integer  );
+   begin {get_1comment}
+      name := open_1comment;
+     while not ((curr_char.valu = '}')
+                 or (next_char.name = end_of_line)
+                 or (next_char.name = file_mark)) do
+         store_next_char({updating} length, curr_char, next_char,
+                         {in} valu );
+       if (curr_char.valu = '}')
+         then
+            begin
+{              store_next_char(( *updating* )length,curr_char, next_char,
+                               ( *in* ) valu  );      ****EXCISED****}
+               name := close_1comment;
+            end;
+   end; {get_1comment}
+ 
+procedure get_2comment({updating}
+                       var curr_char,
+                           next_char :   char_info;
+                       var name      :   key_symbol;
+                       var valu      :   chstring;
+                       var length    :   integer  );
+begin {get_2comment}
+   name := open_2comment;
+   while not( ((curr_char.valu = '*') and (next_char.valu = ')'))
+             or(next_char.name = end_of_line)
+             or(next_char.name = file_mark)) do
+      store_next_char({updating} length, curr_char, next_char,
+                      {in} valu );
+   if ((curr_char.valu = '*') and (next_char.valu = ')' ))
+      then
+         begin
+            store_next_char({updating}length,curr_char,next_char,
+                            {in} valu );
+            name := close_2comment;
+         end;
+end; {get_2comment}
+   function id_type({of} valu : chstring;
+                   {using} length : integer )
+                   {returning}     : key_symbol;
+   var
+      i : integer;
+      key_valu : key;
+      hit : boolean;
+      this_key : key_symbol;
+ 
+   begin {id_type}
+      id_type := other_sym;
+      if length <= max_key_length
+         then
+            begin
+               for i := 1 to length do
+                   key_valu [i] := valu [i];
+               for i := length+1 to max_key_length do
+                   key_valu [i] := space_char;
+               for i := 1 to length do
+                   if key_valu [i] in ['a'..'z'] then
+                       key_valu [i] := chr(ord(key_valu [i])-ord('a')+
+                                       ord('A'));
+               this_key := prog_sym;
+               hit := false;
+               while not (hit or (this_key  = succ(until_sym)))  do
+                  if key_valu = keyword [this_key]
+                     then
+                        hit := true
+                     else
+                        this_key := succ(this_key);
+                  if hit
+                     then
+                        id_type := this_key;
+            end;
+      end; {id_type}
+ 
+   procedure get_identifier ({updating} var curr_char,
+                                            next_char : char_info;
+                             {returning}var name      : key_symbol;
+                                        var valu      : chstring;
+                                        var length    : integer );
+   begin {get_identifier}
+      while next_char.name in [ letter, digit ] do
+         store_next_char ({updating} length, curr_char, next_char,
+                          {in} valu  );
+      name := id_type ({of} valu, {using} length );
+      if name in [recordsym, case_sym, end_sym ]
+          then
+            case name of
+               recordsym : recordseen := true;
+               case_sym   : if recordseen
+                               then name := case_var_sym;
+               end_sym    : recordseen := false;
+               end; {case}
+   end; {get_identifier}
+ 
+   procedure get_number ({updating} var curr_char,
+                                        next_char : char_info;
+                        {returning} var name      : key_symbol;
+                                    var valu      : chstring;
+                                    var length    : integer  );
+   begin {get_number}
+      while next_char.name = digit do
+         store_next_char ({updating} length, curr_char, next_char,
+                          {in} valu );
+      name := other_sym;
+   end; {get_number}
+ 
+   procedure getchar_literal ({updating} var curr_char,
+                                              next_char : char_info;
+                              {returning} var name     : key_symbol;
+                                          var valu     : chstring;
+                                          var length   : integer );
+   begin {getchar_literal}
+      while next_char.name = quote do
+         begin
+            store_next_char({updating} length, curr_char, next_char,
+                            { into } valu    );
+            while not (next_char.name in [quote, end_of_line, file_mark ]) do
+               store_next_char({updating} length,curr_char,next_char,
+                               { into } valu   );
+               if next_char.name = quote
+                  then
+                     store_next_char({updating} length,
+                                                curr_char,
+                                                next_char,
+                                       { into } valu  );
+      end;
+   name := other_sym;
+   end; {getchar_literal}
+ 
+   function char_type({of} curr_char,
+                           next_char : char_info )
+                      {returning}   : key_symbol;
+   var
+      next_two_chars : special_char;
+      hit : boolean;
+      this_char : key_symbol;
+   begin {char_type}
+      next_two_chars [1] := curr_char.valu;
+      next_two_chars [2] := next_char.valu;
+      this_char := becomes;
+      hit := false;
+      while not( hit or ( this_char = open_1comment )) do
+         if next_two_chars = dblchar [this_char]
+            then
+               hit := true
+            else
+               this_char := succ(this_char);
+       if not hit
+          then
+             begin
+                this_char := open_1comment;
+                while not(hit or (pred(this_char) = period)) do
+                   if curr_char.valu = sglchar [this_char]
+                      then
+                         hit := true
+                      else
+                         this_char := succ(this_char);
+            end;
+      if hit
+         then
+            char_type := this_char
+         else
+            char_type := other_sym;
+   end; {char_type}
+ 
+   procedure get_special_char({updating} var curr_char,
+                                         next_char : char_info;
+                              {returning} var name : key_symbol;
+                                          var valu : chstring;
+                                          var length : integer );
+   begin {get_special_char}
+      store_next_char({updating} length,curr_char, next_char,
+                      { in } valu  );
+      name := char_type({ of } curr_char, next_char);
+      if name in dblchars
+         then
+            store_next_char({updating} length, curr_char, next_char,
+                            { into } valu  );
+   end;  {get_special_char}
+ 
+   procedure get_next_symbol({updating} var curr_char,
+                                            next_char : char_info;
+                            {returning} var name    : key_symbol;
+                                        var valu    : chstring;
+                                        var length  : integer  );
+   begin
+      case next_char.name of
+         letter    : get_identifier({updating} curr_char, next_char,
+                                   {returning} name, valu, length );
+         digit     : get_number({updating} curr_char, next_char,
+                               {returning} name, valu, length );
+         quote     : getchar_literal({updating} curr_char,
+                                                 next_char,
+                                 {returning} name, valu, length );
+         other_char: begin
+                        get_special_char({updating} curr_char,
+                                                    next_char,
+                                        {returning} name, valu,length );
+                        if name = open_1comment
+                           then
+                              get_1comment({updating} curr_char,
+                                                     next_char,
+                                                     name,
+                                                     valu, length )
+                         else if name = open_2comment
+                              then
+                                get_2comment({updating} curr_char,
+                                                    next_char,
+                                                    name,
+                                                    valu,
+                                                    length );
+                     end;
+          file_mark  : name := end_of_file;
+      end; {case}
+   end;{ get_next_symbol }
+ 
+   procedure get_symbol({updating} var next_sym  : symbol_info;
+                       {returning} var curr_sym  : symbol_info );
+   var
+      dummy : symbol_info;
+   begin {get_symbol}
+      dummy := curr_sym;
+      curr_sym := next_sym;
+      next_sym := dummy;
+      with next_sym@ do
+         begin
+            skip_spaces({updating} curr_char, next_char,
+                       {returning} spaces_before, crs_before );
+            length := 0;
+            if curr_sym@.name = open_1comment
+               then
+                  get_1comment({updating} curr_char, next_char,
+                             {returning} name, valu, length  )
+                else
+                  if curr_sym@.name = open_2comment
+                     then
+                        get_2comment({updating} curr_char,next_char,
+                                {returning} name, valu, length )
+                      else
+                   get_next_symbol({updating} curr_char, next_char,
+                                  {returning} name, valu, length  );
+      end; {with}
+   end; {get_symbol}
+ 
+   procedure initialize({returning}
+                          var top_of_stack      : integer;
+                          var curr_line_pos,
+                              curr_margin       : integer;
+                          var keyword          : keyword_table;
+                          var dblchars        : dbl_chr_set;
+                          var dblchar          : dblchar_table;
+                          var sglchar          : sglchar_table;
+                          var recordseen       : boolean;
+                          var curr_char,
+                              next_char        : char_info;
+                          var curr_sym,
+                              next_sym          : symbol_info;
+                          var pp_option          : option_table );
+   begin {initialize}
+      {line_limit(output,max_int);}
+      top_of_stack := 0;
+      curr_line_pos := 0;
+      curr_margin := 0;
+      keyword [ prog_sym     ] := 'PROGRAM   ' ;
+      keyword [ func_sym     ] := 'FUNCTION  ' ;
+      keyword [ proc_sym     ] := 'PROCEDURE ' ;
+      keyword [ label_sym    ] := 'LABEL     ' ;
+      keyword [ const_sym    ] := 'CONST     ' ;
+      keyword [ type_sym     ] := 'TYPE      ' ;
+      keyword [ var_sym      ] := 'VAR       ' ;
+      keyword [ begin_sym    ] := 'BEGIN     ' ;
+      keyword [ repeat_sym   ] := 'REPEAT    ' ;
+      keyword [ recordsym   ] := 'RECORD    ' ;
+      keyword [ case_sym     ] := 'CASE      ' ;
+      keyword [ case_var_sym ] := 'CASE      ' ;
+      keyword [ of_sym       ] := 'OF        ' ;
+      keyword [ for_sym      ] := 'FOR       ' ;
+      keyword [ while_sym    ] := 'WHILE     ' ;
+      keyword [ with_sym     ] := 'WITH      ' ;
+      keyword [ do_sym       ] := 'DO        ' ;
+      keyword [ if_sym       ] := 'IF        ' ;
+      keyword [ then_sym     ] := 'THEN      ' ;
+      keyword [ else_sym     ] := 'ELSE      ' ;
+      keyword [ end_sym      ] := 'END       ' ;
+      keyword [ until_sym    ] := 'UNTIL     ' ;
+ 
+      dblchars := [ becomes, open_2comment ];
+      dblchar [ becomes      ] := ':=' ;
+      dblchar [ open_2comment ] := '(*' ;
+ 
+      sglchar [ open_1comment ] := '{' ;
+      sglchar [ semicolon    ] := ';' ;
+      sglchar [ colon        ] := ':' ;
+      sglchar [ equals       ] := '=' ;
+      sglchar [ open_paren   ] := '(' ;
+      sglchar [ close_paren  ] := ')' ;
+      sglchar [ period       ] := '.' ;
+ 
+      recordseen := false;
+ 
+      getchar ({updating} next_char,
+               {returning} curr_char );
+      new(curr_sym);
+      new(next_sym);
+      get_symbol({updating} next_sym,
+                {returning} curr_sym );
+      with pp_option [prog_sym] do
+         begin
+            options_selected := [ blank_line_before, space_after ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ func_sym ] do
+         begin
+            options_selected := [ blank_line_before, d_indent_on_keys,
+                                  space_after ];
+            dindent_symbols := [ label_sym, type_sym, var_sym ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ proc_sym ] do
+         begin
+            options_selected := [ blank_line_before,
+                                  d_indent_on_keys,
+                                  space_after  ];
+            dindent_symbols := [ label_sym, const_sym,
+                                  type_sym,  var_sym  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ label_sym ] do
+         begin
+            options_selected := [ blank_line_before,
+                                  space_after,
+                                  indent_to_clp  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ const_sym ] do
+         begin
+            options_selected := [ blank_line_before,
+                                  d_indent_on_keys,
+                                  space_after,
+                                  indent_to_clp ];
+            dindent_symbols := [ label_sym ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ type_sym ] do
+         begin
+            options_selected := [ blank_line_before,
+                                  d_indent_on_keys,
+                                  space_after,
+                                  indent_to_clp ];
+            dindent_symbols := [ label_sym, const_sym ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ var_sym ] do
+         begin
+            options_selected := [ blank_line_before,
+                                  d_indent_on_keys,
+                                  space_after,
+                                  indent_to_clp ];
+            dindent_symbols := [ label_sym, const_sym, type_sym ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ begin_sym ] do
+         begin
+            options_selected := [ d_indent_on_keys,
+                                  indent_by_tab,
+                                  cr_after  ];
+            dindent_symbols := [ label_sym, const_sym,
+                                  type_sym, var_sym  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ repeat_sym ] do
+         begin
+            options_selected := [ indent_by_tab, cr_after ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ recordsym ] do
+         begin
+            options_selected := [ indent_by_tab, cr_after ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ case_sym ] do
+         begin
+            options_selected := [ space_after,
+                                  indent_by_tab,
+                                  gobble_symbols,
+                                  cr_after  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [ of_sym ];
+         end;
+ 
+      with pp_option [ case_var_sym ] do
+         begin
+            options_selected := [ space_after,
+                                  indent_by_tab,
+                                  gobble_symbols,
+                                  cr_after  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [ of_sym ];
+         end;
+ 
+      with pp_option [ of_sym ] do
+         begin
+            options_selected := [ cr_suppress, space_before ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ for_sym ] do
+         begin
+            options_selected := [ space_after,
+                                  indent_by_tab,
+                                  gobble_symbols,
+                                  cr_after  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [ do_sym ];
+         end;
+ 
+      with pp_option [ while_sym ] do
+         begin
+            options_selected := [ space_after, indent_by_tab,
+                                  gobble_symbols, cr_after  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [ do_sym ];
+         end;
+ 
+      with pp_option [ with_sym ] do
+         begin
+            options_selected := [ space_after, indent_by_tab,
+                                  gobble_symbols, cr_after ];
+            dindent_symbols := [  ];
+            gobble_terminators := [ do_sym ];
+         end;
+ 
+      with pp_option [ do_sym ] do
+         begin
+            options_selected := [ cr_suppress, space_before ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ if_sym ] do
+         begin
+            options_selected := [ space_after, indent_by_tab,
+                                  gobble_symbols ];
+            dindent_symbols := [  ];
+            gobble_terminators := [ then_sym ];
+         end;
+ 
+      with pp_option [ then_sym ] do
+         begin
+            options_selected := [  cr_after ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ else_sym ] do
+         begin
+            options_selected := [ cr_before, d_indent_on_keys,
+                                  indent_by_tab, cr_after ];
+            dindent_symbols := [ if_sym, else_sym ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ end_sym ] do
+         begin
+            options_selected := [ cr_before, d_indent_on_keys,
+                                  dindent, cr_after  ];
+            dindent_symbols := [ if_sym, then_sym, else_sym,
+                                  for_sym, while_sym, with_sym,
+                                  case_var_sym, colon, equals ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ until_sym ] do
+         begin
+            options_selected := [ cr_before, d_indent_on_keys,
+                                   dindent, space_after,
+                                  gobble_symbols, cr_after ];
+            dindent_symbols := [ if_sym, then_sym, else_sym,
+                                  for_sym, while_sym, with_sym,
+                                  colon, equals  ];
+            gobble_terminators := [ end_sym, until_sym,
+                                    else_sym, semicolon ];
+         end;
+ 
+      with pp_option [ becomes ] do
+         begin
+            options_selected := [ space_before, space_after,
+                                  gobble_symbols ];
+            dindent_symbols := [  ];
+            gobble_terminators := [ end_sym, until_sym,
+                                    else_sym, semicolon ];
+         end;
+ 
+      with pp_option [ open_1comment ] do
+         begin
+            options_selected := [ cr_suppress ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ close_1comment ] do
+         begin
+            options_selected := [ cr_suppress ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [open_2comment ] do
+         begin
+            options_selected      := [cr_suppress ];
+            dindent_symbols      := [  ];
+            gobble_terminators    := [  ];
+         end;
+ 
+      with pp_option [ close_2comment ] do
+         begin
+            options_selected      := [cr_suppress ];
+            dindent_symbols      := [  ];
+            gobble_terminators    := [  ];
+         end;
+      with pp_option [ semicolon ] do
+         begin
+            options_selected := [ cr_suppress, d_indent_on_keys, cr_after ];
+            dindent_symbols := [ if_sym, then_sym, else_sym,
+                                  for_sym, while_sym, with_sym,
+                                  colon, equals  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ colon ] do
+         begin
+            options_selected := [ space_after, indent_to_clp ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ equals ] do
+         begin
+            options_selected := [ space_before, space_after,
+                                  indent_to_clp  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ open_paren ] do
+         begin
+            options_selected := [ gobble_symbols ];
+            dindent_symbols := [  ];
+            gobble_terminators := [ close_paren ];
+         end;
+ 
+      with pp_option [ close_paren ] do
+         begin
+            options_selected := [  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ period ] do
+         begin
+            options_selected := [ cr_suppress ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ end_of_file ] do
+         begin
+            options_selected := [  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+      with pp_option [ other_sym ] do
+         begin
+            options_selected := [  ];
+            dindent_symbols := [  ];
+            gobble_terminators := [  ];
+         end;
+ 
+   end; {initialize}
+ 
+   function stack_empty : boolean;
+   begin
+      if top = 0
+         then stack_empty := true
+         else stack_empty := false;
+   end; {stack_empty}
+ 
+   function stack_full : boolean;
+   begin
+      if top = max_stack_size
+         then stack_full := true
+         else stack_full := false;
+   end; {stack_full}
+ 
+   procedure pop_stack({returning} var indent_symbol : key_symbol;
+                                   var prev_margin   : integer );
+   begin {pop_stack}
+       if not stack_empty
+          then
+             begin
+                indent_symbol := stack[top].indent_symbol;
+                prev_margin   := stack[top].prev_margin;
+                top := top - 1;
+             end
+          else
+             begin
+                indent_symbol := other_sym;
+                prev_margin := 0;
+             end
+    end; {pop_stack}
+ 
+   procedure push_stack({using} indent_symbol : key_symbol;
+                                prev_margin : integer );
+   begin {push_stack}
+      if not stack_full
+         then
+            begin
+               top := top + 1;
+               stack[top].indent_symbol := indent_symbol;
+               stack[top].prev_margin   := prev_margin;
+            end
+   end; {push_stack}
+ 
+   procedure write_crs({using} number_of_crs  : integer;
+                      {updating} var curr_line_pos : integer );
+   var i: integer;
+   begin {write_crs}
+      if number_of_crs > 0
+         then
+            begin
+            for i := 1 to number_of_crs do
+                  writeln(output);
+            curr_line_pos := 0
+            end;
+   end; {write_crs}
+ 
+   procedure insert_cr ({updating} var curr_sym : symbol_info );
+   const
+      once = 1;
+   begin
+      if curr_sym@.crs_before = 0
+         then begin
+              write_crs(once,{updating} curr_line_pos );
+              curr_sym@.spaces_before := 0;
+              end;
+   end; {insert_cr}
+ 
+   procedure insert_blank_line({updating} var curr_sym : symbol_info);
+   const
+      once = 1;
+      twice = 2;
+   begin
+      if curr_sym@.crs_before = 0
+         then begin
+              if curr_line_pos = 0
+                 then write_crs(once,{updating} curr_line_pos )
+                 else write_crs(twice,{updating} curr_line_pos );
+               curr_sym@.spaces_before := 0;
+               end
+         else if curr_sym@.crs_before = 1
+                 then if curr_line_pos > 0
+                         then write_crs(once,{updating} curr_line_pos );
+   end; {insert_blank_line}
+ 
+   procedure l_shift_on({using} dindent_symbols : key_sym_set );
+   var
+      indent_symbol : key_symbol;
+      prev_margin : integer;
+   begin
+      if not stack_empty
+         then
+            begin
+               repeat
+                  pop_stack({returning} indent_symbol, prev_margin );
+                  if indent_symbol in dindent_symbols
+                     then
+                        curr_margin := prev_margin
+               until not(indent_symbol in dindent_symbols)
+                     or (stack_empty);
+               if not (indent_symbol in dindent_symbols)
+                  then
+                     push_stack({using} indent_symbol, prev_margin );
+            end
+   end; {l_shift_on}
+ 
+   procedure l_shift;
+   var
+      indent_symbol : key_symbol;
+      prev_margin   : integer;
+   begin {l_shift}
+      if not stack_empty
+         then
+            begin
+               pop_stack({returning} indent_symbol, prev_margin );
+               curr_margin := prev_margin;
+            end;
+   end; {l_shift}
+ 
+   procedure insert_space({using} var symbol : symbol_info );
+   begin
+      if curr_line_pos < max_line_size
+         then
+            begin
+               write(output,space_char);
+               curr_line_pos := curr_line_pos + 1;
+               with symbol@ do
+                  if (crs_before = 0) and (spaces_before > 0)
+                     then
+                        spaces_before := spaces_before - 1;
+            end;
+   end; {insert_space}
+ 
+   procedure move_line_pos({to}   new_line_pos : integer;
+                          {from}  var curr_line_pos : integer );
+   var
+      i : integer;
+   begin {move_line_pos}
+      for i := curr_line_pos+1 to new_line_pos do
+         write(output,space_char);
+      curr_line_pos := new_line_pos;
+   end; {move_line_pos}
+ 
+   procedure print_symbol({in}  curr_sym : symbol_info;
+                         {updating} var curr_line_pos : integer );
+   var i: integer;
+   begin
+      with curr_sym@ do
+         begin
+            for i := 1 to length do
+               write(output,valu[i]);
+            start_pos := curr_line_pos;  {save for tab purposes}
+            curr_line_pos := curr_line_pos + length;
+         end; {with}
+   end; {print_symbol}
+ 
+   procedure pp_symbol({in} curr_sym : symbol_info );
+   const
+      once = 1;
+   var
+      new_line_pos : integer;
+   begin {pp_symbol}
+      with curr_sym@ do
+         begin
+            write_crs({using} crs_before, {updating} curr_line_pos );
+            if    (name in [open_1comment, close_1comment,
+                            open_2comment, close_2comment ])
+               then
+                  new_line_pos := curr_line_pos + spaces_before
+               else
+            if (curr_line_pos <= curr_margin) then
+                  new_line_pos := curr_margin
+               else
+                  new_line_pos := curr_line_pos + spaces_before;
+            if new_line_pos + length > max_line_size
+               then
+                  begin
+                     write_crs(once,{updating} curr_line_pos );
+                     if curr_margin + length <= max_line_size
+                        then
+                           new_line_pos := curr_margin
+                        else
+                           if length < max_line_size
+                              then
+                                 new_line_pos := max_line_size-length
+                               else
+                                 new_line_pos := 0;
+                 end;
+            move_line_pos({to} new_line_pos, {from} curr_line_pos );
+            print_symbol({in} curr_sym, {updating} curr_line_pos );
+      end; {with}
+   end; {pp_symbol}
+ 
+   procedure r_shift_to_clp({using} curr_sym : key_symbol );
+                            forward;
+   procedure gobble({symbols from input}
+                    {up to}    terminators : key_sym_set;
+                    {updating} var curr_sym, next_sym : symbol_info );
+   begin {gobble}
+      r_shift_to_clp({using} curr_sym@.name);
+      while not(next_sym@.name in (terminators+[end_of_file])) do
+         begin
+            get_symbol({updating} next_sym,
+                      {returning} curr_sym  );
+            pp_symbol({in} curr_sym  );
+         end; {while}
+      l_shift;
+   end; {gobble}
+ 
+   procedure r_shift({using} curr_sym : key_symbol );
+   begin {r_shift}
+      if not stack_full
+         then
+            push_stack({using} curr_sym, curr_margin );
+      { if extra indentation was used, then update margin }
+      if start_pos > curr_margin
+         then
+            curr_margin := start_pos;
+      if curr_margin < slofail1
+         then
+            curr_margin := curr_margin + indent_1
+         else
+            if curr_margin < slofail2
+               then
+                  curr_margin := curr_margin + indent_2;
+   end; {rshift}
+ 
+   procedure r_shift_to_clp;
+   begin
+      if not stack_full
+         then
+            push_stack({using} curr_sym, curr_margin );
+      curr_margin := curr_line_pos
+   end; {r_shift_to_clp}
+ 
+begin {pretty_print}
+   reset( Input ); { Do to a bug in IBM PascalVS }
+   initialize ( top, curr_line_pos, curr_margin, keyword,
+                dblchars, dblchar, sglchar, recordseen,
+                curr_char, next_char, curr_sym, next_sym,
+                pp_option  );
+   cr_pending := false;
+   while( next_sym@.name <> end_of_file) do
+      begin
+          get_symbol({updating} next_sym,
+                    {returning} curr_sym  );
+         with pp_option [curr_sym@.name] do
+            begin
+               if (cr_pending and not (cr_suppress in options_selected))
+                  or (cr_before in options_selected)
+                  then
+                     begin
+                        insert_cr({using} curr_sym );
+                        cr_pending := false;
+                     end;
+               if blank_line_before in options_selected
+                  then
+                     begin
+                        insert_blank_line({using} curr_sym );
+                        cr_pending := false;
+                     end;
+               if d_indent_on_keys in options_selected
+                  then
+                     l_shift_on(dindent_symbols);
+               if dindent in options_selected
+                  then
+                     l_shift;
+               if space_before in options_selected
+                  then
+                     insert_space({using} curr_sym);
+               pp_symbol({in} curr_sym);
+               if space_after in options_selected
+                  then
+                     insert_space({using} next_sym);
+               if indent_by_tab in options_selected
+                  then
+                     r_shift({using} curr_sym@.name);
+               if indent_to_clp in options_selected
+                  then
+                     r_shift_to_clp({using} curr_sym@.name);
+               if gobble_symbols in options_selected
+                  then
+                     gobble({up to} gobble_terminators,
+                           {updating} curr_sym, next_sym );
+               if cr_after in options_selected
+                  then
+                     cr_pending := true;
+            end; {with}
+      end; {while}
+   if cr_pending
+      then
+           writeln(output)
+end.

@@ -1,0 +1,246 @@
+
+
+CC.C03    File=zbe$sr:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: sr.c,v 1.4 87/03/10 11:40:48 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /* S T R E N G T H   R E D U C T I O N  */
+        7         7
+        8         8
+        9         9             #include <stdio:h>
+       10        10             #include "types:h"
+       11        11             #include "sr:h"
+       12        12             #include "debug:h"
+       13        13             #include "global:h"
+       14        14             #include "files:h"
+       15        15             #include "get:h"
+       16        16             #include "put:h"
+       17        17             #include "lset:h"
+       18        18             #include "map:h"
+       19        19             #include "alloc:h"
+       20        20             #include "go:h"
+       21        21             #include "sr_aux:h"
+       22        22             #include "sr_iv:h"
+       23        23
+       24        24             /* Strength reduction tries to change expensive operators occurring
+       25        25              * in a loop into cheaper operators. The expensive operators considered
+       26        26              * are multiplication and array referencing.
+       27        27              * The transformations can be expressed in C as:
+       28        28              *
+       29        29              * [1]:      for (i = e1; i <= e2; i++)
+       30        30              *        print(118*i);
+       31        31              *   becomes:
+       32        32              *     for (i = e1, t = 118*e1; i <= e2; i++, t += 118)
+       33        33              *        print(t);
+       34        34              *
+       35        35              * [2]:      for (i = e1; i <= e2; i++)
+       36        36              *        print(a[i]);
+CC.C03    File=zbe$sr:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=2  
+       37        37              *   becomes:
+       38        38              *     for (i = e1, p = &a[i]; i <= e2; i++, p++)
+       39        39              *        print(*p);
+       40        40              * The latter optimization is suppressed if array bound checking
+       41        41              * is required.
+       42        42              */
+       43        43
+       44        44             /* Machine and/or language dependent parameters: */
+       45        45
+       46        46             int ovfl_harmful;
+       47        47             int arrbound_harmful;
+       48        48
+       49        49             int Ssr;  /* #optimizations found */
+       50        50
+       51        51             sr_machinit(f)
+       52        52              FILE *f;
+       53        53             {
+       54        54    1         /* Read target machine dependent information */
+       55        55    1         char s[100];
+       56        56    1
+       57        57    1
+       58        58    1         for (;;) {
+       59        59    2            while(getc(f) != '\n');
+       60        60    2            fscanf(f,"%s",s);
+       61        61    2            if (strcmp(s,"%%SR") == 0)break;
+       62        62    2         }
+       63        63    1         fscanf(f,"%d",&ovfl_harmful);
+       64        64    1         fscanf(f,"%d",&arrbound_harmful);
+       65        65    1        }
+       66        66
+       67        67             STATIC del_ivs(ivs)
+       68        68              lset ivs;
+       69        69             {
+       70        70    1         /* Delete the set of iv structs */
+       71        71    1
+       72        72    1         Lindex i;
+       73        73    1
+CC.C03    File=zbe$sr:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=3  
+       74        74    1         for (i = Lfirst(ivs); i != (Lindex) 0; i = Lnext(i,ivs)) {
+       75        75    2            oldiv(Lelem(i));
+       76        76    2         }
+       77        77    1         Ldeleteset(ivs);
+       78        78    1        }
+       79        79
+       80        80
+       81        81             STATIC do_loop(loop)
+       82        82              loop_p loop;
+       83        83             {
+       84        84    1         lset ivs, vars;
+       85        85    1
+       86        86    1         OUTTRACE("going to process loop %d",loop->lp_id);
+       87        87    1         induc_vars(loop,&ivs, &vars);
+       88        88    1         /* Build a set of iv_structs, one for every induction
+       89        89    1          * variable of the loop, i.e. a variable i that
+       90        90    1          * is changed only by  i := i + c, where c is a loop constant.
+       91        91    1          * Also detects variables that are changed (including induction
+       92        92    1          * variables!).
+       93        93    1          */
+       94        94    1         OUTTRACE("loop has %d induction variables",Lnrelems(ivs));
+       95        95    1         if (Lnrelems(ivs) > 0) {
+       96        96    2            strength_reduction(loop,ivs,vars);
+       97        97    2            /* Perform strength reduction. Reduce:
+       98        98    2             *    iv * c    to addition
+       99        99    2             *    a[iv]     to indirection (*p)
+      100       100    2             *     (unless array bound checking is required)
+      101       101    2             */
+      102       102    2         }
+      103       103    1         del_ivs(ivs);
+      104       104    1         Ldeleteset(vars);
+      105       105    1        }
+      106       106
+      107       107
+      108       108
+      109       109             STATIC loopblocks(p)
+      110       110              proc_p p;
+CC.C03    File=zbe$sr:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=4  
+      111       111             {
+      112       112    1         /* Compute the LP_BLOCKS sets for all loops of p */
+      113       113    1
+      114       114    1         register bblock_p b;
+      115       115    1         register Lindex i;
+      116       116    1
+      117       117    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      118       118    2            for (i = Lfirst(b->b_loops); i != (Lindex) 0;
+      119       119    2               i = Lnext(i,b->b_loops)) {
+      120       120    3               Ladd(b,&(((loop_p) Lelem(i))->LP_BLOCKS));
+      121       121    3            }
+      122       122    2         }
+      123       123    1        }
+      124       124
+      125       125
+      126       126
+      127       127             STATIC opt_proc(p)
+      128       128              proc_p p;
+      129       129             {
+      130       130    1         /* Optimize all loops of one procedure. We first do all
+      131       131    1          * outer loops at the lowest nesting level and proceed
+      132       132    1          * in the inwards direction.
+      133       133    1          */
+      134       134    1
+      135       135    1         Lindex i;
+      136       136    1         loop_p lp,outermost;
+      137       137    1         int min_level;
+      138       138    1
+      139       139    1         for (;;) {
+      140       140    2            min_level = 1000;
+      141       141    2            for (i = Lfirst(p->p_loops); i != (Lindex) 0;
+      142       142    2                 i = Lnext(i,p->p_loops)) {
+      143       143    3               lp = (loop_p) Lelem(i);
+      144       144    3               if (!lp->LP_DONE && lp->lp_level < min_level) {
+      145       145    4                  min_level = lp->lp_level;
+      146       146    4                  outermost = lp;
+      147       147    4               }
+CC.C03    File=zbe$sr:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=5  
+      148       148    3            }
+      149       149    2            if (min_level == 1000) break;
+      150       150    2            do_loop(outermost);
+      151       151    2            outermost->LP_DONE = TRUE;
+      152       152    2            OUTTRACE("loop %d processed",outermost->lp_id);
+      153       153    2         }
+      154       154    1        }
+      155       155
+      156       156
+      157       157
+      158       158             STATIC sr_extproc(p)
+      159       159              proc_p p;
+      160       160             {
+      161       161    1         /* Allocate the extended data structures for procedure p */
+      162       162    1
+      163       163    1         register loop_p lp;
+      164       164    1         register Lindex pi;
+      165       165    1
+      166       166    1         for (pi = Lfirst(p->p_loops); pi != (Lindex) 0;
+      167       167    1            pi = Lnext(pi,p->p_loops)) {
+      168       168    2            lp = (loop_p) Lelem(pi);
+      169       169    2            lp->lp_extend = newsrlpx();
+      170       170    2          lp->LP_BLOCKS = (lset) 0;
+      171       171    2          lp->LP_DONE = 0 ;
+      172       172    2          lp->LP_INSTR = (line_p) 0;
+      173       173    2          lp->LP_HEADER = (bblock_p) 0;
+      174       174    2         }
+      175       175    1        }
+      176       176
+      177       177
+      178       178
+      179       179             STATIC sr_cleanproc(p)
+      180       180              proc_p p;
+      181       181             {
+      182       182    1         /* Remove the extended data structures for procedure p */
+      183       183    1
+      184       184    1         register loop_p lp;
+CC.C03    File=zbe$sr:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=6  
+      185       185    1         register Lindex pi;
+      186       186    1
+      187       187    1
+      188       188    1         for (pi = Lfirst(p->p_loops); pi != (Lindex) 0;
+      189       189    1            pi = Lnext(pi,p->p_loops)) {
+      190       190    2            lp = (loop_p) Lelem(pi);
+      191       191    2            oldsrlpx(lp->lp_extend);
+      192       192    2          lp->lp_extend = (lpext_p) 0;
+      193       193    2         }
+      194       194    1        }
+      195       195
+      196       196
+      197       197             sr_optimize(p)
+      198       198              proc_p p;
+      199       199             {
+      200       200    1         sr_extproc(p);
+      201       201    1         loopblocks(p);
+      202       202    1         opt_proc(p);
+      203       203    1         sr_cleanproc(p);
+      204       204    1        }
+      205       205
+      206       206
+      207       207
+      208       208             srmain(argc,argv)
+      209       209              int argc;
+      210       210              char *argv[];
+      211       211             {
+      212       212    1         ovfl_harmful = 0;
+      213       213    1         arrbound_harmful = 0;
+      214       214    1         go(argc,argv,no_action,sr_optimize,sr_machinit,no_action);
+      215       215    1         report("strength reductions",Ssr);
+      216       216    1           return ;
+      217       217    1        }
+      218       218
+---  Include file information  ---
+
+   stdio:h.:LIBRARY. is referenced
+CC.C03    File=zbe$sr:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=7  
+   zbe$types:h.:ZBC3TOU. is referenced
+   zbe$sr:h.:ZBC3TOU. is referenced
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+   zbe$files:h.:ZBC3TOU. is referenced
+   zbe$get:h.:ZBC3TOU. is referenced
+   zbe$put:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$map:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$go:h.:ZBC3TOU. is referenced
+   zbe$sr_aux:h.:ZBC3TOU. is referenced
+   zbe$sr_iv:h.:ZBC3TOU. is referenced
+
+No diagnostics were issued in the file zbe$sr:c.:ZBC3TSI

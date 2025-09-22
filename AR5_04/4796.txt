@@ -1,0 +1,568 @@
+/*M*  GETLOADED -- Allows APL workspaces to be invoked as run-units */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+/*P*    NAME:       GETLOADED
+        PURPOSE:    To allow an APL workspace to be invoked as if
+                    it was a standard CP-6 rununit.
+ 
+        DESCRIPTION:
+                    When this program is linked into a CP-6 rununit,
+                    it can be copied into a keyed APL workspace.
+ 
+                    When this rununit is invoked, this procedure
+                    turns the invokation into an invokation of APL
+                    specifying the #1 and #4 fids specified for this
+                    invokation, but also specifying the following
+                    APL invokation options:
+ 
+                    QUIET    ... so the APL greeting doesn't appear
+                    WS=fid   ... this rununit file contains an APL WS
+                    SP='..'  ... if UI, OU or options were specified
+                                 on this rununit invokation.
+ 
+                    The contents of the $QSP system variable will
+                    be initialized by the SP= option (in version E00
+                    and later versions of CP-6 APL).  GETLOADED will
+                    specify the value in the following way:
+ 
+                    UI=fid   ... if a UI fid was specified
+                    OU=fid   ... if an OU fid was specified
+                    OVER     ... if the OVER verb was used for OU
+                    INTO     ... if the INTO verb was used for OU
+                    ON       ... if the ON or TO verb was used for OU
+                    (...)    ... for invokation options
+ 
+                                                                    */
+LOADWS: proc main;
+ 
+dcl  NODENUM  sbin constant symdef init(0);
+ 
+%include CP_6;
+%include B_ERRORS_C;
+ 
+%include B$TABLES_C;
+%B$SR_NON_BLANK;
+ 
+%include XU_MACRO_C;
+%include XU_SUBS_C;
+dcl  X$PARSE entry(1) altret;
+ 
+%include B$JIT_C;
+%B$JIT0(STCLASS="based(B$JIT$)");
+%U$JIT1;
+%M$JIT2X;
+%F$JIT3X;
+%S$JIT4X;
+%J$JIT5;
+%A$JIT6X;
+ 
+%F$DCB(STCLASS="based(DCB$)");
+ 
+%FPT_UNFID(   FPTN        =  UNFID,
+              LEN         =  LEN,
+              DCB         =  M$LM,
+              STCLASS     =  STATIC);
+ 
+%FPT_LDTRC(   FPTN        =  LINK,
+              CP_CMD      =  COMMAND,
+              TEXTC       =  NO,
+              ECHO        =  NO,
+              STCLASS     =  CONSTANT);
+ 
+%VLP_NAME(    FPTN        =  CONTINUE_FID,
+              STCLASS     =  CONSTANT,
+              NAME        =  '*CONTINUATION_COMMANDS');
+ 
+%FPT_OPEN(    FPTN        =  OPEN_CONTINUATION,
+              DCB         =  M$IN,
+              FUN         =  UPDATE,
+              ACS         =  SEQUEN,
+              ASN         =  FILE,
+              NAME        =  CONTINUE_FID,
+              SCRUB       =  YES,
+              STCLASS     =  CONSTANT);
+ 
+%FPT_READ(    FPTN        =  READ_CONTINUATION,
+              DCB         =  M$IN,
+              BUF         =  COMMAND,
+              CONT        =  NO,
+              STRPVFC     =  YES,
+              STCLASS     =  CONSTANT);
+ 
+%FPT_CLOSE(   FPTN        =  DELETE_CONTINUATION,
+              DCB         =  M$IN,
+              DISP        =  RELEASE,
+              STCLASS     =  CONSTANT);
+ 
+%P_PCB(       NAME        =  P_PCB_CONSTANT,
+              STCLASS     =  CONSTANT,
+              R           =  RU,
+              WSZ         =  130,
+              C           =  YES,
+              CNTU        =  NO,
+              NBL         =  NO,
+              NX          =  NO,
+              DYNAMIC     =  NO,
+              KEYSCAN     =  NO);
+ 
+%P_PCB(       NAME        =  P_PCB,
+              STCLASS     =  ""    );
+ 
+%PARSE$OUT(   NAME        =  BLOCK,
+              STCLASS     =  "BASED(BLK$)");
+ 
+%PARSE$SYM(   NAME        =  SYMBOL,
+              STCLASS     =  "BASED(BLK$)");
+ 
+%VLP_ERRCODE( FPTN        =  BAD_COMMAND_SYNTAX,
+              STCLASS     =  CONSTANT,
+              FCG         =  "JS",
+              MID         =  "T",
+              MON         =  "'1'b",
+              ERR#        =  %E$NSTDINVOC   );
+ 
+%VLP_ERRCODE( FPTN        =  COMMAND_TOO_LONG,
+              STCLASS     =  CONSTANT,
+              FCG         =  "DP",
+              MID         =  "M",
+              ERR#        =  8              );
+ 
+%FPT_ERR(     FPTN        =  EXIT_SYNTAX,
+              STCLASS     =  CONSTANT,
+              STEPCC      =  ERROR,
+              CODE        =  BAD_COMMAND_SYNTAX);
+ 
+%FPT_ERR(     FPTN        =  EXIT_TOO_LONG,
+              STCLASS     =  CONSTANT,
+              STEPCC      =  ERROR,
+              CODE        =  COMMAND_TOO_LONG);
+ 
+%FPT_ERRMSG(  FPTN        =  DISPLAY_ERROR,
+              STCLASS     =  ""             );
+ 
+%FPT_ERRMSG(  FPTN        =  DISPLAY_ERROR_CONSTANT,
+              STCLASS     =  CONSTANT,
+              BUF         =  COMMAND,
+              INCLCODE    =  NO,
+              OUTDCB1     =  M$DO     );
+ 
+ 
+dcl  COMMAND     char(256)   static;
+dcl  SINAMES     char(256);
+dcl  POS         sbin;
+dcl  CCPOS       sbin;
+dcl  SIPOS       sbin;
+dcl  SIN         sbin;
+dcl  VPOS        sbin;
+dcl  LEN         sbin static;
+dcl  TV          sbin;
+dcl  APL         char(0) constant init('APL          ');
+dcl  APLOPTS     char(0) constant init('(QUIET,WS=');
+dcl  APLSP       char(0) constant init(',SP=''');
+dcl  APLSI       char(0) constant init('SI=');
+dcl  APLUI       char(0) constant init('UI=');
+dcl  APLOU       char(0) constant init('OU=');
+dcl  1  VERBS(0:2)  aligned constant,
+        2 LEN       ubin(18) haligned init(5,5,3),
+        2 TEXT      char(6)  caligned init( ' INTO',' OVER', ' ON');
+dcl  DCB$        ptr;
+ 
+dcl  INS         sbin;
+dcl  INQUOTE     sbin;
+ 
+dcl  SPECL_CHARS(0:23) bit(72) constant init(
+ 
+     '000000000000000000000000'O,  /* 000 -> 007  */
+     '000000000000000000000000'O,  /* 010 -> 017  */
+     '000000000000000000000000'O,  /* 020 -> 027  */
+     '000000000000000000000000'O,  /* 030 -> 037  */
+     '040000042000000000000047'O,  /* 040 -> 047 Stop at Blank,quote*/
+     '000000000000000000000000'O,  /* 050 -> 057  */
+     '000000000000000000000000'O,  /* 060 -> 067  */
+     '000000000000000000000000'O,  /* 070 -> 077  */
+ 
+     '000000000000000000000000'O,  /* 100 -> 177  */
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+ 
+     '000000000000000000000000'O,  /* 200 -> 277  */
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O,
+     '000000000000000000000000'O );
+ 
+ 
+dcl  BLK$        ptr;
+dcl  RBLK$       ptr;
+dcl  RUBLK$      ptr;
+dcl  UIBLK$      ptr;
+dcl  OUBLK$      ptr;
+dcl  OPTBLK$     ptr;
+dcl  UI_P        sbin;
+dcl  OU_P        sbin;
+dcl  OPT_P       sbin;
+dcl  VERB        sbin;
+dcl  RU(0:30)    sbin symref readonly;
+dcl  RU_SILIST   sbin symref readonly;
+ 
+dcl  NODES$(0:2) ptr constant symdef init(addr(RU), addr(RU_SILIST),
+                                          addr(NIL)                 );
+ 
+dcl  INVOKATION  char(300);
+dcl  WORKAREA(0:130) sbin;
+ 
+ 
+dcl  B$JIT$      ptr symref readonly;
+dcl  M$LM        dcb;
+dcl  M$IN        dcb;
+dcl  M$DO        dcb;
+ 
+     SIPOS = NODENUM;  /***** For locating NODENUM when patching ***/
+     call M$OPEN( OPEN_CONTINUATION ) whenreturn do;
+        LEN = 0;  /*  Number of continued records */
+        call INIT_SQUEEZE;
+        DCB$  = dcbaddr( dcbnum(M$IN) );
+        COMMAND    = ' ';
+READING:
+        do while '1'b;
+           call M$READ( READ_CONTINUATION ) whenaltreturn do;
+              exit READING;
+              end;
+           LEN = LEN + 1;   /** Another record   **/
+           call SQUEEZE(COMMAND,F$DCB.ARS#) altret(TOO_LONG);
+        end READING;
+ 
+        call M$CLOSE( DELETE_CONTINUATION );
+        if LEN = 0 then goto CONT_ERR; /**  Nothing in file!  **/
+        end;  /** Of successfull open of *CONTINUATION_COMMANDS **/
+        whenaltreturn do;
+CONT_ERR:
+        call INIT_SQUEEZE;
+        LEN = B$JIT.CCARS;
+        call SQUEEZE(B$JIT.CCBUF,LEN) altret(TOO_LONG);
+        end;
+ 
+ 
+/**
+ **        Parse the run-unit invokation
+ **/
+     P_PCB  = P_PCB_CONSTANT;
+     P_PCB.ROOT$ = NODES$(NODENUM);
+     P_PCB.WORK$ = addr(WORKAREA);
+     P_PCB.TEXT$ = addr(INVOKATION);
+     P_PCB.NCHARS = INS;
+     call X$PARSE( P_PCB ) altret( BAD_PARSE );
+     RBLK$   = P_PCB.OUT$;
+     RUBLK$  = RBLK$;
+     UIBLK$  = addr(nil);    UI_P = 0;
+     OUBLK$  = addr(nil);    OU_P = 0;
+     OPTBLK$ = addr(nil);    OPT_P= 0;
+ 
+/**
+ **     Start the command with 'APL  '
+ **/
+     COMMAND = APL;
+     POS     = lengthc(APL);
+ 
+ 
+/**
+ **     Now scan the parse nodes, building up a
+ **     command line for this invokation.
+ **/
+     SIPOS   = 0;   /*  Number of items obtained in SILIST */
+     SIN     = 0;   /*  Number of names - 1 in SILIST      */
+     TV      = RBLK$->BLOCK.NSUBLKS;
+ 
+     if RBLK$->BLOCK.NDTYPE ~= %FID# then
+     do  CCPOS = 0  to  TV-1;
+ 
+        BLK$ = RBLK$->BLOCK.SUBLK$(CCPOS);
+ 
+        do case( BLOCK.CODE );
+ 
+        case(0);    /**  Ignore  **/
+ 
+        case(1);    /**  RU name **/
+              RUBLK$ = BLK$;
+ 
+        case(2);    /**  SI fid  **/
+              call concat( substr(COMMAND,POS), SYMBOL.TEXT );
+              POS = POS + SYMBOL.COUNT;
+ 
+        case(3);    /**  UI fid  **/
+              UIBLK$ = BLK$;
+              UI_P   = UI_P + 1;
+ 
+        case(4);    /**  OU fid  **/
+              OUBLK$ = BLK$;
+              OU_P   = OU_P + 1;
+ 
+        case(5);    /**  LS fid  **/
+              LEN = SYMBOL.COUNT;
+              call concat(substr(COMMAND,VPOS,LEN+1),',',SYMBOL.TEXT);
+              POS = VPOS + LEN + 1;
+ 
+        case(6,7,8);    /** into | over | on **/
+              VERB = BLOCK.CODE - 6;
+              LEN  = VERBS.LEN(VERB);
+              substr(COMMAND,POS,LEN) = VERBS.TEXT(VERB);
+              VPOS = POS + LEN; /** Appears only if LS fid (5)!!! **/
+ 
+        case(9);    /** '(' **/
+              OPTBLK$ = BLK$;
+              OPT_P   = OPT_P + 1;
+ 
+        case(10);   /** SI list of fids  **/
+              if SIPOS > 0   then do;
+                 substr(SINAMES,SIPOS,1) = ',';
+                 SIPOS = SIPOS + 1;
+                 SIN   = SIN + 1;
+                 end;
+              substr(SINAMES,SIPOS,SYMBOL.COUNT) = SYMBOL.TEXT;
+              SIPOS = SIPOS + SYMBOL.COUNT;
+ 
+        end;  /** Of case on block code  **/
+ 
+     end;     /**  Of do iteration       **/
+ 
+ 
+/**
+ **     Now we insert the options...
+ **
+ **        Start with (QUIET,WS=rufid
+ **/
+     substr(COMMAND,POS) = APLOPTS;   /* Insert (QUIET,WS=    */
+     POS   = POS + lengthc(APLOPTS);
+ 
+/**
+ **  insert the workspace name!
+ **/
+     UNFID.TEXTFID_ = vector(substr(COMMAND,POS,maximum(1,255-POS)));
+     call M$UNFID(UNFID);
+     POS = POS + LEN;
+ 
+/**
+ **     If command line options were specified or a UIfid or an
+ **     OUfid was specified, provide an initial value for the
+ **     $QSP system variable of the form:
+ **
+ **    ,SP=' [SI=sifids] [[,]UI=uifid] [[,]OU=oufid] [[,](options)] '
+ **/
+     if ( UI_P + OU_P + OPT_P + SIPOS )  > 0   then
+     do;   /**  UI, OU or options are specified  **/
+        substr(COMMAND,POS) = APLSP;
+        POS = POS + lengthc(APLSP);
+ 
+        if SIPOS > 0 then do;
+           substr(COMMAND,POS) = APLSI;
+           POS = POS + lengthc(APLSI);
+           if SIN > 0 then do;
+              substr(COMMAND,POS,1) = '(';
+              POS = POS + 1;
+              end;
+           substr(COMMAND,POS,SIPOS) = SINAMES;
+           POS = POS +  SIPOS;
+           if SIN > 0 then do;
+              substr(COMMAND,POS,1) = ')';
+              POS = POS + 1;
+              end;
+           if (UI_P + OU_P + OPT_P ) > 0 then do;
+              substr(COMMAND,POS,1) = ',';
+              POS = POS + 1;
+              end;
+           end;
+ 
+        if UI_P > 0 then do;
+           substr(COMMAND,POS) = APLUI;
+           TV = UIBLK$->SYMBOL.COUNT;
+           substr(COMMAND,POS+lengthc(APLUI),TV) = UIBLK$->SYMBOL.TEXT;
+           if (OU_P + OPT_P) > 0 then do;
+              substr(COMMAND,POS+lengthc(APLUI)+TV,1) = ',';
+              TV = TV + 1;
+              end;
+           POS = POS + lengthc(APLUI) + TV;
+           end;
+ 
+        if OU_P > 0 then do;
+           substr(COMMAND,POS) = APLOU;
+           TV = OUBLK$->SYMBOL.COUNT;
+           substr(COMMAND,POS+lengthc(APLOU),TV) = OUBLK$->SYMBOL.TEXT;
+           POS = POS + lengthc(APLOU) + TV;
+ 
+           LEN = VERBS.LEN(VERB);
+           substr(COMMAND,POS,LEN) = VERBS.TEXT(VERB);
+           substr(COMMAND,POS,1)     = ',';
+           POS = POS + LEN;
+ 
+           if OPT_P > 0 then do;
+              substr(COMMAND,POS,1) = ',';
+              POS = POS + 1;
+              end;
+           end;
+ 
+        if OPT_P > 0 then do;
+           TV = OPTBLK$->SYMBOL.COUNT;
+           substr(COMMAND,POS) = '(';
+           substr(COMMAND,POS+1,TV) = OPTBLK$->SYMBOL.TEXT;
+           POS = POS + TV + 1;
+           end;
+ 
+        substr(COMMAND,POS,1) = ''''; /** terminate $QSP value **/
+        POS = POS + 1;
+     end;
+/**
+ **     Finally, close the option list up and M$LINK to APL
+ **/
+     substr(COMMAND,POS) = ')';
+     if POS > 256 then goto TOO_LONG;
+ 
+     call M$LDTRC(LINK);
+ 
+ 
+BAD_PARSE:
+     DISPLAY_ERROR      =  DISPLAY_ERROR_CONSTANT;
+     DISPLAY_ERROR.CODE_=  vector(BAD_COMMAND_SYNTAX);
+     call M$ERRMSG( DISPLAY_ERROR );
+     call M$ERR( EXIT_SYNTAX );
+ 
+TOO_LONG:
+     DISPLAY_ERROR       =   DISPLAY_ERROR_CONSTANT;
+     DISPLAY_ERROR.CODE_ =   vector(COMMAND_TOO_LONG);
+     call M$ERRMSG( DISPLAY_ERROR );
+     call M$ERR( EXIT_TOO_LONG );
+ 
+ 
+ 
+ 
+ 
+SQUEEZE: proc( LINE, LEN) altret;
+ 
+dcl  LINE        char(LEN) caligned;
+dcl  LEN         sbin;
+ 
+/**
+ **     INPUT:      LINE
+ **                 INS         insertion point in INVOKATION
+ **                 INQUOTE     we are currently within quotes
+ **     OUTPUT:     INVOKATION with extraneous blanks removed
+ **                 INS        the length of the compressed invokation
+ **/
+ 
+dcl  POS         sbin;    /*    position in LINE           */
+dcl  L           sbin;    /*    length of field            */
+dcl  Q           sbin;    /*    quote index                */
+dcl  DONE        sbin;    /*    indicates done with LINE   */
+dcl  I           sbin;    /*    temp                       */
+dcl  TCH         char(1); /*    terminal character         */
+ 
+ 
+     if substr(LINE,LEN-1,1)=';'
+        then substr(LINE,LEN-1,1) = ' ';
+     POS   =  0;
+     DONE  =  1;
+ 
+     if INQUOTE>0   then goto GET_QUOTES;
+SCAN_LINE:
+     do while DONE > 0;
+ 
+        call search(I,TV,B$SR_NON_BLANK,LINE,POS) whenaltreturn do;
+           exit SCAN_LINE;   /** blanks to end of line  **/
+           end;
+        if TV = %ascbin('"') then goto IGNORE_COMMENT;
+ 
+/**
+ **           At this point we know that there is a
+ **           non-blank character in LINE remaining
+ **           to be processed.
+ **/
+        call search(POS,TV,SPECL_CHARS,LINE,I) whenaltreturn do;
+           DONE = 0;
+           POS  = LEN;
+           end;
+ 
+        L = POS - I + DONE;
+        Q = L;
+        TCH = binasc(TV);
+        if TCH = '"' then Q = Q - 1;
+ 
+        if  lengthc(INVOKATION) < (INS + L)
+           then altreturn;
+        substr(INVOKATION,INS,L) = substr(LINE,I,Q);
+        INS = INS + L;
+ 
+ 
+        if TCH = '''' then do;
+GET_QUOTES:
+           call index(Q,'''',LINE,POS+1) altret(CONTINUE);
+           do while LEN>(Q+1) and substr(LINE,Q+1,1)='''';
+              L = Q + 2 - POS;  /** Quad internal quotes **/
+              if lengthc(INVOKATION) < (INS + L)
+                 then altreturn;
+              substr(INVOKATION,INS,L) = substr(LINE,POS,L);
+              INS = INS + L;
+              POS = Q;
+              if LEN<(Q+2) then goto CONTINUE;
+              call index(Q,'''',LINE,Q+2) altret(CONTINUE);
+           end;
+ 
+           L = Q - POS + 1;
+           if lengthc(INVOKATION) < (INS + L + 2)
+              then altreturn;
+           substr(INVOKATION,INS,L) = substr(LINE,POS,L);
+           substr(INVOKATION,INS+L,1) = '''';
+           if LEN > (POS+L+1) then do;
+              substr(INVOKATION,INS+L+1,1) = substr(LINE,POS+L,1);
+              INS = INS + 1;
+              POS = POS + 1;
+              end;
+           INS = INS + L + 1;
+           POS = POS + L;
+        end;  /* of if terminal char was '''' */
+           else
+        if TCH = '"' then do;
+IGNORE_COMMENT:
+           call index(POS,'"',LINE,POS+1) whenaltreturn do;
+              exit SCAN_LINE;
+              end;
+           POS = POS + 1;
+           if POS = LEN then DONE = 0;
+           end;
+ 
+     end SCAN_LINE;  /*  Of while DONE>0  */
+     INQUOTE = 0;
+     return;
+ 
+CONTINUE:
+     L = LEN - POS;
+     substr(INVOKATION,INS,L) = substr(LINE,POS,L);
+     INS = INS + L;
+     INQUOTE = 1;
+     return;
+ 
+end SQUEEZE;
+ 
+ 
+INIT_SQUEEZE: proc;
+ 
+/***    Initialize all of the global variables for
+ ***    the squeeze subroutine.
+ ***/
+ 
+     INS         =  0;
+     INQUOTE     =  0;
+     INVOKATION  =  ' ';
+ 
+end  INIT_SQUEEZE;
+end LOADWS;

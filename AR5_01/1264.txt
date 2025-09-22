@@ -1,0 +1,1836 @@
+VERSION E05
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:1    
+        1        1        /*M* Comgroup message validation for KQL and *FWCG station handling */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*F* NAME:        KQF$GOTMSG
+        8        8             PURPOSE:     To validate the message presented to it by KQL$xFFIND.
+        9        9             DESCRIPTION: This routine is called to determine if the selection
+       10       10                          criteria is met, and if so to optionally add it to
+       11       11                          the informational message (*AUEV, %CG_FWCG#),
+       12       12                          put it on the *FWCG station queue if it is to be
+       13       13                          REATTRed, and stuff it into ONEATTR if it is the
+       14       14                          first such message found. */
+       15       15        /*D* NAME:        KQF$GOTMSG
+       16       16             ENTRY:       KQF$GOTMSG
+       17       17             CALL:        CALL KQF$GOTMSG (KQ$FWP) ALTRET (no DBLK);
+       18       18             INPUT:       KQ$FWP.FC - Function code, only REATTR is significant.
+       19       19                          KQ$FWP.REGOK - Always reset, unless KQF$GOTMSG had to
+       20       20                                         ALTRET because it couldn't GET or FETCH
+       21       21                                         a DBLK.
+       22       22                          See KQ_MAC_C for description of the following input
+       23       23                          parameters: KQ$FWP.GETFIRST, KQ$FWP.INFORM, KQ$FWP.FOUND,
+       24       24                          KQ$FWP.MSGIDXT, KQ$FWP.DBLK$, KQ$FWP.DDA, KQ$FWP.NEXTDDA,
+       25       25                          KQ$FWP.DATA$, KQ$FWP.MAXDATA$, KQ$FWP.STA_$, KQ$FWP.REATTR_$,
+       26       26                          KQ$FWP.CRITERIA_$, KQ$FWP.ONEATTR_$ .
+       27       27             OUTPUT:      KQ$FWP.TOOKIT - Set if message was accepted, else
+       28       28                                          will be reset.
+       29       29                          KQ$FWP.DI - Set if FETCH failed (E$DI).
+       30       30                          See KQ_MAC_C for a description of the following output
+       31       31                          parameters: KQ$FWP.GETFIRST, KQ$FWP.GOTNEXT, KQ$FWP.FOUND,
+       32       32                          KQ$FWP.DBLK$, KQ$FWP.DDA, KQ$FWP.NEXTDDA, KQ$FWP.DATA$ .
+       33       33             SCRATCH:     Local AUTO (TSTACK).
+       34       34             DESCRIPTION: Since KQL$xFFIND already has satisfied the MSGTYP,
+       35       35                          ORIGIN, and MSGID, the only thing left to verify is
+       36       36                          the MSGIDXT. When the last slot in the current DBLK
+       37       37                          is filled then the current DBLK is unlocked; another
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:2    
+       38       38                          DBLK (the *new* next) is obtained, the stamp is set
+       39       39                          in the new next, the DDA of the new next is remembered,
+       40       40                          and the new next is unlocked; the *old* next (now the
+       41       41                          *new* current) is fetched, its link is set to the DDA
+       42       42                          of the new next; and processing can be continued for
+       43       43                          the MBLK of the selected message. Note that the GET
+       44       44                          and/or the FETCH can fail due to either the need to
+       45       45                          defer the operation or due to the lack of available
+       46       46                          defer blocks. In either case, KQF$GOTMSG will ALTRET
+       47       47                          back to KQL$xFFIND. KQL$xFFIND will then clean up its
+       48       48                          act such that the defer operation (user will be REGed)
+       49       49                          can proceed. KQL$xFFIND will then call KQF$GOTMSG with
+       50       50                          the same MBLK as before, but with KQ$FWP.REGOK set.
+       51       51                          The combination of KQ$FWP.REGOK and KQ$FWP.GOTNEXT
+       52       52                          enables KQF$GOTMSG to re-establish processing (FETCH
+       53       53                          or GET operation) where it left off without having to
+       54       54                          re-do the INFORM processing. Note that if the GET or
+       55       55                          FETCH operation fails with KQ$FWP.REGOK set then the
+       56       56                          comgroup must be full (GET) or a read error (FETCH)
+       57       57                          has occurred; if a read error then KQ$FWP.DI is set,
+       58       58                          in any event the current MBLK is fully processed, and
+       59       59                          KQF$GOTMSG will ALTRET back to KQL$xFFIND, signifying
+       60       60                          that it is time to flick it in! */
+       61       61
+       62       62        KQF$GOTMSG: PROC (KQ$FWP,KQ$MBLK) ALTRET;
+       63       63
+       64       64        /* Includes */
+       65       65
+       66       66        %INCLUDE HF_LOCK_C;
+       67       80        %INCLUDE KC$CP6V_C;
+       68      200        %INCLUDE KC_CP6;
+       69      760        %INCLUDE KQ_MAC_C;
+       70     3310        %INCLUDE KQ_SUBS_C;
+       71     3610
+       72     3611        /* Parameters */
+       73     3612
+       74     3613        %KQ_FWP (FPTN=KQ$FWP,STCLASS=" ");
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:3    
+       75     3714        %KQ_MBLK (FPTN=KQ$MBLK,STCLASS=" ");
+       76     3984
+       77     3985        /* Based */
+       78     3986
+       79     3987        %KQ_CG (FPTN=KQ$CG,STCLASS="BASED(CG$)");
+       80     4726        %KQ_DBLK (FPTN=KQ$DBLK,STCLASS="BASED");
+       81     4779        %KQ_DGRAN (FPTN=KQ$DGRAN,STCLASS="BASED");
+       82     4926        %KQ_MBLK (FPTN=KQ$IMBLK,STCLASS="BASED(IMBLK$)");
+       83     5196        %KQ_RBLK (FPTN=KQ$RBLK,STCLASS="BASED");
+       84     5382        %KQ_STA (FPTN=KQ$STA,STCLASS="BASED");
+       85     5721        %VLP$CGMA_V (FPTN=VLP$CGMA,BASED="BASED");
+       86     5733        %VLP$SCGMA_V (FPTN=VLP$SCGMA,BASED="BASED");
+       87     5737
+       88     5738        /* Auto */
+       89     5739
+       90     5740    1   DCL ALTFLAG BIT(1) ALIGNED;
+       91     5741    1   DCL CG$ PTR;
+       92     5742    1   DCL CGMA$ PTR;
+       93     5743    1   DCL IMBLK$ PTR;
+       94     5744    1   DCL NEXTDDA UBIN WORD;
+       95     5745
+       96     5746        /* Refs */
+       97     5747
+       98     5748    1   DCL KQD$DEFERWAIT  ENTRY(3) ALTRET;
+       99     5749    1   DCL KQD$DELDDA     ENTRY(3) ALTRET;
+      100     5750    1   DCL KQD$FETCH      ENTRY(3) ALTRET;
+      101     5751    1   DCL KQD$FETCHR     ENTRY(3) ALTRET;
+      102     5752    1   DCL KQD$GET        ENTRY(3) ALTRET;
+      103     5753    1   DCL KQD$GETR       ENTRY(3) ALTRET;
+      104     5754    1   DCL KQD$UPDATED    ENTRY(2) ALTRET;
+      105     5755
+      106     5756        /* %Subs */
+      107     5757
+      108     5758        %EQU_CG;
+      109     5806
+      110     5807        %EQU FWCG_NONE=0;
+      111     5808        %EQU FWCG_REATTR=1;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:4    
+      112     5809        %EQU FWCG_DELETE=-1;
+      113     5810        %SUB FWCG_SIZC="((4096-SIZEC (KQ$DGRAN)-2*SIZEC (KQ$DBLK))/2)";
+      114     5811
+      115     5812        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:5    
+      116     5813
+      117     5814    1         CALL CHECK_MSG ALTRET (DONT_WANT);
+      118     5815
+      119     5816        /* First message found processing */
+      120     5817
+      121     5818    1         IF KQ$FWP.GETFIRST THEN
+      122     5819    2           DO;
+      123     5820    2           CGMA$ = KQ$FWP.ONEATTR_$;
+      124     5821    2           CALL MBLK2CGMA;
+      125     5822    2           KQ$FWP.GETFIRST = '0'B;
+      126     5823    2           END;
+      127     5824
+      128     5825        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:6    
+      129     5826
+      130     5827        /* INFORM processing */
+      131     5828
+      132     5829    1         IF KQ$FWP.INFORM THEN
+      133     5830    2           DO;
+      134     5831    2           IMBLK$ = KQ$FWP.MYSTA$->KQ$STA.MBLK$;
+      135     5832    2           IF KQ$FWP.REGOK THEN
+      136     5833    3             DO;
+      137     5834    3             IF KQ$FWP.GOTNEXT THEN
+      138     5835    4               DO;
+      139     5836    4               IF KQ$FWP.DBLK$ ~= ADDR(NIL) THEN /* KQD$FETCH got a defer block */
+      140     5837    4                 CALL KQD$DEFERWAIT (KQ$CG,KQ$FWP.DBLK$,KQ$FWP.NEXTDDA) ALTRET (
+              5837                          NO_FETCHR);
+      141     5838    4               ELSE
+      142     5839    4                 KQ$FWP.STAMP = KQ$IMBLK.STAMP;
+      143     5840    4               NEXTDDA = KQ$FWP.NEXTDDA;
+      144     5841    4               CALL KQD$FETCHR (KQ$CG,KQ$FWP.DBLK$,NEXTDDA) ALTRET (NO_FETCHR);
+      145     5842    4               GOTO GOT_FETCH;
+      146     5843    4               END;
+      147     5844    3             IF KQ$FWP.DBLK$ ~= ADDR(NIL) THEN /* KQD$GET got a defer block */
+      148     5845    3               CALL KQD$DEFERWAIT (KQ$CG,KQ$FWP.DBLK$,KQ$FWP.DDA) ALTRET (NO_GETR);
+      149     5846    3             ELSE
+      150     5847    4               DO;
+      151     5848    4               KQ$FWP.DDA = (FWCG_SIZC/SIZEC (VLP$CGMA))*SIZEC (VLP$CGMA);
+      152     5849    4               CALL KQD$GETR (KQ$CG,KQ$FWP.DBLK$,KQ$FWP.DDA) ALTRET (NO_GETR);
+      153     5850    4               END;
+      154     5851    3             GOTO GOT_DBLK;
+      155     5852    3             END;
+      156     5853    2           CGMA$ = KQ$FWP.DATA$;
+      157     5854    2           CALL MBLK2CGMA;
+      158     5855    2           KQ$FWP.DATA$ = PINCRW (KQ$FWP.DATA$,SIZEW (VLP$CGMA));
+      159     5856    2           KQ$FWP.DBLK$->KQ$DBLK.DSIZE = KQ$FWP.DBLK$->KQ$DBLK.DSIZE + SIZEC (VLP$CGMA)
+              5856                    ;
+      160     5857    2           KQ$IMBLK.MSGSIZE = KQ$IMBLK.MSGSIZE + SIZEC (VLP$CGMA);
+      161     5858    2           IF KQ$FWP.DATA$ = KQ$FWP.MAXDATA$ THEN
+      162     5859    3             DO;
+      163     5860
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:7    
+      164     5861        /* Need another DBLK */
+      165     5862
+      166     5863    3             CALL KQD$UPDATED (KQ$CG,KQ$FWP.DBLK$); /* Doesn't ALTRET!! */
+      167     5864    3             KQ$FWP.DDA = (FWCG_SIZC/SIZEC (VLP$CGMA))*SIZEC (VLP$CGMA);
+      168     5865    3             CALL KQD$GET (KQ$CG,KQ$FWP.DBLK$,KQ$FWP.DDA) ALTRET (NO_GET);
+      169     5866    3   GOT_DBLK:
+      170     5867    3             KQ$FWP.GOTNEXT = '1'B;
+      171     5868    3             KQ$FWP.DBLK$->KQ$DBLK.STAMP = KQ$IMBLK.STAMP;
+      172     5869    3             KQ$FWP.DBLK$->KQ$DBLK.DSIZE = 0;
+      173     5870    3             CALL KQD$UPDATED (KQ$CG,KQ$FWP.DBLK$); /* Doesn't ALTRET!! */
+      174     5871    3             KQ$FWP.STAMP = KQ$IMBLK.STAMP;
+      175     5872    3             NEXTDDA = KQ$FWP.NEXTDDA;
+      176     5873    3             IF KQ$FWP.REGOK THEN
+      177     5874    3               CALL KQD$FETCHR (KQ$CG,KQ$FWP.DBLK$,NEXTDDA) ALTRET (NO_FETCHR);
+      178     5875    3             ELSE
+      179     5876    3               CALL KQD$FETCH (KQ$CG,KQ$FWP.DBLK$,NEXTDDA) ALTRET (NO_FETCH);
+      180     5877    3   GOT_FETCH:
+      181     5878    3             KQ$FWP.GOTNEXT = '0'B;
+      182     5879    3             KQ$FWP.DBLK$->KQ$DBLK.FLNKDA = KQ$FWP.DDA;
+      183     5880    3             KQ$FWP.DDA = KQ$FWP.NEXTDDA;
+      184     5881    3             KQ$FWP.NEXTDDA = KQ$FWP.DBLK$->KQ$DBLK.FLNKDA;
+      185     5882    3             KQ$FWP.DATA$ = PINCRW (KQ$FWP.DBLK$,SIZEW (KQ$DBLK));
+      186     5883    3             KQ$FWP.MAXDATA$ = PINCRC (KQ$FWP.DATA$,(FWCG_SIZC/SIZEC (VLP$CGMA))*SIZEC
+              5883                      (VLP$CGMA));
+      187     5884    3             END;
+      188     5885    3             DO WHILE ('0'B);
+      189     5886    3   NO_GETR:
+      190     5887    4               DO WHILE ('0'B);
+      191     5888    4   NO_FETCHR:
+      192     5889    4               KQ$FWP.STAMP = KQ$IMBLK.STAMP;
+      193     5890    4               CALL KQD$DELDDA (KQ$CG,KQ$FWP.STAMP,KQ$FWP.DDA); /* Ignore ALTRET!! */
+      194     5891    4               KQ$FWP.DI = '1'B;
+      195     5892    4               END;
+      196     5893    3             KQ$FWP.DBLK$ = ADDR (NIL);
+      197     5894    3             ALTFLAG = '1'B;
+      198     5895    3             END;
+      199     5896    2           END;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:8    
+      200     5897
+      201     5898        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:9    
+      202     5899
+      203     5900        /* REATTR processing */
+      204     5901
+      205     5902    1         IF KQ$FWP.FC = %FWCG_REATTR THEN
+      206     5903    2           DO;
+      207     5904    2           IF KQ$MBLK.PRIO < %KQ_AUEP# THEN
+      208     5905    3             DO;
+      209     5906    3             IF KQ$FWP.SRA_$->VLP$SCGMA.MSGTYP THEN
+      210     5907    4               DO;
+      211     5908    4               IF KQ$CG.QISS THEN
+      212     5909    4                 KQ$MBLK.KEY2 = KQ$FWP.REATTR_$->VLP$CGMA.MSGTYP;
+      213     5910    4               ELSE
+      214     5911    4                 KQ$MBLK.KEY1 = KQ$FWP.REATTR_$->VLP$CGMA.MSGTYP;
+      215     5912    4               END;
+      216     5913    3             IF KQ$FWP.SRA_$->VLP$SCGMA.ORIGIN THEN
+      217     5914    4               DO;
+      218     5915    4               IF KQ$CG.QISS THEN
+      219     5916    4                 KQ$MBLK.KEY1 = KQ$FWP.REATTR_$->VLP$CGMA.ORIGIN;
+      220     5917    4               ELSE
+      221     5918    4                 KQ$MBLK.KEY2 = KQ$FWP.REATTR_$->VLP$CGMA.ORIGIN;
+      222     5919    4               END;
+      223     5920    3             IF KQ$FWP.SRA_$->VLP$SCGMA.PRIO THEN
+      224     5921    4               DO;
+      225     5922    4               IF KQ$FWP.REATTR_$->VLP$CGMA.PRIO < %KQ_AUEP# THEN
+      226     5923    4                 KQ$MBLK.PRIO = KQ$FWP.REATTR_$->VLP$CGMA.PRIO;
+      227     5924    4               ELSE KQ$MBLK.PRIO = (%KQ_AUEP#-1);
+      228     5925    4               END;
+      229     5926    3             IF KQ$FWP.SRA_$->VLP$SCGMA.UTS THEN
+      230     5927    3               KQ$MBLK.UTS = KQ$FWP.REATTR_$->VLP$CGMA.UTS;
+      231     5928    3             IF KQ$FWP.SRA_$->VLP$SCGMA.DVE THEN
+      232     5929    3               KQ$MBLK.DVE = KQ$FWP.REATTR_$->VLP$CGMA.DVE;
+      233     5930    3             IF KQ$FWP.SRA_$->VLP$SCGMA.TYC THEN
+      234     5931    3               KQ$MBLK.TYC = KQ$FWP.REATTR_$->VLP$CGMA.TYC;
+      235     5932    3             IF KQ$FWP.SRA_$->VLP$SCGMA.MSGID THEN
+      236     5933    4               DO;
+      237     5934    4               KQ$MBLK.MID.PRIMARY = KQ$FWP.REATTR_$->VLP$CGMA.MSGID;
+      238     5935                    %LOCK (G=KQ$CG.TTREE.GATE);
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:10   
+      239     5938    4               IF KQ$MBLK.MID.PRIMARY > KQ$CG.MSGID THEN
+      240     5939    4                 KQ$CG.MSGID = KQ$MBLK.MID.PRIMARY + 1;
+      241     5940                    %UNLOCK (G=KQ$CG.TTREE.GATE);
+      242     5943    4               IF KQ$FWP.SRA_$->VLP$SCGMA.MSGIDXT ~= 0 THEN
+      243     5944    4                 KQ$MBLK.MID.XT = KQ$FWP.REATTR_$->VLP$CGMA.MSGIDBXT;
+      244     5945    4               END;
+      245     5946    3             IF KQ$FWP.SRA_$->VLP$SCGMA.MSGSIZE THEN
+      246     5947    4               DO;
+      247     5948    4               IF KQ$MBLK.MSGSIZE > KQ$FWP.REATTR_$->VLP$CGMA.MSGSIZE THEN
+      248     5949    4                 KQ$MBLK.MSGSIZE = KQ$FWP.REATTR_$->VLP$CGMA.MSGSIZE;
+      249     5950    4               END;
+      250     5951    3             IF KQ$FWP.SRA_$->VLP$SCGMA.DEST THEN
+      251     5952    3               KQ$MBLK.DSTA = KQ$FWP.REATTR_$->VLP$CGMA.DEST;
+      252     5953    3             END;
+      253     5954    2           END;
+      254     5955
+      255     5956        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:11   
+      256     5957
+      257     5958        /* Just about done */
+      258     5959
+      259     5960    1         KQ$FWP.FOUND = KQ$FWP.FOUND + 1;
+      260     5961
+      261     5962    1   WANT_IT:
+      262     5963    2           DO WHILE ('0'B);
+      263     5964    2   NO_GET: ;
+      264     5965    2   NO_FETCH:
+      265     5966    2           ALTFLAG = '1'B;
+      266     5967    2           END;
+      267     5968    1         KQ$FWP.TOOKIT = '1'B;
+      268     5969    2           DO WHILE ('0'B);
+      269     5970    2   DONT_WANT:
+      270     5971    2           KQ$FWP.TOOKIT = '0'B;
+      271     5972    2           END;
+      272     5973    1         IF ALTFLAG THEN
+      273     5974    1           ALTRETURN;
+      274     5975    1         ELSE
+      275     5976    1           RETURN;
+      276     5977
+      277     5978        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:12   
+      278     5979
+      279     5980        /*D* NAME:        KQF$CHKMSG
+      280     5981             ENTRY:       KQF$CKHMSG
+      281     5982             CALL:        CALL KQF$CHKMSG (KQ$FWP);
+      282     5983             DESCRIPTION: Just validates the message, sets KQ$FWP.TOOKIT, and
+      283     5984                          RETURNs. */
+      284     5985
+      285     5986    1   KQF$CHKMSG: ENTRY (KQ$FWP,KQ$MBLK) ALTRET; /* Doesn't ALTRET!! */
+      286     5987
+      287     5988    1         CALL CHECK_MSG ALTRET (DONT_WANT);
+      288     5989
+      289     5990    1         GOTO WANT_IT;
+      290     5991
+      291     5992        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:13   
+      292     5993
+      293     5994        /*I* NAME:        CHECK_MSG
+      294     5995             ENTRY:       CHECK_MSG
+      295     5996             CALL:        CALL CHECK_MSG ALTRET (Doesn't qualify);
+      296     5997             OUTPUT:      ALTFLAG - Initialized to '0'B.
+      297     5998                          CG$ - Pointer to KQ$CG.
+      298     5999             DESCRIPTION: If KQ$FWP.MSGIDXT = 0 then the message qualifies, and
+      299     6000                          CHECK_MSG just RETURNs. Else, the MSGIDXT is validated.
+      300     6001                          If successful then RETURNs, else ALTRETURNs. */
+      301     6002
+      302     6003    1   CHECK_MSG: PROC ALTRET;
+      303     6004
+      304     6005    2   DCL M BIT (BXT) BASED ALIGNED;
+      305     6006    2   DCL BXT UBIN;
+      306     6007
+      307     6008    2         ALTFLAG = '0'B;
+      308     6009    2         CG$ = KQ$FWP.MYSTA$->KQ$STA.CG$;
+      309     6010    2         IF KQ$FWP.MSGIDXT = 0 THEN
+      310     6011    2           RETURN;
+      311     6012    2         ELSE
+      312     6013    3           DO;
+      313     6014    3           IF KQ$CG.AUCTL.BIGMXT THEN
+      314     6015    4             DO;
+      315     6016    4             IF KQ$MBLK.MID.XT = KQ$FWP.CRITERIA_$->VLP$CGMA.MSGIDBXT THEN
+      316     6017    4               RETURN;
+      317     6018    4             END;
+      318     6019    3           ELSE
+      319     6020    4             DO;
+      320     6021    4             BXT = 6 * KQ$FWP.MSGIDXT;
+      321     6022    4             IF ADDR (KQ$MBLK.MID.XT)->M =
+      322     6023    4             ADDR (KQ$FWP.CRITERIA_$->VLP$CGMA.MSGIDXT)->M THEN
+      323     6024    4               RETURN;
+      324     6025    4             END;
+      325     6026    3           END;
+      326     6027
+      327     6028    2         ALTRETURN;
+      328     6029
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:14   
+      329     6030    2   END CHECK_MSG;
+      330     6031
+      331     6032        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:15   
+      332     6033
+      333     6034        /*I* NAME:        MBLK2CGMA
+      334     6035             ENTRY:       MBLK2CGMA
+      335     6036             CALL:        CALL MBLK2CGMA;
+      336     6037             INPUT:       KQ$MBLK - The MBLK (source).
+      337     6038                          CGMA$ - Pointer to VLP$CGMA (destination).
+      338     6039             DESCRIPTION: Parameters from KQ$MBLK are moved to VLP$CGMA area.
+      339     6040                          Currently, the VLP_CGMA looks just like an MBLK,
+      340     6041                          so the code to assign the separate parameters
+      341     6042                          is commented out. */
+      342     6043
+      343     6044    1   MBLK2CGMA: PROC;
+      344     6045
+      345     6046    2         CGMA$->VLP$CGMA=KQ$MBLK;
+      346     6047        /*****CGMA$->VLP$CGMA.MSGTYP = KQ$MBLK.KEY1;***********/
+      347     6048        /*****CGMA$->VLP$CGMA.ORIGIN = KQ$MBLK.KEY2;***********/
+      348     6049    2         IF KQ$CG.QISS THEN
+      349     6050    3           DO;
+      350     6051    3           CGMA$->VLP$CGMA.ORIGIN = KQ$MBLK.KEY1;
+      351     6052    3           CGMA$->VLP$CGMA.MSGTYP = KQ$MBLK.KEY2;
+      352     6053    3           END;
+      353     6054        /*****CGMA$->VLP$CGMA.DEST = KQ$MBLK.DSTA;*************/
+      354     6055        /*****CGMA$->VLP$CGMA.PRIO = KQ$MBLK.PRIO;*************/
+      355     6056        /*****CGMA$->VLP$CGMA.DVE = KQ$MBLK.DVE;***************/
+      356     6057        /*****CGMA$->VLP$CGMA.TYC = KQ$MBLK.TYC;***************/
+      357     6058        /*****CGMA$->VLP$CGMA.UTS = KQ$MBLK.UTS;***************/
+      358     6059        /*****CGMA$->VLP$CGMA.MSGID = KQ$MBLK.MID.PRIMARY;*****/
+      359     6060        /*****CGMA$->VLP$CGMA.MSGIDBXT = KQ$MBLK.MID.XT;*******/
+      360     6061        /*****CGMA$->VLP$CGMA.MSGSIZE = KQ$MBLK.MSGSIZE;*******/
+      361     6062
+      362     6063    2         RETURN;
+      363     6064
+      364     6065    2   END MBLK2CGMA;
+      365     6066
+      366     6067    1   END KQF$GOTMSG;
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:16   
+--  Include file information  --
+
+   KQ_SUBS_C.:E05TOU  is referenced.
+   KQ_MAC_C.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+   KC$CP6V_C.:E05TOU  is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure KQF$GOTMSG.
+
+   Procedure KQF$GOTMSG requires 418 words for executable code.
+   Procedure KQF$GOTMSG requires 16 words of local(AUTO) storage.
+
+    No errors detected in file KQF$GOTMSG.:E05TSI    .
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:17   
+
+ Object Unit name= KQF$GOTMSG                                 File name= KQF$GOTMSG.:E05TOU
+ UTS= JUL 30 '97 01:28:43.12 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   418    642  KQF$GOTMSG
+    1  RoData even  none     3      3  KQF$GOTMSG
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes    yes     yes      Std        2  KQF$GOTMSG
+     0    554          yes     yes      Std        2  KQF$CHKMSG
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       3 KQD$DEFERWAIT
+ yes     yes           Std       3 KQD$DELDDA
+         yes           Std       1 HFC$UNLOCK
+ yes     yes           Std       3 KQD$FETCHR
+ yes     yes           Std       3 KQD$GETR
+ yes     yes           Std       3 KQD$GET
+ yes     yes           Std       2 KQD$UPDATED
+         yes           Std       1 HFC$LOCK
+ yes     yes           Std       3 KQD$FETCH
+                       nStd      0 X66_AUTO_2
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_AALT
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:18   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     B_VECTNIL
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:19   
+
+
+        1        1        /*M* Comgroup message validation for KQL and *FWCG station handling */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*F* NAME:        KQF$GOTMSG
+        8        8             PURPOSE:     To validate the message presented to it by KQL$xFFIND.
+        9        9             DESCRIPTION: This routine is called to determine if the selection
+       10       10                          criteria is met, and if so to optionally add it to
+       11       11                          the informational message (*AUEV, %CG_FWCG#),
+       12       12                          put it on the *FWCG station queue if it is to be
+       13       13                          REATTRed, and stuff it into ONEATTR if it is the
+       14       14                          first such message found. */
+       15       15        /*D* NAME:        KQF$GOTMSG
+       16       16             ENTRY:       KQF$GOTMSG
+       17       17             CALL:        CALL KQF$GOTMSG (KQ$FWP) ALTRET (no DBLK);
+       18       18             INPUT:       KQ$FWP.FC - Function code, only REATTR is significant.
+       19       19                          KQ$FWP.REGOK - Always reset, unless KQF$GOTMSG had to
+       20       20                                         ALTRET because it couldn't GET or FETCH
+       21       21                                         a DBLK.
+       22       22                          See KQ_MAC_C for description of the following input
+       23       23                          parameters: KQ$FWP.GETFIRST, KQ$FWP.INFORM, KQ$FWP.FOUND,
+       24       24                          KQ$FWP.MSGIDXT, KQ$FWP.DBLK$, KQ$FWP.DDA, KQ$FWP.NEXTDDA,
+       25       25                          KQ$FWP.DATA$, KQ$FWP.MAXDATA$, KQ$FWP.STA_$, KQ$FWP.REATTR_$,
+       26       26                          KQ$FWP.CRITERIA_$, KQ$FWP.ONEATTR_$ .
+       27       27             OUTPUT:      KQ$FWP.TOOKIT - Set if message was accepted, else
+       28       28                                          will be reset.
+       29       29                          KQ$FWP.DI - Set if FETCH failed (E$DI).
+       30       30                          See KQ_MAC_C for a description of the following output
+       31       31                          parameters: KQ$FWP.GETFIRST, KQ$FWP.GOTNEXT, KQ$FWP.FOUND,
+       32       32                          KQ$FWP.DBLK$, KQ$FWP.DDA, KQ$FWP.NEXTDDA, KQ$FWP.DATA$ .
+       33       33             SCRATCH:     Local AUTO (TSTACK).
+       34       34             DESCRIPTION: Since KQL$xFFIND already has satisfied the MSGTYP,
+       35       35                          ORIGIN, and MSGID, the only thing left to verify is
+       36       36                          the MSGIDXT. When the last slot in the current DBLK
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:20   
+       37       37                          is filled then the current DBLK is unlocked; another
+       38       38                          DBLK (the *new* next) is obtained, the stamp is set
+       39       39                          in the new next, the DDA of the new next is remembered,
+       40       40                          and the new next is unlocked; the *old* next (now the
+       41       41                          *new* current) is fetched, its link is set to the DDA
+       42       42                          of the new next; and processing can be continued for
+       43       43                          the MBLK of the selected message. Note that the GET
+       44       44                          and/or the FETCH can fail due to either the need to
+       45       45                          defer the operation or due to the lack of available
+       46       46                          defer blocks. In either case, KQF$GOTMSG will ALTRET
+       47       47                          back to KQL$xFFIND. KQL$xFFIND will then clean up its
+       48       48                          act such that the defer operation (user will be REGed)
+       49       49                          can proceed. KQL$xFFIND will then call KQF$GOTMSG with
+       50       50                          the same MBLK as before, but with KQ$FWP.REGOK set.
+       51       51                          The combination of KQ$FWP.REGOK and KQ$FWP.GOTNEXT
+       52       52                          enables KQF$GOTMSG to re-establish processing (FETCH
+       53       53                          or GET operation) where it left off without having to
+       54       54                          re-do the INFORM processing. Note that if the GET or
+       55       55                          FETCH operation fails with KQ$FWP.REGOK set then the
+       56       56                          comgroup must be full (GET) or a read error (FETCH)
+       57       57                          has occurred; if a read error then KQ$FWP.DI is set,
+       58       58                          in any event the current MBLK is fully processed, and
+       59       59                          KQF$GOTMSG will ALTRET back to KQL$xFFIND, signifying
+       60       60                          that it is time to flick it in! */
+       61       61
+       62       62        KQF$GOTMSG: PROC (KQ$FWP,KQ$MBLK) ALTRET;
+
+     62  0 000000   000000 700200 xent  KQF$GOTMSG   TSX0  ! X66_AUTO_2
+         0 000001   000020 000002                    ZERO    16,2
+
+       63       63
+       64       64        /* Includes */
+       65       65
+       66       66        %INCLUDE HF_LOCK_C;
+       67       80        %INCLUDE KC$CP6V_C;
+       68      200        %INCLUDE KC_CP6;
+       69      760        %INCLUDE KQ_MAC_C;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:21   
+       70     3310        %INCLUDE KQ_SUBS_C;
+       71     3610
+       72     3611        /* Parameters */
+       73     3612
+       74     3613        %KQ_FWP (FPTN=KQ$FWP,STCLASS=" ");
+       75     3714        %KQ_MBLK (FPTN=KQ$MBLK,STCLASS=" ");
+       76     3984
+       77     3985        /* Based */
+       78     3986
+       79     3987        %KQ_CG (FPTN=KQ$CG,STCLASS="BASED(CG$)");
+       80     4726        %KQ_DBLK (FPTN=KQ$DBLK,STCLASS="BASED");
+       81     4779        %KQ_DGRAN (FPTN=KQ$DGRAN,STCLASS="BASED");
+       82     4926        %KQ_MBLK (FPTN=KQ$IMBLK,STCLASS="BASED(IMBLK$)");
+       83     5196        %KQ_RBLK (FPTN=KQ$RBLK,STCLASS="BASED");
+       84     5382        %KQ_STA (FPTN=KQ$STA,STCLASS="BASED");
+       85     5721        %VLP$CGMA_V (FPTN=VLP$CGMA,BASED="BASED");
+       86     5733        %VLP$SCGMA_V (FPTN=VLP$SCGMA,BASED="BASED");
+       87     5737
+       88     5738        /* Auto */
+       89     5739
+       90     5740    1   DCL ALTFLAG BIT(1) ALIGNED;
+       91     5741    1   DCL CG$ PTR;
+       92     5742    1   DCL CGMA$ PTR;
+       93     5743    1   DCL IMBLK$ PTR;
+       94     5744    1   DCL NEXTDDA UBIN WORD;
+       95     5745
+       96     5746        /* Refs */
+       97     5747
+       98     5748    1   DCL KQD$DEFERWAIT  ENTRY(3) ALTRET;
+       99     5749    1   DCL KQD$DELDDA     ENTRY(3) ALTRET;
+      100     5750    1   DCL KQD$FETCH      ENTRY(3) ALTRET;
+      101     5751    1   DCL KQD$FETCHR     ENTRY(3) ALTRET;
+      102     5752    1   DCL KQD$GET        ENTRY(3) ALTRET;
+      103     5753    1   DCL KQD$GETR       ENTRY(3) ALTRET;
+      104     5754    1   DCL KQD$UPDATED    ENTRY(2) ALTRET;
+      105     5755
+      106     5756        /* %Subs */
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:22   
+      107     5757
+      108     5758        %EQU_CG;
+      109     5806
+      110     5807        %EQU FWCG_NONE=0;
+      111     5808        %EQU FWCG_REATTR=1;
+      112     5809        %EQU FWCG_DELETE=-1;
+      113     5810        %SUB FWCG_SIZC="((4096-SIZEC (KQ$DGRAN)-2*SIZEC (KQ$DBLK))/2)";
+      114     5811
+      115     5812        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:23   
+      116     5813
+      117     5814    1         CALL CHECK_MSG ALTRET (DONT_WANT);
+
+   5814  0 000002   000561 701000 0                  TSX1    CHECK_MSG
+         0 000003   000545 702000 0                  TSX2    DONT_WANT
+
+      118     5815
+      119     5816        /* First message found processing */
+      120     5817
+      121     5818    1         IF KQ$FWP.GETFIRST THEN
+
+   5818  0 000004   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000005   000007 236100                    LDQ     7,,PR0
+         0 000006   000010 316007                    CANQ    8,DL
+         0 000007   000017 600000 0                  TZE     s:5829
+
+      122     5819    2           DO;
+
+      123     5820    2           CGMA$ = KQ$FWP.ONEATTR_$;
+
+   5820  0 000010   000022 236100                    LDQ     18,,PR0
+         0 000011   200007 756100                    STQ     CGMA$,,AUTO
+
+      124     5821    2           CALL MBLK2CGMA;
+
+   5821  0 000012   000621 701000 0                  TSX1    MBLK2CGMA
+         0 000013   000000 011000                    NOP     0
+
+      125     5822    2           KQ$FWP.GETFIRST = '0'B;
+
+   5822  0 000014   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000015   000000 236000 1                  LDQ     0
+         0 000016   000007 356100                    ANSQ    7,,PR0
+
+      126     5823    2           END;
+
+      127     5824
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:24   
+      128     5825        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:25   
+      129     5826
+      130     5827        /* INFORM processing */
+      131     5828
+      132     5829    1         IF KQ$FWP.INFORM THEN
+
+   5829  0 000017   000007 236100                    LDQ     7,,PR0
+         0 000020   000004 316007                    CANQ    4,DL
+         0 000021   000334 600000 0                  TZE     s:5902
+
+      133     5830    2           DO;
+
+      134     5831    2           IMBLK$ = KQ$FWP.MYSTA$->KQ$STA.MBLK$;
+
+   5831  0 000022   000002 471500                    LDP1    2,,PR0
+         0 000023   100012 236100                    LDQ     10,,PR1
+         0 000024   200010 756100                    STQ     IMBLK$,,AUTO
+
+      135     5832    2           IF KQ$FWP.REGOK THEN
+
+   5832  0 000025   000007 236100                    LDQ     7,,PR0
+         0 000026   100000 316003                    CANQ    32768,DU
+         0 000027   000130 600000 0                  TZE     s:5853
+
+      136     5833    3             DO;
+
+      137     5834    3             IF KQ$FWP.GOTNEXT THEN
+
+   5834  0 000030   000001 316007                    CANQ    1,DL
+         0 000031   000073 600000 0                  TZE     s:5844
+
+      138     5835    4               DO;
+
+      139     5836    4               IF KQ$FWP.DBLK$ ~= ADDR(NIL) THEN /* KQD$FETCH got a defer block */
+
+   5836  0 000032   000012 236100                    LDQ     10,,PR0
+         0 000033   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         0 000034   000051 600000 0                  TZE     s:5839
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:26   
+
+      140     5837    4                 CALL KQD$DEFERWAIT (KQ$CG,KQ$FWP.DBLK$,KQ$FWP.NEXTDDA) ALTRET (
+              5837                          NO_FETCHR);
+
+   5837  0 000035   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000036   000014 036003                    ADLQ    12,DU
+         0 000037   200016 756100                    STQ     BXT+3,,AUTO
+         0 000040   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000041   000012 036003                    ADLQ    10,DU
+         0 000042   200006 235100                    LDA     CG$,,AUTO
+         0 000043   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000044   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000045   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000046   000000 701000 xent               TSX1    KQD$DEFERWAIT
+         0 000047   000304 702000 0                  TSX2    NO_FETCHR
+         0 000050   000055 710000 0                  TRA     s:5840
+
+      141     5838    4               ELSE
+      142     5839    4                 KQ$FWP.STAMP = KQ$IMBLK.STAMP;
+
+   5839  0 000051   200010 473500                    LDP3    IMBLK$,,AUTO
+         0 000052   300001 236100                    LDQ     1,,PR3
+         0 000053   777777 376007                    ANQ     -1,DL
+         0 000054   000012 756100                    STQ     10,,PR0
+
+      143     5840    4               NEXTDDA = KQ$FWP.NEXTDDA;
+
+   5840  0 000055   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000056   000014 235100                    LDA     12,,PR0
+         0 000057   200011 755100                    STA     NEXTDDA,,AUTO
+
+      144     5841    4               CALL KQD$FETCHR (KQ$CG,KQ$FWP.DBLK$,NEXTDDA) ALTRET (NO_FETCHR);
+
+   5841  0 000060   200011 631500                    EPPR1   NEXTDDA,,AUTO
+         0 000061   200016 451500                    STP1    BXT+3,,AUTO
+         0 000062   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000063   000012 036003                    ADLQ    10,DU
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:27   
+         0 000064   200006 235100                    LDA     CG$,,AUTO
+         0 000065   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000066   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000067   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000070   000000 701000 xent               TSX1    KQD$FETCHR
+         0 000071   000304 702000 0                  TSX2    NO_FETCHR
+
+      145     5842    4               GOTO GOT_FETCH;
+
+   5842  0 000072   000262 710000 0                  TRA     GOT_FETCH
+
+      146     5843    4               END;
+      147     5844    3             IF KQ$FWP.DBLK$ ~= ADDR(NIL) THEN /* KQD$GET got a defer block */
+
+   5844  0 000073   000012 236100                    LDQ     10,,PR0
+         0 000074   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         0 000075   000112 600000 0                  TZE     s:5848
+
+      148     5845    3               CALL KQD$DEFERWAIT (KQ$CG,KQ$FWP.DBLK$,KQ$FWP.DDA) ALTRET (NO_GETR);
+
+   5845  0 000076   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000077   000013 036003                    ADLQ    11,DU
+         0 000100   200016 756100                    STQ     BXT+3,,AUTO
+         0 000101   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000102   000012 036003                    ADLQ    10,DU
+         0 000103   200006 235100                    LDA     CG$,,AUTO
+         0 000104   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000105   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000106   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000107   000000 701000 xent               TSX1    KQD$DEFERWAIT
+         0 000110   000303 702000 0                  TSX2    NO_GETR
+         0 000111   000127 710000 0                  TRA     s:5851
+
+      149     5846    3             ELSE
+      150     5847    4               DO;
+
+      151     5848    4               KQ$FWP.DDA = (FWCG_SIZC/SIZEC (VLP$CGMA))*SIZEC (VLP$CGMA);
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:28   
+
+   5848  0 000112   003600 235007                    LDA     1920,DL
+         0 000113   000013 755100                    STA     11,,PR0
+
+      152     5849    4               CALL KQD$GETR (KQ$CG,KQ$FWP.DBLK$,KQ$FWP.DDA) ALTRET (NO_GETR);
+
+   5849  0 000114   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000115   000013 036003                    ADLQ    11,DU
+         0 000116   200016 756100                    STQ     BXT+3,,AUTO
+         0 000117   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000120   000012 036003                    ADLQ    10,DU
+         0 000121   200006 235100                    LDA     CG$,,AUTO
+         0 000122   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000123   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000124   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000125   000000 701000 xent               TSX1    KQD$GETR
+         0 000126   000303 702000 0                  TSX2    NO_GETR
+
+      153     5850    4               END;
+
+      154     5851    3             GOTO GOT_DBLK;
+
+   5851  0 000127   000201 710000 0                  TRA     GOT_DBLK
+
+      155     5852    3             END;
+      156     5853    2           CGMA$ = KQ$FWP.DATA$;
+
+   5853  0 000130   000015 236100                    LDQ     13,,PR0
+         0 000131   200007 756100                    STQ     CGMA$,,AUTO
+
+      157     5854    2           CALL MBLK2CGMA;
+
+   5854  0 000132   000621 701000 0                  TSX1    MBLK2CGMA
+         0 000133   000000 011000                    NOP     0
+
+      158     5855    2           KQ$FWP.DATA$ = PINCRW (KQ$FWP.DATA$,SIZEW (VLP$CGMA));
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:29   
+   5855  0 000134   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000135   000015 236100                    LDQ     13,,PR0
+         0 000136   000020 036003                    ADLQ    16,DU
+         0 000137   000015 756100                    STQ     13,,PR0
+
+      159     5856    2          KQ$FWP.DBLK$->KQ$DBLK.DSIZE = KQ$FWP.DBLK$->KQ$DBLK.DSIZE + SIZEC (VLP$CGMA)
+              5856                    ;
+
+   5856  0 000140   000012 471500                    LDP1    10,,PR0
+         0 000141   100000 720100                    LXL0    0,,PR1
+         0 000142   000100 621010                    EAX1    64,X0
+         0 000143   100000 441100                    SXL1    0,,PR1
+
+      160     5857    2           KQ$IMBLK.MSGSIZE = KQ$IMBLK.MSGSIZE + SIZEC (VLP$CGMA);
+
+   5857  0 000144   200010 471500                    LDP1    IMBLK$,,AUTO
+         0 000145   100016 235100                    LDA     14,,PR1
+         0 000146   000100 035007                    ADLA    64,DL
+         0 000147   100016 755100                    STA     14,,PR1
+
+      161     5858    2           IF KQ$FWP.DATA$ = KQ$FWP.MAXDATA$ THEN
+
+   5858  0 000150   000015 236100                    LDQ     13,,PR0
+         0 000151   000016 116100                    CMPQ    14,,PR0
+         0 000152   000302 601000 0                  TNZ     s:5885
+
+      162     5859    3             DO;
+
+      163     5860
+      164     5861        /* Need another DBLK */
+      165     5862
+      166     5863    3             CALL KQD$UPDATED (KQ$CG,KQ$FWP.DBLK$); /* Doesn't ALTRET!! */
+
+   5863  0 000153   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000154   000012 036003                    ADLQ    10,DU
+         0 000155   200006 235100                    LDA     CG$,,AUTO
+         0 000156   200014 757100                    STAQ    BXT+1,,AUTO
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:30   
+         0 000157   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000160   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000161   000000 701000 xent               TSX1    KQD$UPDATED
+         0 000162   000000 011000                    NOP     0
+
+      167     5864    3             KQ$FWP.DDA = (FWCG_SIZC/SIZEC (VLP$CGMA))*SIZEC (VLP$CGMA);
+
+   5864  0 000163   003600 235007                    LDA     1920,DL
+         0 000164   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000165   000013 755100                    STA     11,,PR0
+
+      168     5865    3             CALL KQD$GET (KQ$CG,KQ$FWP.DBLK$,KQ$FWP.DDA) ALTRET (NO_GET);
+
+   5865  0 000166   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000167   000013 036003                    ADLQ    11,DU
+         0 000170   200016 756100                    STQ     BXT+3,,AUTO
+         0 000171   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000172   000012 036003                    ADLQ    10,DU
+         0 000173   200006 235100                    LDA     CG$,,AUTO
+         0 000174   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000175   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000176   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000177   000000 701000 xent               TSX1    KQD$GET
+         0 000200   000537 702000 0                  TSX2    NO_GET
+
+      169     5866    3   GOT_DBLK:
+      170     5867    3             KQ$FWP.GOTNEXT = '1'B;
+
+   5867  0 000201   200003 470500       GOT_DBLK     LDP0    @KQ$FWP,,AUTO
+         0 000202   000001 236007                    LDQ     1,DL
+         0 000203   000007 256100                    ORSQ    7,,PR0
+
+      171     5868    3             KQ$FWP.DBLK$->KQ$DBLK.STAMP = KQ$IMBLK.STAMP;
+
+   5868  0 000204   000012 471500                    LDP1    10,,PR0
+         0 000205   200010 473500                    LDP3    IMBLK$,,AUTO
+         0 000206   300001 720100                    LXL0    1,,PR3
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:31   
+         0 000207   100000 740100                    STX0    0,,PR1
+
+      172     5869    3             KQ$FWP.DBLK$->KQ$DBLK.DSIZE = 0;
+
+   5869  0 000210   000012 471500                    LDP1    10,,PR0
+         0 000211   000000 220003                    LDX0    0,DU
+         0 000212   100000 440100                    SXL0    0,,PR1
+
+      173     5870    3             CALL KQD$UPDATED (KQ$CG,KQ$FWP.DBLK$); /* Doesn't ALTRET!! */
+
+   5870  0 000213   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000214   000012 036003                    ADLQ    10,DU
+         0 000215   200006 235100                    LDA     CG$,,AUTO
+         0 000216   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000217   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000220   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000221   000000 701000 xent               TSX1    KQD$UPDATED
+         0 000222   000000 011000                    NOP     0
+
+      174     5871    3             KQ$FWP.STAMP = KQ$IMBLK.STAMP;
+
+   5871  0 000223   200010 470500                    LDP0    IMBLK$,,AUTO
+         0 000224   000001 236100                    LDQ     1,,PR0
+         0 000225   777777 376007                    ANQ     -1,DL
+         0 000226   200003 471500                    LDP1    @KQ$FWP,,AUTO
+         0 000227   100012 756100                    STQ     10,,PR1
+
+      175     5872    3             NEXTDDA = KQ$FWP.NEXTDDA;
+
+   5872  0 000230   100014 235100                    LDA     12,,PR1
+         0 000231   200011 755100                    STA     NEXTDDA,,AUTO
+
+      176     5873    3             IF KQ$FWP.REGOK THEN
+
+   5873  0 000232   100007 236100                    LDQ     7,,PR1
+         0 000233   100000 316003                    CANQ    32768,DU
+         0 000234   000250 600000 0                  TZE     s:5876
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:32   
+
+      177     5874    3               CALL KQD$FETCHR (KQ$CG,KQ$FWP.DBLK$,NEXTDDA) ALTRET (NO_FETCHR);
+
+   5874  0 000235   200011 633500                    EPPR3   NEXTDDA,,AUTO
+         0 000236   200016 453500                    STP3    BXT+3,,AUTO
+         0 000237   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000240   000012 036003                    ADLQ    10,DU
+         0 000241   200006 235100                    LDA     CG$,,AUTO
+         0 000242   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000243   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000244   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000245   000000 701000 xent               TSX1    KQD$FETCHR
+         0 000246   000304 702000 0                  TSX2    NO_FETCHR
+         0 000247   000262 710000 0                  TRA     GOT_FETCH
+
+      178     5875    3             ELSE
+      179     5876    3               CALL KQD$FETCH (KQ$CG,KQ$FWP.DBLK$,NEXTDDA) ALTRET (NO_FETCH);
+
+   5876  0 000250   200011 633500                    EPPR3   NEXTDDA,,AUTO
+         0 000251   200016 453500                    STP3    BXT+3,,AUTO
+         0 000252   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000253   000012 036003                    ADLQ    10,DU
+         0 000254   200006 235100                    LDA     CG$,,AUTO
+         0 000255   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000256   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000257   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000260   000000 701000 xent               TSX1    KQD$FETCH
+         0 000261   000537 702000 0                  TSX2    NO_GET
+
+      180     5877    3   GOT_FETCH:
+      181     5878    3             KQ$FWP.GOTNEXT = '0'B;
+
+   5878  0 000262   200003 470500       GOT_FETCH    LDP0    @KQ$FWP,,AUTO
+         0 000263   000001 236000 1                  LDQ     1
+         0 000264   000007 356100                    ANSQ    7,,PR0
+
+      182     5879    3             KQ$FWP.DBLK$->KQ$DBLK.FLNKDA = KQ$FWP.DDA;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:33   
+
+   5879  0 000265   000012 471500                    LDP1    10,,PR0
+         0 000266   000013 235100                    LDA     11,,PR0
+         0 000267   100001 755100                    STA     1,,PR1
+
+      183     5880    3             KQ$FWP.DDA = KQ$FWP.NEXTDDA;
+
+   5880  0 000270   000014 235100                    LDA     12,,PR0
+         0 000271   000013 755100                    STA     11,,PR0
+
+      184     5881    3             KQ$FWP.NEXTDDA = KQ$FWP.DBLK$->KQ$DBLK.FLNKDA;
+
+   5881  0 000272   000012 471500                    LDP1    10,,PR0
+         0 000273   100001 235100                    LDA     1,,PR1
+         0 000274   000014 755100                    STA     12,,PR0
+
+      185     5882    3             KQ$FWP.DATA$ = PINCRW (KQ$FWP.DBLK$,SIZEW (KQ$DBLK));
+
+   5882  0 000275   000012 236100                    LDQ     10,,PR0
+         0 000276   000006 036003                    ADLQ    6,DU
+         0 000277   000015 756100                    STQ     13,,PR0
+
+      186     5883    3             KQ$FWP.MAXDATA$ = PINCRC (KQ$FWP.DATA$,(FWCG_SIZC/SIZEC (VLP$CGMA))*SIZEC
+              5883                      (VLP$CGMA));
+
+   5883  0 000300   000740 036003                    ADLQ    480,DU
+         0 000301   000016 756100                    STQ     14,,PR0
+
+      187     5884    3             END;
+
+      188     5885    3             DO WHILE ('0'B);
+
+   5885  0 000302   000334 710000 0                  TRA     s:5902
+
+      189     5886    3   NO_GETR:
+      190     5887    4               DO WHILE ('0'B);
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:34   
+   5887  0 000303   000327 710000 0     NO_GETR      TRA     s:5893
+
+      191     5888    4   NO_FETCHR:
+      192     5889    4               KQ$FWP.STAMP = KQ$IMBLK.STAMP;
+
+   5889  0 000304   200010 470500       NO_FETCHR    LDP0    IMBLK$,,AUTO
+         0 000305   000001 236100                    LDQ     1,,PR0
+         0 000306   777777 376007                    ANQ     -1,DL
+         0 000307   200003 471500                    LDP1    @KQ$FWP,,AUTO
+         0 000310   100012 756100                    STQ     10,,PR1
+
+      193     5890    4               CALL KQD$DELDDA (KQ$CG,KQ$FWP.STAMP,KQ$FWP.DDA); /* Ignore ALTRET!! */
+
+   5890  0 000311   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000312   000013 036003                    ADLQ    11,DU
+         0 000313   200016 756100                    STQ     BXT+3,,AUTO
+         0 000314   200003 236100                    LDQ     @KQ$FWP,,AUTO
+         0 000315   000012 036003                    ADLQ    10,DU
+         0 000316   200006 235100                    LDA     CG$,,AUTO
+         0 000317   200014 757100                    STAQ    BXT+1,,AUTO
+         0 000320   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000321   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000322   000000 701000 xent               TSX1    KQD$DELDDA
+         0 000323   000000 011000                    NOP     0
+
+      194     5891    4               KQ$FWP.DI = '1'B;
+
+   5891  0 000324   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000325   000002 236007                    LDQ     2,DL
+         0 000326   000007 256100                    ORSQ    7,,PR0
+
+      195     5892    4               END;
+
+      196     5893    3             KQ$FWP.DBLK$ = ADDR (NIL);
+
+   5893  0 000327   000001 236000 xsym               LDQ     B_VECTNIL+1
+         0 000330   200003 470500                    LDP0    @KQ$FWP,,AUTO
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:35   
+         0 000331   000012 756100                    STQ     10,,PR0
+
+      197     5894    3             ALTFLAG = '1'B;
+
+   5894  0 000332   400000 236003                    LDQ     -131072,DU
+         0 000333   200005 756100                    STQ     ALTFLAG,,AUTO
+
+      198     5895    3             END;
+
+      199     5896    2           END;
+
+      200     5897
+      201     5898        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:36   
+      202     5899
+      203     5900        /* REATTR processing */
+      204     5901
+      205     5902    1         IF KQ$FWP.FC = %FWCG_REATTR THEN
+
+   5902  0 000334   000006 235100                    LDA     6,,PR0
+         0 000335   000001 115007                    CMPA    1,DL
+         0 000336   000533 601000 0                  TNZ     s:5960
+
+      206     5903    2           DO;
+
+      207     5904    2           IF KQ$MBLK.PRIO < %KQ_AUEP# THEN
+
+   5904  0 000337   200004 471500                    LDP1    @KQ$MBLK,,AUTO
+         0 000340   100001 220100                    LDX0    1,,PR1
+         0 000341   765000 100003                    CMPX0   -5632,DU
+         0 000342   000533 603000 0                  TRC     s:5960
+
+      208     5905    3             DO;
+
+      209     5906    3             IF KQ$FWP.SRA_$->VLP$SCGMA.MSGTYP THEN
+
+   5906  0 000343   000017 473500                    LDP3    15,,PR0
+         0 000344   300000 234100                    SZN     0,,PR3
+         0 000345   000362 605000 0                  TPL     s:5913
+
+      210     5907    4               DO;
+
+      211     5908    4               IF KQ$CG.QISS THEN
+
+   5908  0 000346   200006 474500                    LDP4    CG$,,AUTO
+         0 000347   400106 235100                    LDA     70,,PR4
+         0 000350   000356 600000 0                  TZE     s:5911
+
+      212     5909    4                 KQ$MBLK.KEY2 = KQ$FWP.REATTR_$->VLP$CGMA.MSGTYP;
+
+   5909  0 000351   000020 475500                    LDP5    16,,PR0
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:37   
+         0 000352   040100 100500                    MLR     fill='040'O
+         0 000353   500002 000010                    ADSC9   2,,PR5                   cn=0,n=8
+         0 000354   100004 000010                    ADSC9   4,,PR1                   cn=0,n=8
+         0 000355   000362 710000 0                  TRA     s:5913
+
+      213     5910    4               ELSE
+      214     5911    4                 KQ$MBLK.KEY1 = KQ$FWP.REATTR_$->VLP$CGMA.MSGTYP;
+
+   5911  0 000356   000020 475500                    LDP5    16,,PR0
+         0 000357   040100 100500                    MLR     fill='040'O
+         0 000360   500002 000010                    ADSC9   2,,PR5                   cn=0,n=8
+         0 000361   100002 000010                    ADSC9   2,,PR1                   cn=0,n=8
+
+      215     5912    4               END;
+
+      216     5913    3             IF KQ$FWP.SRA_$->VLP$SCGMA.ORIGIN THEN
+
+   5913  0 000362   000017 473500                    LDP3    15,,PR0
+         0 000363   300000 236100                    LDQ     0,,PR3
+         0 000364   200000 316003                    CANQ    65536,DU
+         0 000365   000402 600000 0                  TZE     s:5920
+
+      217     5914    4               DO;
+
+      218     5915    4               IF KQ$CG.QISS THEN
+
+   5915  0 000366   200006 474500                    LDP4    CG$,,AUTO
+         0 000367   400106 235100                    LDA     70,,PR4
+         0 000370   000376 600000 0                  TZE     s:5918
+
+      219     5916    4                 KQ$MBLK.KEY1 = KQ$FWP.REATTR_$->VLP$CGMA.ORIGIN;
+
+   5916  0 000371   000020 475500                    LDP5    16,,PR0
+         0 000372   040100 100500                    MLR     fill='040'O
+         0 000373   500004 000010                    ADSC9   4,,PR5                   cn=0,n=8
+         0 000374   100002 000010                    ADSC9   2,,PR1                   cn=0,n=8
+         0 000375   000402 710000 0                  TRA     s:5920
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:38   
+
+      220     5917    4               ELSE
+      221     5918    4                 KQ$MBLK.KEY2 = KQ$FWP.REATTR_$->VLP$CGMA.ORIGIN;
+
+   5918  0 000376   000020 475500                    LDP5    16,,PR0
+         0 000377   040100 100500                    MLR     fill='040'O
+         0 000400   500004 000010                    ADSC9   4,,PR5                   cn=0,n=8
+         0 000401   100004 000010                    ADSC9   4,,PR1                   cn=0,n=8
+
+      222     5919    4               END;
+
+      223     5920    3             IF KQ$FWP.SRA_$->VLP$SCGMA.PRIO THEN
+
+   5920  0 000402   000017 473500                    LDP3    15,,PR0
+         0 000403   300000 236100                    LDQ     0,,PR3
+         0 000404   040000 316003                    CANQ    16384,DU
+         0 000405   000416 600000 0                  TZE     s:5926
+
+      224     5921    4               DO;
+
+      225     5922    4               IF KQ$FWP.REATTR_$->VLP$CGMA.PRIO < %KQ_AUEP# THEN
+
+   5922  0 000406   000020 474500                    LDP4    16,,PR0
+         0 000407   400001 221100                    LDX1    1,,PR4
+         0 000410   765000 101003                    CMPX1   -5632,DU
+         0 000411   000414 603000 0                  TRC     s:5924
+
+      226     5923    4                 KQ$MBLK.PRIO = KQ$FWP.REATTR_$->VLP$CGMA.PRIO;
+
+   5923  0 000412   100001 741100                    STX1    1,,PR1
+         0 000413   000416 710000 0                  TRA     s:5926
+
+      227     5924    4               ELSE KQ$MBLK.PRIO = (%KQ_AUEP#-1);
+
+   5924  0 000414   764777 222003                    LDX2    -5633,DU
+         0 000415   100001 742100                    STX2    1,,PR1
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:39   
+      228     5925    4               END;
+
+      229     5926    3             IF KQ$FWP.SRA_$->VLP$SCGMA.UTS THEN
+
+   5926  0 000416   000017 473500                    LDP3    15,,PR0
+         0 000417   300000 236100                    LDQ     0,,PR3
+         0 000420   020000 316003                    CANQ    8192,DU
+         0 000421   000425 600000 0                  TZE     s:5928
+
+      230     5927    3               KQ$MBLK.UTS = KQ$FWP.REATTR_$->VLP$CGMA.UTS;
+
+   5927  0 000422   000020 474500                    LDP4    16,,PR0
+         0 000423   400007 235100                    LDA     7,,PR4
+         0 000424   100007 755100                    STA     7,,PR1
+
+      231     5928    3             IF KQ$FWP.SRA_$->VLP$SCGMA.DVE THEN
+
+   5928  0 000425   000017 473500                    LDP3    15,,PR0
+         0 000426   300000 236100                    LDQ     0,,PR3
+         0 000427   004000 316003                    CANQ    2048,DU
+         0 000430   000434 600000 0                  TZE     s:5930
+
+      232     5929    3               KQ$MBLK.DVE = KQ$FWP.REATTR_$->VLP$CGMA.DVE;
+
+   5929  0 000431   000020 474500                    LDP4    16,,PR0
+         0 000432   400010 236100                    LDQ     8,,PR4
+         0 000433   100010 552130                    STBQ    8,'30'O,PR1
+
+      233     5930    3             IF KQ$FWP.SRA_$->VLP$SCGMA.TYC THEN
+
+   5930  0 000434   000017 473500                    LDP3    15,,PR0
+         0 000435   300000 430100                    FSZN    0,,PR3
+         0 000436   000442 605000 0                  TPL     s:5932
+
+      234     5931    3               KQ$MBLK.TYC = KQ$FWP.REATTR_$->VLP$CGMA.TYC;
+
+   5931  0 000437   000020 474500                    LDP4    16,,PR0
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:40   
+         0 000440   400013 236100                    LDQ     11,,PR4
+         0 000441   100013 756100                    STQ     11,,PR1
+
+      235     5932    3             IF KQ$FWP.SRA_$->VLP$SCGMA.MSGID THEN
+
+   5932  0 000442   000017 473500                    LDP3    15,,PR0
+         0 000443   300000 236100                    LDQ     0,,PR3
+         0 000444   010000 316003                    CANQ    4096,DU
+         0 000445   000510 600000 0                  TZE     s:5946
+
+      236     5933    4               DO;
+
+      237     5934    4               KQ$MBLK.MID.PRIMARY = KQ$FWP.REATTR_$->VLP$CGMA.MSGID;
+
+   5934  0 000446   000020 474500                    LDP4    16,,PR0
+         0 000447   400014 235100                    LDA     12,,PR4
+         0 000450   100014 755100                    STA     12,,PR1
+
+      238     5935                    %LOCK (G=KQ$CG.TTREE.GATE);
+
+   5936  0 000451   200006 236100                    LDQ     CG$,,AUTO
+         0 000452   000067 036003                    ADLQ    55,DU
+         0 000453   200014 756100                    STQ     BXT+1,,AUTO
+         0 000454   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000455   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000456   000000 701000 xent               TSX1    HFC$LOCK
+         0 000457   000000 011000                    NOP     0
+
+      239     5938    4               IF KQ$MBLK.MID.PRIMARY > KQ$CG.MSGID THEN
+
+   5938  0 000460   200006 470500                    LDP0    CG$,,AUTO
+         0 000461   200004 471500                    LDP1    @KQ$MBLK,,AUTO
+         0 000462   000113 236100                    LDQ     75,,PR0
+         0 000463   100014 116100                    CMPQ    12,,PR1
+         0 000464   000470 603000 0                  TRC     s:5941
+
+      240     5939    4                 KQ$CG.MSGID = KQ$MBLK.MID.PRIMARY + 1;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:41   
+
+   5939  0 000465   100014 235100                    LDA     12,,PR1
+         0 000466   000001 035007                    ADLA    1,DL
+         0 000467   000113 755100                    STA     75,,PR0
+
+      241     5940                    %UNLOCK (G=KQ$CG.TTREE.GATE);
+
+   5941  0 000470   200006 236100                    LDQ     CG$,,AUTO
+         0 000471   000067 036003                    ADLQ    55,DU
+         0 000472   200014 756100                    STQ     BXT+1,,AUTO
+         0 000473   200014 630500                    EPPR0   BXT+1,,AUTO
+         0 000474   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000475   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000476   000000 011000                    NOP     0
+
+      242     5943    4               IF KQ$FWP.SRA_$->VLP$SCGMA.MSGIDXT ~= 0 THEN
+
+   5943  0 000477   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000500   000017 471500                    LDP1    15,,PR0
+         0 000501   100000 236100                    LDQ     0,,PR1
+         0 000502   000777 316003                    CANQ    511,DU
+         0 000503   000510 600000 0                  TZE     s:5946
+
+      243     5944    4                 KQ$MBLK.MID.XT = KQ$FWP.REATTR_$->VLP$CGMA.MSGIDBXT;
+
+   5944  0 000504   000020 473500                    LDP3    16,,PR0
+         0 000505   200004 474500                    LDP4    @KQ$MBLK,,AUTO
+         0 000506   300015 235100                    LDA     13,,PR3
+         0 000507   400015 755100                    STA     13,,PR4
+
+      244     5945    4               END;
+
+      245     5946    3             IF KQ$FWP.SRA_$->VLP$SCGMA.MSGSIZE THEN
+
+   5946  0 000510   000017 471500                    LDP1    15,,PR0
+         0 000511   100000 236100                    LDQ     0,,PR1
+         0 000512   002000 316003                    CANQ    1024,DU
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:42   
+         0 000513   000522 600000 0                  TZE     s:5951
+
+      246     5947    4               DO;
+
+      247     5948    4               IF KQ$MBLK.MSGSIZE > KQ$FWP.REATTR_$->VLP$CGMA.MSGSIZE THEN
+
+   5948  0 000514   000020 473500                    LDP3    16,,PR0
+         0 000515   200004 474500                    LDP4    @KQ$MBLK,,AUTO
+         0 000516   300016 236100                    LDQ     14,,PR3
+         0 000517   400016 116100                    CMPQ    14,,PR4
+         0 000520   000522 603000 0                  TRC     s:5951
+
+      248     5949    4                 KQ$MBLK.MSGSIZE = KQ$FWP.REATTR_$->VLP$CGMA.MSGSIZE;
+
+   5949  0 000521   400016 756100                    STQ     14,,PR4
+
+      249     5950    4               END;
+
+      250     5951    3             IF KQ$FWP.SRA_$->VLP$SCGMA.DEST THEN
+
+   5951  0 000522   000017 471500                    LDP1    15,,PR0
+         0 000523   100000 236100                    LDQ     0,,PR1
+         0 000524   100000 316003                    CANQ    32768,DU
+         0 000525   000533 600000 0                  TZE     s:5960
+
+      251     5952    3               KQ$MBLK.DSTA = KQ$FWP.REATTR_$->VLP$CGMA.DEST;
+
+   5952  0 000526   000020 473500                    LDP3    16,,PR0
+         0 000527   200004 474500                    LDP4    @KQ$MBLK,,AUTO
+         0 000530   040100 100500                    MLR     fill='040'O
+         0 000531   300011 000010                    ADSC9   9,,PR3                   cn=0,n=8
+         0 000532   400011 000010                    ADSC9   9,,PR4                   cn=0,n=8
+
+      252     5953    3             END;
+
+      253     5954    2           END;
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:43   
+      254     5955
+      255     5956        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:44   
+      256     5957
+      257     5958        /* Just about done */
+      258     5959
+      259     5960    1         KQ$FWP.FOUND = KQ$FWP.FOUND + 1;
+
+   5960  0 000533   000010 235100                    LDA     8,,PR0
+         0 000534   000001 035007                    ADLA    1,DL
+         0 000535   000010 755100                    STA     8,,PR0
+
+      260     5961
+      261     5962    1   WANT_IT:
+      262     5963    2           DO WHILE ('0'B);
+
+   5963  0 000536   000541 710000 0     WANT_IT      TRA     s:5968
+
+   5952  0 000537                       NO_GET       null
+      263     5964    2   NO_GET: ;
+      264     5965    2   NO_FETCH:
+      265     5966    2           ALTFLAG = '1'B;
+
+   5966  0 000537   400000 236003       NO_FETCH     LDQ     -131072,DU
+         0 000540   200005 756100                    STQ     ALTFLAG,,AUTO
+
+      266     5967    2           END;
+
+      267     5968    1         KQ$FWP.TOOKIT = '1'B;
+
+   5968  0 000541   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000542   200000 236003                    LDQ     65536,DU
+         0 000543   000007 256100                    ORSQ    7,,PR0
+
+      268     5969    2           DO WHILE ('0'B);
+
+   5969  0 000544   000550 710000 0                  TRA     s:5973
+
+      269     5970    2   DONT_WANT:
+      270     5971    2           KQ$FWP.TOOKIT = '0'B;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:45   
+
+   5971  0 000545   200003 470500       DONT_WANT    LDP0    @KQ$FWP,,AUTO
+         0 000546   000002 236000 1                  LDQ     2
+         0 000547   000007 356100                    ANSQ    7,,PR0
+
+      271     5972    2           END;
+
+      272     5973    1         IF ALTFLAG THEN
+
+   5973  0 000550   200005 234100                    SZN     ALTFLAG,,AUTO
+         0 000551   000553 605000 0                  TPL     s:5976
+
+      273     5974    1           ALTRETURN;
+
+   5974  0 000552   000000 702200 xent               TSX2  ! X66_AALT
+
+      274     5975    1         ELSE
+      275     5976    1           RETURN;
+
+   5976  0 000553   000000 702200 xent               TSX2  ! X66_ARET
+
+      276     5977
+      277     5978        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:46   
+      278     5979
+      279     5980        /*D* NAME:        KQF$CHKMSG
+      280     5981             ENTRY:       KQF$CKHMSG
+      281     5982             CALL:        CALL KQF$CHKMSG (KQ$FWP);
+      282     5983             DESCRIPTION: Just validates the message, sets KQ$FWP.TOOKIT, and
+      283     5984                          RETURNs. */
+      284     5985
+      285     5986    1   KQF$CHKMSG: ENTRY (KQ$FWP,KQ$MBLK) ALTRET; /* Doesn't ALTRET!! */
+
+   5986  0 000554   000000 700200 xent  KQF$CHKMSG   TSX0  ! X66_AUTO_2
+         0 000555   000020 000002                    ZERO    16,2
+
+      286     5987
+      287     5988    1         CALL CHECK_MSG ALTRET (DONT_WANT);
+
+   5988  0 000556   000561 701000 0                  TSX1    CHECK_MSG
+         0 000557   000545 702000 0                  TSX2    DONT_WANT
+
+      288     5989
+      289     5990    1         GOTO WANT_IT;
+
+   5990  0 000560   000536 710000 0                  TRA     WANT_IT
+
+      290     5991
+      291     5992        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:47   
+      292     5993
+      293     5994        /*I* NAME:        CHECK_MSG
+      294     5995             ENTRY:       CHECK_MSG
+      295     5996             CALL:        CALL CHECK_MSG ALTRET (Doesn't qualify);
+      296     5997             OUTPUT:      ALTFLAG - Initialized to '0'B.
+      297     5998                          CG$ - Pointer to KQ$CG.
+      298     5999             DESCRIPTION: If KQ$FWP.MSGIDXT = 0 then the message qualifies, and
+      299     6000                          CHECK_MSG just RETURNs. Else, the MSGIDXT is validated.
+      300     6001                          If successful then RETURNs, else ALTRETURNs. */
+      301     6002
+      302     6003    1   CHECK_MSG: PROC ALTRET;
+
+   6003  0 000561   200012 741300       CHECK_MSG    STX1  ! NEXTDDA+1,,AUTO
+
+      303     6004
+      304     6005    2   DCL M BIT (BXT) BASED ALIGNED;
+      305     6006    2   DCL BXT UBIN;
+      306     6007
+      307     6008    2         ALTFLAG = '0'B;
+
+   6008  0 000562   200005 450100                    STZ     ALTFLAG,,AUTO
+
+      308     6009    2         CG$ = KQ$FWP.MYSTA$->KQ$STA.CG$;
+
+   6009  0 000563   200003 470500                    LDP0    @KQ$FWP,,AUTO
+         0 000564   000002 471500                    LDP1    2,,PR0
+         0 000565   100007 236100                    LDQ     7,,PR1
+         0 000566   200006 756100                    STQ     CG$,,AUTO
+
+      309     6010    2         IF KQ$FWP.MSGIDXT = 0 THEN
+
+   6010  0 000567   000011 235100                    LDA     9,,PR0
+         0 000570   000572 601000 0                  TNZ     s:6014
+
+      310     6011    2           RETURN;
+
+   6011  0 000571   000001 702211                    TSX2  ! 1,X1
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:48   
+
+      311     6012    2         ELSE
+      312     6013    3           DO;
+
+      313     6014    3           IF KQ$CG.AUCTL.BIGMXT THEN
+
+   6014  0 000572   200006 473500                    LDP3    CG$,,AUTO
+         0 000573   300136 236100                    LDQ     94,,PR3
+         0 000574   010000 316003                    CANQ    4096,DU
+         0 000575   000604 600000 0                  TZE     s:6021
+
+      314     6015    4             DO;
+
+      315     6016    4             IF KQ$MBLK.MID.XT = KQ$FWP.CRITERIA_$->VLP$CGMA.MSGIDBXT THEN
+
+   6016  0 000576   000021 474500                    LDP4    17,,PR0
+         0 000577   200004 475500                    LDP5    @KQ$MBLK,,AUTO
+         0 000600   500015 236100                    LDQ     13,,PR5
+         0 000601   400015 116100                    CMPQ    13,,PR4
+         0 000602   000620 601000 0                  TNZ     s:6028
+
+      316     6017    4               RETURN;
+
+   6017  0 000603   000001 702211                    TSX2  ! 1,X1
+
+      317     6018    4             END;
+      318     6019    3           ELSE
+      319     6020    4             DO;
+
+      320     6021    4             BXT = 6 * KQ$FWP.MSGIDXT;
+
+   6021  0 000604   000011 236100                    LDQ     9,,PR0
+         0 000605   000006 402007                    MPY     6,DL
+         0 000606   200013 756100                    STQ     BXT,,AUTO
+
+      321     6022    4             IF ADDR (KQ$MBLK.MID.XT)->M =
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:49   
+   6022  0 000607   000021 474500                    LDP4    17,,PR0
+         0 000610   200004 475500                    LDP5    @KQ$MBLK,,AUTO
+         0 000611   000000 620006                    EAX0    0,QL
+         0 000612   200013 722100                    LXL2    BXT,,AUTO
+         0 000613   000140 066540                    CMPB    filb='0'B
+         0 000614   500015 000010                    BDSC    13,,PR5                  by=0,bit=0,n=*X0
+         0 000615   400015 000012                    BDSC    13,,PR4                  by=0,bit=0,n=*X2
+         0 000616   000620 601000 0                  TNZ     s:6028
+
+      322     6023    4             ADDR (KQ$FWP.CRITERIA_$->VLP$CGMA.MSGIDXT)->M THEN
+      323     6024    4               RETURN;
+
+   6024  0 000617   000001 702211                    TSX2  ! 1,X1
+
+      324     6025    4             END;
+      325     6026    3           END;
+      326     6027
+      327     6028    2         ALTRETURN;
+
+   6028  0 000620   000000 702211                    TSX2  ! 0,X1
+
+      328     6029
+      329     6030    2   END CHECK_MSG;
+      330     6031
+      331     6032        %EJECT;
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:50   
+      332     6033
+      333     6034        /*I* NAME:        MBLK2CGMA
+      334     6035             ENTRY:       MBLK2CGMA
+      335     6036             CALL:        CALL MBLK2CGMA;
+      336     6037             INPUT:       KQ$MBLK - The MBLK (source).
+      337     6038                          CGMA$ - Pointer to VLP$CGMA (destination).
+      338     6039             DESCRIPTION: Parameters from KQ$MBLK are moved to VLP$CGMA area.
+      339     6040                          Currently, the VLP_CGMA looks just like an MBLK,
+      340     6041                          so the code to assign the separate parameters
+      341     6042                          is commented out. */
+      342     6043
+      343     6044    1   MBLK2CGMA: PROC;
+
+   6044  0 000621   200012 741300       MBLK2CGMA    STX1  ! NEXTDDA+1,,AUTO
+
+      344     6045
+      345     6046    2         CGMA$->VLP$CGMA=KQ$MBLK;
+
+   6046  0 000622   200004 470500                    LDP0    @KQ$MBLK,,AUTO
+         0 000623   200007 471500                    LDP1    CGMA$,,AUTO
+         0 000624   000100 100500                    MLR     fill='000'O
+         0 000625   000000 000100                    ADSC9   0,,PR0                   cn=0,n=64
+         0 000626   100000 000100                    ADSC9   0,,PR1                   cn=0,n=64
+
+      346     6047        /*****CGMA$->VLP$CGMA.MSGTYP = KQ$MBLK.KEY1;***********/
+      347     6048        /*****CGMA$->VLP$CGMA.ORIGIN = KQ$MBLK.KEY2;***********/
+      348     6049    2         IF KQ$CG.QISS THEN
+
+   6049  0 000627   200006 473500                    LDP3    CG$,,AUTO
+         0 000630   300106 235100                    LDA     70,,PR3
+         0 000631   000640 600000 0                  TZE     s:6063
+
+      349     6050    3           DO;
+
+      350     6051    3           CGMA$->VLP$CGMA.ORIGIN = KQ$MBLK.KEY1;
+
+   6051  0 000632   000002 237100                    LDAQ    2,,PR0
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:51   
+         0 000633   100004 755100                    STA     4,,PR1
+         0 000634   100005 756100                    STQ     5,,PR1
+
+      351     6052    3           CGMA$->VLP$CGMA.MSGTYP = KQ$MBLK.KEY2;
+
+   6052  0 000635   000004 237100                    LDAQ    4,,PR0
+         0 000636   100002 755100                    STA     2,,PR1
+         0 000637   100003 756100                    STQ     3,,PR1
+
+      352     6053    3           END;
+
+      353     6054        /*****CGMA$->VLP$CGMA.DEST = KQ$MBLK.DSTA;*************/
+      354     6055        /*****CGMA$->VLP$CGMA.PRIO = KQ$MBLK.PRIO;*************/
+      355     6056        /*****CGMA$->VLP$CGMA.DVE = KQ$MBLK.DVE;***************/
+      356     6057        /*****CGMA$->VLP$CGMA.TYC = KQ$MBLK.TYC;***************/
+      357     6058        /*****CGMA$->VLP$CGMA.UTS = KQ$MBLK.UTS;***************/
+      358     6059        /*****CGMA$->VLP$CGMA.MSGID = KQ$MBLK.MID.PRIMARY;*****/
+      359     6060        /*****CGMA$->VLP$CGMA.MSGIDBXT = KQ$MBLK.MID.XT;*******/
+      360     6061        /*****CGMA$->VLP$CGMA.MSGSIZE = KQ$MBLK.MSGSIZE;*******/
+      361     6062
+      362     6063    2         RETURN;
+
+   6063  0 000640   200012 221300                    LDX1  ! NEXTDDA+1,,AUTO
+         0 000641   000001 702211                    TSX2  ! 1,X1
+
+(unnamed)
+ Sect OctLoc
+   1     000   777777 777767   777777 777776   577777 777777                    ............
+      363     6064
+      364     6065    2   END MBLK2CGMA;
+      365     6066
+      366     6067    1   END KQF$GOTMSG;
+
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:52   
+--  Include file information  --
+
+   KQ_SUBS_C.:E05TOU  is referenced.
+   KQ_MAC_C.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+   KC$CP6V_C.:E05TOU  is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure KQF$GOTMSG.
+
+   Procedure KQF$GOTMSG requires 418 words for executable code.
+   Procedure KQF$GOTMSG requires 16 words of local(AUTO) storage.
+
+    No errors detected in file KQF$GOTMSG.:E05TSI    .
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:53   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:54   
+          MINI XREF LISTING
+
+ALTFLAG
+      5740**DCL      5894<<ASSIGN   5966<<ASSIGN   5973>>IF       6008<<ASSIGN
+BXT IN PROCEDURE CHECK_MSG
+      6006**DCL      6005--IMP-SIZ  6021<<ASSIGN   6022>>IF       6022>>IF
+CG$
+      5741**DCL      4002--IMP-PTR  5837>>CALL     5841>>CALL     5845>>CALL     5849>>CALL     5863>>CALL
+      5865>>CALL     5870>>CALL     5874>>CALL     5876>>CALL     5890>>CALL     5908>>IF       5915>>IF
+      5936>>CALL     5938>>IF       5939>>ASSIGN   5941>>CALL     6009<<ASSIGN   6014>>IF       6049>>IF
+CGMA$
+      5742**DCL      5820<<ASSIGN   5853<<ASSIGN   6046>>ASSIGN   6051>>ASSIGN   6052>>ASSIGN
+CHECK_MSG
+      6003**PROC     5814--CALL     5988--CALL
+DONT_WANT
+      5971**LABEL    5814--CALLALT  5988--CALLALT
+GOT_DBLK
+      5867**LABEL    5851--GOTO
+GOT_FETCH
+      5878**LABEL    5842--GOTO
+HFC$LOCK
+        79**DCL-ENT  5936--CALL
+HFC$UNLOCK
+        79**DCL-ENT  5941--CALL
+IMBLK$
+      5743**DCL      4939--IMP-PTR  5831<<ASSIGN   5839>>ASSIGN   5857>>ASSIGN   5857>>ASSIGN   5868>>ASSIGN
+      5871>>ASSIGN   5889>>ASSIGN
+KQ$CG
+      4002**DCL      5837<>CALL     5841<>CALL     5845<>CALL     5849<>CALL     5863<>CALL     5865<>CALL
+      5870<>CALL     5874<>CALL     5876<>CALL     5890<>CALL
+KQ$CG.AUCTL.BIGMXT
+      4448**DCL      6014>>IF
+KQ$CG.AUCTL.DVBYTE.REREAD
+      4445**DCL      4446--REDEF
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:55   
+KQ$CG.MSGID
+      4396**DCL      5938>>IF       5939<<ASSIGN
+KQ$CG.QISS
+      4388**DCL      5908>>IF       5915>>IF       6049>>IF
+KQ$CG.TTREE.GATE
+      4297**DCL      5936<>CALL     5941<>CALL
+KQ$DBLK
+      4739**DCL      5848--ASSIGN   5864--ASSIGN   5882--ASSIGN   5883--ASSIGN
+KQ$DBLK.DSIZE
+      4744**DCL      5856<<ASSIGN   5856>>ASSIGN   5869<<ASSIGN
+KQ$DBLK.FLNKDA
+      4746**DCL      5879<<ASSIGN   5881>>ASSIGN
+KQ$DBLK.STAMP
+      4740**DCL      5868<<ASSIGN
+KQ$DGRAN
+      4792**DCL      5848--ASSIGN   5864--ASSIGN   5883--ASSIGN
+KQ$FWP
+      3626**DCL        62--PROC     5986--ENTRY
+KQ$FWP.CRITERIA_$
+      3707**DCL      6016>>IF       6022>>IF
+KQ$FWP.DATA$
+      3699**DCL      5853>>ASSIGN   5855<<ASSIGN   5855>>ASSIGN   5858>>IF       5882<<ASSIGN   5883>>ASSIGN
+KQ$FWP.DBLK$
+      3691**DCL      3693--REDEF    5836>>IF       5837<>CALL     5841<>CALL     5844>>IF       5845<>CALL
+      5849<>CALL     5856>>ASSIGN   5856>>ASSIGN   5863<>CALL     5865<>CALL     5868>>ASSIGN   5869>>ASSIGN
+      5870<>CALL     5874<>CALL     5876<>CALL     5879>>ASSIGN   5881>>ASSIGN   5882>>ASSIGN   5893<<ASSIGN
+KQ$FWP.DDA
+      3695**DCL      5845<>CALL     5848<<ASSIGN   5849<>CALL     5864<<ASSIGN   5865<>CALL     5879>>ASSIGN
+      5880<<ASSIGN   5890<>CALL
+KQ$FWP.DI
+      3683**DCL      5891<<ASSIGN
+KQ$FWP.FC
+      3647**DCL      5902>>IF
+KQ$FWP.FOUND
+      3687**DCL      5960<<ASSIGN   5960>>ASSIGN
+KQ$FWP.GETFIRST
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:56   
+      3679**DCL      5818>>IF       5822<<ASSIGN
+KQ$FWP.GOTNEXT
+      3685**DCL      5834>>IF       5867<<ASSIGN   5878<<ASSIGN
+KQ$FWP.INFORM
+      3681**DCL      5829>>IF
+KQ$FWP.MAXDATA$
+      3701**DCL      5858>>IF       5883<<ASSIGN
+KQ$FWP.MSGIDXT
+      3689**DCL      6010>>IF       6021>>ASSIGN
+KQ$FWP.MYSTA$
+      3634**DCL      5831>>ASSIGN   6009>>ASSIGN
+KQ$FWP.NEXTDDA
+      3697**DCL      5837<>CALL     5840>>ASSIGN   5872>>ASSIGN   5880>>ASSIGN   5881<<ASSIGN
+KQ$FWP.ONEATTR_$
+      3709**DCL      5820>>ASSIGN
+KQ$FWP.REATTR_$
+      3705**DCL      5909>>ASSIGN   5911>>ASSIGN   5916>>ASSIGN   5918>>ASSIGN   5922>>IF       5923>>ASSIGN
+      5927>>ASSIGN   5929>>ASSIGN   5931>>ASSIGN   5934>>ASSIGN   5944>>ASSIGN   5948>>IF       5949>>ASSIGN
+      5952>>ASSIGN
+KQ$FWP.REGOK
+      3665**DCL      5832>>IF       5873>>IF
+KQ$FWP.SRA_$
+      3703**DCL      5906>>IF       5913>>IF       5920>>IF       5926>>IF       5928>>IF       5930>>IF
+      5932>>IF       5943>>IF       5946>>IF       5951>>IF
+KQ$FWP.STAMP
+      3693**DCL      5839<<ASSIGN   5871<<ASSIGN   5889<<ASSIGN   5890<>CALL
+KQ$FWP.TOOKIT
+      3656**DCL      5968<<ASSIGN   5971<<ASSIGN
+KQ$IMBLK.DVE.EOMCHAR
+      5041**DCL      5043--REDEF
+KQ$IMBLK.KEY1
+      4967**DCL      4969--REDEF
+KQ$IMBLK.KEY2
+      4976**DCL      4994--REDEF
+KQ$IMBLK.LNK$
+      4941**DCL      4943--REDEF    4949--REDEF    4953--REDEF
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:57   
+KQ$IMBLK.MSGSIZE
+      5102**DCL      5857<<ASSIGN   5857>>ASSIGN
+KQ$IMBLK.STAMP
+      4961**DCL      5839>>ASSIGN   5868>>ASSIGN   5871>>ASSIGN   5889>>ASSIGN
+KQ$IMBLK.TYC
+      5090**DCL      5092--REDEF
+KQ$IMBLK.XSP.MREQ$
+      4996**DCL      5000--REDEF
+KQ$MBLK
+      3727**DCL        62--PROC     5986--ENTRY    6046>>ASSIGN
+KQ$MBLK.DSTA
+      3876**DCL      5952<<ASSIGN
+KQ$MBLK.DVE
+      3825**DCL      5929<<ASSIGN
+KQ$MBLK.DVE.EOMCHAR
+      3829**DCL      3831--REDEF
+KQ$MBLK.KEY1
+      3755**DCL      3757--REDEF    5911<<ASSIGN   5916<<ASSIGN   6051>>ASSIGN
+KQ$MBLK.KEY2
+      3764**DCL      3782--REDEF    5909<<ASSIGN   5918<<ASSIGN   6052>>ASSIGN
+KQ$MBLK.LNK$
+      3729**DCL      3731--REDEF    3737--REDEF    3741--REDEF
+KQ$MBLK.MID.PRIMARY
+      3888**DCL      5934<<ASSIGN   5938>>IF       5939>>ASSIGN
+KQ$MBLK.MID.XT
+      3889**DCL      5944<<ASSIGN   6016>>IF       6022--IF
+KQ$MBLK.MSGSIZE
+      3890**DCL      5948>>IF       5949<<ASSIGN
+KQ$MBLK.PRIO
+      3745**DCL      5904>>IF       5923<<ASSIGN   5924<<ASSIGN
+KQ$MBLK.TYC
+      3878**DCL      3880--REDEF    5931<<ASSIGN
+KQ$MBLK.UTS
+      3799**DCL      5927<<ASSIGN
+KQ$MBLK.XSP.MREQ$
+      3784**DCL      3788--REDEF
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:58   
+KQ$RBLK.BUF$
+      5331**DCL      5333--REDEF
+KQ$RBLK.CNACTD
+      5245**DCL      5254--REDEF
+KQ$RBLK.DBLKX
+      5351**DCL      5355--REDEF
+KQ$RBLK.EOFNONE
+      5223**DCL      5226--REDEF
+KQ$RBLK.FROMQ
+      5229**DCL      5232--REDEF
+KQ$RBLK.KEY1R
+      5270**DCL      5271--REDEF
+KQ$RBLK.KEY2R
+      5275**DCL      5276--REDEF
+KQ$RBLK.LATCH
+      5218**DCL      5220--REDEF
+KQ$RBLK.LWRITES$
+      5362**DCL      5366--REDEF
+KQ$STA.ACTTYC
+      5448**DCL      5452--REDEF
+KQ$STA.CG$
+      5435**DCL      6009>>ASSIGN
+KQ$STA.DCBLNK$
+      5455**DCL      5458--REDEF    5462--REDEF
+KQ$STA.EVCNT
+      5541**DCL      5544--REDEF
+KQ$STA.EVNT
+      5507**DCL      5511--REDEF    5514--REDEF
+KQ$STA.MBLK$
+      5441**DCL      5831>>ASSIGN
+KQ$STA.OPNBLKED
+      5568**DCL      5571--REDEF
+KQ$STA.OPNREJ
+      5574**DCL      5576--REDEF
+KQ$STA.SUCCREAD
+      5497**DCL      5501--REDEF
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:59   
+KQ$STA.TCOUNT
+      5626**DCL      5632--REDEF
+KQ$STA.VGOT$
+      5611**DCL      5615--REDEF    5619--REDEF
+KQD$DEFERWAIT
+      5748**DCL-ENT  5837--CALL     5845--CALL
+KQD$DELDDA
+      5749**DCL-ENT  5890--CALL
+KQD$FETCH
+      5750**DCL-ENT  5876--CALL
+KQD$FETCHR
+      5751**DCL-ENT  5841--CALL     5874--CALL
+KQD$GET
+      5752**DCL-ENT  5865--CALL
+KQD$GETR
+      5753**DCL-ENT  5849--CALL
+KQD$UPDATED
+      5754**DCL-ENT  5863--CALL     5870--CALL
+M IN PROCEDURE CHECK_MSG
+      6005**DCL      6022>>IF       6022>>IF
+MBLK2CGMA
+      6044**PROC     5821--CALL     5854--CALL
+NEXTDDA
+      5744**DCL      5840<<ASSIGN   5841<>CALL     5872<<ASSIGN   5874<>CALL     5876<>CALL
+NO_FETCH
+      5966**LABEL    5876--CALLALT
+NO_FETCHR
+      5889**LABEL    5837--CALLALT  5841--CALLALT  5874--CALLALT
+NO_GET
+      5952**LABEL    5865--CALLALT
+NO_GETR
+      5887**LABEL    5845--CALLALT  5849--CALLALT
+VLP$CGMA
+      5723**DCL      5848--ASSIGN   5848--ASSIGN   5855--ASSIGN   5856--ASSIGN   5857--ASSIGN   5864--ASSIGN
+      5864--ASSIGN   5883--ASSIGN   5883--ASSIGN   6046<<ASSIGN
+VLP$CGMA.DEST
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:60   
+      5728**DCL      5952>>ASSIGN
+VLP$CGMA.DVE
+      5728**DCL      5929>>ASSIGN
+VLP$CGMA.MSGID
+      5729**DCL      5934>>ASSIGN
+VLP$CGMA.MSGIDBXT
+      5730**DCL      5944>>ASSIGN   6016>>IF
+VLP$CGMA.MSGIDXT
+      5729**DCL      5730--REDEF    6022--IF
+VLP$CGMA.MSGSIZE
+      5731**DCL      5948>>IF       5949>>ASSIGN
+VLP$CGMA.MSGTYP
+      5727**DCL      5909>>ASSIGN   5911>>ASSIGN   6052<<ASSIGN
+VLP$CGMA.ORIGIN
+      5727**DCL      5916>>ASSIGN   5918>>ASSIGN   6051<<ASSIGN
+VLP$CGMA.PRIO
+      5727**DCL      5922>>IF       5923>>ASSIGN
+VLP$CGMA.TYC
+      5729**DCL      5931>>ASSIGN
+VLP$CGMA.UTS
+      5728**DCL      5927>>ASSIGN
+VLP$SCGMA.DEST
+      5734**DCL      5951>>IF
+VLP$SCGMA.DVE
+      5734**DCL      5928>>IF
+VLP$SCGMA.MSGID
+      5734**DCL      5932>>IF
+VLP$SCGMA.MSGIDXT
+      5735**DCL      5943>>IF
+VLP$SCGMA.MSGSIZE
+      5734**DCL      5946>>IF
+VLP$SCGMA.MSGTYP
+      5734**DCL      5906>>IF
+VLP$SCGMA.ORIGIN
+      5734**DCL      5913>>IF
+VLP$SCGMA.PRIO
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:61   
+      5734**DCL      5920>>IF
+VLP$SCGMA.TYC
+      5735**DCL      5930>>IF
+VLP$SCGMA.UTS
+      5734**DCL      5926>>IF
+WANT_IT
+      5963**LABEL    5990--GOTO
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:62   
+              *** CROSS REFERENCE LISTING ***
+    **     DENOTES     IDENTIFIER DEFINITION
+    <<                 IDENTIFIER'S VALUE SET
+    >>                 IDENTIFIER'S VALUE USED
+    <>                 IDENTIFIER SET AND/OR USED
+    --                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KQF$GOTMSG File=KQF$GOTMSG.:E05TSI                            WED 07/30/97 01:28 Page:63   
+              MINI UREF LISTING
+
+KQF$CHKMSG    5986**ENTRY
+KQF$GOTMSG      62**PROC

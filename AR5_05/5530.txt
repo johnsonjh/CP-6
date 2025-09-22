@@ -1,0 +1,803 @@
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+/* lpd - CP-6 Version of the Unix LPD daemon */
+ 
+#include <time:h>              /*  Standard C include files        */
+#include <stdio:h>
+#include <string:h>
+#include <stdlib:h>
+#include <ctype:h>
+#include <errno:h>
+ 
+#include <xsl_socket:h>         /* Socket library include files    */
+#include <xsl_errno:h>
+#include <xsl_in:h>
+#include <xsl_netdb:h>
+#include <xsl_select:h>
+ 
+#include <b$jit_c:h>           /*  CP-6 JIT include file           */
+ 
+#include "LPD_Cc3"             /*  LPD-specific include file       */
+ 
+#define TRUE 1
+#define bzero(DSL,LEN)
+ 
+int   msgsock, sock;           /* Socket descriptors               */
+char  buffer[MAXBUFSIZE];      /* General purpose buffer           */
+char *cp = &buffer[0];         /* Pointer to buffer                */
+char *printer;                 /* Pointer to LPD print queue name  */
+char *cmd;                     /* Pointer to LPD command           */
+char *joblist;                 /* Pointer to LPD jo list           */
+int  joblist_len;              /* Length of the job list           */
+char *lpd_rmagent = NULL;      /* Pointer to remove cmd agent      */
+int  lpd_rmagent_len = 0;      /* Length of remove agent           */
+ 
+#pragma LIST EJECT
+main ()
+ 
+   {
+   int   size;
+   int   n = 0;
+   int   i;
+   int   k;
+   int   userflag;
+   int   ldevflag;
+   int   privflag;
+   int   logonflag;
+#ifdef STANDALONE
+   int   len;
+   fd_set ready;
+   int  to_val;
+   struct sockaddr_in server;
+#else
+   union {
+         struct sockaddr serv_sock;
+         struct sockaddr_in serv_in;
+         } server;
+#endif
+   privflag = LPD$PRIV();
+   if (privflag < 1) {
+      printf(e_noprivs);
+      exit(1);
+      }
+ 
+   size = sizeof(server);
+#ifdef STANDALONE
+   sock = socket(AF_INET, SOCK_STREAM, 0);
+   server.sin_family = AF_INET;
+   server.sin_addr.s_addr   = INADDR_ANY;
+   server.sin_port   = 515;
+   if (bind(sock,(struct sockaddr *)&server, size) == EFAILURE) {
+      perror("error binding stream socket");
+      exit(1);
+      }
+ 
+   len = sizeof(server);
+   if (getsockname(sock, (struct sockaddr *)&server, &len)) {
+      perror("error getting socket name");
+      exit(1);
+      }
+ 
+   listen(sock, 5);             /* listen for connection requests  */
+#else
+   msgsock = accept_srvr(&server.serv_sock,&size);
+ 
+   if (msgsock < 0) {
+      perror("error opening socket");
+      exit(1);
+      }
+#endif
+ 
+#ifdef STANDALONE
+   do {
+      FD_ZERO(&ready);
+      FD_SET(sock, &ready);
+      to_val = 5;
+      if (select(sock, &ready, 0, 0, (struct timeval *)&to_val) < 0) {
+         perror("select");
+         continue;
+         }
+      if (FD_ISSET(sock, &ready)) {
+         msgsock = accept(sock, 0, 0);
+         if (msgsock == -1)
+            perror("accept");
+         else {
+#endif
+            bzero(buffer, sizeof(buffer));
+            do {
+               if ((n = read(msgsock,cp,1)) != 1) {
+                  if (n < 0) {
+                     printf(e_lostcon);
+                     goto thats_all_folks;
+                     }
+                  if (n == 0) {
+                     }
+                  }
+               } while (*cp++ != '\n');
+ 
+            cmd = &buffer[0];
+            *--cp = '\0';
+ 
+            switch (*cmd++) {
+ 
+              case PRINTCMD:    /* print ... ignore this one       */
+ 
+                   break;
+ 
+              case RECVCMD:     /* receive                         */
+ 
+                   ack();       /* Acknowledge receive command     */
+                   cp = &buffer[1];
+                   printer = &buffer[1];
+                   if (recv_file() > 0) {
+                      process_controlfile();
+                      userflag = LPD$CHKUSER((char *)&lpd_host,(int *)&lpd_host_len,
+                                 (char *)&lpd_person,(int *)&lpd_person_len,
+                                 (char *)&lpd_accn,(int *)&lpd_accn_len,
+                                 (char *)&lpd_uname,(int *)&lpd_uname_len);
+                      switch(userflag) {
+                           case (NOUSER):
+                                printf(e_usernotfnd);
+                                error_info();
+                                exit(1);
+                                break;
+                           case (WILDUSER):
+                                j = B$JIT$;
+                                strncpy(j->accn,(char *)&lpd_host,8);
+                                strncpy(j->uname,(char *)&lpd_person,12);
+                                break;
+                           case (FOUNDUSER):
+                                for (k=lpd_uname_len;k<13;k++) {
+                                    lpd_uname[k] = ' ';
+                                    }
+ 
+                                logonflag = LPD$LOGON((char *)&lpd_accn,
+                                         (char *)&lpd_uname,
+                                         (int *)&lpd_uname_len);
+                                if (logonflag < 0) {
+                                   printf(e_lgnfailed);
+                                   error_info();
+                                   exit(1);
+                                   }
+                                break;
+ 
+                           }
+                      if (userflag > 0) {
+                         lpd_accn[lpd_accn_len] = '\0';
+                         lpd_uname[lpd_uname_len] = '\0';
+                         }
+                      if ((ldevflag=read_printcap((char *)&lpd_queue)) < 0) {
+                         switch(ldevflag) {
+                            case(LDEV_FAILED):;
+                                printf(e_ldevfailed);
+                                error_info();
+                                exit(1);
+                                break;
+                            case(PRINTCAP_ERROR):;
+                                printf(e_prcaperr);
+                                error_info();
+                                exit(1);
+                                break;
+                            case(PRINTER_NOT_FOUND):;
+                                printf(e_prnotfnd);
+                                error_info();
+                                exit(1);
+                                break;
+                            }
+                         goto thats_all_folks;
+                         }
+                      else {
+                         process_printfiles();
+                         LPD$PRIV();
+                         LPD$WRSTATS((char *)&lpd_host[0],(int *)&lpd_host_len,
+                            (char *)&lpd_person[0],(int *)&lpd_person_len,
+                            (char *)&lpd_queue[0],(int *)&lpd_queue_len,
+                            (char *)&lpd_jobname[0],(int *)&lpd_jobname_len,
+                            (char *)&lpd_jobnum[0],(int *)&lpd_jobnum_len);
+                         if (userflag = WILDUSER) {
+                            LPD$PRINT();
+                            logonflag = LPD$LOGON((char *)&lpd_accn,
+                                     (char *)&lpd_uname,
+                                     (int *)&lpd_uname_len);
+                            if (logonflag < 0) {
+                               }
+                            }
+ 
+                         }
+                      }
+                   break;
+ 
+              case DILONGCMD:   /* display m$jobstats (long form)  */
+ 
+              case DISHORTCMD:  /* display m$jobstats (short form) */
+ 
+                   printer = cmd;
+                   printer = strtok(cmd," ");
+                   if ((joblist = strtok(NULL," ")) == NULL) {
+                      write(msgsock,cp6lpq,strlen(cp6lpq));
+                      write(msgsock,cp6msg1,strlen(cp6msg1));
+                      }
+                   else {
+                      k = 0;
+                      do {
+                         joblist_len = strlen(joblist);
+                         i = LPD$CHKSTATS(joblist,
+                                     (int *)&joblist_len,
+                                     (int *)&msgsock,
+                                     NULL,
+                                     NULL,
+                                     (int *)&k);
+                         if (i <= 0) {
+                            write(msgsock,cp6lpq,strlen(cp6lpq));
+                            write(msgsock,joblist,strlen(joblist));
+                            write(msgsock,cp6msg2,strlen(cp6msg2));
+                            }
+                         k++;
+                         joblist = strtok(NULL," ");
+                         } while (joblist != NULL);
+                      }
+                   break;
+ 
+              case RMJOBCMD:    /* remove a job via $jobstats      */
+ 
+                   printer = cmd;
+                   printer = strtok(cmd," ");
+                   lpd_rmagent = strtok(NULL," ");
+                   lpd_rmagent_len = strlen(lpd_rmagent);
+                   if ((joblist = strtok(NULL," ")) == NULL) {
+                      write(msgsock,cp6lprm,strlen(cp6lprm));
+                      write(msgsock,cp6msg4,strlen(cp6msg4));
+                      }
+                   else {
+                      do {
+                         joblist_len = strlen(joblist);
+                         i = LPD$CANCEL(joblist,
+                                     (int *)&joblist_len,
+                                     (int *)&msgsock,
+                                     lpd_rmagent,
+                                     (int *)&lpd_rmagent_len);
+                         if (i <= 0) {
+                            write(msgsock,cp6lprm,strlen(cp6lprm));
+                            write(msgsock,joblist,strlen(joblist));
+                            write(msgsock,cp6msg2,strlen(cp6msg2));
+                            }
+                         else {
+                            write(msgsock,cp6lprm,strlen(cp6lprm));
+                            write(msgsock,joblist,strlen(joblist));
+                            write(msgsock,cp6msg3,strlen(cp6msg3));
+                         }
+                         joblist = strtok(NULL," ");
+                         } while (joblist != NULL);
+                      }
+                   break;
+ 
+              }
+           cp = &buffer[0];
+#ifdef STANDALONE
+         }
+      }
+   } while (TRUE);
+#endif
+ 
+   thats_all_folks:;
+   LPD$UPDSTATS();
+   close(msgsock);
+}
+ 
+#pragma LIST EJECT
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+int recv_file()
+{
+   int  size;
+   int  control_file = 0;
+   int  data_file = 0;
+ 
+   ack();                      /* acknowledge receive command      */
+ 
+   lpd_control.jobcount = 0;
+ 
+   /* save the unix queue name from the receive command            */
+ 
+   strcpy((char *)&lpd_queue, cp);
+   lpd_queue_len = strlen(&lpd_queue[0]);
+ 
+   do  {
+       cp = &buffer[0];
+       do {
+ 
+          /* read receive subcommands from the client one byte
+             at a time until terminated with a lf.                 */
+ 
+          if ((size = read(msgsock,cp,1)) != 1) {
+             /* To be used when running STANDALONE ... */
+             if (errno == EBADF) {
+                }
+             if (errno == ENOTCONN) {
+                }
+             if (errno == ENOTSOCK) {
+                }
+             if (errno == EFAILURE) {
+                }
+             if (size <= 0) {
+                goto end_loop;
+                }
+             }
+          } while (*cp++ != '\n');
+ 
+       /* Make sure the command buffer is null-terminated then
+          position to the start of the buffer                      */
+ 
+       *--cp = '\0';
+       cp = &buffer[0];
+ 
+       switch (*cp++) {
+ 
+         case CLEANUP:         /* cleanup ... delete whats here    */
+              continue;
+ 
+         case CNTLFILE:         /* receive control file            */
+ 
+              size = 0;
+              while (*cp >= '0' && *cp <= '9')
+                    size = size * 10 + (*cp++ - '0');
+              if (*cp++ != ' ')
+                 break;        /* protocol error                   */
+ 
+              control_file += readfile(size,CNTLFILE);
+              continue;
+ 
+         case DATAFILE:         /* receive data file               */
+ 
+              size = 0;
+              while (*cp >= '0' && *cp <= '9')
+                    size = size * 10 + (*cp++ - '0');
+              if (*cp++ != ' ')
+                 break;        /* protocol error                   */
+ 
+              data_file += readfile(size,DATAFILE);
+              continue;
+ 
+         default:
+ 
+              perror("Protocol error");
+              break;
+ 
+         }
+       } while (TRUE);
+ 
+   end_loop:
+ 
+   if ((data_file > 0) && (control_file > 0))
+      return (data_file + control_file);
+   else
+      return (EFAILURE);
+}
+ 
+#pragma LIST EJECT
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+int readfile(filesiz,type)
+ 
+int filesiz;
+int type;
+ 
+{
+    int bufsize;
+    int bytes_read = 0;
+    int n = 0;
+    FILE *tmpfile;
+    char fid[31];
+ 
+    ack();
+ 
+    fid[0] = '*';
+    strcpy((char *)&fid[1], cp);
+ 
+    if (filesiz > MAXBUFSIZE)
+       bufsize = MAXBUFSIZE;
+    else
+       bufsize = filesiz + 1;
+ 
+    if (type == DATAFILE)  {
+       if ((tmpfile = fopen((char *)&fid,"w+")) == NULL) {
+          printf("Cannot open temp data file\n");
+          return(-1);
+          }
+       else {
+          strcpy((char *)&lpd_control.jobinfo[lpd_control.jobcount].filename[0],
+                 (char *)&fid[0]);
+          lpd_control.jobinfo[lpd_control.jobcount].size = filesiz;
+          lpd_control.jobcount++;
+          }
+       }
+    else if (type ==CNTLFILE) {
+       if ((tmpfile = fopen((char *)&fid,"w+")) == NULL) {
+          printf("Cannot open temp control file\n");
+          return(-1);
+          }
+       else {
+          strcpy((char *)&lpd_controlfile[0], (char *)&fid[0]);
+          }
+       }
+ 
+    cp = &buffer[0];
+ 
+    do {
+        if ((n = read(msgsock, cp, bufsize)) > 0) {
+           bytes_read += n;
+           cp = &buffer[0];
+           if ((n = fwrite(cp, 1, n, tmpfile)) > 0) {
+              cp = &buffer[0];
+              }
+           }
+        else
+           break;
+ 
+        if (filesiz - bytes_read < bufsize)
+           bufsize = filesiz - bytes_read + 1;
+ 
+        } while (bytes_read <= filesiz);
+ 
+    fclose(tmpfile);
+    ack();
+    return(1);
+}
+#pragma LIST EJECT
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+int readline (fp)
+ 
+FILE *fp;
+ 
+{
+    int c;
+    int pos = 0;
+    char *p;
+ 
+    p = &buffer[0];
+    FD_ZERO(&buffer);
+    while((c = fgetc(fp)) != '\n') {
+         if (c == EOF)
+            return (-1);
+         if (c == '\r')
+            c = ' ';
+         if (c == '\t') {
+            do {
+               *p++ = ' ';
+               } while ((++pos &0x07) != 0);
+            continue;
+            }
+            *p++ = c;
+            pos++;
+         }
+ 
+    return (pos);
+}
+#pragma LIST EJECT
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+int process_controlfile()
+/* Read the control file and fill in the appropriate global
+   variables and structures.                                */
+ 
+{
+   FILE *cfile;
+   char *jnum_begin;
+   int  i = 0;
+   int  k;
+ 
+   if ((cfile = fopen((char *)lpd_controlfile,"r")) != NULL) {
+      while ((i = readline(cfile)) > -1) {
+         cp = &buffer[1];
+         switch (buffer[0]) {
+ 
+         case 'H':                /*      Host name                */
+              strncpy((char *)&lpd_host, cp, i);
+              lpd_host_len = i - 1;
+              if (strchr((char *)lpd_host,'.') > 0) {
+                 strtok((char *)lpd_host,".");
+                 lpd_host_len = strlen((char *)lpd_host);
+                 }
+              for (k=lpd_host_len;k<10;k++) {
+                  lpd_host[k] = ' ';
+                  }
+              j = B$JIT$;
+              strncpy(j->woo, (char *)lpd_host, 8);
+              lpd_host[lpd_host_len] = '\0';
+              continue;
+         case 'P':                /*      Person's name            */
+              strncpy((char *)&lpd_person, cp, i);
+              lpd_person_len = i - 1;
+              for (k=lpd_person_len;k<13;k++) {
+                  lpd_person[k] = ' ';
+                  }
+              continue;
+         case 'J':                /*      Job Name                 */
+              lpd_jobname[0] = ' ';
+              strncpy((char *)&lpd_jobname[1], cp, i);
+              lpd_jobname_len = i;
+              for (k=lpd_jobname_len;k<32;k++) {
+                  lpd_jobname[k] = ' ';
+                  }
+              j = B$JIT$;
+              strncpy(j->jobname,(char *)&lpd_jobname,lpd_jobname_len + 1);
+              lpd_jobname[lpd_jobname_len] = '\0';
+              continue;
+         case 'L':                /*      Login Name               */
+              strncpy((char *)&lpd_loginname,cp,i);
+              lpd_loginname_len = i - 1;
+              continue;
+         case 'C':                /*      Class                    */
+ 
+         case 'I':                /*      Indent                   */
+ 
+         case 'S':                /*      Unix symbolic link stuff */
+ 
+         case '1':                /*      troff fonts              */
+ 
+         case '2':
+ 
+         case '3':
+ 
+         case '4':
+ 
+         case 'N':                /*      File name                */
+ 
+         case 'U':                /*      Unix unlink stuff        */
+ 
+         case 'M':                /*      Mail request             */
+ 
+         case 'f':                /*      file name - text         */
+ 
+         case 'l':                /*      file name - text + control chars */
+ 
+         case 'p':                /*      file name - print with pr */
+ 
+         case 't':                /*      file name - print with troff */
+ 
+         case 'n':                /*      file name - print with ditroff */
+ 
+         case 'd':                /*      file name - dvi           */
+ 
+         case 'g':                /*      file name - plot file     */
+ 
+         case 'v':                /*      file name - plain raster file */
+ 
+         case 'c':                /*      file name - cifplot file */
+ 
+         default:
+              continue;
+ 
+         }
+      }
+   /*
+      Pull the job number out of the control file name
+   */
+      jnum_begin = &lpd_controlfile[0] + 4;
+      strncpy((char *)&lpd_jobnum[0] , jnum_begin, 3);
+   }
+    fclose(cfile);
+   return (1);
+}
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+#pragma LIST EJECT
+/* lpd$printcap
+ 
+   Read the printcap file and look for the specific queue name
+   requested. If found, look to see if a correct printer number
+   (LPxx) is given and that there are at least three fields. Then
+   pass the rest of the LDEV options to some PL-6 routine for the
+   M$LDEV moniter service call.
+ 
+*/
+ 
+int read_printcap(queue_name)
+ 
+    char *queue_name;
+ 
+    {
+ 
+    FILE  *prcap;
+    char  *ldev, *process_line(), *b;
+    int   ars,ldev_len;
+ 
+/*
+   1. open the file and get a "record"
+   2. Strip comments
+   3. Look for queue_name in a record
+   4. See if there are any ldev options.
+   5. Pass the ldev opts to a pl6 routine
+*/
+ 
+ 
+   b = &buffer[0];
+ 
+   if ((prcap = fopen("etc:printcap.:SYS","r")) != NULL) {
+      while (!feof(prcap)) {
+            if (fgets(b,256,prcap) != NULL) {
+               /* set actual record size to ignore comments */
+               if (strchr(&buffer[0],'#') != NULL) {
+                  ars = strchr(&buffer[0],'#') - &buffer[0];
+                  }
+               else {
+                  ars = strlen(buffer);
+                  }
+               }
+            if (ars > 0) {
+               ldev=process_line(queue_name,buffer,ars);
+ 
+               if (ldev == &buffer[0]) /* all blanks in buffer    */
+                   goto keep_checking;
+ 
+               if (ldev == &buffer[255]) /* no opts after queue  */
+                   {
+                   fclose(prcap);
+                   return(PRINTCAP_ERROR);
+                   }
+ 
+               if (ldev == NULL)         /*que not found in buffer*/
+                  goto keep_checking;
+               else {           /* first look is ok        */
+                  fclose(prcap);
+                  ldev_len = ars - (ldev - &buffer[0]);
+                  if (LPD$LDEV(ldev,&ldev_len) > 0) {
+                     return(LDEV_CREATED);
+                     }
+                  else {
+                     return(LDEV_FAILED);
+                     }
+                  }
+               keep_checking:;
+               }
+            }
+            fclose(prcap);
+            return(PRINTER_NOT_FOUND);
+      }
+      else {
+         return(PRINTCAP_ERROR);
+         }
+   }
+ 
+#pragma LIST EJECT
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+char *process_line(queue,buf,len)
+ 
+    char *queue,*buf;
+    int  len;
+ 
+    {
+ 
+    int i;
+    char *p;
+ 
+    /* If the line is blank, return NULL */
+    for (i=0;i > len; i++) {
+        if (isspace(buf[i]) != 0) {
+           break;
+           }
+        }
+    if (i >= len) {            /* If the buffer is all spaces   */
+       p = &buf[0];            /* return the address of the     */
+       return(p);              /* beginning of the buffer       */
+       }
+ 
+    /* Look for queue in buf. If found, continue with more
+       checking. If not, return NULL. */
+    if ((p = strstr(buf,queue)) == NULL) {
+       return(NULL);
+       }
+    else {
+       /* move to the next character after queue */
+       p = p + strlen(queue) + 1;
+ 
+       /* see if there is anything left, other than spaces,
+          in the buffer between p and buf[ars] */
+       for ( ;p > &buf[len-1];p++) {
+           if (isalnum(*p) != 0)
+              break;
+           }
+ 
+       if (p >= &buf[len-1]) { /* If only spaces, then return   */
+          p = &buf[255];       /* the address of the end of the */
+          return(p);           /* buffer                        */
+          }
+       else
+          return(p);
+       }
+    }
+#pragma LIST EJECT
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+int process_printfiles()
+ 
+{
+    int  i = 0;
+    int  k = 0;
+    FILE *dfile, *print;
+ 
+    print = fopen("LP30#","w");
+ 
+    for(i=0; i <= lpd_control.jobcount; ++i) {
+ 
+       if ((dfile=fopen((char *)&lpd_control.jobinfo[i].filename[0],"rb"))!=NULL) {
+          while ((k = readline(dfile)) >= 0) {
+               if (buffer[0] == 0x0c) {
+                   LPD$EJECT(print);
+                   fprintf(print,"%s\n", (char *)&buffer[1]);
+                   }
+               else
+                   fprintf(print,"%s\n", (char *)&buffer[0]);
+                }
+          fclose(dfile);
+          LPD$EJECT(print);
+          }
+       }
+ 
+    fclose(print);
+}
+#pragma LIST EJECT
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1992    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+ 
+error_info()
+ 
+{
+  printf("\nLPD Status:\n");
+  printf("    Remote Host:   %s\n", lpd_host);
+  printf("    Remote User:   %s\n", lpd_person);
+  printf("    Printer:       %s\n", lpd_queue);
+  printf("    Job name:      %s\n", lpd_jobname);
+  printf("    Job number:    %s\n", lpd_jobnum);
+  printf("\n");
+  printf("    CP6 account:   %s\n", lpd_accn);
+  printf("    CP6 user name: %s\n", lpd_uname);
+ 
+  return;
+}

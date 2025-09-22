@@ -1,0 +1,720 @@
+
+
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: ra.c,v 1.7 87/03/10 11:20:37 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /*
+        7         7              *   R E G I S T E R    A L L O C A T I O N
+        8         8              *
+        9         9              */
+       10        10
+       11        11             #include <stdio:h>
+       12        12             #include "types:h"
+       13        13             #include "debug:h"
+       14        14             #include "global:h"
+       15        15             #include "files:h"
+       16        16             #include "get:h"
+       17        17             #include "put:h"
+       18        18             #include "lset:h"
+       19        19             #include "map:h"
+       20        20             #include "alloc:h"
+       21        21             #include "go:h"
+       22        22             #include "em_reg:h"
+       23        23             #include "ra:h"
+       24        24             #include "ra_items:h"
+       25        25             #include "ra_allocl:h"
+       26        26             #include "ra_profits:h"
+       27        27             #include "ra_pack:h"
+       28        28             #include "ra_xform:h"
+       29        29
+       30        30
+       31        31             #define newrabx()  (bext_p) newstruct(bext_ra)
+       32        32             #define newralpx() (lpext_p)   newstruct(lpext_ra)
+       33        33             #define oldrabx(x) oldstruct(bext_ra,x)
+       34        34             #define oldralpx(x)   oldstruct(lpext_ra,x)
+       35        35
+       36        36             short alloc_id;
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=2  
+       37        37             static item_p items[NRITEMTYPES];
+       38        38             int nrinstrs;
+       39        39             line_p *instrmap;
+       40        40
+       41        41             cond_p alocaltab[NRREGTYPES][NRREGTYPES],alocaddrtab[NRREGTYPES][NRREGTYPES],
+       42        42              aconsttab,adconsttab,aglobaltab,aproctab;
+       43        43             cond_p olocaltab[NRREGTYPES],olocaddrtab[NRREGTYPES],
+       44        44              oconsttab,odconsttab,oglobaltab,oproctab;
+       45        45             cond_p regsav_cost;
+       46        46
+       47        47             short regs_available[] = {
+       48        48    1         /* Actually machine dependent; this is for vax2 */
+       49        49    1         3, /* reg_any i.e. data regs */
+       50        50    1         0, /* reg_loop */
+       51        51    1         3, /* reg_pointer i.e. address reg. */
+       52        52    1         0  /* reg_float */
+       53        53    1        } ;
+       54        54
+       55        55             STATIC cond_p ra_getcondtab(f)
+       56        56              FILE *f;
+       57        57             {
+       58        58    1         int l,i;
+       59        59    1         cond_p tab;
+       60        60    1
+       61        61    1         fscanf(f,"%d",&l);
+       62        62    1         tab = newcondtab(l);
+       63        63    1         for (i = 0; i < l; i++) {
+       64        64    2            fscanf(f,"%hd %hd %hd",&tab[i].mc_cond,&tab[i].mc_tval,
+       65        65    2                &tab[i].mc_sval);
+       66        66    2         }
+       67        67    1         assert(tab[l-1].mc_cond == DEFAULT);
+       68        68    1         return tab;
+       69        69    1        }
+       70        70
+       71        71             get_atab(f,tab)
+       72        72              FILE *f;
+       73        73              cond_p tab[NRREGTYPES][NRREGTYPES];
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=3  
+       74        74             {
+       75        75    1         int i,cnt,totyp,regtyp;
+       76        76    1
+       77        77    1         fscanf(f,"%d",&cnt);
+       78        78    1         for (i = 0; i < cnt; i++) {
+       79        79    2            fscanf(f,"%d %d",&regtyp,&totyp);
+       80        80    2            assert(regtyp >= 0  && regtyp < NRREGTYPES);
+       81        81    2            assert(totyp >= 0  && totyp < NRREGTYPES);
+       82        82    2            tab[regtyp][totyp] = ra_getcondtab(f);
+       83        83    2         }
+       84        84    1        }
+       85        85
+       86        86
+       87        87             get_otab(f,tab)
+       88        88              FILE *f;
+       89        89              cond_p tab[NRREGTYPES];
+       90        90             {
+       91        91    1         int i,cnt,regtyp;
+       92        92    1
+       93        93    1         fscanf(f,"%d",&cnt);
+       94        94    1         for (i = 0; i < cnt; i++) {
+       95        95    2            fscanf(f,"%d",&regtyp);
+       96        96    2            assert(regtyp >= 0  && regtyp < NRREGTYPES);
+       97        97    2            tab[regtyp] = ra_getcondtab(f);
+       98        98    2         }
+       99        99    1        }
+      100       100
+      101       101
+      102       102
+      103       103             STATIC ra_machinit(f)
+      104       104              FILE *f;
+      105       105             {
+      106       106    1         /* Read target machine dependent information for this phase */
+      107       107    1         char s[100];
+      108       108    1
+      109       109    1         for (;;) {
+      110       110    2            while(getc(f) != '\n');
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=4  
+      111       111    2            fscanf(f,"%s",s);
+      112       112    2            if (strcmp(s,"%%RA") == 0)break;
+      113       113    2         }
+      114       114    1         fscanf(f,"%hd",&regs_available[reg_any]);
+      115       115    1         fscanf(f,"%hd",&regs_available[reg_pointer]);
+      116       116    1         fscanf(f,"%hd",&regs_available[reg_float]);
+      117       117    1         get_atab(f,alocaltab);
+      118       118    1         get_atab(f,alocaddrtab);
+      119       119    1         aconsttab = ra_getcondtab(f);
+      120       120    1         adconsttab = ra_getcondtab(f);
+      121       121    1         aglobaltab = ra_getcondtab(f);
+      122       122    1         aproctab = ra_getcondtab(f);
+      123       123    1         get_otab(f,olocaltab);
+      124       124    1         get_otab(f,olocaddrtab);
+      125       125    1         oconsttab = ra_getcondtab(f);
+      126       126    1         odconsttab = ra_getcondtab(f);
+      127       127    1         oglobaltab = ra_getcondtab(f);
+      128       128    1         oproctab = ra_getcondtab(f);
+      129       129    1         regsav_cost = ra_getcondtab(f);
+      130       130    1        }
+      131       131
+      132       132
+      133       133             STATIC bblock_p header(lp)
+      134       134              loop_p lp;
+      135       135             {
+      136       136    1         /* Try to determine the 'header' block of loop lp.
+      137       137    1          * If 'e' is the entry block of loop L, then block 'b' is
+      138       138    1          * called the header block of L, iff:
+      139       139    1          * SUCC(b) = {e} & PRED(e) = {b}
+      140       140    1          * If lp has no header block, 0 is returned.
+      141       141    1          */
+      142       142    1
+      143       143    1         bblock_p x = lp->lp_entry->b_idom;
+      144       144    1
+      145       145    1         if (x != (bblock_p) 0 && Lnrelems(x->b_succ) == 1 &&
+      146       146    1             (bblock_p) Lelem(Lfirst(x->b_succ)) == lp->lp_entry) {
+      147       147    2            return x;
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=5  
+      148       148    2         }
+      149       149    1         return (bblock_p) 0;
+      150       150    1        }
+      151       151
+      152       152
+      153       153             STATIC ra_extproc(p)
+      154       154              proc_p p;
+      155       155             {
+      156       156    1         /* Allocate the extended data structures for procedure p */
+      157       157    1
+      158       158    1         register loop_p lp;
+      159       159    1         register Lindex pi;
+      160       160    1         register bblock_p b;
+      161       161    1
+      162       162    1         for (pi = Lfirst(p->p_loops); pi != (Lindex) 0;
+      163       163    1            pi = Lnext(pi,p->p_loops)) {
+      164       164    2            lp = (loop_p) Lelem(pi);
+      165       165    2            lp->lp_extend = newralpx();
+      166       166    2          lp->LP_BLOCKS = (lset) 0;
+      167       167    2            lp->LP_HEADER = header(lp);
+      168       168    2         }
+      169       169    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      170       170    2            b->b_extend = newrabx();
+      171       171    2         }
+      172       172    1        }
+      173       173
+      174       174
+      175       175
+      176       176
+      177       177             STATIC ra_cleanproc(p)
+      178       178              proc_p p;
+      179       179             {
+      180       180    1         /* Allocate the extended data structures for procedure p */
+      181       181    1
+      182       182    1         register loop_p lp;
+      183       183    1         register Lindex pi;
+      184       184    1         register bblock_p b;
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=6  
+      185       185    1
+      186       186    1         for (pi = Lfirst(p->p_loops); pi != (Lindex) 0;
+      187       187    1            pi = Lnext(pi,p->p_loops)) {
+      188       188    2            lp = (loop_p) Lelem(pi);
+      189       189    2            oldralpx(lp->lp_extend);
+      190       190    2          lp->lp_extend = (lpext_p) 0;
+      191       191    2         }
+      192       192    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      193       193    2            oldrabx(b->b_extend);
+      194       194    2          b->b_extend = (bext_p) 0;
+      195       195    2         }
+      196       196    1        }
+      197       197
+      198       198
+      199       199
+      200       200             STATIC ra_loop_blocks(p)
+      201       201              proc_p p;
+      202       202             {
+      203       203    1         /* Compute the LP_BLOCKS sets for all loops of p */
+      204       204    1
+      205       205    1         register bblock_p b;
+      206       206    1         register Lindex i;
+      207       207    1
+      208       208    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      209       209    2            for (i = Lfirst(b->b_loops); i != (Lindex) 0;
+      210       210    2               i = Lnext(i,b->b_loops)) {
+      211       211    3               Ladd(b,&(((loop_p) Lelem(i))->LP_BLOCKS));
+      212       212    3            }
+      213       213    2         }
+      214       214    1        }
+      215       215
+      216       216
+      217       217
+      218       218
+      219       219             STATIC make_instrmap(p,map)
+      220       220              proc_p p;
+      221       221              line_p map[];
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=7  
+      222       222             {
+      223       223    1         /* make the instructions map of procedure p */
+      224       224    1
+      225       225    1         register bblock_p b;
+      226       226    1         register line_p l;
+      227       227    1         register int i = 0;
+      228       228    1
+      229       229    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      230       230    2            b->B_BEGIN = i; /* number of first instruction */
+      231       231    2            for (l = b->b_start; l != (line_p) 0; l = l->l_next) {
+      232       232    3               map[i++] = l;
+      233       233    3            }
+      234       234    2            b->B_END = i-1; /* number of last instruction */
+      235       235    2         }
+      236       236    1        }
+      237       237
+      238       238
+      239       239
+      240       240             STATIC bool useful_item(item)
+      241       241              item_p item;
+      242       242             {
+      243       243    1         /* See if it may be useful to put the item in a register.
+      244       244    1          * A local variable that is not a parameter may always be put
+      245       245    1          * in a register (as it need not be initialized).
+      246       246    1          * Other items must be used at least twice.
+      247       247    1          */
+      248       248    1
+      249       249    1         int nruses = Lnrelems(item->it_usage);
+      250       250    1         assert (nruses > 0); /* otherwise it would not be an item! */
+      251       251    1         return nruses > 1 || (item->it_type == LOCALVAR &&
+      252       252    1                  item->i_t.it_off < 0);
+      253       253    1        }
+      254       254
+      255       255
+      256       256             STATIC item_p cat_items(items)
+      257       257              item_p items[];
+      258       258             {
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=8  
+      259       259    1         /* Make one item list out of an array of itemlists.
+      260       260    1          * Remove items that are used only once.
+      261       261    1          */
+      262       262    1
+      263       263    1         register item_p it;
+      264       264    1         item_p *ip,head,next;
+      265       265    1         int t;
+      266       266    1
+      267       267    1
+      268       268    1         ip = &head;
+      269       269    1         for (t = 0; t < NRITEMTYPES;t++) {
+      270       270    2            for ( it = items[t]; it != (item_p) 0; it = next) {
+      271       271    3               next = it->it_next;
+      272       272    3               if (!it->it_desirable || !useful_item(it)) {
+      273       273    4                  cleantimeset(it->it_usage);
+      274       274    4                  olditem(it);
+      275       275    4               } else {
+      276       276    4                  *ip = it;
+      277       277    4                  ip = &it->it_next;
+      278       278    4               }
+      279       279    3            }
+      280       280    2         }
+      281       281    1         *ip = (item_p) 0;
+      282       282    1         return head;
+      283       283    1        }
+      284       284
+      285       285
+      286       286
+      287       287
+      288       288             STATIC clean_interval(list)
+      289       289              interv_p list;
+      290       290             {
+      291       291    1         register interv_p x,next;
+      292       292    1
+      293       293    1         for (x = list; x != (interv_p) 0; x = next) {
+      294       294    2            next = x->i_next;
+      295       295    2            oldinterval(x);
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=9  
+      296       296    2         }
+      297       297    1        }
+      298       298
+      299       299
+      300       300
+      301       301             STATIC cleantimeset(s)
+      302       302              lset s;
+      303       303             {
+      304       304    1         register Lindex i;
+      305       305    1         register time_p t;
+      306       306    1
+      307       307    1         for (i = Lfirst(s); i != (Lindex) 0; i = Lnext(i,s)) {
+      308       308    2            t = (time_p) Lelem(i);
+      309       309    2            oldtime(t);
+      310       310    2         }
+      311       311    1         Ldeleteset(s);
+      312       312    1        }
+      313       313
+      314       314
+      315       315
+      316       316             STATIC clean_allocs(list)
+      317       317              alloc_p list;
+      318       318             {
+      319       319    1         register alloc_p x,next;
+      320       320    1
+      321       321    1         for (x = list; x != (alloc_p) 0; x = next) {
+      322       322    2            next = x->al_next;
+      323       323    2            clean_interval(x->al_timespan);
+      324       324    2            Cdeleteset(x->al_rivals);
+      325       325    2            Ldeleteset(x->al_inits);
+      326       326    2            clean_interval(x->al_busy);
+      327       327    2            clean_allocs(x->al_mates);
+      328       328    2            oldalloc(x);
+      329       329    2         }
+      330       330    1        }
+      331       331
+      332       332
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=10 
+      333       333
+      334       334             STATIC cleanitems(list)
+      335       335              item_p list;
+      336       336             {
+      337       337    1         register item_p x,next;
+      338       338    1
+      339       339    1         for (x = list; x != (item_p) 0; x = next ) {
+      340       340    2            next = x->it_next;
+      341       341    2            cleantimeset(x->it_usage);
+      342       342    2            olditem(x);
+      343       343    2         }
+      344       344    1        }
+      345       345
+      346       346
+      347       347             ra_initialize()
+      348       348             {
+      349       349    1         init_replacements(ps,ws);
+      350       350    1        }
+      351       351
+      352       352
+      353       353             ra_optimize(p)
+      354       354              proc_p p;
+      355       355             {
+      356       356    1         item_p itemlist;
+      357       357    1         alloc_p alloclist,packed,unpacked;
+      358       358    1         offset locls;
+      359       359    1         bool time_opt = (time_space_ratio == 100);
+      360       360    1         ra_set_bblocks (p);
+      361       361    1
+      362       362    1         if (oconsttab == (cond_p) 0 && oglobaltab == (cond_p) 0 ) {
+      363       363    2           ra_set_machine_stuff (); }
+      364       364    1
+      365       365    1         ra_extproc(p);
+      366       366    1         ra_loop_blocks(p);
+      367       367    1         alloc_id =0;
+      368       368    1         locls = p->p_localbytes;
+      369       369    1         build_itemlist(p,items,&nrinstrs);
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=11 
+      370       370    1         instrmap = (line_p *) newmap(nrinstrs-1); /* map starts counting at 0 */
+      371       371    1         make_instrmap(p,instrmap);
+      372       372    1         build_lifetimes(items);
+      373       373    1         /*  print_items(items,p); */
+      374       374    1         /* statistics(items); */
+      375       375    1         itemlist = cat_items(items); /* make one list */
+      376       376    1         alloclist = build_alloc_list(p,Lnrelems(p->p_loops),
+      377       377    1                       itemlist);
+      378       378    1         build_rivals_graph(alloclist);
+      379       379    1         compute_profits(alloclist,time_opt);
+      380       380    1         /* print_allocs(alloclist); */
+      381       381    1         pack(alloclist,time_opt,&packed,&unpacked,p);
+      382       382    1         stat_regusage(packed);
+      383       383    1         xform_proc(p,packed,nrinstrs,instrmap);
+      384       384    1         /* print_allocs(packed);   */
+      385       385    1        /* p->p_localbytes = locls;  - keep dummy temps for the present. */
+      386       386    1         /* don't really allocate dummy local variables! */
+      387       387    1        /* rem_locals(p,packed);     DON'T eliminate dummys at this time
+      388       388    1         rem_formals(p,packed);        keep for the present. */
+      389       389    1         /* remove storage for real locals that
+      390       390    1          *are always put in register .
+      391       391    1          */
+      392       392    1         clean_allocs(unpacked);
+      393       393    1         clean_allocs(packed);
+      394       394    1         cleanitems(itemlist);
+      395       395    1         oldmap(instrmap,nrinstrs-1);
+      396       396    1         ra_cleanproc(p);
+      397       397    1        }
+      398       398
+      399       399
+      400       400
+      401       401             ramain(argc,argv)
+      402       402              int argc;
+      403       403              char *argv[];
+      404       404             {
+      405       405    1         int j;
+      406       406    1         int i;
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=12 
+      407       407    1         oproctab = (cond_p) 0;
+      408       408    1         oconsttab = (cond_p) 0;
+      409       409    1         odconsttab = (cond_p) 0;
+      410       410    1         oglobaltab = (cond_p) 0;
+      411       411    1         regsav_cost = (cond_p) 0;
+      412       412    1         aproctab = (cond_p) 0;
+      413       413    1         aconsttab = (cond_p) 0;
+      414       414    1         adconsttab = (cond_p) 0;
+      415       415    1         aglobaltab = (cond_p) 0;
+      416       416    1         for (i=0; i < NRREGTYPES; i++) {
+      417       417    2          olocaddrtab [i] = (cond_p) 0;
+      418       418    2          olocaltab [i] = (cond_p) 0; }
+      419       419    1         for (j=0; j < NRREGTYPES; j++) {
+      420       420    2         for (i=0; i < NRREGTYPES; i++) {
+      421       421    3          alocaltab [i][j] = (cond_p) 0;
+      422       422    3          alocaddrtab [i][j] = (cond_p) 0; } }
+      423       423    1         go(argc,argv,ra_initialize,ra_optimize,ra_machinit,no_action);
+      424       424    1           return ;
+      425       425    1        }
+      426       426
+      427       427
+      428       428             /***************************************************************************/
+      429       429             /***************************************************************************/
+      430       430             /***************************************************************************/
+      431       431
+      432       432             /* debugging stuff */
+      433       433
+      434       434
+      435       435
+      436       436             char *str_types[] = {
+      437       437    1         "local variable",
+      438       438    1         "addr. of local",
+      439       439    1         "addr. of external",
+      440       440    1         "addr. of procedure",
+      441       441    1         "constant",
+      442       442    1         "double constant"
+      443       443    1        };
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=13 
+      444       444
+      445       445             char *str_regtypes[] = {
+      446       446    1         "any",
+      447       447    1         "loop",
+      448       448    1         "pointer",
+      449       449    1         "float"
+      450       450    1        };
+      451       451
+      452       452
+      453       453             print_items(items,p)
+      454       454              item_p items[];
+      455       455              proc_p p;
+      456       456             {
+      457       457    1         int t;
+      458       458    1         item_p item;
+      459       459    1         interv_p iv;
+      460       460    1
+      461       461    1         printf("BEGIN PROCEDURE %d\n",p->p_id);
+      462       462    1         for (t = 0; t < NRITEMTYPES;t++) {
+      463       463    2            for (item = items[t]; item != (item_p) 0;item = item->it_next) {
+      464       464    3               printf("\nitemtype = %s\n",str_types[t]);
+      465       465    3               if (t == GLOBL_ADDR) {
+      466       466    4                  printf("id of external = %d\n",
+      467       467    4                     item->i_t.it_obj->o_id);
+      468       468    4               } else {
+      469       469    4                  printf("offset = %ld\n",
+      470       470    4                     item->i_t.it_off);
+      471       471    4               }
+      472       472    3               printf("regtype = %s\n",str_regtypes[item->it_regtype]);
+      473       473    3               printf("size = %d\n",item->it_size);
+      474       474    3               printf("#usages = %d\n", Lnrelems(item->it_usage));
+      475       475    3               printf("lifetime = {");
+      476       476    3               for (iv = item->it_lives; iv != (interv_p) 0;
+      477       477    3                    iv = iv->i_next) {
+      478       478    4                  printf("(%d,%d) ",iv->i_start,iv->i_stop);
+      479       479    4               }
+      480       480    3               printf("} \n");
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=14 
+      481       481    3            }
+      482       482    2         }
+      483       483    1         printf("END PROCEDURE %d\n\n",p->p_id);
+      484       484    1        }
+      485       485
+      486       486
+      487       487             print_allocs(list)
+      488       488              alloc_p list;
+      489       489             {
+      490       490    1         alloc_p al,m;
+      491       491    1         item_p item;
+      492       492    1         short t;
+      493       493    1         interv_p iv;
+      494       494    1
+      495       495    1         fprintf(stderr,"BEGIN ALLOCLIST of proc %d\n",curproc->p_id);
+      496       496    1         for (m = list ; m != (alloc_p) 0; m = m->al_next) {
+      497       497    2            for (al = m; al != (alloc_p) 0; al = al->al_mates) {
+      498       498    3               item = al->al_item;
+      499       499    3               t = item->it_type;
+      500       500    3               fprintf(stderr,"\nitem: [type = %s, ",str_types[t]);
+      501       501    3               switch(t) {
+      502       502    4               case GLOBL_ADDR:
+      503       503    4                  fprintf(stderr,"id = %d]\n", item->i_t.it_obj->o_id);
+      504       504    4                  break;
+      505       505    4               case PROC_ADDR:
+      506       506    4                  fprintf(stderr,"id = %d]\n", item->i_t.it_proc->p_id);
+      507       507    4                  break;
+      508       508    4               default:
+      509       509    4                  fprintf(stderr,"offset = %ld]\n", item->i_t.it_off);
+      510       510    4               }
+      511       511    3               fprintf(stderr,"#usages(static) = %d\n",al->al_susecount);
+      512       512    3               fprintf(stderr,"#usages(dyn) = %d\n",al->al_dusecount);
+      513       513    3               fprintf(stderr,"#inits = %d\n",Lnrelems(al->al_inits));
+      514       514    3               fprintf(stderr,"timespan = {");
+      515       515    3               for (iv = al->al_timespan; iv != (interv_p) 0;
+      516       516    3                    iv = iv->i_next) {
+      517       517    4                  fprintf(stderr,"(%d,%d) ",iv->i_start,iv->i_stop);
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=15 
+      518       518    4               }
+      519       519    3               fprintf(stderr,"} \n");
+      520       520    3               fprintf(stderr,"busy = {");
+      521       521    3               for (iv = al->al_busy; iv != (interv_p) 0;
+      522       522    3                    iv = iv->i_next) {
+      523       523    4                  fprintf(stderr,"(%d,%d) ",iv->i_start,iv->i_stop);
+      524       524    4               }
+      525       525    3               fprintf(stderr,"} \n");
+      526       526    3               fprintf(stderr,"profits = %d\n",al->al_profits);
+      527       527    3               fprintf(stderr,"dummy local = %ld\n",al->al_dummy);
+      528       528    3               fprintf(stderr,"regnr = %d\n",al->al_regnr);
+      529       529    3            }
+      530       530    2         }
+      531       531    1        }
+      532       532
+      533       533
+      534       534             short regs_needed[4];
+      535       535             stat_regusage(list)
+      536       536              alloc_p list;
+      537       537             {
+      538       538    1         int i;
+      539       539    1         alloc_p x;
+      540       540    1
+      541       541    1         for (i = 0; i < 4; i++) {
+      542       542    2            regs_needed[i] = 0;
+      543       543    2         }
+      544       544    1         for (x = list; x != (alloc_p) 0; x = x->al_next) {
+      545       545    2            regs_needed[x->al_regtype]++;
+      546       546    2         }
+      547       547    1         /* printf("data regs:%d\n",regs_needed[reg_any]); */
+      548       548    1         /* printf("address regs:%d\n",regs_needed[reg_pointer]); */
+      549       549    1        }
+      550       550
+      551       551
+      552       552
+      553       553             int cnt_regtypes[reg_float+1];
+      554       554
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=16 
+      555       555             statistics(items)
+      556       556              item_p items[];
+      557       557             {
+      558       558    1         register item_p item,next;
+      559       559    1         int t,r;
+      560       560    1         int cnt;
+      561       561    1
+      562       562    1         printf("\nSTATISTICS\n");
+      563       563    1         for (r = 0; r <= reg_float; r++) cnt_regtypes[r] = 0;
+      564       564    1         for (t = 0; t < NRITEMTYPES;t++) {
+      565       565    2            cnt = 0;
+      566       566    2            for (item = items[t]; item != (item_p) 0;item = next) {
+      567       567    3               if (useful_item(item)) {
+      568       568    4                  cnt++;
+      569       569    4                  cnt_regtypes[item->it_regtype]++;
+      570       570    4               }
+      571       571    3               next = item->it_next;
+      572       572    3            }
+      573       573    2            printf("#%s = %d\n",str_types[t],cnt);
+      574       574    2         }
+      575       575    1         for (r = 0; r <= reg_float; r++) {
+      576       576    2            printf("#%s = %d\n",str_regtypes[r],cnt_regtypes[r]);
+      577       577    2         }
+      578       578    1        }
+      579       579             /*i*
+      580       580                   name: ra_set_machine_stuff
+      581       581                   purpose: This routine setsup the machine specific features
+      582       582                   for the target machine that we are working with.
+      583       583                   In this case, the setup is for the Bull 36 bit machine line
+      584       584                   (L66, DPS E,DPS 8,DPS 90,DPS 8000,etc.).
+      585       585             */
+      586       586             ra_set_machine_stuff() {
+      587       587    1        cond_p get_s_condtab();
+      588       588    1        cond_p get_l_condtab();
+      589       589    1
+      590       590    1              regs_available[reg_any] =2;
+      591       591    1              regs_available[reg_pointer] = 0;
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=17 
+      592       592    1              regs_available[reg_float] = 0;
+      593       593    1
+      594       594    1              alocaltab[2][0] = get_s_condtab(0,4,0);
+      595       595    1              alocaltab[0][0] = get_s_condtab(0,2,2);
+      596       596    1
+      597       597    1              alocaddrtab[2][0] = get_s_condtab(0,0,0);
+      598       598    1              alocaddrtab[0][0] = get_s_condtab(0,2,2);
+      599       599    1
+      600       600    1              aconsttab = get_s_condtab(0,2,2);
+      601       601    1              adconsttab = get_s_condtab(0,-1,-1);
+      602       602    1              aglobaltab = get_s_condtab(0,4,2);
+      603       603    1              aproctab = get_s_condtab(0,2,2);
+      604       604    1
+      605       605    1              olocaltab[2] = get_s_condtab(0,6,4);
+      606       606    1              olocaltab[0] = get_s_condtab(0,4,2);
+      607       607    1
+      608       608    1              olocaddrtab[2] = get_s_condtab(0,10,5);
+      609       609    1              olocaddrtab[0] = get_s_condtab(0,10,5);
+      610       610    1
+      611       611    1              oconsttab = get_s_condtab(0,6,4);
+      612       612    1              odconsttab = get_s_condtab(0,1000,1000);
+      613       613    1              oglobaltab = get_s_condtab(0,6,4);
+      614       614    1              oproctab = get_s_condtab(0,6,4);
+      615       615    1
+      616       616    1              regsav_cost = get_l_condtab();
+      617       617    1              return;
+      618       618    1        }
+      619       619
+      620       620             /*I*
+      621       621                   name: get_s_condtab
+      622       622                   purpose: This routine sets up the tables with the info
+      623       623                   that is passed into it.
+      624       624             */
+      625       625             cond_p get_s_condtab( a, b, c) int a,b,c; {
+      626       626    1        cond_p tab;
+      627       627    1
+      628       628    1              tab = newcondtab(1);
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=18 
+      629       629    1              tab[0].mc_cond = a;
+      630       630    1              tab[0].mc_tval = b;
+      631       631    1              tab[0].mc_sval = c;
+      632       632    1              return (tab);
+      633       633    1        }
+      634       634
+      635       635
+      636       636             static save_costs[] = {0,0,0,
+      637       637    1              1,24,0,
+      638       638    1              2,24,0,
+      639       639    1              0,0,0 };
+      640       640
+      641       641             /*i*
+      642       642                   name: get_l_condtab
+      643       643                   purpose: This routine sets up the save costs table for
+      644       644                   the ra phase of ego for the 36 bit world of Bull computers.
+      645       645             */
+      646       646             cond_p get_l_condtab() {
+      647       647    1        int i,j;
+      648       648    1        cond_p tab;
+      649       649    1
+      650       650    1              j = 0;
+      651       651    1              tab = newcondtab(4);
+      652       652    1              for (i=0; i < 4; i++) {
+      653       653    2                tab[i].mc_cond = save_costs[j];
+      654       654    2                tab[i].mc_tval = save_costs[j+1];
+      655       655    2                tab[i].mc_sval = save_costs[j+2];
+      656       656    2                j += 3;
+      657       657    2              }
+      658       658    1              return (tab);
+      659       659    1        }
+      660       660
+      661       661             /*i*
+      662       662                   name: ra_set_bblocks
+      663       663                   purpose: This routine sets the block ids for the program
+      664       664                   blocks of the procedure. Also gets new blength count.
+      665       665             */
+CC.C03    File=zbe$ra:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=19 
+      666       666             ra_set_bblocks (p) proc_p p; {
+      667       667    1        int i = 1;
+      668       668    1        bblock_p b;
+      669       669    1
+      670       670    1              blength = 0;
+      671       671    1              for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      672       672    2                b->b_id = i++;
+      673       673    2                blength++;
+      674       674    2              }
+      675       675    1        }
+      676       676
+---  Include file information  ---
+
+   stdio:h.:LIBRARY. is referenced
+   zbe$types:h.:ZBC3TOU. is referenced
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+   zbe$files:h.:ZBC3TOU. is referenced
+   zbe$get:h.:ZBC3TOU. is referenced
+   zbe$put:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$map:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$go:h.:ZBC3TOU. is referenced
+   em_reg:h.:ZBC3TOU. is referenced
+   zbe$ra:h.:ZBC3TOU. is referenced
+   zbe$ra_items:h.:ZBC3TOU. is referenced
+   zbe$ra_allocl:h.:ZBC3TOU. is referenced
+   zbe$ra_profits:h.:ZBC3TOU. is referenced
+   zbe$ra_pack:h.:ZBC3TOU. is referenced
+   zbe$ra_xform:h.:ZBC3TOU. is referenced
+
+No diagnostics were issued in the file zbe$ra:c.:ZBC3TSI

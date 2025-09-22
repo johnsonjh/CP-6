@@ -1,0 +1,2884 @@
+VERSION E05
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:1    
+        1        1        /*M* FTI$LOWIO lowest level tape file management I/O functions */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* THI=1,PLM=3,MCL=10 */
+        8        8
+        9        9        FTI$LOWIO: PROC(BUF$) ALTRET;
+       10       10
+       11       11        /*P*     NAME: FTI$LOWIO
+       12       12                 PURPOSE: Contains lowest level tape file management I/O
+       13       13                    functions.
+       14       14                 DESCRIPTION: Low level I/O routines generally 1) call FTI_INITQ
+       15       15                    to obtain and initialize a queue packet, 2) fill in queue
+       16       16                    packet fields with operation specific information, and then
+       17       17                    3) send queue packet by calling FTI_SENDQ.  All low level
+       18       18                    I/O routines ALTRET if serious errors occurred during the
+       19       19                    I/O operation.  (Serious errors are I/O error, fatal device
+       20       20                    error, memory trap during I/O, tape write-protected, and
+       21       21                    forward read after write.)  A normal return is taken if
+       22       22                    no errors occurred or if anticipated errors such as end of
+       23       23                    file, beginning of file, end of tape, beginning of tape,
+       24       24                    or blank tape on read occurred.
+       25       25         ***/
+       26       26
+       27       27         /***
+       28       28          *** Include files:
+       29       29          ***/
+       30       30
+       31       31        %INCLUDE B$JIT_C;
+       32      345           %B$JIT0;
+       33      434           %U$JIT1X;
+       34      437           %M$JIT2X;
+       35      440           %F$JIT3;
+       36      445           %S$JIT4X;
+       37      448           %J$JIT5X;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:2    
+       38      451           %A$JIT6;
+       39      461        %INCLUDE B_SEGIDS_C;
+       40     1000        %INCLUDE CP_6_SUBS;
+       41     1540        %MACRO F$DCBBJ(BASED=BASED);
+       42     1541        %INCLUDE F$DCB;
+       43     1590        %MEND;
+       44     1591           %F$DCBBJ(BASED="BASED(JDCB$)");
+       45     1641        %INCLUDE F_ERRORS_C;
+       46     1881        %MACRO FT$DDTBD(BASED=BASED);
+       47     1882        %INCLUDE FT$DDT;
+       48     1943        %MEND;
+       49     1944           %FT$DDTBD(BASED="BASED(DDDT$)");
+       50     2006        %INCLUDE FT_SUBS;
+       51     2086        %INCLUDE N$REQ;
+       52     2160            %N$REQ(NAME=N$REQ,STCLASS="BASED(Q$)");
+       53     2218        %INCLUDE N_FC_C;
+       54     2255        %INCLUDE NK$LDCT;
+       55     2357            %NK$LDCT;
+       56     2403        %INCLUDE NK_LDCT_R;
+       57     2412        %INCLUDE B$TABLES_C;
+       58     2520            %B$XL_ASC_EBC;
+       59     2524            %B$XL_EBC_ASC;
+       60     2528
+       61     2529         /***
+       62     2530          *** External routines:
+       63     2531          ***/
+       64     2532
+       65     2533    1   DCL NIO$QUE ENTRY(1) ALTRET;            /* Send queue packet                  */
+       66     2534    1   DCL NIQ$GET ENTRY(1) ALTRET;            /* Get queue packet                   */
+       67     2535    1   DCL NIQ$REL ENTRY(1) ALTRET;            /* Release queue packet               */
+       68     2536    1   DCL SC_FTIBADSEND ENTRY CONV(2,0);      /* Screech due to bad ioq packet send */
+       69     2537
+       70     2538         /***
+       71     2539          *** SYMREF data:
+       72     2540          ***/
+       73     2541
+       74     2542    1   DCL B$JIT$ PTR SYMREF;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:3    
+       75     2543    1   DCL S_CUN UBIN(36) SYMREF;
+       76     2544
+       77     2545         /***
+       78     2546          *** Parameter:
+       79     2547          ***/
+       80     2548
+       81     2549    1   DCL BUF$ PTR;                           /* Pointer to caller's buffer         */
+       82     2550    1   DCL DCTX REDEF BUF$ SBIN;               /* DCTX on non-DCB calls              */
+       83     2551
+       84     2552         /***
+       85     2553          *** AUTO data:
+       86     2554          ***/
+       87     2555
+       88     2556    1   DCL BCDCB$ PTR AUTO;                    /* Bypass cache DCB pointer           */
+       89     2557    1   DCL 1 BCDCB REDEF BCDCB$,
+       90     2558    1         2 * BIT(24) UNAL,
+       91     2559    1         2 SID BIT(12) UNAL;
+       92     2560    1   DCL DDDT$ PTR AUTO;                /* Pointer to DDT entry for DCB's device   */
+       93     2561    1   DCL JDCB$ PTR AUTO;                     /* Pointer to DCB from JIT            */
+       94     2562    1   DCL N SBIN AUTO;                        /* Length of NCHARS                   */
+       95     2563    1   DCL NCHARS CHAR(N) BASED;               /* Adjustable char string             */
+       96     2564    1   DCL Q$ PTR AUTO;                        /* Pointer to queue packet            */
+       97     2565    1   DCL SAVARS SBIN AUTO;                   /* Saved ARS                          */
+       98     2566
+       99     2567         /***
+      100     2568          *** EQUs:
+      101     2569          ***/
+      102     2570
+      103     2571        %EQU NOERRORS=0;
+      104     2572        %EQU POSLOSTERR=1;
+      105     2573        %EQU NONPOSLOSTERR=2;
+      106     2574
+      107     2575         /***
+      108     2576          *** CONSTANT data:
+      109     2577          ***/
+      110     2578
+      111     2579        /*S*   SCREECH_CODE: FTI-S$BADSEND-8
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:4    
+      112     2580                TYPE: Screech.
+      113     2581                MESSAGE: Can't send queue packet.
+      114     2582                REMARKS: An attempt by tape file management to send a
+      115     2583                   queue packet failed.
+      116     2584         ***/
+      117     2585
+      118     2586        %FT$ERR( ERRNAME=E_BLNKTP, MID='11'O, CODE=%E$BLNKTP, SEV=2 );
+      119     2594        /*E*     ERROR: FTI-E$BLNKTP-2
+      120     2595                 MESSAGE: Blank tape on read% on %TA%
+      121     2596                 DESCRIPTION: DCB.TYC.BLNKTP was set by NIO$QUE.
+      122     2597         ***/
+      123     2598
+      124     2599        %FT$ERR( ERRNAME=E_CANTIO, MID='11'O, CODE=%E$CANTIO, SEV=2 );
+      125     2607        /*E*     ERROR: FTI-E$CANTIO-2
+      126     2608                 MESSAGE: I/O not allowed% on %TA% due to previous error
+      127     2609                 DESCRIPTION: I/O was attempted after an error which caused
+      128     2610                    tape position to be lost occurred.
+      129     2611         ***/
+      130     2612
+      131     2613        %FT$ERR( ERRNAME=E_CDALRT, MID='11'O, CODE=%E$CDALRT, SEV=2 );
+      132     2621        /*E*     ERROR: FTI-E$CDALRT-2
+      133     2622                 MESSAGE: Non-ASCII byte on write% to %TA%
+      134     2623                 DESCRIPTION: DCB.TYC.CDALRT was set by NIO$QUE.
+      135     2624         ***/
+      136     2625
+      137     2626        %FT$ERR( ERRNAME=E_FRAW, MID='11'O, CODE=%E$FRAW, SEV=2 );
+      138     2634        /*E*     ERROR: FTI-E$FRAW-2
+      139     2635                 MESSAGE: Attempt to read after writing tape% on %TA%
+      140     2636                 DESCRIPTION: DCB.TYC.FRAW was set by NIO$QUE.
+      141     2637         ***/
+      142     2638
+      143     2639        %FT$ERR( ERRNAME=E_IOERR, MID='11'O, CODE=%E$IOERR, SEV=2 );
+      144     2647        /*E*     ERROR: FTI-E$IOERR-2
+      145     2648                 MESSAGE: Irrecoverable I/O error% on %TA%
+      146     2649                 DESCRIPTION: DCB.TYC.IOERR was set by NIO$QUE.
+      147     2650         ***/
+      148     2651
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:5    
+      149     2652        %FT$ERR( ERRNAME=E_MTRAP, MID='11'O, CODE=%E$MTRAP, SEV=2 );
+      150     2660        /*E*     ERROR: FTI-E$MTRAP-2
+      151     2661                 MESSAGE: Buffer inaccessible during I/O% on %TA%
+      152     2662                 DESCRIPTION: DCB.TYC.MTRAP was set by NIO$QUE.
+      153     2663         ***/
+      154     2664
+      155     2665        %FT$ERR( ERRNAME=E_OPER, MID='11'O, CODE=%E$OPER, SEV=2 );
+      156     2673        /*E*     ERROR: FTI-E$OPER-2
+      157     2674                 MESSAGE: Fatal device error% on %TA%
+      158     2675                 DESCRIPTION: DCB.TYC.OPER was set by NIO$QUE.
+      159     2676         ***/
+      160     2677
+      161     2678        %FT$ERR( ERRNAME=E_PROT, MID='11'O, CODE=%E$PROT, SEV=2 );
+      162     2686        /*E*     ERROR: FTI-E$PROT-2
+      163     2687                 MESSAGE: Write protected drive% on %TA%
+      164     2688                 DESCRIPTION: DCB.TYC.PROT was set by NIO$QUE.
+      165     2689         ***/
+      166     2690
+      167     2691        /*********************************************************************/
+      168     2692        %EJECT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:6    
+      169     2693        /*********************************************************************/
+      170     2694    1   FTI_INITQ: PROC(B$) ALTRET;
+      171     2695        /*F*    NAME: FTI_INITQ
+      172     2696                PURPOSE: Initialize for I/O function.
+      173     2697                DESCRIPTION: Sets up pointer to DCB; gets queue packet and
+      174     2698                   initializes it for user associated I/O.  The pointer to the
+      175     2699                   buffer is passed as an argument; the length of the buffer is
+      176     2700                   obtained from DCB.ARS.
+      177     2701                   An ALTRETURN is taken if position has been lost on the drive.
+      178     2702         ***/
+      179     2703
+      180     2704         /***
+      181     2705          *** Parameter:
+      182     2706          ***/
+      183     2707
+      184     2708    2   DCL B$ PTR;                             /* Pointer to I/O buffer              */
+      185     2709
+      186     2710        /********************/
+      187     2711
+      188     2712    2      JDCB$ = B$JIT.DCB$;                  /* Get pointer to DCB                 */
+      189     2713    2      N = F$DCB.SETX;
+      190     2714    2      IF N > 0
+      191     2715    3       THEN DO;
+      192     2716    3         DDDT$ = NK$LDCT$(N)->NK$LDCT.DDT$;
+      193     2717    3         IF FT$DDT.POSLOST THEN N = 0;
+      194     2718    3         END;
+      195     2719    2      IF N <= 0
+      196     2720    3       THEN DO;                  /* I/O is not allowed due to previous error     */
+      197     2721    3         IF NOT B$JIT.ERR THEN B$JIT.ERR = E_CANTIO; /*E* ERROR: FTI-E$CANTIO */
+      198     2722    3         ALTRETURN;
+      199     2723    3         END;
+      200     2724    2      CALL NIQ$GET(Q$);                    /* Get queue packet                   */
+      201     2725    2      N$REQ.OPFLG.USER = %YES#;            /* User associated                    */
+      202     2726    2      N$REQ.USER# = S_CUN;
+      203     2727    2      F$DCB.WAIT = 1;               /*N* All-tape-I/O-is-wait (for now)  */
+      204     2728    2      IF F$DCB.WAIT = 1
+      205     2729    2       THEN N$REQ.OPFLG.WAIT = %YES#;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:7    
+      206     2730    2       ELSE N$REQ.OPFLG.WAIT = %NO#;
+      207     2731    2      N$REQ.DLA.DCTX = F$DCB.SETX;         /* Set device index                   */
+      208     2732    2      N$REQ.OPFLG.BPF = %YES#;             /* BUF$ contains pointer to buffer    */
+      209     2733    2      N$REQ.BUF$ = B$;                     /* Set buffer pointer                 */
+      210     2734    2      N$REQ.OPFLG.ARS = %YES#;             /* Return DCB.ARS                     */
+      211     2735    2      N$REQ.DCB$ = JDCB$;                  /* Set DCB pointer                    */
+      212     2736    2      N$REQ.BUFSIZE = F$DCB.ARS;           /* Set # bytes to transfer            */
+      213     2737    2      F$DCB.TYC(1) = '0'B;                 /* Reset TYC                          */
+      214     2738    2      N$REQ.OPFLG.HOLD = %YES#;            /* Hold to detect errors              */
+      215     2739    2      RETURN;
+      216     2740
+      217     2741    2   END FTI_INITQ;
+      218     2742        /*********************************************************************/
+      219     2743        %EJECT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:8    
+      220     2744        /*********************************************************************/
+      221     2745    1   FTI_INITQDEV: PROC ALTRET;
+      222     2746        /*F*  NAME: FTI_INITQDEV
+      223     2747              PURPOSE: Initialize for I/O function with no DCB.
+      224     2748              DESCRIPTION: Gets queue packet and initializes
+      225     2749                it for user associated I/O.
+      226     2750         ***/
+      227     2751
+      228     2752        /********************/
+      229     2753
+      230     2754         /***
+      231     2755          *** Make sure I/O ok for this drive.
+      232     2756          ***/
+      233     2757
+      234     2758    2      N = DCTX;                            /* Localize DCTX                      */
+      235     2759    2      IF N > 0
+      236     2760    3       THEN DO;                            /* Have a drive                       */
+      237     2761    3         DDDT$ = NK$LDCT$(N)->NK$LDCT.DDT$;
+      238     2762    3         IF FT$DDT.POSLOST THEN N = 0;
+      239     2763    3         END;
+      240     2764    2      IF N <= 0
+      241     2765    3       THEN DO;                  /* I/O is not allowed due to previous error     */
+      242     2766    3         IF NOT B$JIT.ERR THEN B$JIT.ERR = E_CANTIO; /*E* ERROR: FTI-E$CANTIO */
+      243     2767    3         ALTRETURN;
+      244     2768    3         END;
+      245     2769    2      CALL NIQ$GET(Q$);
+      246     2770    2      N$REQ.OPFLG.USER = %YES#;            /* User associated                    */
+      247     2771    2      N$REQ.USER# = S_CUN;
+      248     2772    2      N$REQ.OPFLG.WAIT = %YES#;
+      249     2773    2      N$REQ.DLA.DCTX = N;
+      250     2774    2      N$REQ.DCB$ = DCBADDR(%M$STAR#);      /* Need a DCB                         */
+      251     2775    2      N$REQ.OPFLG.HOLD = %YES#;            /* Keep to detect any error           */
+      252     2776    2      RETURN;
+      253     2777
+      254     2778    2   END FTI_INITQDEV;
+      255     2779        /*********************************************************************/
+      256     2780        %EJECT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:9    
+      257     2781        /*********************************************************************/
+      258     2782    1   FTI_SENDQ: PROC ALTRET;
+      259     2783        /*F*    NAME: FTI_SENDQ
+      260     2784                PURPOSE: Send queue packet; for serious errors (IOERR, OPER,
+      261     2785                   MTRAP, PROT, FRAW) set JIT.ERR and ALTRETURN.
+      262     2786         ***/
+      263     2787
+      264     2788        /********************/
+      265     2789
+      266     2790    3      DO WHILE('1'B);
+      267     2791    3         CALL NIO$QUE(N$REQ) ALTRET(SENDERR);
+      268     2792    3         B$JIT.ACCESS.TAPES = B$JIT.ACCESS.TAPES + 1;
+      269     2793                                                /* Count successful NIO$QUE calls     */
+      270     2794
+      271     2795            /***
+      272     2796             *** Set JIT.ERR for serious non-recoverable errors.
+      273     2797             ***/
+      274     2798    3         N = %NOERRORS;                    /* Assume no errors                   */
+      275     2799
+      276     2800    3         IF N$REQ.OPFLG.ARS
+      277     2801    4          THEN DO;                         /* DCB associated I/O                 */
+      278     2802    4            BCDCB$ = JDCB$;
+      279     2803    4            BCDCB.SID = %RONCSID;          /* Bypass cache DCB pointer           */
+      280     2804    4            F$DCB.ARS = BCDCB$->F$DCB.ARS; /* Get "real" ARS value               */
+      281     2805    4            F$DCB.TYC(1) = BCDCB$->F$DCB.TYC(1);
+      282     2806    4            F$DCB.TYC(0) = F$DCB.TYC(1);   /* No wait TYC = wait TYC             */
+      283     2807    4            END;
+      284     2808    3         N$REQ.TYC.EGV = '0'B;             /* I/O done                           */
+      285     2809    3         IF NOT N$REQ.TYC THEN GOTO FASTXIT; /* Return if no errors              */
+      286     2810    3         IF N$REQ.TYC.BOT THEN FT$DDT.POS = FTP_BOV#;
+      287     2811    3         N = %NONPOSLOSTERR;               /* Assume not position lost error     */
+      288     2812    3         IF N$REQ.TYC.IOERR
+      289     2813    4          THEN DO;                         /* I/O error                          */
+      290     2814                 /*E* ERROR: FTI-E$IOERR */
+      291     2815    4            B$JIT.ERR = E_IOERR;
+      292     2816    4            N = %POSLOSTERR;               /* Position lost                      */
+      293     2817    4            END;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:10   
+      294     2818    3          ELSE IF N$REQ.TYC.OPER
+      295     2819    4             THEN DO;                      /* Fatal device error                 */
+      296     2820                    /*E* ERROR: FTI-E$OPER */
+      297     2821    4               B$JIT.ERR = E_OPER;
+      298     2822    4               N = %POSLOSTERR;
+      299     2823    4               END;
+      300     2824    3             ELSE IF N$REQ.TYC.MTRAP
+      301     2825    3                THEN                       /* Memory trap during I/O             */
+      302     2826                       /*E* ERROR: FTI-E$MTRAP */
+      303     2827    3                  B$JIT.ERR = E_MTRAP;
+      304     2828    3                ELSE IF N$REQ.TYC.PROT
+      305     2829    3                   THEN                    /* Write protect                      */
+      306     2830                          /*E* ERROR: FTI-E$PROT */
+      307     2831    3                     B$JIT.ERR = E_PROT;
+      308     2832    3                   ELSE IF N$REQ.TYC.FRAW
+      309     2833    3                      THEN                 /* Forward read after write           */
+      310     2834                             /*E* ERROR: FTI-E$FRAW */
+      311     2835    3                        B$JIT.ERR = E_FRAW;
+      312     2836    3                      ELSE IF N$REQ.TYC.BLNKTP
+      313     2837    4                         THEN DO;          /* Blank tape on read                 */
+      314     2838                                /*E* ERROR: FTI-E$BLNKTP */
+      315     2839    4                           B$JIT.ERR = E_BLNKTP;
+      316     2840    4                           N = %POSLOSTERR;
+      317     2841    4                           END;
+      318     2842    3                         ELSE IF N$REQ.TYC.CDALRT
+      319     2843    3                            THEN           /* Code alert                         */
+      320     2844                                   /*E* ERROR: FTI-E$CDALRT */
+      321     2845    3                              B$JIT.ERR = E_CDALRT;
+      322     2846    3                            ELSE N = %NOERRORS;
+      323     2847    3   FASTXIT: ;
+      324     2848    3         CALL NIQ$REL(Q$);
+      325     2849    4         DO CASE(N);
+      326     2850    4          CASE(%NOERRORS);                 /* No or minor error                  */
+      327     2851    4            RETURN;
+      328     2852    4          CASE(%NONPOSLOSTERR);            /* Error not causing position lost    */
+      329     2853    4            ALTRETURN;
+      330     2854    4          CASE(%POSLOSTERR);
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:11   
+      331     2855    4            IF F$DCB.ASN ~= %DEVICE# THEN FT$DDT.POSLOST = %YES#;
+      332     2856    4            ALTRETURN;
+      333     2857    4          END;
+      334     2858
+      335     2859            /***
+      336     2860             *** Error sending queue packet.
+      337     2861             ***/
+      338     2862
+      339     2863    3   SENDERR: ;
+      340     2864    3         CALL SC_FTIBADSEND;        /*S* SCREECH_CODE: FTI-S$BADSEND */
+      341     2865    3         END;
+      342     2866
+      343     2867    2   END FTI_SENDQ;
+      344     2868        /*********************************************************************/
+      345     2869        %EJECT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:12   
+      346     2870        /*********************************************************************/
+      347     2871    1   FTI$RDASC: ENTRY(BUF$) ALTRET;
+      348     2872        /*F*    NAME: FTI$RDASC
+      349     2873                PURPOSE: Read ASCII tape record (DCB.ARS bytes).
+      350     2874         ***/
+      351     2875
+      352     2876        /********************/
+      353     2877
+      354     2878    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+      355     2879    1      IF F$DCB.TAPTYP.USRBUF THEN N$REQ.OPFLG.CLR = %YES#;
+      356     2880    1      N$REQ.FC = %N_RDASC;                 /* Read ASCII                         */
+      357     2881    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      358     2882    1      RETURN;
+      359     2883
+      360     2884        /****************************************/
+      361     2885    1   FTI$RDASCEBC: ENTRY(BUF$) ALTRET;
+      362     2886        /*F*    NAME: FTI$RDASCEBC
+      363     2887                PURPOSE: Read ASCII or EBCDIC tape record (DCB.ARS bytes).
+      364     2888         ***/
+      365     2889
+      366     2890        /********************/
+      367     2891
+      368     2892    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+      369     2893    1      N$REQ.OPFLG.CLR = %YES#;             /* May be into user buffer            */
+      370     2894    1      N$REQ.BUFSIZE = 80;                  /* Read label                         */
+      371     2895    1      N$REQ.FC = %N_RDASC;                 /* Read ASCII                         */
+      372     2896    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      373     2897    1      IF FT$DDT.EBCDIC AND NOT F$DCB.TYC.EOF(1)
+      374     2898    2       THEN DO;                            /* Translate                          */
+      375     2899    2         N = F$DCB.ARS;
+      376     2900    2         CALL XLATE( BUF$->NCHARS, B$XL_EBC_ASC, BUF$->NCHARS );
+      377     2901    2         END;
+      378     2902    1      RETURN;
+      379     2903
+      380     2904        /****************************************/
+      381     2905    1   FTI$RDBIN: ENTRY(BUF$) ALTRET;
+      382     2906        /*F*    NAME: FTI$RDBIN
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:13   
+      383     2907                PURPOSE: Read binary tape record (DCB.ARS bytes).
+      384     2908         ***/
+      385     2909
+      386     2910        /********************/
+      387     2911    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+      388     2912    1      IF F$DCB.TAPTYP.USRBUF THEN N$REQ.OPFLG.CLR = %YES#;
+      389     2913    1      N$REQ.FC = %N_RDBIN;                 /* Read binary                        */
+      390     2914    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      391     2915    1      RETURN;
+      392     2916
+      393     2917        /****************************************/
+      394     2918    1   FTI$WRASC: ENTRY(BUF$) ALTRET;
+      395     2919        /*F*    NAME: FTI$WRASC
+      396     2920                PURPOSE: Write ASCII tape record (DCB.ARS bytes).
+      397     2921         ***/
+      398     2922
+      399     2923
+      400     2924        /********************/
+      401     2925
+      402     2926    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+      403     2927    1      N$REQ.FC = %N_WRASC;                 /* Write ASCII                        */
+      404     2928    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      405     2929    1      RETURN;
+      406     2930
+      407     2931        /****************************************/
+      408     2932    1   FTI$WRASCEBC: ENTRY(BUF$) ALTRET;
+      409     2933        /*F*    NAME: FTI$WRASCEBC
+      410     2934                PURPOSE: Write ASCII or EBCDIC tape record (DCB.ARS bytes).
+      411     2935         ***/
+      412     2936
+      413     2937
+      414     2938        /********************/
+      415     2939
+      416     2940    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+      417     2941    1      N$REQ.BUFSIZE = 80;                  /* Write label                        */
+      418     2942    1      N$REQ.FC = %N_WRASC;                 /* Write ASCII                        */
+      419     2943    1      IF FT$DDT.EBCDIC
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:14   
+      420     2944    2       THEN DO;                            /* Translate                          */
+      421     2945    2         N = 80;
+      422     2946    2         CALL XLATE( BUF$->NCHARS, B$XL_ASC_EBC, BUF$->NCHARS );
+      423     2947    2         END;
+      424     2948    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      425     2949    1      RETURN;
+      426     2950
+      427     2951        /****************************************/
+      428     2952    1   FTI$WRBIN: ENTRY(BUF$) ALTRET;
+      429     2953        /*F*    NAME: FTI$WRBIN
+      430     2954                PURPOSE: Write binary tape record (DCB.ARS bytes).
+      431     2955         ***/
+      432     2956
+      433     2957        /********************/
+      434     2958
+      435     2959    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+      436     2960    1      N$REQ.FC = %N_WRBIN;                 /* Write binary                       */
+      437     2961    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      438     2962    1      RETURN;
+      439     2963
+      440     2964        /****************************************/
+      441     2965    1   FTI$WRFM: ENTRY ALTRET;
+      442     2966        /*F*    NAME: FTI$WRFM
+      443     2967                PURPOSE: Write file mark.
+      444     2968         ***/
+      445     2969
+      446     2970        /********************/
+      447     2971
+      448     2972    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              2972               /* Get and initialize queue packet */
+      449     2973    1      N$REQ.FC = %N_WRFM;                  /* Write file mark                    */
+      450     2974    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      451     2975    1      FT$DDT.FMCNT = FT$DDT.FMCNT + 1;     /* Count file mark written            */
+      452     2976    1      RETURN;
+      453     2977
+      454     2978        /****************************************/
+      455     2979    1   FTI$WRFMDEV: ENTRY(BUF$) ALTRET;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:15   
+      456     2980        /*F*  NAME: FTI$WRFMDEV
+      457     2981              PURPOSE: Non-DCB write file mark.
+      458     2982         ***/
+      459     2983
+      460     2984        /********************/
+      461     2985
+      462     2986    1      CALL FTI_INITQDEV ALTRET(JUSTALT);
+      463     2987    1      N$REQ.FC = %N_WRFM;
+      464     2988    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      465     2989    1      FT$DDT.FMCNT = FT$DDT.FMCNT + 1;
+      466     2990    1      RETURN;
+      467     2991
+      468     2992        /****************************************/
+      469     2993    1   FTI$REWIND: ENTRY ALTRET;
+      470     2994        /*F*    NAME: FTI$REWIND
+      471     2995                PURPOSE: Rewind tape.
+      472     2996         ***/
+      473     2997
+      474     2998        /********************/
+      475     2999
+      476     3000    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3000               /* Get and initialize queue packet */
+      477     3001    1      N$REQ.FC = %N_REWIND;                /* Rewind tape                        */
+      478     3002    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      479     3003    1      FT$DDT.POS = FTP_BOV#;               /* At beginning of volume             */
+      480     3004    1      FT$DDT.FMCNT = 0;                    /* No file marks crossed              */
+      481     3005    1      RETURN;
+      482     3006
+      483     3007        /****************************************/
+      484     3008    1   FTI$PERMIT: ENTRY ALTRET;
+      485     3009        /*F*    NAME: FTI$PERMIT
+      486     3010                PURPOSE: Set write permit if write allowed.
+      487     3011         ***/
+      488     3012
+      489     3013        /********************/
+      490     3014
+      491     3015    1      IF NK$LDCT$(B$JIT.DCB$->F$DCB.SETX)->NK$LDCT.DDT$->FT$DDT.RINGIN
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:16   
+      492     3016    2       THEN DO;                            /* Permit allowed                     */
+      493     3017    2         CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3017                  /* Get and initialize queue packet */
+      494     3018    2         N$REQ.FC = %N_PERMIT;             /* Set write permit                   */
+      495     3019    2         CALL FTI_SENDQ ALTRET(JUSTALT);
+      496     3020    2         RETURN;
+      497     3021    2         END;
+      498     3022    2       ELSE DO;                            /* Can't write--permit not allowed    */
+      499     3023    2         B$JIT.ERR = E_PROT; /*E* ERROR: FTI-E$PROT */
+      500     3024    2         ALTRETURN;
+      501     3025    2         END;
+      502     3026
+      503     3027        /****************************************/
+      504     3028    1   FTI$SD6250: ENTRY ALTRET;
+      505     3029        /*F*    NAME: FTI$SD6250
+      506     3030                PURPOSE: Set density to 6250 bpi.
+      507     3031         ***/
+      508     3032
+      509     3033        /********************/
+      510     3034
+      511     3035    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3035               /* Get and initialize queue packet */
+      512     3036    1      N$REQ.FC = %N_SD6250;                /* Set density to 6250                */
+      513     3037    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      514     3038    1      FT$DDT.DENSITY = %D6250#;
+      515     3039    1      RETURN;
+      516     3040
+      517     3041        /****************************************/
+      518     3042    1   FTI$SD1600: ENTRY ALTRET;
+      519     3043        /*F*    NAME: FTI$SD1600
+      520     3044                PURPOSE: Set density to 1600 bpi.
+      521     3045         ***/
+      522     3046
+      523     3047        /********************/
+      524     3048
+      525     3049    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3049               /* Get and initialize queue packet */
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:17   
+      526     3050    1      N$REQ.FC = %N_SD1600;                /* Set density to 1600                */
+      527     3051    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      528     3052    1      FT$DDT.DENSITY = %D1600#;
+      529     3053    1      RETURN;
+      530     3054
+      531     3055        /****************************************/
+      532     3056    1   FTI$SD800: ENTRY ALTRET;
+      533     3057        /*F*    NAME: FTI$SD800
+      534     3058                PURPOSE: Set density to 800 bpi.
+      535     3059         ***/
+      536     3060
+      537     3061        /********************/
+      538     3062
+      539     3063    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3063               /* Get and initialize queue packet */
+      540     3064    1      N$REQ.FC = %N_SD800;                 /* Set density to 800                 */
+      541     3065    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      542     3066    1      FT$DDT.DENSITY = %D800#;
+      543     3067    1      RETURN;
+      544     3068
+      545     3069        /****************************************/
+      546     3070    1   FTI$SPREC: ENTRY ALTRET;
+      547     3071        /*F*    NAME: FTI$SPREC
+      548     3072                PURPOSE: Space DCB.ARS tape records.
+      549     3073         ***/
+      550     3074
+      551     3075        /********************/
+      552     3076
+      553     3077    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3077               /* Get and initialize queue packet */
+      554     3078    1      N$REQ.FC = %N_SPREC;                 /* Space records                      */
+      555     3079    1      N$REQ.RCT = F$DCB.ARS;               /* # specified in DCB                 */
+      556     3080    1      SAVARS = F$DCB.ARS;
+      557     3081    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      558     3082    1      IF SAVARS < 0
+      559     3083    2       THEN DO;                            /* Change EOF to BOF                  */
+      560     3084    2         IF F$DCB.TYC.EOF(1)
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:18   
+      561     3085    3          THEN DO;
+      562     3086    3            F$DCB.TYC.EOF(1) = '0'B;
+      563     3087    3            F$DCB.TYC.BOF(1) = '1'B;
+      564     3088    3            F$DCB.TYC(0) = F$DCB.TYC(1);
+      565     3089    3            END;
+      566     3090    2         END;
+      567     3091    1      RETURN;
+      568     3092
+      569     3093        /****************************************/
+      570     3094    1   FTI$SPFILE: ENTRY ALTRET;
+      571     3095        /*F*    NAME: FTI$SPFILE
+      572     3096                PURPOSE: Space DCB.ARS tape files.
+      573     3097         ***/
+      574     3098
+      575     3099        /********************/
+      576     3100
+      577     3101    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3101               /* Get and initialize queue packet */
+      578     3102    1      N$REQ.FC = %N_SPFILE;                /* Space files                        */
+      579     3103    1      N$REQ.RCT = F$DCB.ARS;               /* # specified in DCB                 */
+      580     3104    1      SAVARS = F$DCB.ARS;                  /* Remember direction                 */
+      581     3105    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      582     3106    1      IF SAVARS < 0
+      583     3107    2       THEN DO;
+      584     3108    2         N = - F$DCB.ARS;
+      585     3109    2         IF F$DCB.TYC.EOF(1)
+      586     3110    3          THEN DO;                         /* Change EOF to BOF for - SPREC      */
+      587     3111    3            F$DCB.TYC.EOF(1) = '0'B;
+      588     3112    3            F$DCB.TYC.BOF(1) = '1'B;
+      589     3113    3            F$DCB.TYC(0) = F$DCB.TYC(1);
+      590     3114    3            END;
+      591     3115    2         END;
+      592     3116    1       ELSE N = F$DCB.ARS;
+      593     3117    1      FT$DDT.FMCNT = FT$DDT.FMCNT + N;     /* Keep fm count                      */
+      594     3118    1      RETURN;
+      595     3119
+      596     3120        /****************************************/
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:19   
+      597     3121    1   FTI$REWINDDEV: ENTRY(BUF$) ALTRET;
+      598     3122        /*F*  NAME: FTI$REWINDDEV
+      599     3123              PURPOSE: Non-DCB rewind tape.
+      600     3124         ***/
+      601     3125
+      602     3126        /********************/
+      603     3127
+      604     3128    1      CALL FTI_INITQDEV ALTRET(JUSTALT);   /* Get and initialize queue packet    */
+      605     3129    1      N$REQ.FC = %N_REWIND;                /* Rewind tape                        */
+      606     3130    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+      607     3131    1      FT$DDT.POS = FTP_BOV#;
+      608     3132    1      FT$DDT.FMCNT = 0;
+      609     3133    1      RETURN;
+      610     3134
+      611     3135        /****************************************/
+      612     3136
+      613     3137    1   JUSTALT: ;
+      614     3138    1      ALTRETURN;
+      615     3139
+      616     3140    1   END FTI$LOWIO;
+      617     3141        /*********************************************************************/
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:20   
+--  Include file information  --
+
+   B$TABLES_C.:E05TOU  cannot be made into a system file and is referenced.
+   NK_LDCT_R.:E05TOU  cannot be made into a system file and is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   FT_SUBS.:E05TOU  is referenced.
+   FT$DDT.:E05TOU  is referenced.
+   F_ERRORS_C.:E05TOU  is referenced.
+   F$DCB.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   B_SEGIDS_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+      No diagnostics issued in procedure FTI$LOWIO.
+
+   Procedure FTI$LOWIO requires 619 words for executable code.
+   Procedure FTI$LOWIO requires 22 words of local(AUTO) storage.
+
+    No errors detected in file FTI$LOWIO.:E05TSI    .
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:21   
+
+ Object Unit name= FTI$LOWIO                                  File name= FTI$LOWIO.:E05TOU
+ UTS= JUL 29 '97 17:40:31.76 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS      8     10  FTI$LOWIO
+    1   Proc  even  none   619   1153  FTI$LOWIO
+    2  RoData even  none     5      5  FTI$LOWIO
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes    yes     yes      Std        1  FTI$LOWIO
+     1    377          yes     yes      Std        1  FTI$RDASC
+     1    422          yes     yes      Std        1  FTI$RDASCEBC
+     1    471          yes     yes      Std        1  FTI$RDBIN
+     1    514          yes     yes      Std        1  FTI$WRASC
+     1    530          yes     yes      Std        1  FTI$WRASCEBC
+     1    570          yes     yes      Std        1  FTI$WRBIN
+     1    604          yes     yes      Std        0  FTI$WRFM
+     1    626          yes     yes      Std        1  FTI$WRFMDEV
+     1    644          yes     yes      Std        0  FTI$REWIND
+     1    671          yes     yes      Std        0  FTI$PERMIT
+     1    723          yes     yes      Std        0  FTI$SD6250
+     1    746          yes     yes      Std        0  FTI$SD1600
+     1    771          yes     yes      Std        0  FTI$SD800
+     1   1014          yes     yes      Std        0  FTI$SPREC
+     1   1054          yes     yes      Std        0  FTI$SPFILE
+     1   1131          yes     yes      Std        1  FTI$REWINDDEV
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:22   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes          ~proc      0 B_POINTER
+ yes     yes           Std       1 NIQ$GET
+ yes     yes           Std       1 NIO$QUE
+ yes     yes           Std       1 NIQ$REL
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+                       nStd      0 X66_AALT
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_FTIBADSEND                         N$DCT$$                          r    B$XL_ASC_EBC$
+r    B$XL_EBC_ASC$                         B$JIT$                                S_CUN
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ROSID                                 ASLENTSID
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:23   
+
+
+        1        1        /*M* FTI$LOWIO lowest level tape file management I/O functions */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* THI=1,PLM=3,MCL=10 */
+        8        8
+        9        9        FTI$LOWIO: PROC(BUF$) ALTRET;
+
+      9  1 000000   000000 700200 xent  FTI$LOWIO    TSX0  ! X66_AUTO_1
+         1 000001   000026 000001                    ZERO    22,1
+         1 000002   000376 710000 1                  TRA     s:2865+1
+
+       10       10
+       11       11        /*P*     NAME: FTI$LOWIO
+       12       12                 PURPOSE: Contains lowest level tape file management I/O
+       13       13                    functions.
+       14       14                 DESCRIPTION: Low level I/O routines generally 1) call FTI_INITQ
+       15       15                    to obtain and initialize a queue packet, 2) fill in queue
+       16       16                    packet fields with operation specific information, and then
+       17       17                    3) send queue packet by calling FTI_SENDQ.  All low level
+       18       18                    I/O routines ALTRET if serious errors occurred during the
+       19       19                    I/O operation.  (Serious errors are I/O error, fatal device
+       20       20                    error, memory trap during I/O, tape write-protected, and
+       21       21                    forward read after write.)  A normal return is taken if
+       22       22                    no errors occurred or if anticipated errors such as end of
+       23       23                    file, beginning of file, end of tape, beginning of tape,
+       24       24                    or blank tape on read occurred.
+       25       25         ***/
+       26       26
+       27       27         /***
+       28       28          *** Include files:
+       29       29          ***/
+       30       30
+       31       31        %INCLUDE B$JIT_C;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:24   
+       32      345           %B$JIT0;
+       33      434           %U$JIT1X;
+       34      437           %M$JIT2X;
+       35      440           %F$JIT3;
+       36      445           %S$JIT4X;
+       37      448           %J$JIT5X;
+       38      451           %A$JIT6;
+       39      461        %INCLUDE B_SEGIDS_C;
+       40     1000        %INCLUDE CP_6_SUBS;
+       41     1540        %MACRO F$DCBBJ(BASED=BASED);
+       42     1541        %INCLUDE F$DCB;
+       43     1590        %MEND;
+       44     1591           %F$DCBBJ(BASED="BASED(JDCB$)");
+       45     1641        %INCLUDE F_ERRORS_C;
+       46     1881        %MACRO FT$DDTBD(BASED=BASED);
+       47     1882        %INCLUDE FT$DDT;
+       48     1943        %MEND;
+       49     1944           %FT$DDTBD(BASED="BASED(DDDT$)");
+       50     2006        %INCLUDE FT_SUBS;
+       51     2086        %INCLUDE N$REQ;
+       52     2160            %N$REQ(NAME=N$REQ,STCLASS="BASED(Q$)");
+       53     2218        %INCLUDE N_FC_C;
+       54     2255        %INCLUDE NK$LDCT;
+       55     2357            %NK$LDCT;
+       56     2403        %INCLUDE NK_LDCT_R;
+       57     2412        %INCLUDE B$TABLES_C;
+       58     2520            %B$XL_ASC_EBC;
+       59     2524            %B$XL_EBC_ASC;
+       60     2528
+       61     2529         /***
+       62     2530          *** External routines:
+       63     2531          ***/
+       64     2532
+       65     2533    1   DCL NIO$QUE ENTRY(1) ALTRET;            /* Send queue packet                  */
+       66     2534    1   DCL NIQ$GET ENTRY(1) ALTRET;            /* Get queue packet                   */
+       67     2535    1   DCL NIQ$REL ENTRY(1) ALTRET;            /* Release queue packet               */
+       68     2536    1   DCL SC_FTIBADSEND ENTRY CONV(2,0);      /* Screech due to bad ioq packet send */
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:25   
+       69     2537
+       70     2538         /***
+       71     2539          *** SYMREF data:
+       72     2540          ***/
+       73     2541
+       74     2542    1   DCL B$JIT$ PTR SYMREF;
+       75     2543    1   DCL S_CUN UBIN(36) SYMREF;
+       76     2544
+       77     2545         /***
+       78     2546          *** Parameter:
+       79     2547          ***/
+       80     2548
+       81     2549    1   DCL BUF$ PTR;                           /* Pointer to caller's buffer         */
+       82     2550    1   DCL DCTX REDEF BUF$ SBIN;               /* DCTX on non-DCB calls              */
+       83     2551
+       84     2552         /***
+       85     2553          *** AUTO data:
+       86     2554          ***/
+       87     2555
+       88     2556    1   DCL BCDCB$ PTR AUTO;                    /* Bypass cache DCB pointer           */
+       89     2557    1   DCL 1 BCDCB REDEF BCDCB$,
+       90     2558    1         2 * BIT(24) UNAL,
+       91     2559    1         2 SID BIT(12) UNAL;
+       92     2560    1   DCL DDDT$ PTR AUTO;                /* Pointer to DDT entry for DCB's device   */
+       93     2561    1   DCL JDCB$ PTR AUTO;                     /* Pointer to DCB from JIT            */
+       94     2562    1   DCL N SBIN AUTO;                        /* Length of NCHARS                   */
+       95     2563    1   DCL NCHARS CHAR(N) BASED;               /* Adjustable char string             */
+       96     2564    1   DCL Q$ PTR AUTO;                        /* Pointer to queue packet            */
+       97     2565    1   DCL SAVARS SBIN AUTO;                   /* Saved ARS                          */
+       98     2566
+       99     2567         /***
+      100     2568          *** EQUs:
+      101     2569          ***/
+      102     2570
+      103     2571        %EQU NOERRORS=0;
+      104     2572        %EQU POSLOSTERR=1;
+      105     2573        %EQU NONPOSLOSTERR=2;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:26   
+      106     2574
+      107     2575         /***
+      108     2576          *** CONSTANT data:
+      109     2577          ***/
+      110     2578
+      111     2579        /*S*   SCREECH_CODE: FTI-S$BADSEND-8
+      112     2580                TYPE: Screech.
+      113     2581                MESSAGE: Can't send queue packet.
+      114     2582                REMARKS: An attempt by tape file management to send a
+      115     2583                   queue packet failed.
+      116     2584         ***/
+      117     2585
+      118     2586        %FT$ERR( ERRNAME=E_BLNKTP, MID='11'O, CODE=%E$BLNKTP, SEV=2 );
+      119     2594        /*E*     ERROR: FTI-E$BLNKTP-2
+      120     2595                 MESSAGE: Blank tape on read% on %TA%
+      121     2596                 DESCRIPTION: DCB.TYC.BLNKTP was set by NIO$QUE.
+      122     2597         ***/
+      123     2598
+      124     2599        %FT$ERR( ERRNAME=E_CANTIO, MID='11'O, CODE=%E$CANTIO, SEV=2 );
+      125     2607        /*E*     ERROR: FTI-E$CANTIO-2
+      126     2608                 MESSAGE: I/O not allowed% on %TA% due to previous error
+      127     2609                 DESCRIPTION: I/O was attempted after an error which caused
+      128     2610                    tape position to be lost occurred.
+      129     2611         ***/
+      130     2612
+      131     2613        %FT$ERR( ERRNAME=E_CDALRT, MID='11'O, CODE=%E$CDALRT, SEV=2 );
+      132     2621        /*E*     ERROR: FTI-E$CDALRT-2
+      133     2622                 MESSAGE: Non-ASCII byte on write% to %TA%
+      134     2623                 DESCRIPTION: DCB.TYC.CDALRT was set by NIO$QUE.
+      135     2624         ***/
+      136     2625
+      137     2626        %FT$ERR( ERRNAME=E_FRAW, MID='11'O, CODE=%E$FRAW, SEV=2 );
+      138     2634        /*E*     ERROR: FTI-E$FRAW-2
+      139     2635                 MESSAGE: Attempt to read after writing tape% on %TA%
+      140     2636                 DESCRIPTION: DCB.TYC.FRAW was set by NIO$QUE.
+      141     2637         ***/
+      142     2638
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:27   
+      143     2639        %FT$ERR( ERRNAME=E_IOERR, MID='11'O, CODE=%E$IOERR, SEV=2 );
+      144     2647        /*E*     ERROR: FTI-E$IOERR-2
+      145     2648                 MESSAGE: Irrecoverable I/O error% on %TA%
+      146     2649                 DESCRIPTION: DCB.TYC.IOERR was set by NIO$QUE.
+      147     2650         ***/
+      148     2651
+      149     2652        %FT$ERR( ERRNAME=E_MTRAP, MID='11'O, CODE=%E$MTRAP, SEV=2 );
+      150     2660        /*E*     ERROR: FTI-E$MTRAP-2
+      151     2661                 MESSAGE: Buffer inaccessible during I/O% on %TA%
+      152     2662                 DESCRIPTION: DCB.TYC.MTRAP was set by NIO$QUE.
+      153     2663         ***/
+      154     2664
+      155     2665        %FT$ERR( ERRNAME=E_OPER, MID='11'O, CODE=%E$OPER, SEV=2 );
+      156     2673        /*E*     ERROR: FTI-E$OPER-2
+      157     2674                 MESSAGE: Fatal device error% on %TA%
+      158     2675                 DESCRIPTION: DCB.TYC.OPER was set by NIO$QUE.
+      159     2676         ***/
+      160     2677
+      161     2678        %FT$ERR( ERRNAME=E_PROT, MID='11'O, CODE=%E$PROT, SEV=2 );
+      162     2686        /*E*     ERROR: FTI-E$PROT-2
+      163     2687                 MESSAGE: Write protected drive% on %TA%
+      164     2688                 DESCRIPTION: DCB.TYC.PROT was set by NIO$QUE.
+      165     2689         ***/
+      166     2690
+      167     2691        /*********************************************************************/
+      168     2692        %EJECT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:28   
+      169     2693        /*********************************************************************/
+      170     2694    1   FTI_INITQ: PROC(B$) ALTRET;
+
+   2694  1 000003   200012 741300       FTI_INITQ    STX1  ! SAVARS+1,,AUTO
+
+      171     2695        /*F*    NAME: FTI_INITQ
+      172     2696                PURPOSE: Initialize for I/O function.
+      173     2697                DESCRIPTION: Sets up pointer to DCB; gets queue packet and
+      174     2698                   initializes it for user associated I/O.  The pointer to the
+      175     2699                   buffer is passed as an argument; the length of the buffer is
+      176     2700                   obtained from DCB.ARS.
+      177     2701                   An ALTRETURN is taken if position has been lost on the drive.
+      178     2702         ***/
+      179     2703
+      180     2704         /***
+      181     2705          *** Parameter:
+      182     2706          ***/
+      183     2707
+      184     2708    2   DCL B$ PTR;                             /* Pointer to I/O buffer              */
+      185     2709
+      186     2710        /********************/
+      187     2711
+      188     2712    2      JDCB$ = B$JIT.DCB$;                  /* Get pointer to DCB                 */
+
+   2712  1 000004   000000 470400 xsym               LDP0    B$JIT$
+         1 000005   000232 236100                    LDQ     154,,PR0
+         1 000006   200006 756100                    STQ     JDCB$,,AUTO
+
+      189     2713    2      N = F$DCB.SETX;
+
+   2713  1 000007   200006 471500                    LDP1    JDCB$,,AUTO
+         1 000010   100051 236100                    LDQ     41,,PR1
+         1 000011   777777 376007                    ANQ     -1,DL
+         1 000012   200007 756100                    STQ     N,,AUTO
+
+      190     2714    2      IF N > 0
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:29   
+   2714  1 000013   000025 604400 1                  TMOZ    s:2719
+
+      191     2715    3       THEN DO;
+
+      192     2716    3         DDDT$ = NK$LDCT$(N)->NK$LDCT.DDT$;
+
+   2716  1 000014   000000 473400 xsym               LDP3    N$DCT$$
+         1 000015   300000 474506                    LDP4    0,QL,PR3
+         1 000016   400004 236100                    LDQ     4,,PR4
+         1 000017   200005 756100                    STQ     DDDT$,,AUTO
+
+      193     2717    3         IF FT$DDT.POSLOST THEN N = 0;
+
+   2717  1 000020   200005 474500                    LDP4    DDDT$,,AUTO
+         1 000021   400006 236100                    LDQ     6,,PR4
+         1 000022   004000 316007                    CANQ    2048,DL
+         1 000023   000025 600000 1                  TZE     s:2719
+
+   2717  1 000024   200007 450100                    STZ     N,,AUTO
+
+      194     2718    3         END;
+
+      195     2719    2      IF N <= 0
+
+   2719  1 000025   200007 235100                    LDA     N,,AUTO
+         1 000026   000035 605400 1                  TPNZ    s:2724
+
+      196     2720    3       THEN DO;                  /* I/O is not allowed due to previous error     */
+
+      197     2721    3         IF NOT B$JIT.ERR THEN B$JIT.ERR = E_CANTIO; /*E* ERROR: FTI-E$CANTIO */
+
+   2721  1 000027   000012 235100                    LDA     10,,PR0
+         1 000030   000033 601000 1                  TNZ     s:2722
+
+   2721  1 000031   000001 236000 0                  LDQ     E_CANTIO
+         1 000032   000012 756100                    STQ     10,,PR0
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:30   
+      198     2722    3         ALTRETURN;
+
+   2722  1 000033   200012 221300                    LDX1  ! SAVARS+1,,AUTO
+         1 000034   000000 702211                    TSX2  ! 0,X1
+
+      199     2723    3         END;
+      200     2724    2      CALL NIQ$GET(Q$);                    /* Get queue packet                   */
+
+   2724  1 000035   200010 633500                    EPPR3   Q$,,AUTO
+         1 000036   200014 453500                    STP3    @B$+1,,AUTO
+         1 000037   200014 630500                    EPPR0   @B$+1,,AUTO
+         1 000040   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000041   000000 701000 xent               TSX1    NIQ$GET
+         1 000042   000000 011000                    NOP     0
+
+      201     2725    2      N$REQ.OPFLG.USER = %YES#;            /* User associated                    */
+
+   2725  1 000043   200010 470500                    LDP0    Q$,,AUTO
+         1 000044   000400 236007                    LDQ     256,DL
+         1 000045   000004 256100                    ORSQ    4,,PR0
+
+      202     2726    2      N$REQ.USER# = S_CUN;
+
+   2726  1 000046   200010 470500                    LDP0    Q$,,AUTO
+         1 000047   000000 236000 xsym               LDQ     S_CUN
+         1 000050   000027 552104                    STBQ    23,'04'O,PR0
+
+      203     2727    2      F$DCB.WAIT = 1;               /*N* All-tape-I/O-is-wait (for now)  */
+
+   2727  1 000051   200006 471500                    LDP1    JDCB$,,AUTO
+         1 000052   000020 236007                    LDQ     16,DL
+         1 000053   100064 256100                    ORSQ    52,,PR1
+
+      204     2728    2      IF F$DCB.WAIT = 1
+
+   2728  1 000054   100064 236100                    LDQ     52,,PR1
+         1 000055   000020 376007                    ANQ     16,DL
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:31   
+         1 000056   000020 116007                    CMPQ    16,DL
+         1 000057   000063 601000 1                  TNZ     s:2730
+
+      205     2729    2       THEN N$REQ.OPFLG.WAIT = %YES#;
+
+   2729  1 000060   000020 236007                    LDQ     16,DL
+         1 000061   000004 256100                    ORSQ    4,,PR0
+         1 000062   000065 710000 1                  TRA     s:2731
+
+      206     2730    2       ELSE N$REQ.OPFLG.WAIT = %NO#;
+
+   2730  1 000063   000000 236000 2                  LDQ     0
+         1 000064   000004 356100                    ANSQ    4,,PR0
+
+      207     2731    2      N$REQ.DLA.DCTX = F$DCB.SETX;         /* Set device index                   */
+
+   2731  1 000065   200010 470500                    LDP0    Q$,,AUTO
+         1 000066   100051 236100                    LDQ     41,,PR1
+         1 000067   000025 736000                    QLS     21
+         1 000070   000001 676100                    ERQ     1,,PR0
+         1 000071   777770 376003                    ANQ     -8,DU
+         1 000072   000001 656100                    ERSQ    1,,PR0
+
+      208     2732    2      N$REQ.OPFLG.BPF = %YES#;             /* BUF$ contains pointer to buffer    */
+
+   2732  1 000073   200010 470500                    LDP0    Q$,,AUTO
+         1 000074   000010 236007                    LDQ     8,DL
+         1 000075   000004 256100                    ORSQ    4,,PR0
+
+      209     2733    2      N$REQ.BUF$ = B$;                     /* Set buffer pointer                 */
+
+   2733  1 000076   200013 470500                    LDP0    @B$,,AUTO
+         1 000077   000000 236100                    LDQ     0,,PR0
+         1 000100   200010 473500                    LDP3    Q$,,AUTO
+         1 000101   300005 756100                    STQ     5,,PR3
+
+      210     2734    2      N$REQ.OPFLG.ARS = %YES#;             /* Return DCB.ARS                     */
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:32   
+
+   2734  1 000102   200010 473500                    LDP3    Q$,,AUTO
+         1 000103   000200 236007                    LDQ     128,DL
+         1 000104   300004 256100                    ORSQ    4,,PR3
+
+      211     2735    2      N$REQ.DCB$ = JDCB$;                  /* Set DCB pointer                    */
+
+   2735  1 000105   200006 236100                    LDQ     JDCB$,,AUTO
+         1 000106   200010 473500                    LDP3    Q$,,AUTO
+         1 000107   300022 756100                    STQ     18,,PR3
+
+      212     2736    2      N$REQ.BUFSIZE = F$DCB.ARS;           /* Set # bytes to transfer            */
+
+   2736  1 000110   100000 236100                    LDQ     0,,PR1
+         1 000111   000020 736000                    QLS     16
+         1 000112   300004 676100                    ERQ     4,,PR3
+         1 000113   000034 376000 xsym               ANQ     B_VECTNIL+28
+         1 000114   300004 656100                    ERSQ    4,,PR3
+
+      213     2737    2      F$DCB.TYC(1) = '0'B;                 /* Reset TYC                          */
+
+   2737  1 000115   100002 450100                    STZ     2,,PR1
+
+      214     2738    2      N$REQ.OPFLG.HOLD = %YES#;            /* Hold to detect errors              */
+
+   2738  1 000116   200010 473500                    LDP3    Q$,,AUTO
+         1 000117   000004 236007                    LDQ     4,DL
+         1 000120   300004 256100                    ORSQ    4,,PR3
+
+      215     2739    2      RETURN;
+
+   2739  1 000121   200012 221300                    LDX1  ! SAVARS+1,,AUTO
+         1 000122   000001 702211                    TSX2  ! 1,X1
+
+      216     2740
+      217     2741    2   END FTI_INITQ;
+      218     2742        /*********************************************************************/
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:33   
+      219     2743        %EJECT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:34   
+      220     2744        /*********************************************************************/
+      221     2745    1   FTI_INITQDEV: PROC ALTRET;
+
+   2745  1 000123   200012 741300       FTI_INITQDEV STX1  ! SAVARS+1,,AUTO
+
+      222     2746        /*F*  NAME: FTI_INITQDEV
+      223     2747              PURPOSE: Initialize for I/O function with no DCB.
+      224     2748              DESCRIPTION: Gets queue packet and initializes
+      225     2749                it for user associated I/O.
+      226     2750         ***/
+      227     2751
+      228     2752        /********************/
+      229     2753
+      230     2754         /***
+      231     2755          *** Make sure I/O ok for this drive.
+      232     2756          ***/
+      233     2757
+      234     2758    2      N = DCTX;                            /* Localize DCTX                      */
+
+   2758  1 000124   200003 470500                    LDP0    @BUF$,,AUTO
+         1 000125   000000 235100                    LDA     0,,PR0
+         1 000126   200007 755100                    STA     N,,AUTO
+
+      235     2759    2      IF N > 0
+
+   2759  1 000127   000141 604400 1                  TMOZ    s:2764
+
+      236     2760    3       THEN DO;                            /* Have a drive                       */
+
+      237     2761    3         DDDT$ = NK$LDCT$(N)->NK$LDCT.DDT$;
+
+   2761  1 000130   000000 471400 xsym               LDP1    N$DCT$$
+         1 000131   100000 473505                    LDP3    0,AL,PR1
+         1 000132   300004 236100                    LDQ     4,,PR3
+         1 000133   200005 756100                    STQ     DDDT$,,AUTO
+
+      238     2762    3         IF FT$DDT.POSLOST THEN N = 0;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:35   
+
+   2762  1 000134   200005 473500                    LDP3    DDDT$,,AUTO
+         1 000135   300006 236100                    LDQ     6,,PR3
+         1 000136   004000 316007                    CANQ    2048,DL
+         1 000137   000141 600000 1                  TZE     s:2764
+
+   2762  1 000140   200007 450100                    STZ     N,,AUTO
+
+      239     2763    3         END;
+
+      240     2764    2      IF N <= 0
+
+   2764  1 000141   200007 235100                    LDA     N,,AUTO
+         1 000142   000152 605400 1                  TPNZ    s:2769
+
+      241     2765    3       THEN DO;                  /* I/O is not allowed due to previous error     */
+
+      242     2766    3         IF NOT B$JIT.ERR THEN B$JIT.ERR = E_CANTIO; /*E* ERROR: FTI-E$CANTIO */
+
+   2766  1 000143   000000 471400 xsym               LDP1    B$JIT$
+         1 000144   100012 235100                    LDA     10,,PR1
+         1 000145   000150 601000 1                  TNZ     s:2767
+
+   2766  1 000146   000001 236000 0                  LDQ     E_CANTIO
+         1 000147   100012 756100                    STQ     10,,PR1
+
+      243     2767    3         ALTRETURN;
+
+   2767  1 000150   200012 221300                    LDX1  ! SAVARS+1,,AUTO
+         1 000151   000000 702211                    TSX2  ! 0,X1
+
+      244     2768    3         END;
+      245     2769    2      CALL NIQ$GET(Q$);
+
+   2769  1 000152   200010 631500                    EPPR1   Q$,,AUTO
+         1 000153   200014 451500                    STP1    @B$+1,,AUTO
+         1 000154   200014 630500                    EPPR0   @B$+1,,AUTO
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:36   
+         1 000155   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000156   000000 701000 xent               TSX1    NIQ$GET
+         1 000157   000000 011000                    NOP     0
+
+      246     2770    2      N$REQ.OPFLG.USER = %YES#;            /* User associated                    */
+
+   2770  1 000160   200010 470500                    LDP0    Q$,,AUTO
+         1 000161   000400 236007                    LDQ     256,DL
+         1 000162   000004 256100                    ORSQ    4,,PR0
+
+      247     2771    2      N$REQ.USER# = S_CUN;
+
+   2771  1 000163   200010 470500                    LDP0    Q$,,AUTO
+         1 000164   000000 236000 xsym               LDQ     S_CUN
+         1 000165   000027 552104                    STBQ    23,'04'O,PR0
+
+      248     2772    2      N$REQ.OPFLG.WAIT = %YES#;
+
+   2772  1 000166   000020 236007                    LDQ     16,DL
+         1 000167   000004 256100                    ORSQ    4,,PR0
+
+      249     2773    2      N$REQ.DLA.DCTX = N;
+
+   2773  1 000170   200010 470500                    LDP0    Q$,,AUTO
+         1 000171   200007 236100                    LDQ     N,,AUTO
+         1 000172   000025 736000                    QLS     21
+         1 000173   000001 676100                    ERQ     1,,PR0
+         1 000174   777770 376003                    ANQ     -8,DU
+         1 000175   000001 656100                    ERSQ    1,,PR0
+
+      250     2774    2      N$REQ.DCB$ = DCBADDR(%M$STAR#);      /* Need a DCB                         */
+
+   2774  1 000176   000001 470400 2                  LDP0    1
+         1 000177   000000 471500                    LDP1    0,,PR0
+         1 000200   100001 236100                    LDQ     1,,PR1
+         1 000201   200010 473500                    LDP3    Q$,,AUTO
+         1 000202   300022 756100                    STQ     18,,PR3
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:37   
+
+      251     2775    2      N$REQ.OPFLG.HOLD = %YES#;            /* Keep to detect any error           */
+
+   2775  1 000203   000004 236007                    LDQ     4,DL
+         1 000204   300004 256100                    ORSQ    4,,PR3
+
+      252     2776    2      RETURN;
+
+   2776  1 000205   200012 221300                    LDX1  ! SAVARS+1,,AUTO
+         1 000206   000001 702211                    TSX2  ! 1,X1
+
+      253     2777
+      254     2778    2   END FTI_INITQDEV;
+      255     2779        /*********************************************************************/
+      256     2780        %EJECT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:38   
+      257     2781        /*********************************************************************/
+      258     2782    1   FTI_SENDQ: PROC ALTRET;
+
+   2782  1 000207   200012 741300       FTI_SENDQ    STX1  ! SAVARS+1,,AUTO
+
+      259     2783        /*F*    NAME: FTI_SENDQ
+      260     2784                PURPOSE: Send queue packet; for serious errors (IOERR, OPER,
+      261     2785                   MTRAP, PROT, FRAW) set JIT.ERR and ALTRETURN.
+      262     2786         ***/
+      263     2787
+      264     2788        /********************/
+      265     2789
+      266     2790    3      DO WHILE('1'B);
+
+      267     2791    3         CALL NIO$QUE(N$REQ) ALTRET(SENDERR);
+
+   2791  1 000210   200010 630500                    EPPR0   Q$,,AUTO
+         1 000211   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000212   000000 701000 xent               TSX1    NIO$QUE
+         1 000213   000373 702000 1                  TSX2    SENDERR
+
+      268     2792    3         B$JIT.ACCESS.TAPES = B$JIT.ACCESS.TAPES + 1;
+
+   2792  1 000214   000000 470400 xsym               LDP0    B$JIT$
+         1 000215   000330 054100                    AOS     216,,PR0
+
+      269     2793                                                /* Count successful NIO$QUE calls     */
+      270     2794
+      271     2795            /***
+      272     2796             *** Set JIT.ERR for serious non-recoverable errors.
+      273     2797             ***/
+      274     2798    3         N = %NOERRORS;                    /* Assume no errors                   */
+
+   2798  1 000216   200007 450100                    STZ     N,,AUTO
+
+      275     2799
+      276     2800    3         IF N$REQ.OPFLG.ARS
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:39   
+
+   2800  1 000217   200010 471500                    LDP1    Q$,,AUTO
+         1 000220   100004 236100                    LDQ     4,,PR1
+         1 000221   000200 316007                    CANQ    128,DL
+         1 000222   000236 600000 1                  TZE     s:2808
+
+      277     2801    4          THEN DO;                         /* DCB associated I/O                 */
+
+      278     2802    4            BCDCB$ = JDCB$;
+
+   2802  1 000223   200006 236100                    LDQ     JDCB$,,AUTO
+         1 000224   200004 756100                    STQ     BCDCB$,,AUTO
+
+      279     2803    4            BCDCB.SID = %RONCSID;          /* Bypass cache DCB pointer           */
+
+   2803  1 000225   006124 236007                    LDQ     3156,DL
+         1 000226   200004 752103                    STCQ    BCDCB$,'03'O,AUTO
+
+      280     2804    4            F$DCB.ARS = BCDCB$->F$DCB.ARS; /* Get "real" ARS value               */
+
+   2804  1 000227   200004 473500                    LDP3    BCDCB$,,AUTO
+         1 000230   200006 474500                    LDP4    JDCB$,,AUTO
+         1 000231   300000 235100                    LDA     0,,PR3
+         1 000232   400000 755100                    STA     0,,PR4
+
+      281     2805    4            F$DCB.TYC(1) = BCDCB$->F$DCB.TYC(1);
+
+   2805  1 000233   300002 236100                    LDQ     2,,PR3
+         1 000234   400002 756100                    STQ     2,,PR4
+
+      282     2806    4            F$DCB.TYC(0) = F$DCB.TYC(1);   /* No wait TYC = wait TYC             */
+
+   2806  1 000235   400001 756100                    STQ     1,,PR4
+
+      283     2807    4            END;
+
+      284     2808    3         N$REQ.TYC.EGV = '0'B;             /* I/O done                           */
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:40   
+
+   2808  1 000236   200010 470500                    LDP0    Q$,,AUTO
+         1 000237   000031 236000 xsym               LDQ     B_VECTNIL+25
+         1 000240   000021 356100                    ANSQ    17,,PR0
+
+      285     2809    3         IF NOT N$REQ.TYC THEN GOTO FASTXIT; /* Return if no errors              */
+
+   2809  1 000241   000021 235100                    LDA     17,,PR0
+         1 000242   000340 600000 1                  TZE     FASTXIT
+
+      286     2810    3         IF N$REQ.TYC.BOT THEN FT$DDT.POS = FTP_BOV#;
+
+   2810  1 000243   000021 236100                    LDQ     17,,PR0
+         1 000244   040000 316003                    CANQ    16384,DU
+         1 000245   000253 600000 1                  TZE     s:2811
+
+   2810  1 000246   200005 471500                    LDP1    DDDT$,,AUTO
+         1 000247   100006 236100                    LDQ     6,,PR1
+         1 000250   000002 376000 2                  ANQ     2
+         1 000251   000020 276007                    ORQ     16,DL
+         1 000252   100006 756100                    STQ     6,,PR1
+
+      287     2811    3         N = %NONPOSLOSTERR;               /* Assume not position lost error     */
+
+   2811  1 000253   000002 235007                    LDA     2,DL
+         1 000254   200007 755100                    STA     N,,AUTO
+
+      288     2812    3         IF N$REQ.TYC.IOERR
+
+   2812  1 000255   200010 470500                    LDP0    Q$,,AUTO
+         1 000256   000021 430100                    FSZN    17,,PR0
+         1 000257   000266 605000 1                  TPL     s:2818
+
+      289     2813    4          THEN DO;                         /* I/O error                          */
+
+      290     2814                 /*E* ERROR: FTI-E$IOERR */
+      291     2815    4            B$JIT.ERR = E_IOERR;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:41   
+
+   2815  1 000260   000004 236000 0                  LDQ     E_IOERR
+         1 000261   000000 471400 xsym               LDP1    B$JIT$
+         1 000262   100012 756100                    STQ     10,,PR1
+
+      292     2816    4            N = %POSLOSTERR;               /* Position lost                      */
+
+   2816  1 000263   000001 235007                    LDA     1,DL
+         1 000264   200007 755100                    STA     N,,AUTO
+
+      293     2817    4            END;
+
+   2817  1 000265   000340 710000 1                  TRA     FASTXIT
+
+      294     2818    3          ELSE IF N$REQ.TYC.OPER
+
+   2818  1 000266   000021 236100                    LDQ     17,,PR0
+         1 000267   200000 316003                    CANQ    65536,DU
+         1 000270   000277 600000 1                  TZE     s:2824
+
+      295     2819    4             THEN DO;                      /* Fatal device error                 */
+
+      296     2820                    /*E* ERROR: FTI-E$OPER */
+      297     2821    4               B$JIT.ERR = E_OPER;
+
+   2821  1 000271   000006 236000 0                  LDQ     E_OPER
+         1 000272   000000 471400 xsym               LDP1    B$JIT$
+         1 000273   100012 756100                    STQ     10,,PR1
+
+      298     2822    4               N = %POSLOSTERR;
+
+   2822  1 000274   000001 235007                    LDA     1,DL
+         1 000275   200007 755100                    STA     N,,AUTO
+
+      299     2823    4               END;
+
+   2823  1 000276   000340 710000 1                  TRA     FASTXIT
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:42   
+
+      300     2824    3             ELSE IF N$REQ.TYC.MTRAP
+
+   2824  1 000277   000100 316003                    CANQ    64,DU
+         1 000300   000305 600000 1                  TZE     s:2828
+
+      301     2825    3                THEN                       /* Memory trap during I/O             */
+      302     2826                       /*E* ERROR: FTI-E$MTRAP */
+      303     2827    3                  B$JIT.ERR = E_MTRAP;
+
+   2827  1 000301   000005 236000 0                  LDQ     E_MTRAP
+         1 000302   000000 471400 xsym               LDP1    B$JIT$
+         1 000303   100012 756100                    STQ     10,,PR1
+         1 000304   000340 710000 1                  TRA     FASTXIT
+
+      304     2828    3                ELSE IF N$REQ.TYC.PROT
+
+   2828  1 000305   000004 316003                    CANQ    4,DU
+         1 000306   000313 600000 1                  TZE     s:2832
+
+      305     2829    3                   THEN                    /* Write protect                      */
+      306     2830                          /*E* ERROR: FTI-E$PROT */
+      307     2831    3                     B$JIT.ERR = E_PROT;
+
+   2831  1 000307   000007 236000 0                  LDQ     E_PROT
+         1 000310   000000 471400 xsym               LDP1    B$JIT$
+         1 000311   100012 756100                    STQ     10,,PR1
+         1 000312   000340 710000 1                  TRA     FASTXIT
+
+      308     2832    3                   ELSE IF N$REQ.TYC.FRAW
+
+   2832  1 000313   000002 316003                    CANQ    2,DU
+         1 000314   000321 600000 1                  TZE     s:2836
+
+      309     2833    3                      THEN                 /* Forward read after write           */
+      310     2834                             /*E* ERROR: FTI-E$FRAW */
+      311     2835    3                        B$JIT.ERR = E_FRAW;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:43   
+
+   2835  1 000315   000003 236000 0                  LDQ     E_FRAW
+         1 000316   000000 471400 xsym               LDP1    B$JIT$
+         1 000317   100012 756100                    STQ     10,,PR1
+         1 000320   000340 710000 1                  TRA     FASTXIT
+
+      312     2836    3                      ELSE IF N$REQ.TYC.BLNKTP
+
+   2836  1 000321   010000 316003                    CANQ    4096,DU
+         1 000322   000331 600000 1                  TZE     s:2842
+
+      313     2837    4                         THEN DO;          /* Blank tape on read                 */
+
+      314     2838                                /*E* ERROR: FTI-E$BLNKTP */
+      315     2839    4                           B$JIT.ERR = E_BLNKTP;
+
+   2839  1 000323   000000 236000 0                  LDQ     E_BLNKTP
+         1 000324   000000 471400 xsym               LDP1    B$JIT$
+         1 000325   100012 756100                    STQ     10,,PR1
+
+      316     2840    4                           N = %POSLOSTERR;
+
+   2840  1 000326   000001 235007                    LDA     1,DL
+         1 000327   200007 755100                    STA     N,,AUTO
+
+      317     2841    4                           END;
+
+   2841  1 000330   000340 710000 1                  TRA     FASTXIT
+
+      318     2842    3                         ELSE IF N$REQ.TYC.CDALRT
+
+   2842  1 000331   400000 316007                    CANQ    -131072,DL
+         1 000332   000337 600000 1                  TZE     s:2846
+
+      319     2843    3                            THEN           /* Code alert                         */
+      320     2844                                   /*E* ERROR: FTI-E$CDALRT */
+      321     2845    3                              B$JIT.ERR = E_CDALRT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:44   
+
+   2845  1 000333   000002 236000 0                  LDQ     E_CDALRT
+         1 000334   000000 471400 xsym               LDP1    B$JIT$
+         1 000335   100012 756100                    STQ     10,,PR1
+         1 000336   000340 710000 1                  TRA     FASTXIT
+
+      322     2846    3                            ELSE N = %NOERRORS;
+
+   2846  1 000337   200007 450100                    STZ     N,,AUTO
+
+   2840  1 000340                       FASTXIT      null
+      323     2847    3   FASTXIT: ;
+      324     2848    3         CALL NIQ$REL(Q$);
+
+   2848  1 000340   200010 631500                    EPPR1   Q$,,AUTO
+         1 000341   200014 451500                    STP1    @B$+1,,AUTO
+         1 000342   200014 630500                    EPPR0   @B$+1,,AUTO
+         1 000343   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000344   000000 701000 xent               TSX1    NIQ$REL
+         1 000345   000000 011000                    NOP     0
+
+      325     2849    4         DO CASE(N);
+
+   2849  1 000346   200007 235100                    LDA     N,,AUTO
+         1 000347   000003 115007                    CMPA    3,DL
+         1 000350   000352 602005 1                  TNC     s:2849+4,AL
+         1 000351   000373 710000 1                  TRA     SENDERR
+         1 000352   000355 710000 1                  TRA     s:2851
+         1 000353   000361 710000 1                  TRA     s:2855
+         1 000354   000357 710000 1                  TRA     s:2853
+
+      326     2850    4          CASE(%NOERRORS);                 /* No or minor error                  */
+
+      327     2851    4            RETURN;
+
+   2851  1 000355   200012 221300                    LDX1  ! SAVARS+1,,AUTO
+         1 000356   000001 702211                    TSX2  ! 1,X1
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:45   
+
+      328     2852    4          CASE(%NONPOSLOSTERR);            /* Error not causing position lost    */
+
+      329     2853    4            ALTRETURN;
+
+   2853  1 000357   200012 221300                    LDX1  ! SAVARS+1,,AUTO
+         1 000360   000000 702211                    TSX2  ! 0,X1
+
+      330     2854    4          CASE(%POSLOSTERR);
+
+      331     2855    4            IF F$DCB.ASN ~= %DEVICE# THEN FT$DDT.POSLOST = %YES#;
+
+   2855  1 000361   200006 470500                    LDP0    JDCB$,,AUTO
+         1 000362   000032 236100                    LDQ     26,,PR0
+         1 000363   777000 376007                    ANQ     -512,DL
+         1 000364   003000 116007                    CMPQ    1536,DL
+         1 000365   000371 600000 1                  TZE     s:2856
+
+   2855  1 000366   200005 471500                    LDP1    DDDT$,,AUTO
+         1 000367   004000 236007                    LDQ     2048,DL
+         1 000370   100006 256100                    ORSQ    6,,PR1
+
+      332     2856    4            ALTRETURN;
+
+   2856  1 000371   200012 221300                    LDX1  ! SAVARS+1,,AUTO
+         1 000372   000000 702211                    TSX2  ! 0,X1
+
+      333     2857    4          END;
+
+   2849  1 000373                       SENDERR      null
+      334     2858
+      335     2859            /***
+      336     2860             *** Error sending queue packet.
+      337     2861             ***/
+      338     2862
+      339     2863    3   SENDERR: ;
+      340     2864    3         CALL SC_FTIBADSEND;        /*S* SCREECH_CODE: FTI-S$BADSEND */
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:46   
+
+   2864  1 000373   000000 713400 xsym               CLIMB   SC_FTIBADSEND
+         1 000374   000000 600000 xsid               climb   nvectors=         0
+
+      341     2865    3         END;
+
+   2865  1 000375   000210 710000 1                  TRA     s:2791
+         1 000376   000401 710000 1                  TRA     s:2878
+
+      342     2866
+      343     2867    2   END FTI_SENDQ;
+      344     2868        /*********************************************************************/
+      345     2869        %EJECT;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:47   
+      346     2870        /*********************************************************************/
+      347     2871    1   FTI$RDASC: ENTRY(BUF$) ALTRET;
+
+   2871  1 000377   000000 700200 xent  FTI$RDASC    TSX0  ! X66_AUTO_1
+         1 000400   000026 000001                    ZERO    22,1
+
+      348     2872        /*F*    NAME: FTI$RDASC
+      349     2873                PURPOSE: Read ASCII tape record (DCB.ARS bytes).
+      350     2874         ***/
+      351     2875
+      352     2876        /********************/
+      353     2877
+      354     2878    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+
+   2878  1 000401   200003 236100                    LDQ     @BUF$,,AUTO
+         1 000402   200013 756100                    STQ     SAVARS+2,,AUTO
+         1 000403   000003 701000 1                  TSX1    FTI_INITQ
+         1 000404   001152 702000 1                  TSX2    JUSTALT
+
+      355     2879    1      IF F$DCB.TAPTYP.USRBUF THEN N$REQ.OPFLG.CLR = %YES#;
+
+   2879  1 000405   200006 470500                    LDP0    JDCB$,,AUTO
+         1 000406   000067 236100                    LDQ     55,,PR0
+         1 000407   000100 316003                    CANQ    64,DU
+         1 000410   000414 600000 1                  TZE     s:2880
+
+   2879  1 000411   200010 471500                    LDP1    Q$,,AUTO
+         1 000412   000001 236007                    LDQ     1,DL
+         1 000413   100004 256100                    ORSQ    4,,PR1
+
+      356     2880    1      N$REQ.FC = %N_RDASC;                 /* Read ASCII                         */
+
+   2880  1 000414   200010 471500                    LDP1    Q$,,AUTO
+         1 000415   000004 236007                    LDQ     4,DL
+         1 000416   100003 552104                    STBQ    3,'04'O,PR1
+
+      357     2881    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:48   
+
+   2881  1 000417   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000420   001152 702000 1                  TSX2    JUSTALT
+
+      358     2882    1      RETURN;
+
+   2882  1 000421   000000 702200 xent               TSX2  ! X66_ARET
+
+      359     2883
+      360     2884        /****************************************/
+      361     2885    1   FTI$RDASCEBC: ENTRY(BUF$) ALTRET;
+
+   2885  1 000422   000000 700200 xent  FTI$RDASCEBC TSX0  ! X66_AUTO_1
+         1 000423   000026 000001                    ZERO    22,1
+
+      362     2886        /*F*    NAME: FTI$RDASCEBC
+      363     2887                PURPOSE: Read ASCII or EBCDIC tape record (DCB.ARS bytes).
+      364     2888         ***/
+      365     2889
+      366     2890        /********************/
+      367     2891
+      368     2892    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+
+   2892  1 000424   200003 236100                    LDQ     @BUF$,,AUTO
+         1 000425   200013 756100                    STQ     SAVARS+2,,AUTO
+         1 000426   000003 701000 1                  TSX1    FTI_INITQ
+         1 000427   001152 702000 1                  TSX2    JUSTALT
+
+      369     2893    1      N$REQ.OPFLG.CLR = %YES#;             /* May be into user buffer            */
+
+   2893  1 000430   200010 470500                    LDP0    Q$,,AUTO
+         1 000431   000001 236007                    LDQ     1,DL
+         1 000432   000004 256100                    ORSQ    4,,PR0
+
+      370     2894    1      N$REQ.BUFSIZE = 80;                  /* Read label                         */
+
+   2894  1 000433   200010 470500                    LDP0    Q$,,AUTO
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:49   
+         1 000434   000004 236100                    LDQ     4,,PR0
+         1 000435   177777 376007                    ANQ     65535,DL
+         1 000436   000024 276003                    ORQ     20,DU
+         1 000437   000004 756100                    STQ     4,,PR0
+
+      371     2895    1      N$REQ.FC = %N_RDASC;                 /* Read ASCII                         */
+
+   2895  1 000440   200010 470500                    LDP0    Q$,,AUTO
+         1 000441   000004 236007                    LDQ     4,DL
+         1 000442   000003 552104                    STBQ    3,'04'O,PR0
+
+      372     2896    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   2896  1 000443   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000444   001152 702000 1                  TSX2    JUSTALT
+
+      373     2897    1      IF FT$DDT.EBCDIC AND NOT F$DCB.TYC.EOF(1)
+
+   2897  1 000445   200005 470500                    LDP0    DDDT$,,AUTO
+         1 000446   000006 236100                    LDQ     6,,PR0
+         1 000447   100000 316007                    CANQ    32768,DL
+         1 000450   000470 600000 1                  TZE     s:2902
+         1 000451   200006 471500                    LDP1    JDCB$,,AUTO
+         1 000452   100002 236100                    LDQ     2,,PR1
+         1 000453   004000 316003                    CANQ    2048,DU
+         1 000454   000470 601000 1                  TNZ     s:2902
+
+      374     2898    2       THEN DO;                            /* Translate                          */
+
+      375     2899    2         N = F$DCB.ARS;
+
+   2899  1 000455   100000 235100                    LDA     0,,PR1
+         1 000456   200007 755100                    STA     N,,AUTO
+
+      376     2900    2         CALL XLATE( BUF$->NCHARS, B$XL_EBC_ASC, BUF$->NCHARS );
+
+   2900  1 000457   200003 473500                    LDP3    @BUF$,,AUTO
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:50   
+         1 000460   300000 474500                    LDP4    0,,PR3
+         1 000461   000000 620005                    EAX0    0,AL
+         1 000462   000000 475400 xsym               LDP5    B$XL_EBC_ASC$
+         1 000463   200007 721100                    LXL1    N,,AUTO
+         1 000464   040140 160540                    MVT     fill='040'O
+         1 000465   400000 000010                    ADSC9   0,,PR4                   cn=0,n=*X0
+         1 000466   400000 000011                    ADSC9   0,,PR4                   cn=0,n=*X1
+         1 000467   500000 000100                    ARG     0,,PR5
+
+      377     2901    2         END;
+
+      378     2902    1      RETURN;
+
+   2902  1 000470   000000 702200 xent               TSX2  ! X66_ARET
+
+      379     2903
+      380     2904        /****************************************/
+      381     2905    1   FTI$RDBIN: ENTRY(BUF$) ALTRET;
+
+   2905  1 000471   000000 700200 xent  FTI$RDBIN    TSX0  ! X66_AUTO_1
+         1 000472   000026 000001                    ZERO    22,1
+
+      382     2906        /*F*    NAME: FTI$RDBIN
+      383     2907                PURPOSE: Read binary tape record (DCB.ARS bytes).
+      384     2908         ***/
+      385     2909
+      386     2910        /********************/
+      387     2911    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+
+   2911  1 000473   200003 236100                    LDQ     @BUF$,,AUTO
+         1 000474   200013 756100                    STQ     SAVARS+2,,AUTO
+         1 000475   000003 701000 1                  TSX1    FTI_INITQ
+         1 000476   001152 702000 1                  TSX2    JUSTALT
+
+      388     2912    1      IF F$DCB.TAPTYP.USRBUF THEN N$REQ.OPFLG.CLR = %YES#;
+
+   2912  1 000477   200006 470500                    LDP0    JDCB$,,AUTO
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:51   
+         1 000500   000067 236100                    LDQ     55,,PR0
+         1 000501   000100 316003                    CANQ    64,DU
+         1 000502   000506 600000 1                  TZE     s:2913
+
+   2912  1 000503   200010 471500                    LDP1    Q$,,AUTO
+         1 000504   000001 236007                    LDQ     1,DL
+         1 000505   100004 256100                    ORSQ    4,,PR1
+
+      389     2913    1      N$REQ.FC = %N_RDBIN;                 /* Read binary                        */
+
+   2913  1 000506   200010 471500                    LDP1    Q$,,AUTO
+         1 000507   000002 236007                    LDQ     2,DL
+         1 000510   100003 552104                    STBQ    3,'04'O,PR1
+
+      390     2914    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   2914  1 000511   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000512   001152 702000 1                  TSX2    JUSTALT
+
+      391     2915    1      RETURN;
+
+   2915  1 000513   000000 702200 xent               TSX2  ! X66_ARET
+
+      392     2916
+      393     2917        /****************************************/
+      394     2918    1   FTI$WRASC: ENTRY(BUF$) ALTRET;
+
+   2918  1 000514   000000 700200 xent  FTI$WRASC    TSX0  ! X66_AUTO_1
+         1 000515   000026 000001                    ZERO    22,1
+
+      395     2919        /*F*    NAME: FTI$WRASC
+      396     2920                PURPOSE: Write ASCII tape record (DCB.ARS bytes).
+      397     2921         ***/
+      398     2922
+      399     2923
+      400     2924        /********************/
+      401     2925
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:52   
+      402     2926    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+
+   2926  1 000516   200003 236100                    LDQ     @BUF$,,AUTO
+         1 000517   200013 756100                    STQ     SAVARS+2,,AUTO
+         1 000520   000003 701000 1                  TSX1    FTI_INITQ
+         1 000521   001152 702000 1                  TSX2    JUSTALT
+
+      403     2927    1      N$REQ.FC = %N_WRASC;                 /* Write ASCII                        */
+
+   2927  1 000522   200010 470500                    LDP0    Q$,,AUTO
+         1 000523   000005 236007                    LDQ     5,DL
+         1 000524   000003 552104                    STBQ    3,'04'O,PR0
+
+      404     2928    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   2928  1 000525   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000526   001152 702000 1                  TSX2    JUSTALT
+
+      405     2929    1      RETURN;
+
+   2929  1 000527   000000 702200 xent               TSX2  ! X66_ARET
+
+      406     2930
+      407     2931        /****************************************/
+      408     2932    1   FTI$WRASCEBC: ENTRY(BUF$) ALTRET;
+
+   2932  1 000530   000000 700200 xent  FTI$WRASCEBC TSX0  ! X66_AUTO_1
+         1 000531   000026 000001                    ZERO    22,1
+
+      409     2933        /*F*    NAME: FTI$WRASCEBC
+      410     2934                PURPOSE: Write ASCII or EBCDIC tape record (DCB.ARS bytes).
+      411     2935         ***/
+      412     2936
+      413     2937
+      414     2938        /********************/
+      415     2939
+      416     2940    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:53   
+
+   2940  1 000532   200003 236100                    LDQ     @BUF$,,AUTO
+         1 000533   200013 756100                    STQ     SAVARS+2,,AUTO
+         1 000534   000003 701000 1                  TSX1    FTI_INITQ
+         1 000535   001152 702000 1                  TSX2    JUSTALT
+
+      417     2941    1      N$REQ.BUFSIZE = 80;                  /* Write label                        */
+
+   2941  1 000536   200010 470500                    LDP0    Q$,,AUTO
+         1 000537   000004 236100                    LDQ     4,,PR0
+         1 000540   177777 376007                    ANQ     65535,DL
+         1 000541   000024 276003                    ORQ     20,DU
+         1 000542   000004 756100                    STQ     4,,PR0
+
+      418     2942    1      N$REQ.FC = %N_WRASC;                 /* Write ASCII                        */
+
+   2942  1 000543   200010 470500                    LDP0    Q$,,AUTO
+         1 000544   000005 236007                    LDQ     5,DL
+         1 000545   000003 552104                    STBQ    3,'04'O,PR0
+
+      419     2943    1      IF FT$DDT.EBCDIC
+
+   2943  1 000546   200005 470500                    LDP0    DDDT$,,AUTO
+         1 000547   000006 236100                    LDQ     6,,PR0
+         1 000550   100000 316007                    CANQ    32768,DL
+         1 000551   000565 600000 1                  TZE     s:2948
+
+      420     2944    2       THEN DO;                            /* Translate                          */
+
+      421     2945    2         N = 80;
+
+   2945  1 000552   000120 235007                    LDA     80,DL
+         1 000553   200007 755100                    STA     N,,AUTO
+
+      422     2946    2         CALL XLATE( BUF$->NCHARS, B$XL_ASC_EBC, BUF$->NCHARS );
+
+   2946  1 000554   200003 471500                    LDP1    @BUF$,,AUTO
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:54   
+         1 000555   100000 473500                    LDP3    0,,PR1
+         1 000556   000000 620005                    EAX0    0,AL
+         1 000557   000000 474400 xsym               LDP4    B$XL_ASC_EBC$
+         1 000560   200007 721100                    LXL1    N,,AUTO
+         1 000561   040140 160540                    MVT     fill='040'O
+         1 000562   300000 000010                    ADSC9   0,,PR3                   cn=0,n=*X0
+         1 000563   300000 000011                    ADSC9   0,,PR3                   cn=0,n=*X1
+         1 000564   400000 000100                    ARG     0,,PR4
+
+      423     2947    2         END;
+
+      424     2948    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   2948  1 000565   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000566   001152 702000 1                  TSX2    JUSTALT
+
+      425     2949    1      RETURN;
+
+   2949  1 000567   000000 702200 xent               TSX2  ! X66_ARET
+
+      426     2950
+      427     2951        /****************************************/
+      428     2952    1   FTI$WRBIN: ENTRY(BUF$) ALTRET;
+
+   2952  1 000570   000000 700200 xent  FTI$WRBIN    TSX0  ! X66_AUTO_1
+         1 000571   000026 000001                    ZERO    22,1
+
+      429     2953        /*F*    NAME: FTI$WRBIN
+      430     2954                PURPOSE: Write binary tape record (DCB.ARS bytes).
+      431     2955         ***/
+      432     2956
+      433     2957        /********************/
+      434     2958
+      435     2959    1      CALL FTI_INITQ(BUF$) ALTRET(JUSTALT); /* Get and initialize queue packet   */
+
+   2959  1 000572   200003 236100                    LDQ     @BUF$,,AUTO
+         1 000573   200013 756100                    STQ     SAVARS+2,,AUTO
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:55   
+         1 000574   000003 701000 1                  TSX1    FTI_INITQ
+         1 000575   001152 702000 1                  TSX2    JUSTALT
+
+      436     2960    1      N$REQ.FC = %N_WRBIN;                 /* Write binary                       */
+
+   2960  1 000576   200010 470500                    LDP0    Q$,,AUTO
+         1 000577   000003 236007                    LDQ     3,DL
+         1 000600   000003 552104                    STBQ    3,'04'O,PR0
+
+      437     2961    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   2961  1 000601   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000602   001152 702000 1                  TSX2    JUSTALT
+
+      438     2962    1      RETURN;
+
+   2962  1 000603   000000 702200 xent               TSX2  ! X66_ARET
+
+      439     2963
+      440     2964        /****************************************/
+      441     2965    1   FTI$WRFM: ENTRY ALTRET;
+
+   2965  1 000604   000000 700200 xent  FTI$WRFM     TSX0  ! X66_AUTO_1
+         1 000605   000026 000001                    ZERO    22,1
+
+      442     2966        /*F*    NAME: FTI$WRFM
+      443     2967                PURPOSE: Write file mark.
+      444     2968         ***/
+      445     2969
+      446     2970        /********************/
+      447     2971
+      448     2972    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              2972               /* Get and initialize queue packet */
+
+   2972  1 000606   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000607   200015 756100                    STQ     @B$+2,,AUTO
+         1 000610   200015 630500                    EPPR0   @B$+2,,AUTO
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:56   
+         1 000611   200013 450500                    STP0    SAVARS+2,,AUTO
+         1 000612   000003 701000 1                  TSX1    FTI_INITQ
+         1 000613   001152 702000 1                  TSX2    JUSTALT
+
+      449     2973    1      N$REQ.FC = %N_WRFM;                  /* Write file mark                    */
+
+   2973  1 000614   200010 470500                    LDP0    Q$,,AUTO
+         1 000615   000012 236007                    LDQ     10,DL
+         1 000616   000003 552104                    STBQ    3,'04'O,PR0
+
+      450     2974    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   2974  1 000617   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000620   001152 702000 1                  TSX2    JUSTALT
+
+      451     2975    1      FT$DDT.FMCNT = FT$DDT.FMCNT + 1;     /* Count file mark written            */
+
+   2975  1 000621   200005 470500                    LDP0    DDDT$,,AUTO
+         1 000622   000006 220100                    LDX0    6,,PR0
+         1 000623   000001 621010                    EAX1    1,X0
+         1 000624   000006 741100                    STX1    6,,PR0
+
+      452     2976    1      RETURN;
+
+   2976  1 000625   000000 702200 xent               TSX2  ! X66_ARET
+
+      453     2977
+      454     2978        /****************************************/
+      455     2979    1   FTI$WRFMDEV: ENTRY(BUF$) ALTRET;
+
+   2979  1 000626   000000 700200 xent  FTI$WRFMDEV  TSX0  ! X66_AUTO_1
+         1 000627   000026 000001                    ZERO    22,1
+
+      456     2980        /*F*  NAME: FTI$WRFMDEV
+      457     2981              PURPOSE: Non-DCB write file mark.
+      458     2982         ***/
+      459     2983
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:57   
+      460     2984        /********************/
+      461     2985
+      462     2986    1      CALL FTI_INITQDEV ALTRET(JUSTALT);
+
+   2986  1 000630   000123 701000 1                  TSX1    FTI_INITQDEV
+         1 000631   001152 702000 1                  TSX2    JUSTALT
+
+      463     2987    1      N$REQ.FC = %N_WRFM;
+
+   2987  1 000632   200010 470500                    LDP0    Q$,,AUTO
+         1 000633   000012 236007                    LDQ     10,DL
+         1 000634   000003 552104                    STBQ    3,'04'O,PR0
+
+      464     2988    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   2988  1 000635   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000636   001152 702000 1                  TSX2    JUSTALT
+
+      465     2989    1      FT$DDT.FMCNT = FT$DDT.FMCNT + 1;
+
+   2989  1 000637   200005 470500                    LDP0    DDDT$,,AUTO
+         1 000640   000006 220100                    LDX0    6,,PR0
+         1 000641   000001 621010                    EAX1    1,X0
+         1 000642   000006 741100                    STX1    6,,PR0
+
+      466     2990    1      RETURN;
+
+   2990  1 000643   000000 702200 xent               TSX2  ! X66_ARET
+
+      467     2991
+      468     2992        /****************************************/
+      469     2993    1   FTI$REWIND: ENTRY ALTRET;
+
+   2993  1 000644   000000 700200 xent  FTI$REWIND   TSX0  ! X66_AUTO_1
+         1 000645   000026 000001                    ZERO    22,1
+
+      470     2994        /*F*    NAME: FTI$REWIND
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:58   
+      471     2995                PURPOSE: Rewind tape.
+      472     2996         ***/
+      473     2997
+      474     2998        /********************/
+      475     2999
+      476     3000    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3000               /* Get and initialize queue packet */
+
+   3000  1 000646   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000647   200016 756100                    STQ     @B$+3,,AUTO
+         1 000650   200016 630500                    EPPR0   @B$+3,,AUTO
+         1 000651   200013 450500                    STP0    SAVARS+2,,AUTO
+         1 000652   000003 701000 1                  TSX1    FTI_INITQ
+         1 000653   001152 702000 1                  TSX2    JUSTALT
+
+      477     3001    1      N$REQ.FC = %N_REWIND;                /* Rewind tape                        */
+
+   3001  1 000654   200010 470500                    LDP0    Q$,,AUTO
+         1 000655   000006 236007                    LDQ     6,DL
+         1 000656   000003 552104                    STBQ    3,'04'O,PR0
+
+      478     3002    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   3002  1 000657   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000660   001152 702000 1                  TSX2    JUSTALT
+
+      479     3003    1      FT$DDT.POS = FTP_BOV#;               /* At beginning of volume             */
+
+   3003  1 000661   200005 470500                    LDP0    DDDT$,,AUTO
+         1 000662   000006 236100                    LDQ     6,,PR0
+         1 000663   000002 376000 2                  ANQ     2
+         1 000664   000020 276007                    ORQ     16,DL
+         1 000665   000006 756100                    STQ     6,,PR0
+
+      480     3004    1      FT$DDT.FMCNT = 0;                    /* No file marks crossed              */
+
+   3004  1 000666   000000 220003                    LDX0    0,DU
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:59   
+         1 000667   000006 740100                    STX0    6,,PR0
+
+      481     3005    1      RETURN;
+
+   3005  1 000670   000000 702200 xent               TSX2  ! X66_ARET
+
+      482     3006
+      483     3007        /****************************************/
+      484     3008    1   FTI$PERMIT: ENTRY ALTRET;
+
+   3008  1 000671   000000 700200 xent  FTI$PERMIT   TSX0  ! X66_AUTO_1
+         1 000672   000026 000001                    ZERO    22,1
+
+      485     3009        /*F*    NAME: FTI$PERMIT
+      486     3010                PURPOSE: Set write permit if write allowed.
+      487     3011         ***/
+      488     3012
+      489     3013        /********************/
+      490     3014
+      491     3015    1      IF NK$LDCT$(B$JIT.DCB$->F$DCB.SETX)->NK$LDCT.DDT$->FT$DDT.RINGIN
+
+   3015  1 000673   000000 470400 xsym               LDP0    B$JIT$
+         1 000674   000232 471500                    LDP1    154,,PR0
+         1 000675   100051 720100                    LXL0    41,,PR1
+         1 000676   000000 473400 xsym               LDP3    N$DCT$$
+         1 000677   300000 474510                    LDP4    0,X0,PR3
+         1 000700   400004 475500                    LDP5    4,,PR4
+         1 000701   500006 236100                    LDQ     6,,PR5
+         1 000702   040000 316007                    CANQ    16384,DL
+         1 000703   000720 600000 1                  TZE     s:3023
+
+      492     3016    2       THEN DO;                            /* Permit allowed                     */
+
+      493     3017    2         CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3017                  /* Get and initialize queue packet */
+
+   3017  1 000704   000001 236000 xsym               LDQ     B_VECTNIL+1
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:60   
+         1 000705   200017 756100                    STQ     @B$+4,,AUTO
+         1 000706   200017 634500                    EPPR4   @B$+4,,AUTO
+         1 000707   200013 454500                    STP4    SAVARS+2,,AUTO
+         1 000710   000003 701000 1                  TSX1    FTI_INITQ
+         1 000711   001152 702000 1                  TSX2    JUSTALT
+
+      494     3018    2         N$REQ.FC = %N_PERMIT;             /* Set write permit                   */
+
+   3018  1 000712   200010 470500                    LDP0    Q$,,AUTO
+         1 000713   000020 236007                    LDQ     16,DL
+         1 000714   000003 552104                    STBQ    3,'04'O,PR0
+
+      495     3019    2         CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   3019  1 000715   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000716   001152 702000 1                  TSX2    JUSTALT
+
+      496     3020    2         RETURN;
+
+   3020  1 000717   000000 702200 xent               TSX2  ! X66_ARET
+
+      497     3021    2         END;
+      498     3022    2       ELSE DO;                            /* Can't write--permit not allowed    */
+
+      499     3023    2         B$JIT.ERR = E_PROT; /*E* ERROR: FTI-E$PROT */
+
+   3023  1 000720   000007 236000 0                  LDQ     E_PROT
+         1 000721   000012 756100                    STQ     10,,PR0
+
+      500     3024    2         ALTRETURN;
+
+   3024  1 000722   000000 702200 xent               TSX2  ! X66_AALT
+
+      501     3025    2         END;
+      502     3026
+      503     3027        /****************************************/
+      504     3028    1   FTI$SD6250: ENTRY ALTRET;
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:61   
+
+   3028  1 000723   000000 700200 xent  FTI$SD6250   TSX0  ! X66_AUTO_1
+         1 000724   000026 000001                    ZERO    22,1
+
+      505     3029        /*F*    NAME: FTI$SD6250
+      506     3030                PURPOSE: Set density to 6250 bpi.
+      507     3031         ***/
+      508     3032
+      509     3033        /********************/
+      510     3034
+      511     3035    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3035               /* Get and initialize queue packet */
+
+   3035  1 000725   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000726   200020 756100                    STQ     @B$+5,,AUTO
+         1 000727   200020 630500                    EPPR0   @B$+5,,AUTO
+         1 000730   200013 450500                    STP0    SAVARS+2,,AUTO
+         1 000731   000003 701000 1                  TSX1    FTI_INITQ
+         1 000732   001152 702000 1                  TSX2    JUSTALT
+
+      512     3036    1      N$REQ.FC = %N_SD6250;                /* Set density to 6250                */
+
+   3036  1 000733   200010 470500                    LDP0    Q$,,AUTO
+         1 000734   000025 236007                    LDQ     21,DL
+         1 000735   000003 552104                    STBQ    3,'04'O,PR0
+
+      513     3037    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   3037  1 000736   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000737   001152 702000 1                  TSX2    JUSTALT
+
+      514     3038    1      FT$DDT.DENSITY = %D6250#;
+
+   3038  1 000740   200005 470500                    LDP0    DDDT$,,AUTO
+         1 000741   000006 236100                    LDQ     6,,PR0
+         1 000742   000003 376000 2                  ANQ     3
+         1 000743   002000 276007                    ORQ     1024,DL
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:62   
+         1 000744   000006 756100                    STQ     6,,PR0
+
+      515     3039    1      RETURN;
+
+   3039  1 000745   000000 702200 xent               TSX2  ! X66_ARET
+
+      516     3040
+      517     3041        /****************************************/
+      518     3042    1   FTI$SD1600: ENTRY ALTRET;
+
+   3042  1 000746   000000 700200 xent  FTI$SD1600   TSX0  ! X66_AUTO_1
+         1 000747   000026 000001                    ZERO    22,1
+
+      519     3043        /*F*    NAME: FTI$SD1600
+      520     3044                PURPOSE: Set density to 1600 bpi.
+      521     3045         ***/
+      522     3046
+      523     3047        /********************/
+      524     3048
+      525     3049    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3049               /* Get and initialize queue packet */
+
+   3049  1 000750   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000751   200021 756100                    STQ     @B$+6,,AUTO
+         1 000752   200021 630500                    EPPR0   @B$+6,,AUTO
+         1 000753   200013 450500                    STP0    SAVARS+2,,AUTO
+         1 000754   000003 701000 1                  TSX1    FTI_INITQ
+         1 000755   001152 702000 1                  TSX2    JUSTALT
+
+      526     3050    1      N$REQ.FC = %N_SD1600;                /* Set density to 1600                */
+
+   3050  1 000756   200010 470500                    LDP0    Q$,,AUTO
+         1 000757   000024 236007                    LDQ     20,DL
+         1 000760   000003 552104                    STBQ    3,'04'O,PR0
+
+      527     3051    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:63   
+   3051  1 000761   000207 701000 1                  TSX1    FTI_SENDQ
+         1 000762   001152 702000 1                  TSX2    JUSTALT
+
+      528     3052    1      FT$DDT.DENSITY = %D1600#;
+
+   3052  1 000763   200005 470500                    LDP0    DDDT$,,AUTO
+         1 000764   000006 236100                    LDQ     6,,PR0
+         1 000765   000003 376000 2                  ANQ     3
+         1 000766   001400 276007                    ORQ     768,DL
+         1 000767   000006 756100                    STQ     6,,PR0
+
+      529     3053    1      RETURN;
+
+   3053  1 000770   000000 702200 xent               TSX2  ! X66_ARET
+
+      530     3054
+      531     3055        /****************************************/
+      532     3056    1   FTI$SD800: ENTRY ALTRET;
+
+   3056  1 000771   000000 700200 xent  FTI$SD800    TSX0  ! X66_AUTO_1
+         1 000772   000026 000001                    ZERO    22,1
+
+      533     3057        /*F*    NAME: FTI$SD800
+      534     3058                PURPOSE: Set density to 800 bpi.
+      535     3059         ***/
+      536     3060
+      537     3061        /********************/
+      538     3062
+      539     3063    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3063               /* Get and initialize queue packet */
+
+   3063  1 000773   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000774   200022 756100                    STQ     @B$+7,,AUTO
+         1 000775   200022 630500                    EPPR0   @B$+7,,AUTO
+         1 000776   200013 450500                    STP0    SAVARS+2,,AUTO
+         1 000777   000003 701000 1                  TSX1    FTI_INITQ
+         1 001000   001152 702000 1                  TSX2    JUSTALT
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:64   
+
+      540     3064    1      N$REQ.FC = %N_SD800;                 /* Set density to 800                 */
+
+   3064  1 001001   200010 470500                    LDP0    Q$,,AUTO
+         1 001002   000023 236007                    LDQ     19,DL
+         1 001003   000003 552104                    STBQ    3,'04'O,PR0
+
+      541     3065    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   3065  1 001004   000207 701000 1                  TSX1    FTI_SENDQ
+         1 001005   001152 702000 1                  TSX2    JUSTALT
+
+      542     3066    1      FT$DDT.DENSITY = %D800#;
+
+   3066  1 001006   200005 470500                    LDP0    DDDT$,,AUTO
+         1 001007   000006 236100                    LDQ     6,,PR0
+         1 001010   000003 376000 2                  ANQ     3
+         1 001011   001000 276007                    ORQ     512,DL
+         1 001012   000006 756100                    STQ     6,,PR0
+
+      543     3067    1      RETURN;
+
+   3067  1 001013   000000 702200 xent               TSX2  ! X66_ARET
+
+      544     3068
+      545     3069        /****************************************/
+      546     3070    1   FTI$SPREC: ENTRY ALTRET;
+
+   3070  1 001014   000000 700200 xent  FTI$SPREC    TSX0  ! X66_AUTO_1
+         1 001015   000026 000001                    ZERO    22,1
+
+      547     3071        /*F*    NAME: FTI$SPREC
+      548     3072                PURPOSE: Space DCB.ARS tape records.
+      549     3073         ***/
+      550     3074
+      551     3075        /********************/
+      552     3076
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:65   
+      553     3077    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3077               /* Get and initialize queue packet */
+
+   3077  1 001016   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 001017   200023 756100                    STQ     @B$+8,,AUTO
+         1 001020   200023 630500                    EPPR0   @B$+8,,AUTO
+         1 001021   200013 450500                    STP0    SAVARS+2,,AUTO
+         1 001022   000003 701000 1                  TSX1    FTI_INITQ
+         1 001023   001152 702000 1                  TSX2    JUSTALT
+
+      554     3078    1      N$REQ.FC = %N_SPREC;                 /* Space records                      */
+
+   3078  1 001024   200010 470500                    LDP0    Q$,,AUTO
+         1 001025   000016 236007                    LDQ     14,DL
+         1 001026   000003 552104                    STBQ    3,'04'O,PR0
+
+      555     3079    1      N$REQ.RCT = F$DCB.ARS;               /* # specified in DCB                 */
+
+   3079  1 001027   200006 470500                    LDP0    JDCB$,,AUTO
+         1 001030   000000 720100                    LXL0    0,,PR0
+         1 001031   200010 471500                    LDP1    Q$,,AUTO
+         1 001032   100030 440100                    SXL0    24,,PR1
+
+      556     3080    1      SAVARS = F$DCB.ARS;
+
+   3080  1 001033   000000 235100                    LDA     0,,PR0
+         1 001034   200011 755100                    STA     SAVARS,,AUTO
+
+      557     3081    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   3081  1 001035   000207 701000 1                  TSX1    FTI_SENDQ
+         1 001036   001152 702000 1                  TSX2    JUSTALT
+
+      558     3082    1      IF SAVARS < 0
+
+   3082  1 001037   200011 235100                    LDA     SAVARS,,AUTO
+         1 001040   001053 605000 1                  TPL     s:3091
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:66   
+
+      559     3083    2       THEN DO;                            /* Change EOF to BOF                  */
+
+      560     3084    2         IF F$DCB.TYC.EOF(1)
+
+   3084  1 001041   200006 470500                    LDP0    JDCB$,,AUTO
+         1 001042   000002 236100                    LDQ     2,,PR0
+         1 001043   004000 316003                    CANQ    2048,DU
+         1 001044   001053 600000 1                  TZE     s:3091
+
+      561     3085    3          THEN DO;
+
+      562     3086    3            F$DCB.TYC.EOF(1) = '0'B;
+
+   3086  1 001045   000004 236000 2                  LDQ     4
+         1 001046   000002 356100                    ANSQ    2,,PR0
+
+      563     3087    3            F$DCB.TYC.BOF(1) = '1'B;
+
+   3087  1 001047   020000 236003                    LDQ     8192,DU
+         1 001050   000002 256100                    ORSQ    2,,PR0
+
+      564     3088    3            F$DCB.TYC(0) = F$DCB.TYC(1);
+
+   3088  1 001051   000002 236100                    LDQ     2,,PR0
+         1 001052   000001 756100                    STQ     1,,PR0
+
+      565     3089    3            END;
+
+      566     3090    2         END;
+
+      567     3091    1      RETURN;
+
+   3091  1 001053   000000 702200 xent               TSX2  ! X66_ARET
+
+      568     3092
+      569     3093        /****************************************/
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:67   
+      570     3094    1   FTI$SPFILE: ENTRY ALTRET;
+
+   3094  1 001054   000000 700200 xent  FTI$SPFILE   TSX0  ! X66_AUTO_1
+         1 001055   000026 000001                    ZERO    22,1
+
+      571     3095        /*F*    NAME: FTI$SPFILE
+      572     3096                PURPOSE: Space DCB.ARS tape files.
+      573     3097         ***/
+      574     3098
+      575     3099        /********************/
+      576     3100
+      577     3101    1      CALL FTI_INITQ( ADDR(NIL) ) ALTRET(JUSTALT);
+              3101               /* Get and initialize queue packet */
+
+   3101  1 001056   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 001057   200024 756100                    STQ     @B$+9,,AUTO
+         1 001060   200024 630500                    EPPR0   @B$+9,,AUTO
+         1 001061   200013 450500                    STP0    SAVARS+2,,AUTO
+         1 001062   000003 701000 1                  TSX1    FTI_INITQ
+         1 001063   001152 702000 1                  TSX2    JUSTALT
+
+      578     3102    1      N$REQ.FC = %N_SPFILE;                /* Space files                        */
+
+   3102  1 001064   200010 470500                    LDP0    Q$,,AUTO
+         1 001065   000017 236007                    LDQ     15,DL
+         1 001066   000003 552104                    STBQ    3,'04'O,PR0
+
+      579     3103    1      N$REQ.RCT = F$DCB.ARS;               /* # specified in DCB                 */
+
+   3103  1 001067   200006 470500                    LDP0    JDCB$,,AUTO
+         1 001070   000000 720100                    LXL0    0,,PR0
+         1 001071   200010 471500                    LDP1    Q$,,AUTO
+         1 001072   100030 440100                    SXL0    24,,PR1
+
+      580     3104    1      SAVARS = F$DCB.ARS;                  /* Remember direction                 */
+
+   3104  1 001073   000000 235100                    LDA     0,,PR0
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:68   
+         1 001074   200011 755100                    STA     SAVARS,,AUTO
+
+      581     3105    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   3105  1 001075   000207 701000 1                  TSX1    FTI_SENDQ
+         1 001076   001152 702000 1                  TSX2    JUSTALT
+
+      582     3106    1      IF SAVARS < 0
+
+   3106  1 001077   200011 235100                    LDA     SAVARS,,AUTO
+         1 001100   001117 605000 1                  TPL     s:3116
+
+      583     3107    2       THEN DO;
+
+      584     3108    2         N = - F$DCB.ARS;
+
+   3108  1 001101   200006 470500                    LDP0    JDCB$,,AUTO
+         1 001102   000000 235100                    LDA     0,,PR0
+         1 001103   000000 531000                    NEG     0
+         1 001104   200007 755100                    STA     N,,AUTO
+
+      585     3109    2         IF F$DCB.TYC.EOF(1)
+
+   3109  1 001105   000002 236100                    LDQ     2,,PR0
+         1 001106   004000 316003                    CANQ    2048,DU
+         1 001107   001122 600000 1                  TZE     s:3117
+
+      586     3110    3          THEN DO;                         /* Change EOF to BOF for - SPREC      */
+
+      587     3111    3            F$DCB.TYC.EOF(1) = '0'B;
+
+   3111  1 001110   000004 236000 2                  LDQ     4
+         1 001111   000002 356100                    ANSQ    2,,PR0
+
+      588     3112    3            F$DCB.TYC.BOF(1) = '1'B;
+
+   3112  1 001112   020000 236003                    LDQ     8192,DU
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:69   
+         1 001113   000002 256100                    ORSQ    2,,PR0
+
+      589     3113    3            F$DCB.TYC(0) = F$DCB.TYC(1);
+
+   3113  1 001114   000002 236100                    LDQ     2,,PR0
+         1 001115   000001 756100                    STQ     1,,PR0
+
+      590     3114    3            END;
+
+      591     3115    2         END;
+
+   3115  1 001116   001122 710000 1                  TRA     s:3117
+
+      592     3116    1       ELSE N = F$DCB.ARS;
+
+   3116  1 001117   200006 470500                    LDP0    JDCB$,,AUTO
+         1 001120   000000 235100                    LDA     0,,PR0
+         1 001121   200007 755100                    STA     N,,AUTO
+
+      593     3117    1      FT$DDT.FMCNT = FT$DDT.FMCNT + N;     /* Keep fm count                      */
+
+   3117  1 001122   200005 471500                    LDP1    DDDT$,,AUTO
+         1 001123   100006 236100                    LDQ     6,,PR1
+         1 001124   000022 772000                    QRL     18
+         1 001125   200007 036100                    ADLQ    N,,AUTO
+         1 001126   000000 620006                    EAX0    0,QL
+         1 001127   100006 740100                    STX0    6,,PR1
+
+      594     3118    1      RETURN;
+
+   3118  1 001130   000000 702200 xent               TSX2  ! X66_ARET
+
+      595     3119
+      596     3120        /****************************************/
+      597     3121    1   FTI$REWINDDEV: ENTRY(BUF$) ALTRET;
+
+   3121  1 001131   000000 700200 xent  FTI$REWINDD* TSX0  ! X66_AUTO_1
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:70   
+         1 001132   000026 000001                    ZERO    22,1
+
+      598     3122        /*F*  NAME: FTI$REWINDDEV
+      599     3123              PURPOSE: Non-DCB rewind tape.
+      600     3124         ***/
+      601     3125
+      602     3126        /********************/
+      603     3127
+      604     3128    1      CALL FTI_INITQDEV ALTRET(JUSTALT);   /* Get and initialize queue packet    */
+
+   3128  1 001133   000123 701000 1                  TSX1    FTI_INITQDEV
+         1 001134   001152 702000 1                  TSX2    JUSTALT
+
+      605     3129    1      N$REQ.FC = %N_REWIND;                /* Rewind tape                        */
+
+   3129  1 001135   200010 470500                    LDP0    Q$,,AUTO
+         1 001136   000006 236007                    LDQ     6,DL
+         1 001137   000003 552104                    STBQ    3,'04'O,PR0
+
+      606     3130    1      CALL FTI_SENDQ ALTRET(JUSTALT);
+
+   3130  1 001140   000207 701000 1                  TSX1    FTI_SENDQ
+         1 001141   001152 702000 1                  TSX2    JUSTALT
+
+      607     3131    1      FT$DDT.POS = FTP_BOV#;
+
+   3131  1 001142   200005 470500                    LDP0    DDDT$,,AUTO
+         1 001143   000006 236100                    LDQ     6,,PR0
+         1 001144   000002 376000 2                  ANQ     2
+         1 001145   000020 276007                    ORQ     16,DL
+         1 001146   000006 756100                    STQ     6,,PR0
+
+      608     3132    1      FT$DDT.FMCNT = 0;
+
+   3132  1 001147   000000 220003                    LDX0    0,DU
+         1 001150   000006 740100                    STX0    6,,PR0
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:71   
+      609     3133    1      RETURN;
+
+   3133  1 001151   000000 702200 xent               TSX2  ! X66_ARET
+
+   3132  1 001152                       JUSTALT      null
+      610     3134
+      611     3135        /****************************************/
+      612     3136
+      613     3137    1   JUSTALT: ;
+      614     3138    1      ALTRETURN;
+
+   3138  1 001152   000000 702200 xent               TSX2  ! X66_AALT
+
+E_BLNKTP
+ Sect OctLoc
+   0     000   062411 400052                                                    2..*
+
+E_CANTIO
+ Sect OctLoc
+   0     001   062411 413332                                                    2...
+
+E_CDALRT
+ Sect OctLoc
+   0     002   062411 400222                                                    2...
+
+E_FRAW
+ Sect OctLoc
+   0     003   062411 400202                                                    2...
+
+E_IOERR
+ Sect OctLoc
+   0     004   062411 400102                                                    2..B
+
+E_MTRAP
+ Sect OctLoc
+   0     005   062411 400132                                                    2..Z
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:72   
+E_OPER
+ Sect OctLoc
+   0     006   062411 400012                                                    2...
+
+E_PROT
+ Sect OctLoc
+   0     007   062411 400172                                                    2..z
+
+(unnamed)
+ Sect OctLoc
+   2     000   777777 777757   000000 006003   777777 777617   777777 774377    ................
+   2     004   773777 777777                                                    ....
+      615     3139
+      616     3140    1   END FTI$LOWIO;
+      617     3141        /*********************************************************************/
+
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:73   
+--  Include file information  --
+
+   B$TABLES_C.:E05TOU  cannot be made into a system file and is referenced.
+   NK_LDCT_R.:E05TOU  cannot be made into a system file and is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   FT_SUBS.:E05TOU  is referenced.
+   FT$DDT.:E05TOU  is referenced.
+   F_ERRORS_C.:E05TOU  is referenced.
+   F$DCB.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   B_SEGIDS_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+      No diagnostics issued in procedure FTI$LOWIO.
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:74   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData FTI$LOWIO
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/b STRC        r     1 E_BLNKTP                   1-0-0/b STRC        r     1 E_CANTIO
+     2-0-0/b STRC        r     1 E_CDALRT                   3-0-0/b STRC        r     1 E_FRAW
+     4-0-0/b STRC        r     1 E_IOERR                    5-0-0/b STRC        r     1 E_MTRAP
+     6-0-0/b STRC        r     1 E_OPER                     7-0-0/b STRC        r     1 E_PROT
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    13-0-0/w PTR         r     1 @B$                        3-0-0/w PTR         r     1 @BUF$
+    *0-0-0/w PTR         r     1 B$                         4-0-0/w STRC        r     1 BCDCB
+     4-0-0/w PTR         r     1 BCDCB$                    *0-0-0/w PTR         r     1 BUF$
+    *0-0-0/w SBIN        r     1 DCTX                       5-0-0/w PTR         r     1 DDDT$
+     6-0-0/w PTR         r     1 JDCB$                      7-0-0/w SBIN        r     1 N
+    10-0-0/w PTR         r     1 Q$                        11-0-0/w SBIN        r     1 SAVARS
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$JIT$                     0-0-0/w PTR         r     1 B$XL_ASC_EBC$
+     0-0-0/w PTR         r     1 B$XL_EBC_ASC$              0-0-0/w PTR         r     1 N$DCT$$
+     0-0-0/w UBIN        r     1 S_CUN
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:75   
+
+     0-0-0/d STRC(8856)  r     1 B$JIT                      0-0-0/d STRC(4608)  r     1 B$XL_ASC_EBC
+     0-0-0/d STRC(4608)  r     1 B$XL_EBC_ASC               0-0-0/d ASTR(3528)  r     1 F$DCB
+     0-0-0/w STRC(288)   r     1 FT$DDT                     0-0-0/d STRC(1080)  r     1 N$REQ
+     0-0-0/c ACHR        r     1 NCHARS                     0-0-0/d STRC(864)   r     1 NK$LDCT
+     0-0-0/w PTR         r     1 NK$LDCT$(0:0)
+
+
+   Procedure FTI$LOWIO requires 619 words for executable code.
+   Procedure FTI$LOWIO requires 22 words of local(AUTO) storage.
+
+    No errors detected in file FTI$LOWIO.:E05TSI    .
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:76   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:77   
+          MINI XREF LISTING
+
+B$ IN PROCEDURE FTI_INITQ
+      2708**DCL      2694--PROC     2733>>ASSIGN
+B$JIT.ACCESS.TAPES
+       453**DCL      2792<<ASSIGN   2792>>ASSIGN
+B$JIT.DCB$
+       441**DCL      2712>>ASSIGN   3015>>IF
+B$JIT.ERR
+       351**DCL      2721>>IF       2721<<ASSIGN   2766>>IF       2766<<ASSIGN   2815<<ASSIGN   2821<<ASSIGN
+      2827<<ASSIGN   2831<<ASSIGN   2835<<ASSIGN   2839<<ASSIGN   2845<<ASSIGN   3023<<ASSIGN
+B$JIT.ERR.MID
+       352**DCL       352--REDEF
+B$JIT.ORIGINATOR_PORT.FROM_CR
+       456**DCL       456--REDEF     457--REDEF
+B$JIT.TSLINE
+       454**DCL       455--REDEF
+B$JIT$
+      2542**DCL       346--IMP-PTR  2712>>ASSIGN   2721>>IF       2721>>ASSIGN   2766>>IF       2766>>ASSIGN
+      2792>>ASSIGN   2792>>ASSIGN   2815>>ASSIGN   2821>>ASSIGN   2827>>ASSIGN   2831>>ASSIGN   2835>>ASSIGN
+      2839>>ASSIGN   2845>>ASSIGN   3015>>IF       3023>>ASSIGN
+B$XL_ASC_EBC
+      2522**DCL      2946>>CALLBLT
+B$XL_ASC_EBC$
+      2521**DCL      2522--IMP-PTR  2946>>CALLBLT
+B$XL_EBC_ASC
+      2526**DCL      2900>>CALLBLT
+B$XL_EBC_ASC$
+      2525**DCL      2526--IMP-PTR  2900>>CALLBLT
+BCDCB.SID
+      2559**DCL      2803<<ASSIGN
+BCDCB$
+      2556**DCL      2557--REDEF    2802<<ASSIGN   2804>>ASSIGN   2805>>ASSIGN
+BUF$
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:78   
+      2549**DCL         9--PROC     2550--REDEF    2871--ENTRY    2878<>CALL     2885--ENTRY    2892<>CALL
+      2900>>CALLBLT  2900>>CALLBLT  2905--ENTRY    2911<>CALL     2918--ENTRY    2926<>CALL     2932--ENTRY
+      2940<>CALL     2946>>CALLBLT  2946>>CALLBLT  2952--ENTRY    2959<>CALL     2979--ENTRY    3121--ENTRY
+DCTX
+      2550**DCL      2758>>ASSIGN
+DDDT$
+      2560**DCL      1952--IMP-PTR  2716<<ASSIGN   2717>>IF       2761<<ASSIGN   2762>>IF       2810>>ASSIGN
+      2855>>ASSIGN   2897>>IF       2943>>IF       2975>>ASSIGN   2975>>ASSIGN   2989>>ASSIGN   2989>>ASSIGN
+      3003>>ASSIGN   3004>>ASSIGN   3038>>ASSIGN   3052>>ASSIGN   3066>>ASSIGN   3117>>ASSIGN   3117>>ASSIGN
+      3131>>ASSIGN   3132>>ASSIGN
+E_BLNKTP
+      2587**DCL      2839>>ASSIGN
+E_CANTIO
+      2600**DCL      2721>>ASSIGN   2766>>ASSIGN
+E_CDALRT
+      2614**DCL      2845>>ASSIGN
+E_FRAW
+      2627**DCL      2835>>ASSIGN
+E_IOERR
+      2640**DCL      2815>>ASSIGN
+E_MTRAP
+      2653**DCL      2827>>ASSIGN
+E_OPER
+      2666**DCL      2821>>ASSIGN
+E_PROT
+      2679**DCL      2831>>ASSIGN   3023>>ASSIGN
+F$DCB.ACTPOS
+      1617**DCL      1617--REDEF
+F$DCB.ARS
+      1592**DCL      1592--REDEF    2736>>ASSIGN   2804<<ASSIGN   2804>>ASSIGN   2899>>ASSIGN   3079>>ASSIGN
+      3080>>ASSIGN   3103>>ASSIGN   3104>>ASSIGN   3108>>ASSIGN   3116>>ASSIGN
+F$DCB.ASN
+      1607**DCL      2855>>IF
+F$DCB.ATTR
+      1610**DCL      1611--REDEF
+F$DCB.BORROW
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:79   
+      1625**DCL      1625--REDEF    1625--REDEF    1625--REDEF
+F$DCB.DCBNAME.L
+      1639**DCL      1639--IMP-SIZ
+F$DCB.EOMCHAR
+      1596**DCL      1596--REDEF
+F$DCB.FLDID
+      1620**DCL      1620--REDEF
+F$DCB.FORM$
+      1614**DCL      1614--REDEF
+F$DCB.FSECT
+      1630**DCL      1630--REDEF
+F$DCB.FSN
+      1607**DCL      1607--REDEF    1607--REDEF    1608--REDEF
+F$DCB.HEADER$
+      1613**DCL      1613--REDEF
+F$DCB.IXTNSIZE
+      1611**DCL      1611--REDEF
+F$DCB.LASTSTA$
+      1601**DCL      1601--REDEF
+F$DCB.LVL
+      1626**DCL      1626--REDEF
+F$DCB.NAME.C
+      1601**DCL      1601--REDEF
+F$DCB.NOEOF
+      1622**DCL      1622--REDEF
+F$DCB.NRECS
+      1612**DCL      1612--REDEF
+F$DCB.NRECX
+      1631**DCL      1631--REDEF
+F$DCB.OHDR
+      1623**DCL      1623--REDEF
+F$DCB.ORG
+      1606**DCL      1606--REDEF
+F$DCB.PRECNO
+      1629**DCL      1629--REDEF
+F$DCB.RCSZ
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:80   
+      1634**DCL      1634--REDEF
+F$DCB.RES
+      1602**DCL      1602--REDEF
+F$DCB.SETX
+      1614**DCL      1614--REDEF    2713>>ASSIGN   2731>>ASSIGN   3015>>IF
+F$DCB.TAB$
+      1613**DCL      1614--REDEF
+F$DCB.TAPTYP.USRBUF
+      1627**DCL      2879>>IF       2912>>IF
+F$DCB.TDA
+      1628**DCL      1628--REDEF
+F$DCB.TYC
+      1592**DCL      2737<<ASSIGN   2805<<ASSIGN   2805>>ASSIGN   2806<<ASSIGN   2806>>ASSIGN   3088<<ASSIGN
+      3088>>ASSIGN   3113<<ASSIGN   3113>>ASSIGN
+F$DCB.TYC.BOF
+      1592**DCL      3087<<ASSIGN   3112<<ASSIGN
+F$DCB.TYC.EOF
+      1593**DCL      2897>>IF       3084>>IF       3086<<ASSIGN   3109>>IF       3111<<ASSIGN
+F$DCB.WAIT
+      1624**DCL      2727<<ASSIGN   2728>>IF
+F$DCB.WSN
+      1603**DCL      1603--REDEF
+FASTXIT IN PROCEDURE FTI_SENDQ
+      2840**LABEL    2809--GOTO
+FT$DDT.DENSITY
+      1983**DCL      3038<<ASSIGN   3052<<ASSIGN   3066<<ASSIGN
+FT$DDT.EBCDIC
+      1971**DCL      2897>>IF       2943>>IF
+FT$DDT.FMCNT
+      1966**DCL      2975<<ASSIGN   2975>>ASSIGN   2989<<ASSIGN   2989>>ASSIGN   3004<<ASSIGN   3117<<ASSIGN
+      3117>>ASSIGN   3132<<ASSIGN
+FT$DDT.POS
+      1986**DCL      2810<<ASSIGN   3003<<ASSIGN   3131<<ASSIGN
+FT$DDT.POSLOST
+      1979**DCL      2717>>IF       2762>>IF       2855<<ASSIGN
+FT$DDT.RINGIN
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:81   
+      1972**DCL      3015>>IF
+FTI_INITQ
+      2694**PROC     2878--CALL     2892--CALL     2911--CALL     2926--CALL     2940--CALL     2959--CALL
+      2972--CALL     3000--CALL     3017--CALL     3035--CALL     3049--CALL     3063--CALL     3077--CALL
+      3101--CALL
+FTI_INITQDEV
+      2745**PROC     2986--CALL     3128--CALL
+FTI_SENDQ
+      2782**PROC     2881--CALL     2896--CALL     2914--CALL     2928--CALL     2948--CALL     2961--CALL
+      2974--CALL     2988--CALL     3002--CALL     3019--CALL     3037--CALL     3051--CALL     3065--CALL
+      3081--CALL     3105--CALL     3130--CALL
+JDCB$
+      2561**DCL      1592--IMP-PTR  2712<<ASSIGN   2713>>ASSIGN   2727>>ASSIGN   2728>>IF       2731>>ASSIGN
+      2735>>ASSIGN   2736>>ASSIGN   2737>>ASSIGN   2802>>ASSIGN   2804>>ASSIGN   2805>>ASSIGN   2806>>ASSIGN
+      2806>>ASSIGN   2855>>IF       2879>>IF       2897>>IF       2899>>ASSIGN   2912>>IF       3079>>ASSIGN
+      3080>>ASSIGN   3084>>IF       3086>>ASSIGN   3087>>ASSIGN   3088>>ASSIGN   3088>>ASSIGN   3103>>ASSIGN
+      3104>>ASSIGN   3108>>ASSIGN   3109>>IF       3111>>ASSIGN   3112>>ASSIGN   3113>>ASSIGN   3113>>ASSIGN
+      3116>>ASSIGN
+JUSTALT
+      3132**LABEL    2878--CALLALT  2881--CALLALT  2892--CALLALT  2896--CALLALT  2911--CALLALT  2914--CALLALT
+      2926--CALLALT  2928--CALLALT  2940--CALLALT  2948--CALLALT  2959--CALLALT  2961--CALLALT  2972--CALLALT
+      2974--CALLALT  2986--CALLALT  2988--CALLALT  3000--CALLALT  3002--CALLALT  3017--CALLALT  3019--CALLALT
+      3035--CALLALT  3037--CALLALT  3049--CALLALT  3051--CALLALT  3063--CALLALT  3065--CALLALT  3077--CALLALT
+      3081--CALLALT  3101--CALLALT  3105--CALLALT  3128--CALLALT  3130--CALLALT
+N
+      2562**DCL      2563--IMP-SIZ  2713<<ASSIGN   2714>>IF       2716>>ASSIGN   2717<<ASSIGN   2719>>IF
+      2758<<ASSIGN   2759>>IF       2761>>ASSIGN   2762<<ASSIGN   2764>>IF       2773>>ASSIGN   2798<<ASSIGN
+      2811<<ASSIGN   2816<<ASSIGN   2822<<ASSIGN   2840<<ASSIGN   2846<<ASSIGN   2849>>DOCASE   2899<<ASSIGN
+      2900>>CALLBLT  2900>>CALLBLT  2945<<ASSIGN   2946>>CALLBLT  2946>>CALLBLT  3108<<ASSIGN   3116<<ASSIGN
+      3117>>ASSIGN
+N$DCT$$
+      2410**DCL      2410--IMP-PTR  2716>>ASSIGN   2761>>ASSIGN   3015>>IF
+N$REQ
+      2169**DCL      2791<>CALL
+N$REQ.BUF$
+      2178**DCL      2733<<ASSIGN
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:82   
+N$REQ.BUFADDR
+      2178**DCL      2179--REDEF    2179--REDEF
+N$REQ.BUFSIZE
+      2172**DCL      2736<<ASSIGN   2894<<ASSIGN   2941<<ASSIGN
+N$REQ.DCB$
+      2200**DCL      2735<<ASSIGN   2774<<ASSIGN
+N$REQ.DLA.DCTX
+      2169**DCL      2731<<ASSIGN   2773<<ASSIGN
+N$REQ.DLA.DRELADDR
+      2170**DCL      2170--REDEF
+N$REQ.DVE.EOMCHAR
+      2207**DCL      2208--REDEF
+N$REQ.EAINFO
+      2201**DCL      2201--REDEF
+N$REQ.EAINFOX
+      2201**DCL      2202--REDEF
+N$REQ.EVNTINFO
+      2202**DCL      2202--REDEF
+N$REQ.FC
+      2172**DCL      2880<<ASSIGN   2895<<ASSIGN   2913<<ASSIGN   2927<<ASSIGN   2942<<ASSIGN   2960<<ASSIGN
+      2973<<ASSIGN   2987<<ASSIGN   3001<<ASSIGN   3018<<ASSIGN   3036<<ASSIGN   3050<<ASSIGN   3064<<ASSIGN
+      3078<<ASSIGN   3102<<ASSIGN   3129<<ASSIGN
+N$REQ.OPFLG.ARS
+      2175**DCL      2734<<ASSIGN   2800>>IF
+N$REQ.OPFLG.BPF
+      2177**DCL      2732<<ASSIGN
+N$REQ.OPFLG.CLR
+      2178**DCL      2879<<ASSIGN   2893<<ASSIGN   2912<<ASSIGN
+N$REQ.OPFLG.HOLD
+      2177**DCL      2738<<ASSIGN   2775<<ASSIGN
+N$REQ.OPFLG.USER
+      2175**DCL      2725<<ASSIGN   2770<<ASSIGN
+N$REQ.OPFLG.WAIT
+      2176**DCL      2729<<ASSIGN   2730<<ASSIGN   2772<<ASSIGN
+N$REQ.RCT
+      2204**DCL      3079<<ASSIGN   3103<<ASSIGN
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:83   
+N$REQ.STATUS
+      2183**DCL      2189--REDEF
+N$REQ.TYC
+      2191**DCL      2809>>IF
+N$REQ.TYC.BLNKTP
+      2193**DCL      2836>>IF
+N$REQ.TYC.BOT
+      2192**DCL      2810>>IF
+N$REQ.TYC.CDALRT
+      2197**DCL      2842>>IF
+N$REQ.TYC.EGV
+      2191**DCL      2808<<ASSIGN
+N$REQ.TYC.FRAW
+      2197**DCL      2832>>IF
+N$REQ.TYC.IOERR
+      2194**DCL      2812>>IF
+N$REQ.TYC.MTRAP
+      2195**DCL      2824>>IF
+N$REQ.TYC.OPER
+      2192**DCL      2818>>IF
+N$REQ.TYC.PROT
+      2196**DCL      2828>>IF
+N$REQ.USER#
+      2203**DCL      2726<<ASSIGN   2771<<ASSIGN
+NCHARS
+      2563**DCL      2900<<CALLBLT  2900>>CALLBLT  2946<<CALLBLT  2946>>CALLBLT
+NIO$QUE
+      2533**DCL-ENT  2791--CALL
+NIQ$GET
+      2534**DCL-ENT  2724--CALL     2769--CALL
+NIQ$REL
+      2535**DCL-ENT  2848--CALL
+NK$LDCT.DDT$
+      2372**DCL      2372--REDEF    2716>>ASSIGN   2761>>ASSIGN   3015>>IF
+NK$LDCT.IOQ$
+      2371**DCL      2372--REDEF
+PL6.E3A0      #001=FTI$LOWIO File=FTI$LOWIO.:E05TSI                              TUE 07/29/97 17:40 Page:84   
+NK$LDCT.LDCTX
+      2373**DCL      2373--REDEF
+NK$LDCT.LKFLG.ABORTED
+      2385**DCL      2386--REDEF
+NK$LDCT.RLCID.LDCTX
+      2395**DCL      2395--REDEF
+NK$LDCT.STA$
+      2391**DCL      2392--REDEF
+NK$LDCT.SYMB$
+      2370**DCL      2370--REDEF    2370--REDEF    2371--REDEF
+NK$LDCT$
+      2410**DCL      2716>>ASSIGN   2761>>ASSIGN   3015>>IF
+Q$
+      2564**DCL      2169--IMP-PTR  2724<>CALL     2725>>ASSIGN   2726>>ASSIGN   2729>>ASSIGN   2730>>ASSIGN
+      2731>>ASSIGN   2732>>ASSIGN   2733>>ASSIGN   2734>>ASSIGN   2735>>ASSIGN   2736>>ASSIGN   2738>>ASSIGN
+      2769<>CALL     2770>>ASSIGN   2771>>ASSIGN   2772>>ASSIGN   2773>>ASSIGN   2774>>ASSIGN   2775>>ASSIGN
+      2791>>CALL     2800>>IF       2808>>ASSIGN   2809>>IF       2810>>IF       2812>>IF       2818>>IF
+      2824>>IF       2828>>IF       2832>>IF       2836>>IF       2842>>IF       2848<>CALL     2879>>ASSIGN
+      2880>>ASSIGN   2893>>ASSIGN   2894>>ASSIGN   2895>>ASSIGN   2912>>ASSIGN   2913>>ASSIGN   2927>>ASSIGN
+      2941>>ASSIGN   2942>>ASSIGN   2960>>ASSIGN   2973>>ASSIGN   2987>>ASSIGN   3001>>ASSIGN   3018>>ASSIGN
+      3036>>ASSIGN   3050>>ASSIGN   3064>>ASSIGN   3078>>ASSIGN   3079>>ASSIGN   3102>>ASSIGN   3103>>ASSIGN
+      3129>>ASSIGN
+SAVARS
+      2565**DCL      3080<<ASSIGN   3082>>IF       3104<<ASSIGN   3106>>IF
+SC_FTIBADSEND
+      2536**DCL-ENT  2864--CALL
+SENDERR IN PROCEDURE FTI_SENDQ
+      2849**LABEL    2791--CALLALT
+S_CUN
+      2543**DCL      2726>>ASSIGN   2771>>ASSIGN

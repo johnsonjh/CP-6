@@ -1,0 +1,470 @@
+/*M* MARMOT - Memory Allocation Resource Manager for Online Tests */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMR,PLM=5,IND=3,CTI=3,SDI=3,MCL=10,CSI=0,ECI=0          */
+ 
+MARMOT: PROC MAIN;
+ 
+/*
+   Includes
+*/
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE MARMOT_C61;
+%INCLUDE B_ERRORS_C;
+%INCLUDE B_SEGIDS_C;
+%INCLUDE DA_MAP_R;
+%INCLUDE B$JIT;
+%INCLUDE B$USER;
+%INCLUDE XUF_ENTRY;
+%INCLUDE XU_MACRO_C;
+%INCLUDE XU_FORMAT_C;
+ 
+/*
+   Macros
+*/
+%F$DCB;
+%B$USERREFS;
+%P_PCB     (NAME=P_PCB, STCLASS="STATIC SYMDEF");
+%PARSE$OUT (NAME=OUT,STCLASS="BASED(CMD$)");
+%PARSE$SYM (NAME=SYM,STCLASS="BASED(CMD$)");
+%XUR_INIT  (SYNTAX=NO,PCB=P_PCB,COMMANDS=NO);
+%F_FDS     (NAME=FDS,DCB=M$LO,BUF=FMT_BUF);
+ 
+/*
+   Entry points
+*/
+DCL DAM$MAP     ENTRY(5)  ALTRET;
+DCL DAM$INIT    ENTRY     ALTRET;
+DCL XUR$GETCMD  ENTRY(6)  ALTRET;
+DCL XUR$INIT    ENTRY(3)  ALTRET;
+DCL XUR$ERRMSG  ENTRY(7)  ALTRET;
+/*
+   Pointers
+*/
+DCL B$JIT$ PTR SYMREF;
+DCL M$LM$  PTR;
+DCL U$LM$  PTR;
+DCL CMD$   PTR;
+DCL JIT$   PTR;
+DCL MY$LM$ PTR;
+/*
+   Vectors
+*/
+DCL NAME_ VECTOR;
+DCL V_    VECTOR;
+/*
+   DCB's
+*/
+DCL M$LO DCB;
+DCL M$LM DCB;
+ 
+/*
+   FPT's, VLR's, and VLP's
+*/
+%FPT_WRITE (FPTN = WRITE,
+            DCB = M$LO,
+            BUF = MSG_BUF);
+ 
+%FPT_GDS (FPTN = GET_SEGMENT,
+          RESULTS = SEGMENT,
+          SEGSIZE = 262143);
+ 
+%VLP_VECTOR (FPTN = SEGMENT);
+ 
+%FPT_PRIV (PRIV = %PR_SPCLMM#,AUTH = YES);
+ 
+%FPT_YC (CMD = IBEX_CMD);
+ 
+/*
+   Miscellaneous Variables
+*/
+DCL CMD_ARS  SBIN WORD;
+DCL MARMOT_CMD SBIN SYMREF;
+DCL TEMP_ARS SBIN;
+DCL I SBIN;
+DCL I_PROMPT CHAR(1) CONSTANT INIT('!');
+DCL J SBIN;
+DCL TARGET_VALUE UBIN WORD ALIGNED;
+DCL MSG_BUF CHAR(80) STATIC;
+DCL IBEX_CMD CHAR(20) STATIC;
+DCL G_USERS UBIN WORD STATIC INIT(0);
+DCL G_MEM   UBIN WORD STATIC INIT(0);
+DCL G_FMT CHAR(0) STATIC INIT
+('    %D ghosts are running %A eating up %D pages of memory.');
+DCL S_FMT CHAR(0) STATIC INIT
+('    %D %A ghosts have been stopped, releasing %D pages.');
+DCL NO_PRIVS CHAR(0) STATIC INIT
+('    Insufficient privileges to run %A.');
+DCL TOO_MUCH_FMT CHAR(0) STATIC INIT
+('    You can''t ask for more memory than you have on the machine.');
+DCL NOT_ENUF_FMT CHAR(0) STATIC INIT
+('    Insufficient memory to start %A ghosts.');
+DCL OFF_N_RUNNING CHAR(0) STATIC INIT
+('    %A is off and running, going after %D pages of memory.');
+DCL FMT_BUF CHAR(80) STATIC;
+%EJECT;
+/*
+   Check privs
+*/
+     CALL M$SPRIV (FPT_PRIV);
+     IF NOT (B$JIT$->B$JIT.PRIV.ACTIVE&(%PR_SPCLMM#|%PR_EXMM#)) THEN DO;
+        MY$LM$ = DCBADDR(DCBNUM(M$LM));
+        VBASE(NAME_) = ADDR(MY$LM$->F$DCB.NAME#.C);
+        VBOUND(NAME_) = MY$LM$->F$DCB.NAME#.L - 1;
+        CALL X$WRITE (FDS,VECTOR(NO_PRIVS),NAME_);
+        CALL M$EXIT;
+        END;
+ 
+/*
+   Parse command line
+*/
+     TEMP_ARS = B$JIT.CCARS;
+     CALL XUR$INIT (XUR_INIT);
+     CALL XUR$GETCMD(MARMOT_CMD,
+        CMD$,
+        VECTOR(I_PROMPT),
+        B$JIT.CCBUF,
+        TEMP_ARS)
+ 
+     WHENALTRETURN DO;
+        CALL XUR$ERRMSG(CMD$);
+        CALL M$EXIT;
+        END;
+ 
+     DO I = 0 TO OUT.NSUBLKS - 1;
+        J = OUT.SUBLK$(I)->OUT.CODE;
+        IF J = %EAT#
+        THEN DO;
+           CALL CHARBIN(TARGET_VALUE,
+              OUT.SUBLK$(0)->OUT.SUBLK$(0)->SYM.TEXT);
+           END;
+        END;
+ 
+     DO CASE(J);
+ 
+     CASE(%STOP#);
+        CALL STOP;
+     CASE(%EAT#);
+        CALL EAT;
+     CASE(ELSE);
+        CALL NO_CMD;
+     END;
+%EJECT;
+STOP: PROC;
+ 
+%FPT_WAIT (FPTN = WAIT_10, UNITS = 10);
+ 
+DCL I UBIN BYTE;
+DCL NO_MORE_GHOSTS BIT(1) STATIC INIT('0'B);
+DCL FIRST_PASS BIT(1) STATIC INIT('1'B);
+DCL G_MAXUSERS UBIN WORD STATIC INIT(0);
+DCL G_MAXMEM   UBIN WORD STATIC INIT(0);
+ 
+     M$LM$ = DCBADDR(DCBNUM(M$LM));
+     MY$LM$ = DCBADDR(DCBNUM(M$LM));
+ 
+     CALL DAM$INIT;
+ 
+     DO UNTIL NO_MORE_GHOSTS = '1'B;
+        DO I = 1 TO DA_MUAIS;
+           CALL DAM$MAP (M$LM$, U$LM$, -I, 0)
+           WHENRETURN DO;
+              IF ((U$LM$->F$DCB.ACCT# = MY$LM$->F$DCB.ACCT#) AND
+                 (U$LM$->F$DCB.NAME#.C = MY$LM$->F$DCB.NAME#.C)) THEN DO;
+ 
+                 CALL DAM$MAP(B$JIT$, JIT$, -I, 0)
+                 WHENRETURN DO;
+                    IF JIT$->B$JIT.MODE = %M_GHOST# THEN DO;
+                       G_USERS = G_USERS + 1;
+                       G_MEM = G_MEM + JIT$->B$JIT.CURRCORE;
+                       END;
+                    END;
+                 END;
+              END;
+           END;
+ 
+        IF FIRST_PASS = '1'B THEN DO;
+           FIRST_PASS = '0'B;
+           G_MAXUSERS = G_USERS;
+           G_MAXMEM = G_MEM;
+           END;
+ 
+        IF G_USERS = 0 THEN DO;
+           NO_MORE_GHOSTS = '1'B;
+           END;
+ 
+        IF G_USERS > 0 THEN DO;
+           G_USERS = 0;
+           G_MEM = 0;
+           END;
+ 
+        CALL DAM$INIT;
+ 
+        END;
+ 
+     VBASE(V_) = ADDR(MY$LM$->F$DCB.NAME#.C);
+     VBOUND(V_) = MY$LM$->F$DCB.NAME#.L - 1;
+ 
+     CALL X$WRITE (FDS,VECTOR(S_FMT),VECTOR(G_MAXUSERS),V_,
+        VECTOR(G_MAXMEM));
+END STOP;
+%EJECT;
+EAT: PROC;
+ 
+/*
+   FPT's, VLR's, and VLP's
+*/
+ 
+%FPT_MONINFO (FPTN = MONINFO,
+MONINFO = SYSTEM_MEMORY);
+ 
+%VLR_MONINFO (FPTN = SYSTEM_MEMORY);
+ 
+%FPT_GDS (FPTN = GET_SEGMENT,
+RESULTS = SEGMENT,
+SEGSIZE = 1024);
+ 
+%VLP_VECTOR (FPTN = SEGMENT);
+ 
+%FPT_WAIT (FPTN = WAIT_1, UNITS = 1);
+%FPT_WAIT (FPTN = WAIT_5, UNITS = 5);
+%FPT_GJOB (FPTN = PROPAGATE);
+ 
+/*
+   Miscellaneous Variables
+*/
+DCL G_CCBUF       CHAR(100) STATIC INIT(' ');
+DCL TARGET_PAGES  UBIN WORD STATIC INIT(0);
+DCL CURRENT_PAGES UBIN WORD STATIC INIT(0);
+DCL I             UBIN BYTE STATIC INIT(0);
+DCL J             UBIN BYTE STATIC INIT(0);
+DCL K             UBIN BYTE STATIC INIT(0);
+DCL OUR_TOTAL_MEM  UBIN WORD STATIC INIT(0);
+DCL TEMP_ARS      UBIN WORD;
+DCL I_PROMPT      CHAR(1) CONSTANT INIT('!');
+DCL MY$JIT$ PTR;
+ 
+     TARGET_PAGES = TARGET_VALUE * 1024;
+ 
+     CALL DAM$INIT;
+     CALL M$MONINFO (MONINFO);
+ 
+     M$LM$ = DCBADDR(DCBNUM(M$LM));
+     MY$LM$ = DCBADDR(DCBNUM(M$LM));
+     MY$JIT$ = B$JIT$;
+     CALL CONCAT(G_CCBUF,'!',MY$JIT$->B$JIT.CCBUF);
+ 
+     IF TARGET_PAGES > SYSTEM_MEMORY.PCORE# THEN DO;
+        CALL X$WRITE (FDS,VECTOR(TOO_MUCH_FMT));
+        CALL M$EXIT;
+        END;
+ 
+     IF SYSTEM_MEMORY.ACORE# <= %MEM_LIMIT# THEN DO;
+        VBASE(V_) = ADDR(MY$LM$->F$DCB.NAME#.C);
+        VBOUND(V_) = MY$LM$->F$DCB.NAME#.L - 1;
+        CALL X$WRITE (FDS, VECTOR(NOT_ENUF_FMT),V_);
+        CALL M$EXIT;
+        END;
+ 
+     DO I = 1 TO DA_MUAIS;
+        CALL DAM$MAP (M$LM$, U$LM$, -I, 0)
+        WHENRETURN DO;
+           IF ((U$LM$->F$DCB.ACCT# = MY$LM$->F$DCB.ACCT#) AND
+              (U$LM$->F$DCB.NAME#.C = MY$LM$->F$DCB.NAME#.C)) THEN DO;
+ 
+              CALL DAM$MAP(B$JIT$, JIT$, -I, 0)
+              WHENRETURN DO;
+                 IF JIT$->B$JIT.MODE = %M_GHOST# THEN DO;
+                    OUR_TOTAL_MEM = OUR_TOTAL_MEM + JIT$->B$JIT.CURRCORE;
+                    END;
+                 END;
+              END;
+           END;
+        END;
+ 
+     IF OUR_TOTAL_MEM < TARGET_PAGES AND
+        MY$JIT$->B$JIT.MODE = %M_GHOST# THEN DO;
+ 
+        CALL SIMULATE_ORES;
+ 
+        SEGMENT.W2.SEGID# = %DS3SID;
+ 
+        DO WHILE '1'B;
+ 
+           DO WHILE '1'B;
+ 
+              CALL M$GDS (GET_SEGMENT) ALTRET (NEXT_SEGMENT);
+ 
+              OUR_TOTAL_MEM = OUR_TOTAL_MEM + 1;
+ 
+              IF OUR_TOTAL_MEM >= TARGET_PAGES THEN GOTO NO_MORE_MEM;
+ 
+              CALL M$MONINFO (MONINFO);
+ 
+              IF SYSTEM_MEMORY.ACORE# <= %MEM_LIMIT#
+              THEN GOTO NO_MORE_MEM;
+ 
+              END;
+ 
+NEXT_SEGMENT:
+ 
+           DO SELECT (SEGMENT.W2.SEGID#);
+           SELECT (%DS3SID);
+              SEGMENT.W2.SEGID# = %DS4SID;
+           SELECT (%DS4SID);
+              SEGMENT.W2.SEGID# = %DS5SID;
+           SELECT (%DS5SID);
+              SEGMENT.W2.SEGID# = %DS6SID;
+           SELECT (%DS6SID);
+              SEGMENT.W2.SEGID# = %DS7SID;
+           SELECT (%DS7SID);
+              SEGMENT.W2.SEGID# = %DS8SID;
+           SELECT (%DS8SID);
+              GOTO NO_MORE_MEM_FOR_ME;
+           END;
+ 
+           CALL M$GDS (GET_SEGMENT) ALTRET (NO_MORE_MEM_FOR_ME);
+ 
+           OUR_TOTAL_MEM = OUR_TOTAL_MEM + 1;
+ 
+           END;
+ 
+        END;
+ 
+NO_MORE_MEM_FOR_ME:
+ 
+     IF OUR_TOTAL_MEM < TARGET_PAGES THEN DO;
+        PROPAGATE.CCBUF_ = VECTOR(G_CCBUF);
+        CALL M$GJOB (PROPAGATE) ALTRET (NO_MORE_MEM);
+        END;
+ 
+NO_MORE_MEM:
+ 
+   /* now, hang out here. Wake up now and then and look
+      for one of us who is saying STOP!!! */
+ 
+     IF MY$JIT$->B$JIT.MODE = %M_GHOST# THEN DO;
+ 
+        DO WHILE '1'B;
+ 
+           CALL M$WAIT (WAIT_5);
+           DO I = 1 TO DA_MUAIS;
+              CALL DAM$MAP (M$LM$, U$LM$, -I, 0)
+              WHENRETURN DO;
+                 IF ((U$LM$->F$DCB.ACCT# = MY$LM$->F$DCB.ACCT#) AND
+                    (U$LM$->F$DCB.NAME#.C = MY$LM$->F$DCB.NAME#.C)) THEN DO;
+ 
+                    CALL DAM$MAP(B$JIT$, JIT$, -I, 0)
+                    WHENRETURN DO;
+                       TEMP_ARS = JIT$->B$JIT.CCARS;
+                       CALL XUR$GETCMD (MARMOT_CMD,
+                          CMD$,
+                          VECTOR(I_PROMPT),
+                          JIT$->B$JIT.CCBUF,
+                          TEMP_ARS);
+ 
+                       DO J = 0 TO OUT.NSUBLKS -1;
+                          K = OUT.SUBLK$(J)->OUT.CODE;
+                          IF K = %STOP# THEN DO;
+                             CALL M$WAIT(WAIT_5);
+                             IBEX_CMD = 'SET M$LL NO';
+                             CALL M$YC (FPT_YC);
+                             IBEX_CMD = 'ERASE';
+                             CALL M$YC (FPT_YC);
+                             CALL M$EXIT;
+                             END;
+                          END;
+                       END;
+                    END;
+                 END;
+              END;
+           CALL DAM$INIT;
+           END;
+        END;
+     ELSE DO;
+ 
+        VBASE(V_) = ADDR(MY$LM$->F$DCB.NAME#.C);
+        VBOUND(V_) = MY$LM$->F$DCB.NAME#.L - 1;
+        CALL X$WRITE (FDS, VECTOR(OFF_N_RUNNING),V_,VECTOR(TARGET_PAGES));
+ 
+        END;
+END EAT;
+%EJECT;
+NO_CMD: PROC;
+ 
+DCL I UBIN BYTE;
+ 
+     M$LM$ = DCBADDR(DCBNUM(M$LM));
+     MY$LM$ = DCBADDR(DCBNUM(M$LM));
+ 
+     CALL DAM$INIT;
+ 
+     DO I = 1 TO DA_MUAIS;
+        CALL DAM$MAP (M$LM$, U$LM$, -I, 0)
+        WHENRETURN DO;
+           IF ((U$LM$->F$DCB.ACCT# = MY$LM$->F$DCB.ACCT#) AND
+              (U$LM$->F$DCB.NAME#.C = MY$LM$->F$DCB.NAME#.C)) THEN DO;
+ 
+              CALL DAM$MAP(B$JIT$, JIT$, -I, 0)
+              WHENRETURN DO;
+                 IF JIT$->B$JIT.MODE = %M_GHOST# THEN DO;
+                    G_USERS = G_USERS + 1;
+                    G_MEM = G_MEM + JIT$->B$JIT.CURRCORE;
+                    END;
+                 END;
+              END;
+           END;
+        END;
+ 
+     VBASE(V_) = ADDR(MY$LM$->F$DCB.NAME#.C);
+     VBOUND(V_) = MY$LM$->F$DCB.NAME#.L - 1;
+ 
+     CALL X$WRITE (FDS,VECTOR(G_FMT),VECTOR(G_USERS),V_,
+        VECTOR(G_MEM));
+ 
+END NO_CMD;
+ %EJECT;
+SIMULATE_ORES: PROC;
+DCL OUT_BUF CHAR(80) STATIC;
+DCL HI UBIN WORD STATIC INIT(1024);
+DCL LO UBIN WORD STATIC INIT(10);
+DCL CUR UBIN WORD STATIC;
+DCL MEM_STR CHAR(10) STATIC;
+ 
+     CUR = (HI - LO)/2;
+     CALL BINCHAR(MEM_STR,CUR);
+     CALL CONCAT(IBEX_CMD,'ORES MEM=',MEM_STR);
+ 
+     DO WHILE '1'B;
+ 
+        CALL M$YC (FPT_YC)
+ 
+        WHENRETURN DO;
+           LO = CUR;
+           CUR = CUR + ((HI-LO)/2);
+           END;
+ 
+        WHENALTRETURN DO;
+           HI = CUR;
+           CUR = CUR - ((HI-LO)/2);
+           END;
+ 
+        CALL BINCHAR(MEM_STR,CUR);
+        CALL CONCAT(IBEX_CMD,'ORES MEM=',MEM_STR);
+ 
+        IF (HI - LO = 2) THEN GOTO ALL_DONE;
+ 
+        END;
+ 
+ALL_DONE:
+ 
+     CALL BINCHAR(MEM_STR,HI - 1);
+     CALL CONCAT(IBEX_CMD,'ORES MEM=',MEM_STR);
+     CALL M$YC (FPT_YC);
+ 
+END SIMULATE_ORES;
+END MARMOT;

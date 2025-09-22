@@ -1,0 +1,1530 @@
+
+PL6.E3A0      #001=XBI$INIT_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:1    
+        1        1        /*T***********************************************************/
+        2        2        /*T*                                                         */
+        3        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+        4        4        /*T*                                                         */
+        5        5        /*T***********************************************************/
+        6        6        /*
+        7        7         * CP-6 C heap routines.
+        8        8         *
+        9        9         * Based on the boundary tag method as described by Donald E Knuth and
+       10       10         * Ellis Horowitz and Sahni.
+       11       11         *
+       12       12         * This system allocates all memory from the dynamic segment creating
+       13       13         * structures of the following form:
+       14       14         *
+       15       15         *                structure
+       16       16         *                   PTR*     Left_Link;
+       17       17         *                   PTR*     Right_Link;
+       18       18         *                   INTEGER  Size;          -- stored as a 2^n value
+       19       19         *                   BIT      Flags [36];    -- includes a TAG field and
+       20       20         *                                           -- a PROTECTED field.  The
+       21       21         *                                           -- other fields are for padding
+       22       22         *                   CHAR     Data [Size];   -- A block of data
+       23       23         *                   PTR*     Up_Link;       -- Required for the boundary tag method
+       24       24         *                endstructure
+       25       25         *
+       26       26         * OK, a quicky explanation:  What we allocate is a left and right pointer
+       27       27         * to other unallocated data.  The Size is the size of the unallocated
+       28       28         * block and the Up_Link is the pointer which points back UP to the top
+       29       29         * of the structure.  As well, there are a set of flags (36 reserved bits)
+       30       30         * which can be used for whatever the SYSTEMS programmer wishes.  These
+       31       31         * are NOT visible to the user.
+       32       32         *
+       33       33         * This, of course, leads us to reserving 4 words before the block of data
+       34       34         * and 2 words after.  However, in most cases this will not impact heavily
+       35       35         * upon memory usage since in most cases allocated memory is greater than
+       36       36         * 6 words.  Also, it is hoped, by examining the method in which CP-6
+       37       37         * allocates data, to shrink the above information down to 3 words, whereby
+PL6.E3A0      #001=XBI$INIT_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:2    
+       38       38         * the information would be stored as follows:
+       39       39         *
+       40       40         *            35   (16 bits)   19    (20 bits)    0
+       41       41         *             +---------------+------------------+
+       42       42         *             |     Size      |   Left Pointer   |      Word 1
+       43       43         *             +---------------+------------------+
+       44       44         *
+       45       45         *            35   (16 bits)   19    (20 bits)    0
+       46       46         *             +---------------+------------------+
+       47       47         *             |     Flags     |  Right Pointer   |      Word 2
+       48       48         *             +---------------+------------------+
+       49       49         *
+       50       50         *                             :
+       51       51         *
+       52       52         *                        D  A  T  A                     Words 3 .. n-1
+       53       53         *
+       54       54         *                             :
+       55       55         *
+       56       56         *            35   (16 bits)   19    (20 bits)    0
+       57       57         *             +---------------+------------------+
+       58       58         *             |     Flags     |    Up Pointer    |      Word n
+       59       59         *             +---------------+------------------+
+       60       60         *
+       61       61         *
+       62       62         * Of course we then have to limit the size of an allocated block to
+       63       63         * 64k (eeek!  Shades of MS-DOS (CP/M???)).  However, this method is
+       64       64         * there just as an example of what MAY be possible to shrink the size
+       65       65         * of the reserved word space required.  It may NOT be feasible...
+       66       66         *
+       67       67         */
+       68       68
+       69       69        xbi$init_heap: PROC ALTRET;
+       70       70           /*I*  NAME: XBI$INIT_HEAP
+       71       71                 CALL: CALL XBI$INIT_HEAP;
+       72       72                 DESCRIPTION: Initializes the heap.
+       73       73           */
+       74       74
+PL6.E3A0      #001=XBI$INIT_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:3    
+       75       75           %INCLUDE CP_6;
+       76     5635           %INCLUDE xb_heap_i6;
+       77     5710
+       78     5711    1      DCL Tail_p              PTR;
+       79     5712
+       80     5713    1      DCL XBI_SET_ERRNO       ENTRY (1);
+       81     5714
+       82     5715           %HEAP_SYMDEF;
+       83     5730
+       84     5731           %FPT_GDS (FPTN=FPT_GDS, STCLASS="STATIC SYMDEF", FREE=YES);
+       85     5747
+       86     5748    1      FPT_GDS.Results_   = Vector (XBI$Allocation_Heap.Heap_);
+       87     5749           /* start off allocating 1024 words to the heap */
+       88     5750    1      FPT_GDS.V.SegSize# = 1024;
+       89     5751
+       90     5752    1      XBI$Allocation_Heap.Initialized = '1'B;
+       91     5753
+       92     5754    1      CALL M$GDS (FPT_GDS)
+       93     5755    2         WHENALTRETURN DO;
+       94     5756    2            CALL XBI_SET_ERRNO;
+       95     5757    2            ALTRETURN;
+       96     5758    2         END;
+       97     5759
+       98     5760           /*
+       99     5761            * start up the free list
+      100     5762            */
+      101     5763
+      102     5764    1      XBI$AV = XBI$Allocation_Heap.Heap_.Base$;
+      103     5765
+      104     5766    1      XBI$First_AV = XBI$AV;
+      105     5767
+      106     5768    1      XBI$AV->Head.Left_Link       = XBI$AV;
+      107     5769    1      XBI$AV->Head.Right_Link      = XBI$AV;
+      108     5770    1      XBI$AV->Head.Size            = XBI$Allocation_Heap.Heap_.Size# + 1 - %
+              5770               HEAP_SLOP_SPACE;
+      109     5771    1      XBI$AV->Head.Flags           = '0'B;
+      110     5772
+PL6.E3A0      #001=XBI$INIT_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:4    
+      111     5773    1      Tail_p = PINCRW (XBI$AV, XBI$AV->Head.Size - SIZEW (Tail));
+      112     5774
+      113     5775    1      Tail_p->Tail.Up_Link         = XBI$AV;
+      114     5776    1      XBI$Last_AV = PINCRW (Tail_p, SIZEW (tail));
+      115     5777
+      116     5778    1   END xbi$init_heap;
+      117     5779        %EOD;
+
+PL6.E3A0      #001=XBI$INIT_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:5    
+--  Include file information  --
+
+   xb_heap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI$INIT_HEAP.
+
+   Procedure XBI$INIT_HEAP requires 42 words for executable code.
+   Procedure XBI$INIT_HEAP requires 4 words of local(AUTO) storage.
+
+PL6.E3A0      #001=XBI$INIT_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:6    
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=XBI$INIT_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:7    
+          MINI XREF LISTING
+
+FPT_GDS
+      5742**DCL      5754<>CALL
+FPT_GDS.RESULTS_
+      5742**DCL      5748<<ASSIGN
+FPT_GDS.V
+      5742**DCL      5742--DCLINIT
+FPT_GDS.V.SEGSIZE#
+      5745**DCL      5750<<ASSIGN
+HEAD.FLAGS
+      5692**DCL      5771<<ASSIGN
+HEAD.LEFT_LINK
+      5689**DCL      5768<<ASSIGN
+HEAD.RIGHT_LINK
+      5690**DCL      5769<<ASSIGN
+HEAD.SIZE
+      5691**DCL      5770<<ASSIGN   5773>>ASSIGN
+M$GDS
+      5598**DCL-ENT  5754--CALL
+TAIL
+      5701**DCL      5773--ASSIGN   5776--ASSIGN
+TAIL.UP_LINK
+      5702**DCL      5775<<ASSIGN
+TAIL_P
+      5711**DCL      5773<<ASSIGN   5775>>ASSIGN   5776>>ASSIGN
+XBI$ALLOCATION_HEAP.HEAP_
+      5721**DCL      5748--ASSIGN
+XBI$ALLOCATION_HEAP.HEAP_.BASE$
+      5724**DCL      5725--REDEF    5764>>ASSIGN
+XBI$ALLOCATION_HEAP.HEAP_.SIZE#
+      5722**DCL      5770>>ASSIGN
+XBI$ALLOCATION_HEAP.INITIALIZED
+      5728**DCL      5752<<ASSIGN
+PL6.E3A0      #001=XBI$INIT_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:8    
+XBI$AV
+      5716**DCL      5764<<ASSIGN   5766>>ASSIGN   5768>>ASSIGN   5768>>ASSIGN   5769>>ASSIGN   5769>>ASSIGN
+      5770>>ASSIGN   5771>>ASSIGN   5773>>ASSIGN   5773>>ASSIGN   5775>>ASSIGN
+XBI$FIRST_AV
+      5717**DCL      5766<<ASSIGN
+XBI$LAST_AV
+      5718**DCL      5776<<ASSIGN
+XBI_SET_ERRNO
+      5713**DCL-ENT  5756--CALL
+
+PL6.E3A0      #002=XBI$FREE_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:9    
+      118        1        /*T***********************************************************/
+      119        2        /*T*                                                         */
+      120        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+      121        4        /*T*                                                         */
+      122        5        /*T***********************************************************/
+      123        6
+      124        7        xbi$free_heap: PROC;
+      125        8           /*I*  NAME: XBI$INIT_HEAP
+      126        9                 CALL: CALL XBI$INIT_HEAP;
+      127       10                 DESCRIPTION: Free's the heap.
+      128       11           */
+      129       12
+      130       13           %INCLUDE CP_6;
+      131     5573           %INCLUDE xb_heap_i6;
+      132     5648
+      133     5649    1      DCL XBI_SET_ERRNO       ENTRY (1);
+      134     5650    1      DCL XB_IO_ERROR         ENTRY;
+      135     5651
+      136     5652           %HEAP_SYMREF;
+      137     5667
+      138     5668           %FPT_FDS (FPTN=FPT_FDS_CONST, STCLASS=CONSTANT);
+      139     5683           %FPT_FDS (FPTN=FPT_FDS);
+      140     5698
+      141     5699    1      IF NOT XBI$Allocation_Heap.Initialized THEN RETURN;
+      142     5700
+      143     5701    1      FPT_FDS = FPT_FDS_CONST;
+      144     5702    1      FPT_FDS.V_ = VECTOR (FPT_FDS.V);
+      145     5703    1      FPT_FDS.Results_   = Vector (XBI$Allocation_Heap.Heap_);
+      146     5704    1      FPT_FDS.V.SegSize# = XBI$Allocation_Heap.Heap_.Size#;
+      147     5705
+      148     5706    1      CALL M$FDS (FPT_FDS)
+      149     5707    2         WHENALTRETURN DO;
+      150     5708    2            CALL XBI_SET_ERRNO;
+      151     5709    2            CALL XB_IO_ERROR;
+      152     5710    2         END;
+      153     5711
+      154     5712    1      XBI$Allocation_Heap.Initialized = '0'B;
+PL6.E3A0      #002=XBI$FREE_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:10   
+      155     5713    1      XBI$Allocation_Heap.Heap_.Size# = 0;
+      156     5714    1   END xbi$free_heap;
+      157     5715        %EOD;
+
+PL6.E3A0      #002=XBI$FREE_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:11   
+--  Include file information  --
+
+   xb_heap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI$FREE_HEAP.
+
+   Procedure XBI$FREE_HEAP requires 29 words for executable code.
+   Procedure XBI$FREE_HEAP requires 4 words of local(AUTO) storage.
+
+PL6.E3A0      #002=XBI$FREE_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:12   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=XBI$FREE_HEAP File=xbi_stdlib:6.:XBC3TSI                      FRI 01/06/95 11:40 Page:13   
+          MINI XREF LISTING
+
+FPT_FDS
+      5694**DCL      5701<<ASSIGN   5706<>CALL
+FPT_FDS.RESULTS_
+      5694**DCL      5703<<ASSIGN
+FPT_FDS.V
+      5694**DCL      5694--DCLINIT  5702--ASSIGN
+FPT_FDS.V.SEGSIZE#
+      5696**DCL      5704<<ASSIGN
+FPT_FDS.V_
+      5694**DCL      5702<<ASSIGN
+FPT_FDS_CONST
+      5679**DCL      5701>>ASSIGN
+FPT_FDS_CONST.V
+      5679**DCL      5679--DCLINIT
+M$FDS
+      5536**DCL-ENT  5706--CALL
+XBI$ALLOCATION_HEAP.HEAP_
+      5658**DCL      5703--ASSIGN
+XBI$ALLOCATION_HEAP.HEAP_.BASE$
+      5661**DCL      5662--REDEF
+XBI$ALLOCATION_HEAP.HEAP_.SIZE#
+      5659**DCL      5704>>ASSIGN   5713<<ASSIGN
+XBI$ALLOCATION_HEAP.INITIALIZED
+      5665**DCL      5699>>IF       5712<<ASSIGN
+XBI_SET_ERRNO
+      5649**DCL-ENT  5708--CALL
+XB_IO_ERROR
+      5650**DCL-ENT  5709--CALL
+
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:14   
+      158        1        /*T***********************************************************/
+      159        2        /*T*                                                         */
+      160        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+      161        4        /*T*                                                         */
+      162        5        /*T***********************************************************/
+      163        6
+      164        7        xbi_malloc: PROC (Size_In_Bytes, Result);
+      165        8           /*I*  NAME: XBI_MALLOC
+      166        9                 CALL: CALL XBI_MALLOC (size_in_bytes, result);
+      167       10                 INPUT:   size_in_bytes  UBIN;
+      168       11                 OUTPUT:  result         PTR;
+      169       12                 DESCRIPTION: finds a block of memory size_in_bytes large in the
+      170       13                    heap and returns a pointer to it in result.  If size_in_bytes
+      171       14                    is zero, or memory is unavailable, a nil pointer is returned.
+      172       15           */
+      173       16
+      174       17           %INCLUDE CP_6;
+      175     5577           %INCLUDE xb_heap_i6;
+      176     5652           %INCLUDE xb_errors_i6;
+      177     5723
+      178     5724    1      DCL Size_In_Bytes          UBIN;
+      179     5725    1      DCL Result                 PTR;
+      180     5726
+      181     5727    1      DCL Size_In_Words          UBIN;
+      182     5728    1      DCL p                      PTR;
+      183     5729    1      DCL Tail_P                 PTR;
+      184     5730    1      DCL Old_Size               SBIN;
+      185     5731    1      DCL difference             SBIN;
+      186     5732    1      DCL epsilon         CONSTANT SBIN INIT (4);
+              5732               /* so we can easily modify it from DELTA */
+      187     5733    1      DCL space_needed           SBIN;
+      188     5734
+      189     5735    1      DCL xbi$init_heap          ENTRY ALTRET;
+      190     5736    1      DCL XBI_SET_ERRNO          ENTRY (1);
+      191     5737    1      DCL XBI_FREE               ENTRY (1);
+      192     5738
+      193     5739
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:15   
+      194     5740           %HEAP_SYMREF;
+      195     5755
+      196     5756           %FPT_GDS (FPTN=FPT_GDS, STCLASS="SYMREF",FREE=YES);
+      197     5772
+      198     5773           /*
+      199     5774            * Allocate (n: Integer; p: PTR)
+      200     5775            *
+      201     5776            * Use next fit to allocate a block of memory of size at least n, n > 0.
+      202     5777            * The available space list is maintained as described above and it is
+      203     5778            * assumed that no blocks of size < epsilon are to be retained.  p is
+      204     5779            * set to be the address of the first word in the block allocated.  AV
+      205     5780            * points to a node on the available list.
+      206     5781            */
+      207     5782
+      208     5783           /*
+      209     5784            * p is based onto Free_Block (looks like Heap)
+      210     5785            * We start the search for an appropriate free block at p which
+      211     5786            * is actually the Heap's right link
+      212     5787            */
+      213     5788
+      214     5789    1      Size_In_Words = (Size_In_Bytes + 3) / 4 + sizew (head) + sizew (tail);
+      215     5790
+      216     5791           /* we'll be conservative and make sure all blocks are double word
+      217     5792              aligned. */
+      218     5793
+      219     5794    1      Size_In_Words = Size_In_Words + mod(Size_In_Words, 2);
+      220     5795
+      221     5796    1      if (~XBI$Allocation_Heap.Initialized)
+      222     5797    1      then
+      223     5798    1         CALL xbi$init_heap
+      224     5799    2            WHENALTRETURN DO;
+      225     5800    2               result = ADDR(NIL);
+      226     5801    2               if XBI_Debug = 0 then return;   else CALL M$XXX;
+      227     5802    2            END;
+      228     5803
+      229     5804    1   try_again:
+      230     5805    1      if XBI$AV = ADDR(NIL) then
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:16   
+      231     5806    1         p = ADDR(NIL);
+      232     5807    2      else do;
+      233     5808    2         p = XBI$AV;                           /* begin search at p */
+      234     5809
+      235     5810    3         do until (p = XBI$AV);
+      236     5811    3            if (p->Head.Size >= Size_In_Words)
+      237     5812    3            then                                            /* block is big enough */
+      238     5813    4               do;
+      239     5814    5                  do inhibit;
+      240     5815    5                     difference = p->Head.Size - Size_In_Words;
+      241     5816
+      242     5817    5                     if difference < (epsilon + SIZEW(Head) + SIZEW(Tail))
+      243     5818    5                     then                                    /* allocate whole block */
+      244     5819    6                        do;
+      245     5820                                /*
+      246     5821                                 * Delete node from available list
+      247     5822                                 */
+      248     5823
+      249     5824    6                           p->Head.Left_Link->Head.Right_Link = p->Head.Right_Link;
+      250     5825    6                           p->Head.Right_Link->Head.Left_Link = p->Head.Left_Link;
+      251     5826
+      252     5827    6                           p->Head.Flags     = '0'B;
+      253     5828    6                           p->Head.Flags.Tag = '1'B;                 /* set tags */
+      254     5829    6                           p->Head.Flags.Stamp = 88;
+      255     5830
+      256     5831                                /*
+      257     5832                                 * set starting point of next search
+      258     5833                                 */
+      259     5834
+      260     5835    6                           XBI$AV = p->Head.Left_Link;
+      261     5836
+      262     5837    6                           p->Head.Left_Link = ADDR(NIL);
+      263     5838    6                           p->Head.Right_Link = ADDR(NIL);
+      264     5839
+      265     5840                                /* free list may be exhausted */
+      266     5841    6                           IF XBI$AV = p THEN XBI$AV = ADDR(NIL);
+      267     5842    6                           Result = PINCRW (p, SIZEW (Head));
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:17   
+              5842                                    /* point past data block */
+      268     5843    6                           return;
+      269     5844    6                        end;
+      270     5845    5                     else
+      271     5846    6                        do;
+      272     5847    6                           XBI$AV = p;                       /* posn for next search */
+      273     5848
+      274     5849                                /*
+      275     5850                                 * Allocate *LOWER* n words
+      276     5851                                 */
+      277     5852
+      278     5853    6                           p->Head.Size       = difference;
+      279     5854    6                           Tail_p             = PINCRW (p, difference - SIZEW (Tail));
+      280     5855    6                           Tail_p->Tail.Up_Link = p;
+      281     5856
+      282     5857
+      283     5858    6                           p = PINCRW (p, difference);      /* set to point one past */
+      284     5859
+      285     5860    6                           p->Head.Size = Size_In_Words;
+      286     5861    6                           p->Head.Flags       = '0'B;
+      287     5862    6                           p->Head.Flags.Tag   = '1'B;
+      288     5863    6                           p->Head.Flags.Stamp = 88;
+      289     5864    6                           p->Head.Left_Link = ADDR(NIL);
+      290     5865    6                           p->Head.Right_Link = ADDR(NIL);
+      291     5866
+      292     5867    6                           Tail_p = PINCRW (p, Size_In_Words - SIZEW(Tail));
+      293     5868    6                           Tail_p -> Tail.Up_Link = p;
+      294     5869
+      295     5870    6                           Result = PINCRW (p, SIZEW (Head));
+              5870                                    /* point past data block */
+      296     5871    6                           return;
+      297     5872    6                        end;
+      298     5873    5                  end /* inhibit */;
+      299     5874    4               end;
+      300     5875
+      301     5876    3            p = p->Head.Right_Link;
+      302     5877    3         end;
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:18   
+      303     5878    2      end;
+      304     5879
+      305     5880           /*
+      306     5881            * no block large enough
+      307     5882            *
+      308     5883            * If there is nothing left to allocate (i.e. p is NIL)
+      309     5884            * then try to get more memory from CP-6.
+      310     5885            */
+      311     5886    1      Old_Size = XBI$Allocation_Heap.Heap_.Size#;
+      312     5887    1      p = PINCRW (XBI$Allocation_Heap.Heap_.base$, Old_Size + 1 - %HEAP_SLOP_SPACE);
+      313     5888    1      FPT_GDS.Results_   = Vector (XBI$Allocation_Heap.Heap_);
+      314     5889           /* allocate only pages to save on monitor calls. */
+      315     5890    1     space_needed = ((Size_In_Words+1023) / 1024) * 1024;
+      316     5891    1      if XBI$Allocation_Heap.Heap_.Size# + space_needed > (256 * 1024 - 1)
+      317     5892    1      then
+      318     5893    2         do;
+      319     5894    2            call XBI_SET_ERRNO (ERR$NO_MEMORY_FOR_MALLOC);
+      320     5895    2            result = ADDR(NIL);
+      321     5896    2            if XBI_Debug = 0 then return;   else CALL M$XXX;
+      322     5897    2         end;
+      323     5898    1      FPT_GDS.V.SegSize# = space_needed;
+      324     5899
+      325     5900    1      CALL M$GDS (FPT_GDS)
+      326     5901    2         WHENALTRETURN DO;
+      327     5902    2            CALL XBI_SET_ERRNO;
+      328     5903    2            result = ADDR(NIL);
+      329     5904    2            if XBI_Debug = 0 then return;   else CALL M$XXX;
+      330     5905    2         END;
+      331     5906
+      332     5907           /*
+      333     5908            * Now link this into the existing memory map so that the
+      334     5909            * tags and other structures exist.
+      335     5910            */
+      336     5911
+      337     5912
+      338     5913           /*
+      339     5914            * set the appropriate variables so that this block can be
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:19   
+      340     5915            * quickly reclaimed when free'd
+      341     5916            */
+      342     5917
+      343     5918    2      do inhibit;
+      344     5919    2         p->Head.Right_Link      = ADDR (NIL);
+      345     5920    2         p->Head.Left_Link       = ADDR (NIL);
+      346     5921    2         p->Head.Size            = XBI$Allocation_Heap.Heap_.Size# - Old_Size;
+      347     5922    2         p->Head.Flags           = '0'B;       /* not in use */
+      348     5923    2         p->Head.Flags.Stamp     = 88;
+      349     5924
+      350     5925    2         Tail_p = PINCRW (p, p->Head.Size - SIZEW(Tail));
+      351     5926
+      352     5927    2         Tail_p->Tail.Up_Link         = p;    /* for quick reclaim */
+      353     5928
+      354     5929    2         XBI$Last_AV = PINCRW (Tail_p, SIZEW (Tail)); /* remember the *last* alloc!! */
+      355     5930    2      end /* inhibit */;
+      356     5931
+      357     5932    1      call xbi_free (PINCRW (p, SIZEW(Head)));  /* link new block into free list */
+      358     5933    1      goto try_again;     /* Ugh... backwards goto!  Minus 20 points for style! */
+      359     5934    1   END xbi_malloc;
+      360     5935        %EOD;
+
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:20   
+--  Include file information  --
+
+   xb_errors_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   xb_heap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI_MALLOC.
+
+   Procedure XBI_MALLOC requires 197 words for executable code.
+   Procedure XBI_MALLOC requires 14 words of local(AUTO) storage.
+
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:21   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:22   
+          MINI XREF LISTING
+
+DIFFERENCE
+      5731**DCL      5815<<ASSIGN   5817>>IF       5853>>ASSIGN   5854>>ASSIGN   5858>>ASSIGN
+EPSILON
+      5732**DCL      5817>>IF
+FPT_GDS
+      5767**DCL      5900<>CALL
+FPT_GDS.RESULTS_
+      5767**DCL      5888<<ASSIGN
+FPT_GDS.V.SEGSIZE#
+      5770**DCL      5898<<ASSIGN
+HEAD
+      5630**DCL      5789--ASSIGN   5817--IF       5842--ASSIGN   5870--ASSIGN   5932--CALL
+HEAD.FLAGS
+      5634**DCL      5827<<ASSIGN   5861<<ASSIGN   5922<<ASSIGN
+HEAD.FLAGS.STAMP
+      5641**DCL      5829<<ASSIGN   5863<<ASSIGN   5923<<ASSIGN
+HEAD.FLAGS.TAG
+      5635**DCL      5828<<ASSIGN   5862<<ASSIGN
+HEAD.LEFT_LINK
+      5631**DCL      5824>>ASSIGN   5825<<ASSIGN   5825>>ASSIGN   5835>>ASSIGN   5837<<ASSIGN   5864<<ASSIGN
+      5920<<ASSIGN
+HEAD.RIGHT_LINK
+      5632**DCL      5824<<ASSIGN   5824>>ASSIGN   5825>>ASSIGN   5838<<ASSIGN   5865<<ASSIGN   5876>>ASSIGN
+      5919<<ASSIGN
+HEAD.SIZE
+      5633**DCL      5811>>IF       5815>>ASSIGN   5853<<ASSIGN   5860<<ASSIGN   5921<<ASSIGN   5925>>ASSIGN
+M$GDS
+      5540**DCL-ENT  5900--CALL
+M$XXX
+      5517**DCL-ENT  5801--CALL     5896--CALL     5904--CALL
+OLD_SIZE
+      5730**DCL      5886<<ASSIGN   5887>>ASSIGN   5921>>ASSIGN
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:23   
+P
+      5728**DCL      5806<<ASSIGN   5808<<ASSIGN   5810>>DOUNTIL  5811>>IF       5815>>ASSIGN   5824>>ASSIGN
+      5824>>ASSIGN   5825>>ASSIGN   5825>>ASSIGN   5827>>ASSIGN   5828>>ASSIGN   5829>>ASSIGN   5835>>ASSIGN
+      5837>>ASSIGN   5838>>ASSIGN   5841>>IF       5842>>ASSIGN   5847>>ASSIGN   5853>>ASSIGN   5854>>ASSIGN
+      5855>>ASSIGN   5858<<ASSIGN   5858>>ASSIGN   5860>>ASSIGN   5861>>ASSIGN   5862>>ASSIGN   5863>>ASSIGN
+      5864>>ASSIGN   5865>>ASSIGN   5867>>ASSIGN   5868>>ASSIGN   5870>>ASSIGN   5876<<ASSIGN   5876>>ASSIGN
+      5887<<ASSIGN   5919>>ASSIGN   5920>>ASSIGN   5921>>ASSIGN   5922>>ASSIGN   5923>>ASSIGN   5925>>ASSIGN
+      5925>>ASSIGN   5927>>ASSIGN   5932>>CALL
+RESULT
+      5725**DCL         7--PROC     5800<<ASSIGN   5842<<ASSIGN   5870<<ASSIGN   5895<<ASSIGN   5903<<ASSIGN
+SIZE_IN_BYTES
+      5724**DCL         7--PROC     5789>>ASSIGN
+SIZE_IN_WORDS
+      5727**DCL      5789<<ASSIGN   5794<<ASSIGN   5794>>ASSIGN   5794>>ASSIGN   5811>>IF       5815>>ASSIGN
+      5860>>ASSIGN   5867>>ASSIGN   5890>>ASSIGN
+SPACE_NEEDED
+      5733**DCL      5890<<ASSIGN   5891>>IF       5898>>ASSIGN
+TAIL
+      5643**DCL      5789--ASSIGN   5817--IF       5854--ASSIGN   5867--ASSIGN   5925--ASSIGN   5929--ASSIGN
+TAIL.UP_LINK
+      5644**DCL      5855<<ASSIGN   5868<<ASSIGN   5927<<ASSIGN
+TAIL_P
+      5729**DCL      5854<<ASSIGN   5855>>ASSIGN   5867<<ASSIGN   5868>>ASSIGN   5925<<ASSIGN   5927>>ASSIGN
+      5929>>ASSIGN
+TRY_AGAIN
+      5805**LABEL    5933--GOTO
+XB$ERR$NO_MEMORY_FOR_MALLOC
+      5698**DCL      5894<>CALL
+XBI$ALLOCATION_HEAP.HEAP_
+      5746**DCL      5888--ASSIGN
+XBI$ALLOCATION_HEAP.HEAP_.BASE$
+      5749**DCL      5750--REDEF    5887>>ASSIGN
+XBI$ALLOCATION_HEAP.HEAP_.SIZE#
+      5747**DCL      5886>>ASSIGN   5891>>IF       5921>>ASSIGN
+XBI$ALLOCATION_HEAP.INITIALIZED
+      5753**DCL      5796>>IF
+PL6.E3A0      #003=XBI_MALLOC File=xbi_stdlib:6.:XBC3TSI                         FRI 01/06/95 11:40 Page:24   
+XBI$AV
+      5741**DCL      5805>>IF       5808>>ASSIGN   5810>>DOUNTIL  5835<<ASSIGN   5841>>IF       5841<<ASSIGN
+      5847<<ASSIGN
+XBI$INIT_HEAP
+      5735**DCL-ENT  5798--CALL
+XBI$LAST_AV
+      5743**DCL      5929<<ASSIGN
+XBI_DEBUG
+      5744**DCL      5801>>IF       5896>>IF       5904>>IF
+XBI_FREE
+      5737**DCL-ENT  5932--CALL
+XBI_SET_ERRNO
+      5736**DCL-ENT  5894--CALL     5902--CALL
+
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:25   
+      361        1        /*T***********************************************************/
+      362        2        /*T*                                                         */
+      363        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+      364        4        /*T*                                                         */
+      365        5        /*T***********************************************************/
+      366        6
+      367        7        xbi_free: PROC (A$);
+      368        8           /*I*  NAME: XBI_FREE
+      369        9                 CALL: CALL XBI_FREE (A$);
+      370       10                 INPUT: A$ PTR;
+      371       11                 DESCRIPTION: If A$ is a pointer into the heap and the Protected flag
+      372       12                    is not set, the block of storage
+      373       13                    it points to is deallocated and added to the free list.  If A$ is
+      374       14                    null or doesn't point into the heap nothing is done.
+      375       15           */
+      376       16
+      377       17        %INCLUDE CP_6;
+      378     5577           %INCLUDE xb_heap_i6;
+      379     5652           %INCLUDE xb_errors_i6;
+      380     5723
+      381     5724    1      DCL A$                     PTR;
+      382     5725    1      DCL 1 A$_exposed REDEF A$,
+      383     5726    1         2  Word_Offset          UBIN (18) UNAL,
+      384     5727    1         2  Byte_Bit_Segid       UBIN (18) UNAL;
+      385     5728
+      386     5729    1      DCL p                      PTR;
+      387     5730    1      DCL Tail_p                 PTR;
+      388     5731    1      DCL n                      SBIN;
+      389     5732    1      DCL Next_p                 PTR;
+      390     5733    1      DCL Prev_p                 PTR;
+      391     5734    1      DCL Next_Tail              PTR;
+      392     5735    1      DCL Prev_Tail              PTR;
+      393     5736    1      DCL Next_Tag               BIT (1);
+      394     5737    1      DCL Prev_Tag               BIT (1);
+      395     5738    1      DCL XBI_SET_ERRNO          ENTRY (1);
+      396     5739    1      DCL XB_IO_ERROR            ENTRY;
+      397     5740
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:26   
+      398     5741           %HEAP_SYMREF;
+      399     5756
+      400     5757    1      if A$ = ADDR(NIL)
+      401     5758    1      then if XBI_Debug = 0 then return;   else CALL M$XXX;
+      402     5759
+      403     5760           /* Ignore requests to free things that are not in the heap.  This also
+      404     5761              serves as a test for the null pointer.
+      405     5762           */
+      406     5763    1      if A$_exposed.Byte_Bit_Segid ~= XBI$Allocation_Heap.Heap_.Base.Byte_Bit_Segid
+      407     5764    1      then
+      408     5765    1         if XBI_Debug = 0 then return;   else CALL M$XXX;
+      409     5766
+      410     5767    1      p = PINCRW (A$, -SIZEW (Head));    /* set to point to allocation data */
+      411     5768
+      412     5769                                     /* don't free if block is protected */
+      413     5770    1      if p -> Head.Flags.Protected then
+      414     5771    1         if XBI_Debug = 0 then return;   else CALL M$XXX;
+      415     5772
+      416     5773           /* something's funny if left link and right link not NIL. */
+      417     5774    1      if p -> Head.Left_Link ~= ADDR(NIL)
+      418     5775    1        or p -> Head.Right_Link ~= ADDR(NIL)
+      419     5776    1      then if XBI_Debug = 0 then return;   else CALL M$XXX;
+      420     5777
+      421     5778           /* clear the Stamp field */
+      422     5779
+      423     5780
+      424     5781           /*
+      425     5782            * p (passed as an argument to free) points to the block to be
+      426     5783            * freed.  We use a based structure to look at it more elegantly
+      427     5784            */
+      428     5785
+      429     5786    1      n = p->Head.Size;
+      430     5787
+      431     5788    1      Tail_p = PINCRW (p, n-SIZEW(Tail));
+      432     5789    1      if Tail_p->Tail.Up_Link ~= p
+      433     5790    1      then if XBI_Debug = 0 then return;   else CALL M$XXX;
+      434     5791
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:27   
+      435     5792    2      DO INHIBIT;
+      436     5793    2         if p = XBI$First_AV
+      437     5794    2         then
+      438     5795    3            do;
+      439     5796    3               Prev_Tail     = ADDR(NIL);
+      440     5797    3               Prev_p        = ADDR(NIL);
+      441     5798    3               Prev_Tag      = '1'B;
+      442     5799    3            end;
+      443     5800    2         else
+      444     5801    3            do;
+      445     5802    3               Prev_Tail     = PINCRW (p, -SIZEW (Tail));
+      446     5803    3               Prev_p        = Prev_Tail -> Tail.Up_Link;
+      447     5804    3               Prev_Tag      = Prev_p -> Head.Flags.Tag;
+      448     5805    3            end;
+      449     5806    2         Next_p = PINCRW (p, n);
+      450     5807    2         if Next_p = XBI$Last_AV
+      451     5808    2         then
+      452     5809    2            Next_Tag = '1'B;
+      453     5810    2         else
+      454     5811    2            Next_Tag = Next_p -> Head.Flags.Tag;
+      455     5812
+      456     5813    2         if Prev_Tag and Next_Tag
+      457     5814    2         then
+      458     5815    3            do;
+      459     5816                    /*
+      460     5817                     * Both adjacent blocks are in use
+      461     5818                     */
+      462     5819
+      463     5820    3               p->Head.Flags.Tag          = '0'B;
+      464     5821
+      465     5822                    /* The free list may be empty... */
+      466     5823    3               if XBI$AV = ADDR(NIL)
+      467     5824    3               then
+      468     5825    4                  do;
+      469     5826    4                     XBI$AV = p;
+      470     5827    4                     p -> Head.Right_Link = p;
+      471     5828    4                     p -> Head.Left_Link = p;
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:28   
+      472     5829    4                  end;
+      473     5830    3               else
+      474     5831    4                  do;
+      475     5832                          /*
+      476     5833                           * Insert at right of AV
+      477     5834                           */
+      478     5835
+      479     5836    4                     p->Head.Left_Link  = XBI$AV;
+      480     5837    4                     p->Head.Right_Link = XBI$AV->Head.Right_Link;
+      481     5838
+      482     5839    4                     p->Head.Right_Link->Head.Left_Link = p;
+      483     5840    4                     XBI$AV->Head.Right_Link                = p;
+      484     5841    4                  end;
+      485     5842    3            end;
+      486     5843    2         else if ~Prev_Tag and Next_Tag
+      487     5844    2         then
+      488     5845    3            do;
+      489     5846                    /*
+      490     5847                     * Only the left block is free
+      491     5848                     */
+      492     5849
+      493     5850    3               Prev_p -> Head.Size = Prev_p->Head.Size + n;
+      494     5851    4               if (XBI$AV = addr (NIL)) then do;
+      495     5852    4                  call XBI_SET_ERRNO (ERR$BAD_MEMORY_STACK);
+      496     5853    4                  call XB_IO_ERROR;
+      497     5854    4               end;
+      498     5855    3               Tail_p = PINCRW (p, n - SIZEW (Tail));
+      499     5856    3               Tail_p -> Tail.Up_Link = Prev_P;
+      500     5857    3             end;
+      501     5858    2         else if Prev_Tag and ~Next_Tag
+      502     5859    2         then
+      503     5860    3            do;
+      504     5861                    /*
+      505     5862                     * Only right adjacent block is free
+      506     5863                     */
+      507     5864
+      508     5865    4               if (XBI$AV = addr (NIL)) then do;
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:29   
+      509     5866    4                  call XBI_SET_ERRNO (ERR$BAD_MEMORY_STACK);
+      510     5867    4                  call XB_IO_ERROR;
+      511     5868    4               end;
+      512     5869    3               Prev_p = Next_p->Head.Right_Link;
+      513     5870    3               Next_p->Head.Left_Link->Head.Right_Link = p;
+              5870                        /* Replace block beginning */
+      514     5871    3               Prev_p->Head.Left_Link = p;  /* at p + n by one */
+      515     5872    3               if (XBI$AV = Next_p)
+      516     5873    3               then
+      517     5874    3                  XBI$AV = p;
+      518     5875
+      519     5876    3               p->Head.Left_Link  = Next_p->Head.Left_Link;  /* beginning at p */
+      520     5877    3               p->Head.Right_Link = Next_p->Head.Right_Link;
+      521     5878    3               p->Head.Size       = Next_p->Head.Size + n;
+      522     5879    3               p->Head.Flags.Tag        = '0'B;
+      523     5880
+      524     5881    3               Tail_p = PINCRW (p, p->Head.size - SIZEW (Tail));
+      525     5882    3               Tail_p->Tail.Up_Link = p;
+      526     5883    3            end;
+      527     5884    2         else
+      528     5885    3            do;
+      529     5886                    /*
+      530     5887                     * both adjacent blocks are free
+      531     5888                     * delete right free block from AV list
+      532     5889                     */
+      533     5890
+      534     5891    3               Next_p->Head.Left_Link->Head.Right_Link = Next_p->Head.Right_Link;
+      535     5892    4               if (XBI$AV = addr (NIL)) then do;
+      536     5893    4                  call XBI_SET_ERRNO (ERR$BAD_MEMORY_STACK);
+      537     5894    4                  call XB_IO_ERROR;
+      538     5895    4               end;
+      539     5896    3               Next_p->Head.Right_Link->Head.Left_Link = Next_p->Head.Left_Link;
+      540     5897    3               if (XBI$AV = Next_p)
+      541     5898    3               then
+      542     5899    3                  XBI$AV = Prev_p;
+      543     5900    3               Prev_p -> Head.Size = Prev_p->Head.Size + n + Next_p -> Head.Size;
+      544     5901    3               Prev_Tail = PINCRW (Prev_p, Prev_p -> Head.Size - SIZEW (Tail));
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:30   
+      545     5902    3               Prev_Tail -> Tail.Up_link = Prev_p;
+      546     5903    3            end;
+      547     5904    2      END /* INHIBIT */;
+      548     5905    1   END xbi_free;
+      549     5906        %EOD;
+
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:31   
+--  Include file information  --
+
+   xb_errors_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   xb_heap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI_FREE.
+
+   Procedure XBI_FREE requires 232 words for executable code.
+   Procedure XBI_FREE requires 14 words of local(AUTO) storage.
+
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:32   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:33   
+          MINI XREF LISTING
+
+A$
+      5724**DCL         7--PROC     5725--REDEF    5757>>IF       5767>>ASSIGN
+A$_EXPOSED.BYTE_BIT_SEGID
+      5727**DCL      5763>>IF
+HEAD
+      5630**DCL      5767--ASSIGN
+HEAD.FLAGS.PROTECTED
+      5636**DCL      5770>>IF
+HEAD.FLAGS.TAG
+      5635**DCL      5804>>ASSIGN   5811>>ASSIGN   5820<<ASSIGN   5879<<ASSIGN
+HEAD.LEFT_LINK
+      5631**DCL      5774>>IF       5828<<ASSIGN   5836<<ASSIGN   5839<<ASSIGN   5870>>ASSIGN   5871<<ASSIGN
+      5876<<ASSIGN   5876>>ASSIGN   5891>>ASSIGN   5896<<ASSIGN   5896>>ASSIGN
+HEAD.RIGHT_LINK
+      5632**DCL      5774>>IF       5827<<ASSIGN   5837<<ASSIGN   5837>>ASSIGN   5839>>ASSIGN   5840<<ASSIGN
+      5869>>ASSIGN   5870<<ASSIGN   5877<<ASSIGN   5877>>ASSIGN   5891<<ASSIGN   5891>>ASSIGN   5896>>ASSIGN
+HEAD.SIZE
+      5633**DCL      5786>>ASSIGN   5850<<ASSIGN   5850>>ASSIGN   5878<<ASSIGN   5878>>ASSIGN   5881>>ASSIGN
+      5900<<ASSIGN   5900>>ASSIGN   5900>>ASSIGN   5901>>ASSIGN
+M$XXX
+      5517**DCL-ENT  5758--CALL     5765--CALL     5771--CALL     5776--CALL     5790--CALL
+N
+      5731**DCL      5786<<ASSIGN   5788>>ASSIGN   5806>>ASSIGN   5850>>ASSIGN   5855>>ASSIGN   5878>>ASSIGN
+      5900>>ASSIGN
+NEXT_P
+      5732**DCL      5806<<ASSIGN   5807>>IF       5811>>ASSIGN   5869>>ASSIGN   5870>>ASSIGN   5872>>IF
+      5876>>ASSIGN   5877>>ASSIGN   5878>>ASSIGN   5891>>ASSIGN   5891>>ASSIGN   5896>>ASSIGN   5896>>ASSIGN
+      5897>>IF       5900>>ASSIGN
+NEXT_TAG
+      5736**DCL      5809<<ASSIGN   5811<<ASSIGN   5813>>IF       5843>>IF       5858>>IF
+P
+      5729**DCL      5767<<ASSIGN   5770>>IF       5774>>IF       5774>>IF       5786>>ASSIGN   5788>>ASSIGN
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:34   
+      5789>>IF       5793>>IF       5802>>ASSIGN   5806>>ASSIGN   5820>>ASSIGN   5826>>ASSIGN   5827>>ASSIGN
+      5827>>ASSIGN   5828>>ASSIGN   5828>>ASSIGN   5836>>ASSIGN   5837>>ASSIGN   5839>>ASSIGN   5839>>ASSIGN
+      5840>>ASSIGN   5855>>ASSIGN   5870>>ASSIGN   5871>>ASSIGN   5874>>ASSIGN   5876>>ASSIGN   5877>>ASSIGN
+      5878>>ASSIGN   5879>>ASSIGN   5881>>ASSIGN   5881>>ASSIGN   5882>>ASSIGN
+PREV_P
+      5733**DCL      5797<<ASSIGN   5803<<ASSIGN   5804>>ASSIGN   5850>>ASSIGN   5850>>ASSIGN   5856>>ASSIGN
+      5869<<ASSIGN   5871>>ASSIGN   5899>>ASSIGN   5900>>ASSIGN   5900>>ASSIGN   5901>>ASSIGN   5901>>ASSIGN
+      5902>>ASSIGN
+PREV_TAG
+      5737**DCL      5798<<ASSIGN   5804<<ASSIGN   5813>>IF       5843>>IF       5858>>IF
+PREV_TAIL
+      5735**DCL      5796<<ASSIGN   5802<<ASSIGN   5803>>ASSIGN   5901<<ASSIGN   5902>>ASSIGN
+TAIL
+      5643**DCL      5788--ASSIGN   5802--ASSIGN   5855--ASSIGN   5881--ASSIGN   5901--ASSIGN
+TAIL.UP_LINK
+      5644**DCL      5789>>IF       5803>>ASSIGN   5856<<ASSIGN   5882<<ASSIGN   5902<<ASSIGN
+TAIL_P
+      5730**DCL      5788<<ASSIGN   5789>>IF       5855<<ASSIGN   5856>>ASSIGN   5881<<ASSIGN   5882>>ASSIGN
+XB$ERR$BAD_MEMORY_STACK
+      5718**DCL      5852<>CALL     5866<>CALL     5893<>CALL
+XBI$ALLOCATION_HEAP.HEAP_.BASE.BYTE_BIT_SEGID
+      5753**DCL      5763>>IF
+XBI$ALLOCATION_HEAP.HEAP_.BASE$
+      5750**DCL      5751--REDEF
+XBI$AV
+      5742**DCL      5823>>IF       5826<<ASSIGN   5836>>ASSIGN   5837>>ASSIGN   5840>>ASSIGN   5851>>IF
+      5865>>IF       5872>>IF       5874<<ASSIGN   5892>>IF       5897>>IF       5899<<ASSIGN
+XBI$FIRST_AV
+      5743**DCL      5793>>IF
+XBI$LAST_AV
+      5744**DCL      5807>>IF
+XBI_DEBUG
+      5745**DCL      5758>>IF       5765>>IF       5771>>IF       5776>>IF       5790>>IF
+XBI_SET_ERRNO
+      5738**DCL-ENT  5852--CALL     5866--CALL     5893--CALL
+XB_IO_ERROR
+PL6.E3A0      #004=XBI_FREE File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:35   
+      5739**DCL-ENT  5853--CALL     5867--CALL     5894--CALL
+
+PL6.E3A0      #005=XBI$PROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI                FRI 01/06/95 11:40 Page:36   
+      550        1        /*T***********************************************************/
+      551        2        /*T*                                                         */
+      552        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+      553        4        /*T*                                                         */
+      554        5        /*T***********************************************************/
+      555        6
+      556        7        XBI$PROTECT_POINTER: PROC (P$);
+      557        8           /*I*  NAME: XBI$PROTECT_POINTER
+      558        9                 CALL: CALL XBI$PROTECT_POINTER (P$);
+      559       10                 INPUT: P$ PTR;
+      560       11                 DESCRIPTION: If P$ points to a block in the heap, then the
+      561       12                    Protected flag for that block is set.
+      562       13           */
+      563       14
+      564       15        %INCLUDE CP_6;
+      565     5575           %INCLUDE xb_heap_i6;
+      566     5650           %INCLUDE xb_vheap_i6;
+      567     5723
+      568     5724    1      DCL P$               PTR;
+      569     5725    1      DCL 1 P$_exposed REDEF P$,
+      570     5726    1         2  Word_Offset          UBIN (18) UNAL,
+      571     5727    1         2  Byte_Bit_Segid       UBIN (18) UNAL;
+      572     5728    1      DCL 1 P$_AS_SEG REDEF P$,
+      573     5729    1         2  Word_Offset          UBIN (24) UNAL,
+      574     5730    1         2  Segid                UBIN (12) UNAL;
+      575     5731
+      576     5732    1      DCL p                PTR;
+      577     5733           %HEAP_SYMREF;
+      578     5748
+      579     5749    1      if P$ = ADDR(NIL) then return;
+      580     5750
+      581     5751           /* Ignore requests to protect things that are not in the heap */
+      582     5752    1      if P$_exposed.Byte_Bit_Segid ~= XBI$Allocation_Heap.Heap_.Base.Byte_Bit_Segid
+      583     5753    2      then do;
+      584     5754    2         if ((P$_AS_SEG.Segid < %XBI$VIRT_MIN_AS) or
+      585     5755    2             (P$_AS_SEG.Segid > %XBI$VIRT_MAX_AS)) then
+      586     5756    2            return;
+PL6.E3A0      #005=XBI$PROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI                FRI 01/06/95 11:40 Page:37   
+      587     5757    2      end;
+      588     5758
+      589     5759           /* compute pointer to head of block */
+      590     5760    1      p = PINCRW(P$, -SIZEW(Head));
+      591     5761
+      592     5762           /* something's funny if left link and right link not NIL. */
+      593     5763    1      if p -> Head.Left_Link ~= ADDR(NIL)
+      594     5764    1        or p -> Head.Right_Link ~= ADDR(NIL)
+      595     5765    1      then if XBI_Debug = 0 then return;   else CALL M$XXX;
+      596     5766
+      597     5767
+      598     5768    1      p -> Head.Flags.Protected = '1'B;
+      599     5769    1   END XBI$PROTECT_POINTER;
+      600     5770        %EOD;
+
+PL6.E3A0      #005=XBI$PROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI                FRI 01/06/95 11:40 Page:38   
+--  Include file information  --
+
+   xb_vheap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   xb_heap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI$PROTECT_POINTER.
+
+   Procedure XBI$PROTECT_POINTER requires 37 words for executable code.
+   Procedure XBI$PROTECT_POINTER requires 6 words of local(AUTO) storage.
+
+PL6.E3A0      #005=XBI$PROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI                FRI 01/06/95 11:40 Page:39   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #005=XBI$PROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI                FRI 01/06/95 11:40 Page:40   
+          MINI XREF LISTING
+
+HEAD
+      5628**DCL      5760--ASSIGN
+HEAD.FLAGS.PROTECTED
+      5634**DCL      5768<<ASSIGN
+HEAD.LEFT_LINK
+      5629**DCL      5763>>IF
+HEAD.RIGHT_LINK
+      5630**DCL      5763>>IF
+M$XXX
+      5515**DCL-ENT  5765--CALL
+P
+      5732**DCL      5760<<ASSIGN   5763>>IF       5763>>IF       5768>>ASSIGN
+P$
+      5724**DCL         7--PROC     5725--REDEF    5728--REDEF    5749>>IF       5760>>ASSIGN
+P$_AS_SEG.SEGID
+      5730**DCL      5754>>IF       5754>>IF
+P$_EXPOSED.BYTE_BIT_SEGID
+      5727**DCL      5752>>IF
+XBI$ALLOCATION_HEAP.HEAP_.BASE.BYTE_BIT_SEGID
+      5745**DCL      5752>>IF
+XBI$ALLOCATION_HEAP.HEAP_.BASE$
+      5742**DCL      5743--REDEF
+XBI_DEBUG
+      5737**DCL      5765>>IF
+
+PL6.E3A0      #006=XBI$UNPROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI              FRI 01/06/95 11:40 Page:41   
+      601        1        /*T***********************************************************/
+      602        2        /*T*                                                         */
+      603        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+      604        4        /*T*                                                         */
+      605        5        /*T***********************************************************/
+      606        6
+      607        7        XBI$UNPROTECT_POINTER: PROC (P$);
+      608        8           /*I*  NAME: XBI$UNPROTECT_POINTER
+      609        9                 CALL: CALL XBI$UNPROTECT_POINTER (P$);
+      610       10                 INPUT: P$ PTR;
+      611       11                 DESCRIPTION: If P$ points to a block in the heap, then the
+      612       12                    Protected flag for that block is cleared.
+      613       13           */
+      614       14
+      615       15        %INCLUDE CP_6;
+      616     5575           %INCLUDE xb_heap_i6;
+      617     5650           %INCLUDE xb_vheap_i6;
+      618     5723
+      619     5724    1      DCL P$               PTR;
+      620     5725    1      DCL 1 P$_exposed REDEF P$,
+      621     5726    1         2  Word_Offset          UBIN (18) UNAL,
+      622     5727    1         2  Byte_Bit_Segid       UBIN (18) UNAL;
+      623     5728    1      DCL 1 P$_AS_SEG REDEF P$,
+      624     5729    1         2  Word_Offset          UBIN (24) UNAL,
+      625     5730    1         2  Segid                UBIN (12) UNAL;
+      626     5731
+      627     5732    1      DCL p                PTR;
+      628     5733           %HEAP_SYMREF;
+      629     5748
+      630     5749    1      if P$ = ADDR(NIL) then return;
+      631     5750
+      632     5751           /* Ignore requests to unprotect things that are not in the heap */
+      633     5752    1      if P$_exposed.Byte_Bit_Segid ~= XBI$Allocation_Heap.Heap_.Base.Byte_Bit_Segid
+      634     5753    2      then do;
+      635     5754    2         if ((P$_AS_SEG.Segid < %XBI$VIRT_MIN_AS) or
+      636     5755    2             (P$_AS_SEG.Segid > %XBI$VIRT_MAX_AS)) then
+      637     5756    2            return;
+PL6.E3A0      #006=XBI$UNPROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI              FRI 01/06/95 11:40 Page:42   
+      638     5757    2      end;
+      639     5758
+      640     5759           /* compute pointer to head of block */
+      641     5760    1      p = PINCRW(P$, -SIZEW(Head));
+      642     5761
+      643     5762           /* something's funny if left link and right link not NIL. */
+      644     5763    1      if p -> Head.Left_Link ~= ADDR(NIL)
+      645     5764    1        or p -> Head.Right_Link ~= ADDR(NIL)
+      646     5765    1      then if XBI_Debug = 0 then return;   else CALL M$XXX;
+      647     5766
+      648     5767    1      p -> Head.Flags.Protected = '0'B;
+      649     5768    1   END XBI$UNPROTECT_POINTER;
+      650     5769        %EOD;
+
+PL6.E3A0      #006=XBI$UNPROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI              FRI 01/06/95 11:40 Page:43   
+--  Include file information  --
+
+   xb_vheap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   xb_heap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI$UNPROTECT_POINTER.
+
+   Procedure XBI$UNPROTECT_POINTER requires 37 words for executable code.
+   Procedure XBI$UNPROTECT_POINTER requires 6 words of local(AUTO) storage.
+
+PL6.E3A0      #006=XBI$UNPROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI              FRI 01/06/95 11:40 Page:44   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #006=XBI$UNPROTECT_POINTER File=xbi_stdlib:6.:XBC3TSI              FRI 01/06/95 11:40 Page:45   
+          MINI XREF LISTING
+
+HEAD
+      5628**DCL      5760--ASSIGN
+HEAD.FLAGS.PROTECTED
+      5634**DCL      5767<<ASSIGN
+HEAD.LEFT_LINK
+      5629**DCL      5763>>IF
+HEAD.RIGHT_LINK
+      5630**DCL      5763>>IF
+M$XXX
+      5515**DCL-ENT  5765--CALL
+P
+      5732**DCL      5760<<ASSIGN   5763>>IF       5763>>IF       5767>>ASSIGN
+P$
+      5724**DCL         7--PROC     5725--REDEF    5728--REDEF    5749>>IF       5760>>ASSIGN
+P$_AS_SEG.SEGID
+      5730**DCL      5754>>IF       5754>>IF
+P$_EXPOSED.BYTE_BIT_SEGID
+      5727**DCL      5752>>IF
+XBI$ALLOCATION_HEAP.HEAP_.BASE.BYTE_BIT_SEGID
+      5745**DCL      5752>>IF
+XBI$ALLOCATION_HEAP.HEAP_.BASE$
+      5742**DCL      5743--REDEF
+XBI_DEBUG
+      5737**DCL      5765>>IF
+
+PL6.E3A0      #007=XBI_EXIT File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:46   
+      651        1        /*T***********************************************************/
+      652        2        /*T*                                                         */
+      653        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+      654        4        /*T*                                                         */
+      655        5        /*T***********************************************************/
+      656        6
+      657        7        XBI_EXIT: PROC (status);
+      658        8        /*D* PROTOTYPE:   void exit (status)
+      659        9             DESCRIPTION: XBI_EXIT causes the program to terminate and passes
+      660       10                          the status back as the STEPCC.
+      661       11
+      662       12                          Within CP-6 the available STEPCC values are 0 to
+      663       13                          511 so if the caller passes a value > 511 I will
+      664       14                          put it in place as an error code and then do a
+      665       15                          M$EXIT STEPCC=ERROR.
+      666       16                          If there is no argument then I assume all is well.
+      667       17             RAP Nov 9, 1988
+      668       18        */
+      669       19
+      670       20        %INCLUDE CP_6;
+      671     5580        %INCLUDE CP_6_SUBS;
+      672     6120        %INCLUDE B$JIT;
+      673     6723
+      674     6724    1   DCL  B$JIT$   PTR SYMREF;
+      675     6725
+      676     6726    1   DCL status UBIN;
+      677     6727    1   DCL real_status UBIN WORD;
+      678     6728    1   DCL funny_ptr REDEF real_status PTR;
+      679     6729
+      680     6730    1   DCL XBI_CLOSE_DCBS ENTRY;
+      681     6731    1   DCL XBI$DISABLE_XCON ENTRY;
+      682     6732    1   DCL XBI_GET_ERRNO    ENTRY(1);
+      683     6733
+      684     6734    1   DCL  ERRNO_P  PTR SYMREF;
+      685     6735    1   DCL  ERRNO    SBIN BASED(ERRNO_P);
+      686     6736
+      687     6737    1   DCL 1 at_exit_list EXT,
+PL6.E3A0      #007=XBI_EXIT File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:47   
+      688     6738    1         2 in_use UBIN WORD INIT(0),
+      689     6739    1         2 routines(0:32) EPTR;
+      690     6740
+      691     6741    1   DCL place_to_call EPTR;
+      692     6742
+      693     6743        %FPT_EXIT (FPTN=EXIT_CONSTANT, STCLASS=CONSTANT);
+      694     6758        %FPT_EXIT (FPTN=EXIT_AUTO, STCLASS=AUTO);
+      695     6773        %FPT_MERC(FPTN=FPT_MERC, STCLASS="");
+      696     6786        %VLP_ERRCODE(FPTN=CP6_ERRNO, STCLASS=AUTO);
+      697     6831
+      698     6832    1   EXIT_AUTO = EXIT_CONSTANT;
+      699     6833    1   EXIT_AUTO.V_ = VECTOR(EXIT_AUTO.V);
+      700     6834
+      701     6835    1   funny_ptr = ADDR(status);
+      702     6836
+      703     6837        /* run down to list of routines registered by atexit() */
+      704     6838
+      705     6839    2   DO WHILE (at_exit_list.in_use > 0);
+      706     6840    2      place_to_call = at_exit_list.routines(at_exit_list.in_use);
+      707     6841    2      CALL place_to_call;
+      708     6842    2      at_exit_list.in_use = at_exit_list.in_use - 1;
+      709     6843    2      END;
+      710     6844
+      711     6845        /* turn off exit control, a necessity before we exit */
+      712     6846
+      713     6847    1   CALL XBI$DISABLE_XCON;
+      714     6848
+      715     6849        /* now close down all the users DCBs */
+      716     6850
+      717     6851    1   CALL XBI_CLOSE_DCBS;
+      718     6852
+      719     6853    1   IF funny_ptr = ADDR(NIL) THEN real_status = 0;    /* OK */
+      720     6854
+      721     6855    1   if REAL_STATUS >= bitbin('400000000000'O) then REAL_STATUS = 511;
+      722     6856
+      723     6857        /* here comes the M$EXIT or M$ERR */
+      724     6858
+PL6.E3A0      #007=XBI_EXIT File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:48   
+      725     6859    2   if REAL_STATUS >= bitbin('000040000000'O) then do;
+      726     6860    2      ERRNO = REAL_STATUS;
+      727     6861    2      CALL XBI_GET_ERRNO(CP6_ERRNO);
+      728     6862    2      if CP6_ERRNO.SEV = 0 then CP6_ERRNO.SEV = 1;
+      729     6863    2      FPT_MERC.JERR_ = vector(CP6_ERRNO);
+      730     6864    2      EXIT_AUTO.CODE_ = FPT_MERC.JERR_;
+      731     6865    2      EXIT_AUTO.V.STEPCC# = 4;
+      732     6866    2      call M$MERC(FPT_MERC);
+      733     6867    2      end;
+      734     6868
+      735     6869    1   IF REAL_STATUS > 511 THEN REAL_STATUS = 511;
+      736     6870    1   EXIT_AUTO.V.STEPCC# = REAL_STATUS;
+      737     6871    1   if REAL_STATUS > 7  and  B$JIT.MODE ~= %M_INT#
+      738     6872    1      then call M$ERR(EXIT_AUTO);
+      739     6873    1      else call M$EXIT(EXIT_AUTO);
+      740     6874
+      741     6875
+      742     6876    1   END XBI_EXIT;
+      743     6877        %EOD;
+
+PL6.E3A0      #007=XBI_EXIT File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:49   
+--  Include file information  --
+
+   B$JIT_C.:LIB_E04  is referenced.
+   B$JIT.:LIB_E04  cannot be made into a system file and is referenced.
+   CP_6_SUBS.:LIB_E04  is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI_EXIT.
+
+   Procedure XBI_EXIT requires 93 words for executable code.
+   Procedure XBI_EXIT requires 18 words of local(AUTO) storage.
+
+PL6.E3A0      #007=XBI_EXIT File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:50   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #007=XBI_EXIT File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:51   
+          MINI XREF LISTING
+
+AT_EXIT_LIST.IN_USE
+      6738**DCL      6839>>DOWHILE  6840>>ASSIGN   6842<<ASSIGN   6842>>ASSIGN
+AT_EXIT_LIST.ROUTINES
+      6739**DCL      6840>>ASSIGN
+B$JIT.CPFLAGS1.SLEAZE
+      6541**DCL      6541--REDEF
+B$JIT.ERR.MID
+      6448**DCL      6448--REDEF
+B$JIT.JRESPEAK
+      6609**DCL      6610--REDEF
+B$JIT.MODE
+      6442**DCL      6871>>IF
+B$JIT.ORIGINATOR_PORT.FROM_CR
+      6718**DCL      6718--REDEF    6719--REDEF
+B$JIT.PNR
+      6622**DCL      6622--REDEF
+B$JIT.TSLINE
+      6716**DCL      6717--REDEF
+B$JIT$
+      6724**DCL      6442--IMP-PTR  6871>>IF
+CP6_ERRNO
+      6798**DCL      6861<>CALL     6863--ASSIGN
+CP6_ERRNO.SEV
+      6828**DCL      6862>>IF       6862<<ASSIGN
+ERRNO
+      6735**DCL      6860<<ASSIGN
+ERRNO_P
+      6734**DCL      6735--IMP-PTR  6860>>ASSIGN
+EXIT_AUTO
+      6769**DCL      6832<<ASSIGN   6872<>CALL     6873<>CALL
+EXIT_AUTO.CODE_
+      6769**DCL      6864<<ASSIGN
+PL6.E3A0      #007=XBI_EXIT File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:52   
+EXIT_AUTO.V
+      6769**DCL      6833--ASSIGN
+EXIT_AUTO.V.STEPCC#
+      6770**DCL      6770--REDEF    6865<<ASSIGN   6870<<ASSIGN
+EXIT_AUTO.V_
+      6769**DCL      6833<<ASSIGN
+EXIT_CONSTANT
+      6754**DCL      6832>>ASSIGN
+EXIT_CONSTANT.V
+      6754**DCL      6754--DCLINIT
+EXIT_CONSTANT.V.STEPCC#
+      6755**DCL      6755--REDEF
+FPT_MERC
+      6784**DCL      6866<>CALL
+FPT_MERC.JERR_
+      6784**DCL      6863<<ASSIGN   6864>>ASSIGN
+FUNNY_PTR
+      6728**DCL      6835<<ASSIGN   6853>>IF
+M$ERR
+      5520**DCL-ENT  6872--CALL
+M$EXIT
+      5520**DCL-ENT  6873--CALL
+M$MERC
+      5564**DCL-ENT  6866--CALL
+PLACE_TO_CALL
+      6741**DCL      6840<<ASSIGN   6841>>CALL
+REAL_STATUS
+      6727**DCL      6728--REDEF    6853<<ASSIGN   6855>>IF       6855<<ASSIGN   6859>>IF       6860>>ASSIGN
+      6869>>IF       6869<<ASSIGN   6870>>ASSIGN   6871>>IF
+STATUS
+      6726**DCL         7--PROC     6835--ASSIGN
+XBI$DISABLE_XCON
+      6731**DCL-ENT  6847--CALL
+XBI_CLOSE_DCBS
+      6730**DCL-ENT  6851--CALL
+XBI_GET_ERRNO
+PL6.E3A0      #007=XBI_EXIT File=xbi_stdlib:6.:XBC3TSI                           FRI 01/06/95 11:40 Page:53   
+      6732**DCL-ENT  6861--CALL
+
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:54   
+      744        1        /*T***********************************************************/
+      745        2        /*T*                                                         */
+      746        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+      747        4        /*T*                                                         */
+      748        5        /*T***********************************************************/
+      749        6
+      750        7        XBI$STRING_TO_REAL: PROC (STRING, RESULT, OVERFLOW_ERROR);
+      751        8
+      752        9        /*D* NAME: XK_STRING_TO_REAL
+      753       10           CALL: CALL XK_STRING_TO_REAL (STRING, RESULT, OVERFLOW_ERROR);
+      754       11           INTERFACE: XK_DECIMAL_STRING_TO_INTEGER, XPN_7LSPTOD
+      755       12           INPUT: STRING - A Pascal varying length string containing the optionally
+      756       13                           signed printable representation of the floating point number
+      757       14           OUTPUT: RESULT - A 72 bit floating point number
+      758       15                   OVERFLOW_ERROR - Boolean, TRUE if the string given could
+      759       16                                    not be represented as a binary floating
+      760       17                                    point number.
+      761       18           DESCRIPTION: The input string must be an optionally signed
+      762       19              floating point number.  It must not contain any leading or
+      763       20              trailing blanks.  The number may have
+      764       21              an optional exponent field denoted by 'E' or 'e' followed by
+      765       22              an optionally signed integer value (the power of ten).
+      766       23              Leading zeros in the mantissa are ignored.  An attempt to convert
+      767       24              a number that is too large to represent will cause the boolean
+      768       25              parameter OVERFLOW_ERROR to be set.  Underflow, however, returns
+      769       26              a floating point 0.0.
+      770       27           EXCEPTIONS: None
+      771       28        */
+      772       29           %INCLUDE xb_string_support_i6;
+      773       65
+      774       66        %EQU TRUE = 1;
+      775       67        %EQU FALSE = 0;
+      776       68        %CONST_STRING_PARAMETER (NAME=STRING);
+      777       73    1   DCL RESULT                                BIT(72) DALIGNED;
+      778       74    1   DCL OVERFLOW_ERROR                        BIT (1) ALIGNED;
+      779       75
+      780       76        %STRING_VARIABLE (NAME=STRING_CONVERSION_BUFFER, MAXIMUM_LENGTH = 100);
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:55   
+      781       81        %SUB MAXIMUM_LENGTH                       = 20;
+      782       82    1   DCL CONVERSION_BUFFER                     (0:MAXIMUM_LENGTH) CHAR(1);
+      783       83    1   DCL CONVERSION_BUFFER_INDEX               SBIN WORD ALIGNED;
+      784       84    1   DCL STRING_INDEX                          SBIN WORD ALIGNED;
+      785       85    1   DCL E_POSITION                            SBIN WORD ALIGNED;
+      786       86    1   DCL POWER_OF_TEN                          SBIN WORD ALIGNED;
+      787       87    1   DCL NEGATIVE_EXPONENT                     BIT(1) ALIGNED;
+      788       88    1   DCL CHARACTER                             CHAR(1) ALIGNED;
+      789       89    1   DCL ADJUST                                SBIN WORD ALIGNED;
+      790       90    1   DCL EXPONENT_START                        SBIN WORD ALIGNED;
+      791       91    1   DCL START_OF_SCAN                         SBIN WORD ALIGNED;
+      792       92    1   DCL CONVERSION_BUFFER_FULL                BIT(1) ALIGNED;
+      793       93    1   DCL SKIPPING_ZEROS                        BIT(1) ALIGNED;
+      794       94
+      795       95    1   DCL pos_infinity BIT(72) DALIGNED CONSTANT INIT('376777777777000000000000'O);
+      796       96    1   DCL neg_infinity BIT(72) DALIGNED CONSTANT INIT('377000000001000000000000'O);
+      797       97
+      798       98    1   DCL XPN_7LSPTOD                           ENTRY(4) ALTRET;
+      799       99    1   DCL XPN_7NS0TOI                           ENTRY (3) ALTRET;
+      800      100
+      801      101    1      CALL INDEX1 (E_POSITION, 'E', STRING.STRING);
+      802      102    1      IF E_POSITION = STRING.SIZE THEN
+      803      103    1         CALL INDEX1 (E_POSITION, 'e', STRING.STRING);
+      804      104
+      805      105    1      IF E_POSITION = STRING.SIZE THEN
+      806      106    1         POWER_OF_TEN = 0;
+      807      107    2      ELSE DO;
+      808      108    2         EXPONENT_START = E_POSITION + 1;
+      809      109    2         IF SUBSTR(STRING.STRING, EXPONENT_START, 1) = '-' THEN
+      810      110    2            NEGATIVE_EXPONENT = '1'B;
+      811      111    2         ELSE
+      812      112    2            NEGATIVE_EXPONENT = '0'B;
+      813      113    2         IF SUBSTR(STRING.STRING, EXPONENT_START, 1) = '-' OR SUBSTR(STRING.STRING,
+               113                  EXPONENT_START, 1) = '+' THEN
+      814      114    2            EXPONENT_START = EXPONENT_START + 1;
+      815      115    2         STRING_CONVERSION_BUFFER.SIZE = STRING.SIZE - EXPONENT_START;
+      816      116    2         STRING_CONVERSION_BUFFER.STRING = SUBSTR (STRING.STRING, EXPONENT_START);
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:56   
+      817      117    2         CALL XPN_7NS0TOI (POWER_OF_TEN, STRING_CONVERSION_BUFFER.STRING,
+      818      118    2               STRING_CONVERSION_BUFFER.SIZE)
+      819      119    3            WHENRETURN DO;
+      820      120    3               OVERFLOW_ERROR = '0'B;
+      821      121    3            END;
+      822      122    3            WHENALTRETURN DO;
+      823      123    3               OVERFLOW_ERROR = '1'B;
+      824      124    3               IF NEGATIVE_EXPONENT THEN
+      825      125    3                  RESULT = '1'B;
+      826      126    3               GOTO SIGNAL_OVERFLOW_ERROR;
+      827      127    3            END;
+      828      128    2         IF NEGATIVE_EXPONENT THEN POWER_OF_TEN = - POWER_OF_TEN;
+      829      129    2      END;
+      830      130
+      831      131           /* Now we are all done the optional exponent portion of the number */
+      832      132
+      833      133    1      SKIPPING_ZEROS = '1'B;
+      834      134    1      CONVERSION_BUFFER_FULL = '0'B;
+      835      135    1      ADJUST = +0;
+      836      136    1      CHARACTER = SUBSTR (STRING.STRING, 0, 1);
+      837      137    2      IF CHARACTER = '+' OR CHARACTER = '-' THEN DO;
+      838      138    2         START_OF_SCAN = 1;
+      839      139    2         CONVERSION_BUFFER (0) = CHARACTER;
+      840      140    2         END;
+      841      141    2      ELSE DO;
+      842      142    2         START_OF_SCAN = 0;
+      843      143    2         CONVERSION_BUFFER (0) = '+';
+      844      144    2      END;
+      845      145    1      CONVERSION_BUFFER_INDEX = 1;
+      846      146    2      DO STRING_INDEX = START_OF_SCAN TO E_POSITION - 1;
+      847      147    2         CHARACTER = SUBSTR(STRING.STRING, STRING_INDEX, 1);
+      848      148    3         IF CHARACTER ~= '0' OR NOT SKIPPING_ZEROS THEN DO;
+      849      149    4            IF CHARACTER = '.' THEN DO;
+      850      150    4               ADJUST = -1;
+      851      151    4               IF CONVERSION_BUFFER_FULL THEN GOTO EXIT_DO;
+      852      152    4               END;
+      853      153    4            ELSE DO;
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:57   
+      854      154    4            SKIPPING_ZEROS = '0'B;
+      855      155    4               IF CONVERSION_BUFFER_FULL THEN
+      856      156    4                  POWER_OF_TEN = POWER_OF_TEN + ADJUST;
+      857      157    5               ELSE DO;
+      858      158    5                  CONVERSION_BUFFER(CONVERSION_BUFFER_INDEX) = CHARACTER;
+      859      159    5                  CONVERSION_BUFFER_INDEX = CONVERSION_BUFFER_INDEX + 1;
+      860      160    5                  POWER_OF_TEN = POWER_OF_TEN + ADJUST;
+      861      161    6                  IF CONVERSION_BUFFER_INDEX > MAXIMUM_LENGTH THEN DO;
+      862      162    6                     CONVERSION_BUFFER_FULL = '1'B;
+      863      163    6                     ADJUST = ADJUST + 1;
+      864      164    6                  END;
+      865      165    5               END;
+      866      166    4            END;
+      867      167    2         END; ELSE
+      868      168    2            POWER_OF_TEN = POWER_OF_TEN + ADJUST;
+      869      169    2      END;
+      870      170    1     EXIT_DO:
+      871      171           /* If the exponent is ridiculously negative, bring it back a bit */
+      872      172    1      IF POWER_OF_TEN < -999 THEN POWER_OF_TEN = -999;
+      873      173
+      874      174           /* If we don't have anything to convert, make it '0' */
+      875      175    2      IF CONVERSION_BUFFER_INDEX = 1 THEN DO; /* only a + or - */
+      876      176    2         CONVERSION_BUFFER_INDEX = 2;
+      877      177    2         CONVERSION_BUFFER(1) = '0';
+      878      178    2      END;
+      879      179           /* Number of digits is CONVERSION_BUFFER_INDEX-1 since sign is there */
+      880      180    1      CALL XPN_7LSPTOD(RESULT, CONVERSION_BUFFER, CONVERSION_BUFFER_INDEX-1,
+               180               POWER_OF_TEN) ALTRET (SIGNAL_OVERFLOW_ERROR);
+      881      181    1      OVERFLOW_ERROR = '0'B;
+      882      182    1      RETURN;
+      883      183
+      884      184    1     SIGNAL_OVERFLOW_ERROR:
+      885      185    2      IF NEGATIVE_EXPONENT AND RESULT = '1'B THEN DO;
+      886      186           /* If XPN_7NSTOD returns 0.0 (O'400000000000') and reports */
+      887      187           /* conversion error - this was an exponent underflow       */
+      888      188           /* (XPN_7NSTOD could return 0.0 for a DTB conversion error */
+      889      189           /* but we ensure that <= 21 digits are passed - therefore  */
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:58   
+      890      190           /* this case should never happen. )                        */
+      891      191    2         OVERFLOW_ERROR = '1'B;
+      892      192    2         RETURN;
+      893      193    2      END;
+      894      194
+      895      195           /* Otherwise: it's an overflow - return with RESULT set to +infinity */
+      896      196           /* which is what XPN_7LSTOD will give us in that case                */
+      897      197    1      OVERFLOW_ERROR = '1'B;
+      898      198    1      IF SUBSTR (STRING.STRING, 0, 1) = '-' THEN
+      899      199    1         result = neg_infinity;
+      900      200    1      ELSE
+      901      201    1         result = pos_infinity;
+      902      202    1   END XBI$STRING_TO_REAL;
+
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:59   
+--  Include file information  --
+
+   xb_string_support_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI$STRING_TO_REAL.
+
+   Procedure XBI$STRING_TO_REAL requires 217 words for executable code.
+   Procedure XBI$STRING_TO_REAL requires 56 words of local(AUTO) storage.
+
+    No errors detected in file xbi_stdlib:6.:XBC3TSI    .
+
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:60   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:61   
+          MINI XREF LISTING
+
+ADJUST
+        89**DCL       135<<ASSIGN    150<<ASSIGN    156>>ASSIGN    160>>ASSIGN    163<<ASSIGN    163>>ASSIGN
+       168>>ASSIGN
+CHARACTER
+        88**DCL       136<<ASSIGN    137>>IF        137>>IF        139>>ASSIGN    147<<ASSIGN    148>>IF
+       149>>IF        158>>ASSIGN
+CONVERSION_BUFFER
+        82**DCL       139<<ASSIGN    143<<ASSIGN    158<<ASSIGN    177<<ASSIGN    180<>CALL
+CONVERSION_BUFFER_FULL
+        92**DCL       134<<ASSIGN    151>>IF        155>>IF        162<<ASSIGN
+CONVERSION_BUFFER_INDEX
+        83**DCL       145<<ASSIGN    158>>ASSIGN    159<<ASSIGN    159>>ASSIGN    161>>IF        175>>IF
+       176<<ASSIGN    180>>CALL
+EXIT_DO
+       172**LABEL     151--GOTO
+EXPONENT_START
+        90**DCL       108<<ASSIGN    109>>IF        113>>IF        113>>IF        114<<ASSIGN    114>>ASSIGN
+       115>>ASSIGN    116>>ASSIGN
+E_POSITION
+        85**DCL       101<<CALLBLT   102>>IF        103<<CALLBLT   105>>IF        108>>ASSIGN    146>>DOINDEX
+NEGATIVE_EXPONENT
+        87**DCL       110<<ASSIGN    112<<ASSIGN    124>>IF        128>>IF        185>>IF
+NEG_INFINITY
+        96**DCL       199>>ASSIGN
+OVERFLOW_ERROR
+        74**DCL         7--PROC      120<<ASSIGN    123<<ASSIGN    181<<ASSIGN    191<<ASSIGN    197<<ASSIGN
+POS_INFINITY
+        95**DCL       201>>ASSIGN
+POWER_OF_TEN
+        86**DCL       106<<ASSIGN    117<>CALL      128<<ASSIGN    128>>ASSIGN    156<<ASSIGN    156>>ASSIGN
+       160<<ASSIGN    160>>ASSIGN    168<<ASSIGN    168>>ASSIGN    172>>IF        172<<ASSIGN    180<>CALL
+RESULT
+PL6.E3A0      #008=XBI$STRING_TO_REAL File=xbi_stdlib:6.:XBC3TSI                 FRI 01/06/95 11:41 Page:62   
+        73**DCL         7--PROC      125<<ASSIGN    180<>CALL      185>>IF        199<<ASSIGN    201<<ASSIGN
+SIGNAL_OVERFLOW_ERROR
+       185**LABEL     126--GOTO      180--CALLALT
+SKIPPING_ZEROS
+        93**DCL       133<<ASSIGN    148>>IF        154<<ASSIGN
+START_OF_SCAN
+        91**DCL       138<<ASSIGN    142<<ASSIGN    146>>DOINDEX
+STRING
+        69**DCL         7--PROC
+STRING.SIZE
+        70**DCL        71--IMP-SIZ   101>>CALLBLT   102>>IF        103>>CALLBLT   105>>IF        109>>IF
+       113>>IF        113>>IF        115>>ASSIGN    116>>ASSIGN    136>>ASSIGN    147>>ASSIGN    198>>IF
+STRING.STRING
+        71**DCL       101>>CALLBLT   103>>CALLBLT   109>>IF        113>>IF        113>>IF        116>>ASSIGN
+       136>>ASSIGN    147>>ASSIGN    198>>IF
+STRING_CONVERSION_BUFFER.SIZE
+        78**DCL       115<<ASSIGN    117<>CALL
+STRING_CONVERSION_BUFFER.STRING
+        79**DCL       116<<ASSIGN    117<>CALL
+STRING_INDEX
+        84**DCL       146<<DOINDEX   147>>ASSIGN
+XPN_7LSPTOD
+        98**DCL-ENT   180--CALL
+XPN_7NS0TOI
+        99**DCL-ENT   117--CALL

@@ -1,0 +1,1701 @@
+VERSION E05
+
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:1    
+        1        1        /*M* TOE$EVENT_HANDLER      TOLTS EVENT HANDLER program */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7
+        8        8        /*X* PLM=3,DCI=6,SQB=N,PRB=N,DTI=5,ENI=0,AND=Y,ECI=0,CSU=3,DIN=3,
+        9        9             CTI=8,CRM=109,CRT=1,NLB=N,NTB=Y,MCL=110 */
+       10       10
+       11       11        /*P* NAME:         TOE$EVENT_HANDLER
+       12       12             PURPOSE:      Asynchronous Condition Handler for taking control
+       13       13                           when an Event completes.  Event completions in
+       14       14                           TOLTS are due to "no wait" test I/O to
+       15       15                           peripherals or Front End Processors.
+       16       16             DESCRIPTION:  Fetches the Event ID from the TCB frame and calls
+       17       17                           TOD$DISPATCHER to build an entry to service the
+       18       18                           completion of a no wait I/O.  Each subexec has
+       19       19                           its own type of dispatcher entry, i.e., completion
+       20       20                           of POLTS I/O, or completion of COLTS I/O, etc.
+       21       21                           The dispatcher later services the event completion
+       22       22                           and notifies the subexec of completion.
+       23       23             LAST UPDATE:  08/18/83
+       24       24             REFERENCE:    CP-6 Release C0K0
+       25       25                           Carl J. Eichert
+       26       26        */
+       27       27        %EJECT ;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:2    
+       28       28        /*F* NAME:         TOE$EVENT_HANDLER
+       29       29             DESCRIPTION:  Procedure Nesting Hierarchy
+       30       30
+       31       31                           TOE$EVENT_HANDLER: procedure ASYNC
+       32       32                              TOE$DECR_IOCOUNT: procedure
+       33       33                              TOE$FIND_EVENT_ID: procedure
+       34       34        */
+       35       35
+       36       36        TOE$EVENT_HANDLER: PROC ASYNC;
+       37       37
+       38       38        /* Include Files */
+       39       39
+       40       40           %INCLUDE CP_6;
+       41     5599           %INCLUDE CP_6_SUBS;
+       42     6139           %INCLUDE TOT_TOLTS_M;
+       43     7257           %INCLUDE TO_PERR_C ;
+       44     7842           %EJECT ;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:3    
+       45     7843        /* Variables */
+       46     7844
+       47     7845           %B$TCB;
+       48     7848           %B$TDIO;
+       49     7861    1      DCL EVENT_ID       UBIN WORD;
+       50     7862    1      DCL QUEUE_ENTRY    (0:2) UBIN WORD;
+       51     7863    1      DCL REQUEST_TYPE   UBIN WORD;
+       52     7864    1      DCL SERVICE_CODE   UBIN HALF;
+       53     7865    1      DCL 1 STATUS,
+       54     7866    1            2 WD1        UBIN WORD,
+       55     7867    1            2 WD2        UBIN WORD;
+       56     7868           %VLP_ERRCODE (FPTN = TOE_ERROR_CODE,
+       57     7869                         FCG  = 'TO',
+       58     7870                         MID  = 'E',
+       59     7871                         SEV  = 0) ;
+       60     7916
+       61     7917        /* External Variables */
+       62     7918
+       63     7919    1      DCL B$TCB$         PTR SYMREF;
+       64     7920           %TOT$DMC (STCLASS = SYMREF) ;
+       65     7954           %TOP$TCP (STCLASS = "BASED (TOT$DMC.TOP$TCP.PTR$)") ;
+       66     8042           %TOT$ECP (STCLASS = SYMREF) ;
+       67     8091
+       68     8092        /* External Entries */
+       69     8093
+       70     8094    1      DCL TOD$DISPATCHER    ENTRY (3) ;
+       71     8095    1      DCL TOX$SCREECH       ENTRY (1) ;
+       72     8096           %EJECT;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:4    
+       73     8097        /*D* NAME:         TOE$EVENT_HANDLER
+       74     8098             INTERFACE:    TOD$DISPATCHER
+       75     8099             INPUT:        Event ID in TCB frame.
+       76     8100             OUTPUT:       Entry in dispatcher queue.
+       77     8101             DESCRIPTION:  The Event Handler is established at TOLTS
+       78     8102                           initialization time by calling M$EVENT.  There-
+       79     8103                           after, all event completions will come here.  In
+       80     8104                           TOLTS, the only event completions should be for
+       81     8105                           no wait I/O to FEPs or peripherals.
+       82     8106
+       83     8107                           The Event Id is fetched from the TCB frame with the B$TDIO
+       84     8108                           structure.  Based on the range of the Event ID,
+       85     8109                           a dispatcher entry is built signifying the
+       86     8110                           subexec for which the I/O completed.  This is so
+       87     8111                           the dispatcher will know who to return the
+       88     8112                           completion to.  The ranges are:
+       89     8113
+       90     8114                             20-27   MOLTS special interrupt for ITRs
+       91     8115                             100-107 POLTS and MOLTS I/O completion
+       92     8116                             200     COLTS I/O completion
+       93     8117                             IPCW_EVENT terminate interrupt for IPCW command
+       94     8118
+       95     8119                           The Event Handler does not do any servicing of I/O
+       96     8120                           completions, but merely queues up the completions
+       97     8121                           so that they can be serviced at a more convenient
+       98     8122                           time.  In the case of the Slave Mode Subexecs
+       99     8123                           the Courtesy Call routines (in GMAP) are not
+      100     8124                           reentrant or recursive, so that unless these I/O
+      101     8125                           completions are gated throught a dispatcher,
+      102     8126                           an I/O may complete before the Courtesy Call
+      103     8127                           processing is done for the first.  The Courtesy
+      104     8128                           Call routine would be entered a second time
+      105     8129                           before the first one was done, and everything would
+      106     8130                           get clobberred and mixed up.
+      107     8131
+      108     8132                           By running all I/O completions through the
+      109     8133                           dispatcher, and controlling when the dispatcher can
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:5    
+      110     8134                           service its queue, this problem is circumvented.
+      111     8135
+      112     8136                           A number of things are worthy of note at this
+      113     8137                           point:
+      114     8138
+      115     8139                           a.  Both POLTS and MOLTS test I/O are treated the
+      116     8140                               same, i.e., have the same Event IDs, and
+      117     8141                               eventually processed by the same completion
+      118     8142                               routines.
+      119     8143                           b.  MOLTS special interrupts for ITR I/O are also
+      120     8144                               treated the same as normal test I/O and are
+      121     8145                               eventually processed by the same completion
+      122     8146                               routines, but are assigned different Event IDs
+      123     8147                               so those processing routines can tell the
+      124     8148                               difference between terminate and special interrupts.
+      125     8149                           c.  The outstanding I/O count is not decremented
+      126     8150                               on the completion of a special interrupt.
+      127     8151                               Management of that count, TOT$ECP.IO.COUNT is done
+      128     8152                               by the subroutine DECR_IOCOUNT, as is the
+      129     8153                               management of TOT$ECP.ISC.GERELC_WAIT.
+      130     8154                           d.  MOLTS does not expect an interrupt when it
+      131     8155                               issues an IPCW command.  In the first place,
+      132     8156                               the hardware will not return any interrupt
+      133     8157                               following the command.  But CP6 will time it
+      134     8158                               out and return a lost interrupt.  That interrupt
+      135     8159                               which is assigned a unique Event ID will be
+      136     8160                               ignored here, althought the I/O counts are
+      137     8161                               updated.
+      138     8162
+      139     8163                           The return from this routine should resume
+      140     8164                           execution at whatever program was interrupted.
+      141     8165        */
+      142     8166        %EJECT;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:6    
+      143     8167        /* Main Code */
+      144     8168
+      145     8169    1      EVENT_ID = B$TCB$->B$TCB.STK$->B$TDIO.EVID;
+      146     8170    2      DO CASE (EVENT_ID);
+      147     8171    2         CASE (20,21,22,23,24,25,26,27) ;
+      148     8172    2            REQUEST_TYPE = %DRT_BUILD;
+      149     8173    2            SERVICE_CODE = %DSC_MIO;
+      150     8174    2            QUEUE_ENTRY(0) = EVENT_ID;
+      151     8175    2            STATUS = B$TCB$->B$TCB.STK$->B$TDIO.STATUS;
+      152     8176    2            QUEUE_ENTRY(1) = STATUS.WD1;
+      153     8177    2            QUEUE_ENTRY(2) = STATUS.WD2;
+      154     8178    2            CALL TOD$DISPATCHER(REQUEST_TYPE,SERVICE_CODE,QUEUE_ENTRY);
+      155     8179    2         CASE (100,101,102,103,104,105,106,107) ;
+      156     8180    2            TOP$TCP.IO.DONE(EVENT_ID - %TIO_EVENT_BASE) = '1'B ;
+      157     8181    2            CALL TOE$DECR_IOCOUNT;
+      158     8182    2            REQUEST_TYPE = %DRT_BUILD;
+      159     8183    2            SERVICE_CODE = %DSC_PIO;
+      160     8184    2            QUEUE_ENTRY(0) = EVENT_ID;
+      161     8185    2            STATUS = B$TCB$->B$TCB.STK$->B$TDIO.STATUS;
+      162     8186    2            QUEUE_ENTRY(1) = STATUS.WD1;
+      163     8187    2            QUEUE_ENTRY(2) = STATUS.WD2;
+      164     8188    2            CALL TOD$DISPATCHER(REQUEST_TYPE,SERVICE_CODE,QUEUE_ENTRY);
+      165     8189    2         CASE (200,201,202,203,204,205,206,207,208);
+      166     8190    2            CALL TOE$DECR_IOCOUNT;
+      167     8191    2            REQUEST_TYPE = %DRT_BUILD;
+      168     8192    2            SERVICE_CODE = %DSC_CIO;
+      169     8193    2            QUEUE_ENTRY(0) = EVENT_ID;
+      170     8194    2            QUEUE_ENTRY(1) = 0;
+      171     8195    2            QUEUE_ENTRY(2) = 0;
+      172     8196    2            CALL TOD$DISPATCHER(REQUEST_TYPE,SERVICE_CODE,QUEUE_ENTRY);
+      173     8197                 %EJECT ;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:7    
+      174     8198    2         CASE (%IPCW_EVENT);
+      175     8199    2            CALL TOE$DECR_IOCOUNT;
+      176     8200    2         CASE (ELSE);
+      177     8201    2            TOE_ERROR_CODE.ERR# = %E$BADEVID ;
+      178     8202    2            CALL TOX$SCREECH (TOE_ERROR_CODE) ;
+      179     8203    2      END /* CASE */ ;
+      180     8204    1      RETURN;
+      181     8205
+      182     8206        /* END TOE$EVENT_HANDLER */
+      183     8207        %EJECT;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:8    
+      184     8208        /*I* NAME:        TOE$DECR_IO_COUNT
+      185     8209             PURPOSE:     Decrements I/O Count
+      186     8210             DESCRIPTION: Inhibited code to decrement the I/O count
+      187     8211        */
+      188     8212
+      189     8213    1   TOE$DECR_IOCOUNT: PROC;
+      190     8214
+      191     8215        /* Code */
+      192     8216
+      193     8217    3      DO INHIBIT;
+      194     8218    3         TOT$ECP.IO.COUNT = TOT$ECP.IO.COUNT - 1 ;
+      195     8219    3         IF TOT$ECP.IO.COUNT < 0
+      196     8220    4         THEN DO ;
+      197     8221    4                 TOE_ERROR_CODE.ERR# = %E$BADIOCNT ;
+      198     8222    4                 CALL TOX$SCREECH (TOE_ERROR_CODE) ;
+      199     8223    4              END /* THEN */ ;
+      200     8224    3         ELSE /* Do Nothing */ ;
+      201     8225    3         IF TOT$ECP.ISC.GERELC_WAIT
+      202     8226    3         THEN TOT$ECP.ISC.GERELC_WAIT = %FALSE ;
+      203     8227    3         ELSE /* Do Nothing */ ;
+      204     8228    3      END;
+      205     8229    2      RETURN;
+      206     8230
+      207     8231    2   END TOE$DECR_IOCOUNT;
+      208     8232    1   END TOE$EVENT_HANDLER ;
+
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:9    
+--  Include file information  --
+
+   TO_PERR_C.:E05TOU  is referenced.
+   TOT_TOLTS_M.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   CP_6_C.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure TOE$EVENT_HANDLER.
+
+   Procedure TOE$EVENT_HANDLER requires 320 words for executable code.
+   Procedure TOE$EVENT_HANDLER requires 18 words of local(AUTO) storage.
+
+    No errors detected in file TOE$EVENT_HANDLER.:E05TSI    .
+
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:10   
+
+ Object Unit name= TOE$EVENT_HANDLER                          File name= TOE$EVENT_HANDLER.:E05TOU
+ UTS= JUL 30 '97 06:21:54.92 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   DCB   even  none     0      0  M$UC
+    1   Data  even  none     1      1  TOE$EVENT_HANDLER
+    2   Proc  even  none   320    500  TOE$EVENT_HANDLER
+    3  RoData even  none     3      3  TOE$EVENT_HANDLER
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes            yes     Async       0  TOE$EVENT_HANDLER
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       3 TOD$DISPATCHER
+         yes           Std       1 TOX$SCREECH
+                       nStd      0 X66_AAUTO
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_AARET
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:11   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     M$UC                                  B$TCB$                                TOT$DMC
+     TOT$ECP                               B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:12   
+
+
+        1        1        /*M* TOE$EVENT_HANDLER      TOLTS EVENT HANDLER program */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7
+        8        8        /*X* PLM=3,DCI=6,SQB=N,PRB=N,DTI=5,ENI=0,AND=Y,ECI=0,CSU=3,DIN=3,
+        9        9             CTI=8,CRM=109,CRT=1,NLB=N,NTB=Y,MCL=110 */
+       10       10
+       11       11        /*P* NAME:         TOE$EVENT_HANDLER
+       12       12             PURPOSE:      Asynchronous Condition Handler for taking control
+       13       13                           when an Event completes.  Event completions in
+       14       14                           TOLTS are due to "no wait" test I/O to
+       15       15                           peripherals or Front End Processors.
+       16       16             DESCRIPTION:  Fetches the Event ID from the TCB frame and calls
+       17       17                           TOD$DISPATCHER to build an entry to service the
+       18       18                           completion of a no wait I/O.  Each subexec has
+       19       19                           its own type of dispatcher entry, i.e., completion
+       20       20                           of POLTS I/O, or completion of COLTS I/O, etc.
+       21       21                           The dispatcher later services the event completion
+       22       22                           and notifies the subexec of completion.
+       23       23             LAST UPDATE:  08/18/83
+       24       24             REFERENCE:    CP-6 Release C0K0
+       25       25                           Carl J. Eichert
+       26       26        */
+       27       27        %EJECT ;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:13   
+       28       28        /*F* NAME:         TOE$EVENT_HANDLER
+       29       29             DESCRIPTION:  Procedure Nesting Hierarchy
+       30       30
+       31       31                           TOE$EVENT_HANDLER: procedure ASYNC
+       32       32                              TOE$DECR_IOCOUNT: procedure
+       33       33                              TOE$FIND_EVENT_ID: procedure
+       34       34        */
+       35       35
+       36       36        TOE$EVENT_HANDLER: PROC ASYNC;
+
+     36  2 000000   000000 700200 xent  TOE$EVENT_H* TSX0  ! X66_AAUTO
+         2 000001   000022 000000                    ZERO    18,0
+
+       37       37
+       38       38        /* Include Files */
+       39       39
+       40       40           %INCLUDE CP_6;
+       41     5599           %INCLUDE CP_6_SUBS;
+       42     6139           %INCLUDE TOT_TOLTS_M;
+       43     7257           %INCLUDE TO_PERR_C ;
+       44     7842           %EJECT ;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:14   
+       45     7843        /* Variables */
+       46     7844
+       47     7845           %B$TCB;
+       48     7848           %B$TDIO;
+       49     7861    1      DCL EVENT_ID       UBIN WORD;
+       50     7862    1      DCL QUEUE_ENTRY    (0:2) UBIN WORD;
+       51     7863    1      DCL REQUEST_TYPE   UBIN WORD;
+       52     7864    1      DCL SERVICE_CODE   UBIN HALF;
+       53     7865    1      DCL 1 STATUS,
+       54     7866    1            2 WD1        UBIN WORD,
+       55     7867    1            2 WD2        UBIN WORD;
+       56     7868           %VLP_ERRCODE (FPTN = TOE_ERROR_CODE,
+       57     7869                         FCG  = 'TO',
+       58     7870                         MID  = 'E',
+       59     7871                         SEV  = 0) ;
+       60     7916
+       61     7917        /* External Variables */
+       62     7918
+       63     7919    1      DCL B$TCB$         PTR SYMREF;
+       64     7920           %TOT$DMC (STCLASS = SYMREF) ;
+       65     7954           %TOP$TCP (STCLASS = "BASED (TOT$DMC.TOP$TCP.PTR$)") ;
+       66     8042           %TOT$ECP (STCLASS = SYMREF) ;
+       67     8091
+       68     8092        /* External Entries */
+       69     8093
+       70     8094    1      DCL TOD$DISPATCHER    ENTRY (3) ;
+       71     8095    1      DCL TOX$SCREECH       ENTRY (1) ;
+       72     8096           %EJECT;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:15   
+       73     8097        /*D* NAME:         TOE$EVENT_HANDLER
+       74     8098             INTERFACE:    TOD$DISPATCHER
+       75     8099             INPUT:        Event ID in TCB frame.
+       76     8100             OUTPUT:       Entry in dispatcher queue.
+       77     8101             DESCRIPTION:  The Event Handler is established at TOLTS
+       78     8102                           initialization time by calling M$EVENT.  There-
+       79     8103                           after, all event completions will come here.  In
+       80     8104                           TOLTS, the only event completions should be for
+       81     8105                           no wait I/O to FEPs or peripherals.
+       82     8106
+       83     8107                           The Event Id is fetched from the TCB frame with the B$TDIO
+       84     8108                           structure.  Based on the range of the Event ID,
+       85     8109                           a dispatcher entry is built signifying the
+       86     8110                           subexec for which the I/O completed.  This is so
+       87     8111                           the dispatcher will know who to return the
+       88     8112                           completion to.  The ranges are:
+       89     8113
+       90     8114                             20-27   MOLTS special interrupt for ITRs
+       91     8115                             100-107 POLTS and MOLTS I/O completion
+       92     8116                             200     COLTS I/O completion
+       93     8117                             IPCW_EVENT terminate interrupt for IPCW command
+       94     8118
+       95     8119                           The Event Handler does not do any servicing of I/O
+       96     8120                           completions, but merely queues up the completions
+       97     8121                           so that they can be serviced at a more convenient
+       98     8122                           time.  In the case of the Slave Mode Subexecs
+       99     8123                           the Courtesy Call routines (in GMAP) are not
+      100     8124                           reentrant or recursive, so that unless these I/O
+      101     8125                           completions are gated throught a dispatcher,
+      102     8126                           an I/O may complete before the Courtesy Call
+      103     8127                           processing is done for the first.  The Courtesy
+      104     8128                           Call routine would be entered a second time
+      105     8129                           before the first one was done, and everything would
+      106     8130                           get clobberred and mixed up.
+      107     8131
+      108     8132                           By running all I/O completions through the
+      109     8133                           dispatcher, and controlling when the dispatcher can
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:16   
+      110     8134                           service its queue, this problem is circumvented.
+      111     8135
+      112     8136                           A number of things are worthy of note at this
+      113     8137                           point:
+      114     8138
+      115     8139                           a.  Both POLTS and MOLTS test I/O are treated the
+      116     8140                               same, i.e., have the same Event IDs, and
+      117     8141                               eventually processed by the same completion
+      118     8142                               routines.
+      119     8143                           b.  MOLTS special interrupts for ITR I/O are also
+      120     8144                               treated the same as normal test I/O and are
+      121     8145                               eventually processed by the same completion
+      122     8146                               routines, but are assigned different Event IDs
+      123     8147                               so those processing routines can tell the
+      124     8148                               difference between terminate and special interrupts.
+      125     8149                           c.  The outstanding I/O count is not decremented
+      126     8150                               on the completion of a special interrupt.
+      127     8151                               Management of that count, TOT$ECP.IO.COUNT is done
+      128     8152                               by the subroutine DECR_IOCOUNT, as is the
+      129     8153                               management of TOT$ECP.ISC.GERELC_WAIT.
+      130     8154                           d.  MOLTS does not expect an interrupt when it
+      131     8155                               issues an IPCW command.  In the first place,
+      132     8156                               the hardware will not return any interrupt
+      133     8157                               following the command.  But CP6 will time it
+      134     8158                               out and return a lost interrupt.  That interrupt
+      135     8159                               which is assigned a unique Event ID will be
+      136     8160                               ignored here, althought the I/O counts are
+      137     8161                               updated.
+      138     8162
+      139     8163                           The return from this routine should resume
+      140     8164                           execution at whatever program was interrupted.
+      141     8165        */
+      142     8166        %EJECT;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:17   
+      143     8167        /* Main Code */
+      144     8168
+      145     8169    1      EVENT_ID = B$TCB$->B$TCB.STK$->B$TDIO.EVID;
+
+   8169  2 000002   000000 470400 xsym               LDP0    B$TCB$
+         2 000003   000001 471500                    LDP1    1,,PR0
+         2 000004   100101 235100                    LDA     65,,PR1
+         2 000005   200003 755100                    STA     EVENT_ID,,AUTO
+
+      146     8170    2      DO CASE (EVENT_ID);
+
+   8170  2 000006   000012 135007                    SBLA    10,DL
+         2 000007   000307 115007                    CMPA    199,DL
+         2 000010   000012 602005 2                  TNC     s:8170+4,AL
+         2 000011   000444 710000 2                  TRA     s:8201
+         2 000012   000441 710000 2                  TRA     s:8199
+         2 000013   000444 710000 2                  TRA     s:8201
+         2 000014   000444 710000 2                  TRA     s:8201
+         2 000015   000444 710000 2                  TRA     s:8201
+         2 000016   000444 710000 2                  TRA     s:8201
+         2 000017   000444 710000 2                  TRA     s:8201
+         2 000020   000444 710000 2                  TRA     s:8201
+         2 000021   000444 710000 2                  TRA     s:8201
+         2 000022   000444 710000 2                  TRA     s:8201
+         2 000023   000444 710000 2                  TRA     s:8201
+         2 000024   000321 710000 2                  TRA     s:8172
+         2 000025   000321 710000 2                  TRA     s:8172
+         2 000026   000321 710000 2                  TRA     s:8172
+         2 000027   000321 710000 2                  TRA     s:8172
+         2 000030   000321 710000 2                  TRA     s:8172
+         2 000031   000321 710000 2                  TRA     s:8172
+         2 000032   000321 710000 2                  TRA     s:8172
+         2 000033   000321 710000 2                  TRA     s:8172
+         2 000034   000444 710000 2                  TRA     s:8201
+         2 000035   000444 710000 2                  TRA     s:8201
+         2 000036   000444 710000 2                  TRA     s:8201
+         2 000037   000444 710000 2                  TRA     s:8201
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:18   
+         2 000040   000444 710000 2                  TRA     s:8201
+         2 000041   000444 710000 2                  TRA     s:8201
+         2 000042   000444 710000 2                  TRA     s:8201
+         2 000043   000444 710000 2                  TRA     s:8201
+         2 000044   000444 710000 2                  TRA     s:8201
+         2 000045   000444 710000 2                  TRA     s:8201
+         2 000046   000444 710000 2                  TRA     s:8201
+         2 000047   000444 710000 2                  TRA     s:8201
+         2 000050   000444 710000 2                  TRA     s:8201
+         2 000051   000444 710000 2                  TRA     s:8201
+         2 000052   000444 710000 2                  TRA     s:8201
+         2 000053   000444 710000 2                  TRA     s:8201
+         2 000054   000444 710000 2                  TRA     s:8201
+         2 000055   000444 710000 2                  TRA     s:8201
+         2 000056   000444 710000 2                  TRA     s:8201
+         2 000057   000444 710000 2                  TRA     s:8201
+         2 000060   000444 710000 2                  TRA     s:8201
+         2 000061   000444 710000 2                  TRA     s:8201
+         2 000062   000444 710000 2                  TRA     s:8201
+         2 000063   000444 710000 2                  TRA     s:8201
+         2 000064   000444 710000 2                  TRA     s:8201
+         2 000065   000444 710000 2                  TRA     s:8201
+         2 000066   000444 710000 2                  TRA     s:8201
+         2 000067   000444 710000 2                  TRA     s:8201
+         2 000070   000444 710000 2                  TRA     s:8201
+         2 000071   000444 710000 2                  TRA     s:8201
+         2 000072   000444 710000 2                  TRA     s:8201
+         2 000073   000444 710000 2                  TRA     s:8201
+         2 000074   000444 710000 2                  TRA     s:8201
+         2 000075   000444 710000 2                  TRA     s:8201
+         2 000076   000444 710000 2                  TRA     s:8201
+         2 000077   000444 710000 2                  TRA     s:8201
+         2 000100   000444 710000 2                  TRA     s:8201
+         2 000101   000444 710000 2                  TRA     s:8201
+         2 000102   000444 710000 2                  TRA     s:8201
+         2 000103   000444 710000 2                  TRA     s:8201
+         2 000104   000444 710000 2                  TRA     s:8201
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:19   
+         2 000105   000444 710000 2                  TRA     s:8201
+         2 000106   000444 710000 2                  TRA     s:8201
+         2 000107   000444 710000 2                  TRA     s:8201
+         2 000110   000444 710000 2                  TRA     s:8201
+         2 000111   000444 710000 2                  TRA     s:8201
+         2 000112   000444 710000 2                  TRA     s:8201
+         2 000113   000444 710000 2                  TRA     s:8201
+         2 000114   000444 710000 2                  TRA     s:8201
+         2 000115   000444 710000 2                  TRA     s:8201
+         2 000116   000444 710000 2                  TRA     s:8201
+         2 000117   000444 710000 2                  TRA     s:8201
+         2 000120   000444 710000 2                  TRA     s:8201
+         2 000121   000444 710000 2                  TRA     s:8201
+         2 000122   000444 710000 2                  TRA     s:8201
+         2 000123   000444 710000 2                  TRA     s:8201
+         2 000124   000444 710000 2                  TRA     s:8201
+         2 000125   000444 710000 2                  TRA     s:8201
+         2 000126   000444 710000 2                  TRA     s:8201
+         2 000127   000444 710000 2                  TRA     s:8201
+         2 000130   000444 710000 2                  TRA     s:8201
+         2 000131   000444 710000 2                  TRA     s:8201
+         2 000132   000444 710000 2                  TRA     s:8201
+         2 000133   000444 710000 2                  TRA     s:8201
+         2 000134   000444 710000 2                  TRA     s:8201
+         2 000135   000444 710000 2                  TRA     s:8201
+         2 000136   000444 710000 2                  TRA     s:8201
+         2 000137   000444 710000 2                  TRA     s:8201
+         2 000140   000444 710000 2                  TRA     s:8201
+         2 000141   000444 710000 2                  TRA     s:8201
+         2 000142   000444 710000 2                  TRA     s:8201
+         2 000143   000444 710000 2                  TRA     s:8201
+         2 000144   000352 710000 2                  TRA     s:8180
+         2 000145   000352 710000 2                  TRA     s:8180
+         2 000146   000352 710000 2                  TRA     s:8180
+         2 000147   000352 710000 2                  TRA     s:8180
+         2 000150   000352 710000 2                  TRA     s:8180
+         2 000151   000352 710000 2                  TRA     s:8180
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:20   
+         2 000152   000352 710000 2                  TRA     s:8180
+         2 000153   000352 710000 2                  TRA     s:8180
+         2 000154   000444 710000 2                  TRA     s:8201
+         2 000155   000444 710000 2                  TRA     s:8201
+         2 000156   000444 710000 2                  TRA     s:8201
+         2 000157   000444 710000 2                  TRA     s:8201
+         2 000160   000444 710000 2                  TRA     s:8201
+         2 000161   000444 710000 2                  TRA     s:8201
+         2 000162   000444 710000 2                  TRA     s:8201
+         2 000163   000444 710000 2                  TRA     s:8201
+         2 000164   000444 710000 2                  TRA     s:8201
+         2 000165   000444 710000 2                  TRA     s:8201
+         2 000166   000444 710000 2                  TRA     s:8201
+         2 000167   000444 710000 2                  TRA     s:8201
+         2 000170   000444 710000 2                  TRA     s:8201
+         2 000171   000444 710000 2                  TRA     s:8201
+         2 000172   000444 710000 2                  TRA     s:8201
+         2 000173   000444 710000 2                  TRA     s:8201
+         2 000174   000444 710000 2                  TRA     s:8201
+         2 000175   000444 710000 2                  TRA     s:8201
+         2 000176   000444 710000 2                  TRA     s:8201
+         2 000177   000444 710000 2                  TRA     s:8201
+         2 000200   000444 710000 2                  TRA     s:8201
+         2 000201   000444 710000 2                  TRA     s:8201
+         2 000202   000444 710000 2                  TRA     s:8201
+         2 000203   000444 710000 2                  TRA     s:8201
+         2 000204   000444 710000 2                  TRA     s:8201
+         2 000205   000444 710000 2                  TRA     s:8201
+         2 000206   000444 710000 2                  TRA     s:8201
+         2 000207   000444 710000 2                  TRA     s:8201
+         2 000210   000444 710000 2                  TRA     s:8201
+         2 000211   000444 710000 2                  TRA     s:8201
+         2 000212   000444 710000 2                  TRA     s:8201
+         2 000213   000444 710000 2                  TRA     s:8201
+         2 000214   000444 710000 2                  TRA     s:8201
+         2 000215   000444 710000 2                  TRA     s:8201
+         2 000216   000444 710000 2                  TRA     s:8201
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:21   
+         2 000217   000444 710000 2                  TRA     s:8201
+         2 000220   000444 710000 2                  TRA     s:8201
+         2 000221   000444 710000 2                  TRA     s:8201
+         2 000222   000444 710000 2                  TRA     s:8201
+         2 000223   000444 710000 2                  TRA     s:8201
+         2 000224   000444 710000 2                  TRA     s:8201
+         2 000225   000444 710000 2                  TRA     s:8201
+         2 000226   000444 710000 2                  TRA     s:8201
+         2 000227   000444 710000 2                  TRA     s:8201
+         2 000230   000444 710000 2                  TRA     s:8201
+         2 000231   000444 710000 2                  TRA     s:8201
+         2 000232   000444 710000 2                  TRA     s:8201
+         2 000233   000444 710000 2                  TRA     s:8201
+         2 000234   000444 710000 2                  TRA     s:8201
+         2 000235   000444 710000 2                  TRA     s:8201
+         2 000236   000444 710000 2                  TRA     s:8201
+         2 000237   000444 710000 2                  TRA     s:8201
+         2 000240   000444 710000 2                  TRA     s:8201
+         2 000241   000444 710000 2                  TRA     s:8201
+         2 000242   000444 710000 2                  TRA     s:8201
+         2 000243   000444 710000 2                  TRA     s:8201
+         2 000244   000444 710000 2                  TRA     s:8201
+         2 000245   000444 710000 2                  TRA     s:8201
+         2 000246   000444 710000 2                  TRA     s:8201
+         2 000247   000444 710000 2                  TRA     s:8201
+         2 000250   000444 710000 2                  TRA     s:8201
+         2 000251   000444 710000 2                  TRA     s:8201
+         2 000252   000444 710000 2                  TRA     s:8201
+         2 000253   000444 710000 2                  TRA     s:8201
+         2 000254   000444 710000 2                  TRA     s:8201
+         2 000255   000444 710000 2                  TRA     s:8201
+         2 000256   000444 710000 2                  TRA     s:8201
+         2 000257   000444 710000 2                  TRA     s:8201
+         2 000260   000444 710000 2                  TRA     s:8201
+         2 000261   000444 710000 2                  TRA     s:8201
+         2 000262   000444 710000 2                  TRA     s:8201
+         2 000263   000444 710000 2                  TRA     s:8201
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:22   
+         2 000264   000444 710000 2                  TRA     s:8201
+         2 000265   000444 710000 2                  TRA     s:8201
+         2 000266   000444 710000 2                  TRA     s:8201
+         2 000267   000444 710000 2                  TRA     s:8201
+         2 000270   000444 710000 2                  TRA     s:8201
+         2 000271   000444 710000 2                  TRA     s:8201
+         2 000272   000444 710000 2                  TRA     s:8201
+         2 000273   000444 710000 2                  TRA     s:8201
+         2 000274   000444 710000 2                  TRA     s:8201
+         2 000275   000444 710000 2                  TRA     s:8201
+         2 000276   000444 710000 2                  TRA     s:8201
+         2 000277   000444 710000 2                  TRA     s:8201
+         2 000300   000444 710000 2                  TRA     s:8201
+         2 000301   000444 710000 2                  TRA     s:8201
+         2 000302   000444 710000 2                  TRA     s:8201
+         2 000303   000444 710000 2                  TRA     s:8201
+         2 000304   000444 710000 2                  TRA     s:8201
+         2 000305   000444 710000 2                  TRA     s:8201
+         2 000306   000444 710000 2                  TRA     s:8201
+         2 000307   000444 710000 2                  TRA     s:8201
+         2 000310   000414 710000 2                  TRA     s:8190
+         2 000311   000414 710000 2                  TRA     s:8190
+         2 000312   000414 710000 2                  TRA     s:8190
+         2 000313   000414 710000 2                  TRA     s:8190
+         2 000314   000414 710000 2                  TRA     s:8190
+         2 000315   000414 710000 2                  TRA     s:8190
+         2 000316   000414 710000 2                  TRA     s:8190
+         2 000317   000414 710000 2                  TRA     s:8190
+         2 000320   000414 710000 2                  TRA     s:8190
+
+      147     8171    2         CASE (20,21,22,23,24,25,26,27) ;
+
+      148     8172    2            REQUEST_TYPE = %DRT_BUILD;
+
+   8172  2 000321   000001 236007                    LDQ     1,DL
+         2 000322   200007 756100                    STQ     REQUEST_TYPE,,AUTO
+
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:23   
+      149     8173    2            SERVICE_CODE = %DSC_MIO;
+
+   8173  2 000323   000005 220003                    LDX0    5,DU
+         2 000324   200010 740100                    STX0    SERVICE_CODE,,AUTO
+
+      150     8174    2            QUEUE_ENTRY(0) = EVENT_ID;
+
+   8174  2 000325   200003 235100                    LDA     EVENT_ID,,AUTO
+         2 000326   200004 755100                    STA     QUEUE_ENTRY,,AUTO
+
+      151     8175    2            STATUS = B$TCB$->B$TCB.STK$->B$TDIO.STATUS;
+
+   8175  2 000327   000001 471500                    LDP1    1,,PR0
+         2 000330   000100 100500                    MLR     fill='000'O
+         2 000331   100105 000010                    ADSC9   69,,PR1                  cn=0,n=8
+         2 000332   200011 000010                    ADSC9   STATUS,,AUTO             cn=0,n=8
+
+      152     8176    2            QUEUE_ENTRY(1) = STATUS.WD1;
+
+   8176  2 000333   200011 235100                    LDA     STATUS,,AUTO
+         2 000334   200005 755100                    STA     QUEUE_ENTRY+1,,AUTO
+
+      153     8177    2            QUEUE_ENTRY(2) = STATUS.WD2;
+
+   8177  2 000335   200012 235100                    LDA     STATUS+1,,AUTO
+         2 000336   200006 755100                    STA     QUEUE_ENTRY+2,,AUTO
+
+      154     8178    2            CALL TOD$DISPATCHER(REQUEST_TYPE,SERVICE_CODE,QUEUE_ENTRY);
+
+   8178  2 000337   200004 631500                    EPPR1   QUEUE_ENTRY,,AUTO
+         2 000340   200020 451500                    STP1    STATUS+7,,AUTO
+         2 000341   200010 633500                    EPPR3   SERVICE_CODE,,AUTO
+         2 000342   200017 453500                    STP3    STATUS+6,,AUTO
+         2 000343   200007 634500                    EPPR4   REQUEST_TYPE,,AUTO
+         2 000344   200016 454500                    STP4    STATUS+5,,AUTO
+         2 000345   200016 630500                    EPPR0   STATUS+5,,AUTO
+         2 000346   000021 631400 xsym               EPPR1   B_VECTNIL+17
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:24   
+         2 000347   000000 701000 xent               TSX1    TOD$DISPATCHER
+         2 000350   000000 011000                    NOP     0
+         2 000351   000454 710000 2                  TRA     s:8204
+
+      155     8179    2         CASE (100,101,102,103,104,105,106,107) ;
+
+      156     8180    2            TOP$TCP.IO.DONE(EVENT_ID - %TIO_EVENT_BASE) = '1'B ;
+
+   8180  2 000352   200003 236100                    LDQ     EVENT_ID,,AUTO
+         2 000353   000244 402007                    MPY     164,DL
+         2 000354   000003 473400 xsym               LDP3    TOT$DMC+3
+         2 000355   740000 620006                    EAX0    -16384,QL
+         2 000356   020000 236003                    LDQ     8192,DU
+         2 000357   377772 256110                    ORSQ    -6,X0,PR3
+
+      157     8181    2            CALL TOE$DECR_IOCOUNT;
+
+   8181  2 000360   000455 701000 2                  TSX1    TOE$DECR_IOCOUNT
+         2 000361   000000 011000                    NOP     0
+
+      158     8182    2            REQUEST_TYPE = %DRT_BUILD;
+
+   8182  2 000362   000001 235007                    LDA     1,DL
+         2 000363   200007 755100                    STA     REQUEST_TYPE,,AUTO
+
+      159     8183    2            SERVICE_CODE = %DSC_PIO;
+
+   8183  2 000364   000003 220003                    LDX0    3,DU
+         2 000365   200010 740100                    STX0    SERVICE_CODE,,AUTO
+
+      160     8184    2            QUEUE_ENTRY(0) = EVENT_ID;
+
+   8184  2 000366   200003 236100                    LDQ     EVENT_ID,,AUTO
+         2 000367   200004 756100                    STQ     QUEUE_ENTRY,,AUTO
+
+      161     8185    2            STATUS = B$TCB$->B$TCB.STK$->B$TDIO.STATUS;
+
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:25   
+   8185  2 000370   000000 470400 xsym               LDP0    B$TCB$
+         2 000371   000001 471500                    LDP1    1,,PR0
+         2 000372   000100 100500                    MLR     fill='000'O
+         2 000373   100105 000010                    ADSC9   69,,PR1                  cn=0,n=8
+         2 000374   200011 000010                    ADSC9   STATUS,,AUTO             cn=0,n=8
+
+      162     8186    2            QUEUE_ENTRY(1) = STATUS.WD1;
+
+   8186  2 000375   200011 235100                    LDA     STATUS,,AUTO
+         2 000376   200005 755100                    STA     QUEUE_ENTRY+1,,AUTO
+
+      163     8187    2            QUEUE_ENTRY(2) = STATUS.WD2;
+
+   8187  2 000377   200012 235100                    LDA     STATUS+1,,AUTO
+         2 000400   200006 755100                    STA     QUEUE_ENTRY+2,,AUTO
+
+      164     8188    2            CALL TOD$DISPATCHER(REQUEST_TYPE,SERVICE_CODE,QUEUE_ENTRY);
+
+   8188  2 000401   200004 631500                    EPPR1   QUEUE_ENTRY,,AUTO
+         2 000402   200020 451500                    STP1    STATUS+7,,AUTO
+         2 000403   200010 633500                    EPPR3   SERVICE_CODE,,AUTO
+         2 000404   200017 453500                    STP3    STATUS+6,,AUTO
+         2 000405   200007 634500                    EPPR4   REQUEST_TYPE,,AUTO
+         2 000406   200016 454500                    STP4    STATUS+5,,AUTO
+         2 000407   200016 630500                    EPPR0   STATUS+5,,AUTO
+         2 000410   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         2 000411   000000 701000 xent               TSX1    TOD$DISPATCHER
+         2 000412   000000 011000                    NOP     0
+         2 000413   000454 710000 2                  TRA     s:8204
+
+      165     8189    2         CASE (200,201,202,203,204,205,206,207,208);
+
+      166     8190    2            CALL TOE$DECR_IOCOUNT;
+
+   8190  2 000414   000455 701000 2                  TSX1    TOE$DECR_IOCOUNT
+         2 000415   000000 011000                    NOP     0
+
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:26   
+      167     8191    2            REQUEST_TYPE = %DRT_BUILD;
+
+   8191  2 000416   000001 235007                    LDA     1,DL
+         2 000417   200007 755100                    STA     REQUEST_TYPE,,AUTO
+
+      168     8192    2            SERVICE_CODE = %DSC_CIO;
+
+   8192  2 000420   000004 220003                    LDX0    4,DU
+         2 000421   200010 740100                    STX0    SERVICE_CODE,,AUTO
+
+      169     8193    2            QUEUE_ENTRY(0) = EVENT_ID;
+
+   8193  2 000422   200003 236100                    LDQ     EVENT_ID,,AUTO
+         2 000423   200004 756100                    STQ     QUEUE_ENTRY,,AUTO
+
+      170     8194    2            QUEUE_ENTRY(1) = 0;
+
+   8194  2 000424   200005 450100                    STZ     QUEUE_ENTRY+1,,AUTO
+
+      171     8195    2            QUEUE_ENTRY(2) = 0;
+
+   8195  2 000425   200006 450100                    STZ     QUEUE_ENTRY+2,,AUTO
+
+      172     8196    2            CALL TOD$DISPATCHER(REQUEST_TYPE,SERVICE_CODE,QUEUE_ENTRY);
+
+   8196  2 000426   200004 630500                    EPPR0   QUEUE_ENTRY,,AUTO
+         2 000427   200020 450500                    STP0    STATUS+7,,AUTO
+         2 000430   200010 631500                    EPPR1   SERVICE_CODE,,AUTO
+         2 000431   200017 451500                    STP1    STATUS+6,,AUTO
+         2 000432   200007 633500                    EPPR3   REQUEST_TYPE,,AUTO
+         2 000433   200016 453500                    STP3    STATUS+5,,AUTO
+         2 000434   200016 630500                    EPPR0   STATUS+5,,AUTO
+         2 000435   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         2 000436   000000 701000 xent               TSX1    TOD$DISPATCHER
+         2 000437   000000 011000                    NOP     0
+         2 000440   000454 710000 2                  TRA     s:8204
+
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:27   
+      173     8197                 %EJECT ;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:28   
+      174     8198    2         CASE (%IPCW_EVENT);
+
+      175     8199    2            CALL TOE$DECR_IOCOUNT;
+
+   8199  2 000441   000455 701000 2                  TSX1    TOE$DECR_IOCOUNT
+         2 000442   000000 011000                    NOP     0
+         2 000443   000454 710000 2                  TRA     s:8204
+
+      176     8200    2         CASE (ELSE);
+
+      177     8201    2            TOE_ERROR_CODE.ERR# = %E$BADEVID ;
+
+   8201  2 000444   000000 236000 1                  LDQ     TOE_ERROR_CODE
+         2 000445   000000 376000 3                  ANQ     0
+         2 000446   000700 276007                    ORQ     448,DL
+         2 000447   000000 756000 1                  STQ     TOE_ERROR_CODE
+
+      178     8202    2            CALL TOX$SCREECH (TOE_ERROR_CODE) ;
+
+   8202  2 000450   000001 630400 3                  EPPR0   1
+         2 000451   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         2 000452   000000 701000 xent               TSX1    TOX$SCREECH
+         2 000453   000000 011000                    NOP     0
+
+      179     8203    2      END /* CASE */ ;
+
+      180     8204    1      RETURN;
+
+   8204  2 000454   000000 702200 xent               TSX2  ! X66_AARET
+
+      181     8205
+      182     8206        /* END TOE$EVENT_HANDLER */
+      183     8207        %EJECT;
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:29   
+      184     8208        /*I* NAME:        TOE$DECR_IO_COUNT
+      185     8209             PURPOSE:     Decrements I/O Count
+      186     8210             DESCRIPTION: Inhibited code to decrement the I/O count
+      187     8211        */
+      188     8212
+      189     8213    1   TOE$DECR_IOCOUNT: PROC;
+
+   8213  2 000455   200014 741300       TOE$DECR_IO* STX1  ! STATUS+3,,AUTO
+
+      190     8214
+      191     8215        /* Code */
+      192     8216
+      193     8217    3      DO INHIBIT;
+
+      194     8218    3         TOT$ECP.IO.COUNT = TOT$ECP.IO.COUNT - 1 ;
+
+   8218  2 000456   000001 336207                    LCQ   ! 1,DL
+         2 000457   000004 056200 xsym               ASQ   ! TOT$ECP+4
+
+      195     8219    3         IF TOT$ECP.IO.COUNT < 0
+
+   8219  2 000460   000471 605200 2                  TPL   ! s:8225
+
+      196     8220    4         THEN DO ;
+
+      197     8221    4                 TOE_ERROR_CODE.ERR# = %E$BADIOCNT ;
+
+   8221  2 000461   000000 236200 1                  LDQ   ! TOE_ERROR_CODE
+         2 000462   000000 376200 3                  ANQ   ! 0
+         2 000463   000710 276207                    ORQ   ! 456,DL
+         2 000464   000000 756200 1                  STQ   ! TOE_ERROR_CODE
+
+      198     8222    4                 CALL TOX$SCREECH (TOE_ERROR_CODE) ;
+
+   8222  2 000465   000001 630600 3                  EPPR0 ! 1
+         2 000466   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         2 000467   000000 701200 xent               TSX1  ! TOX$SCREECH
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:30   
+         2 000470   000000 011200                    NOP   ! 0
+
+      199     8223    4              END /* THEN */ ;
+
+      200     8224    3         ELSE /* Do Nothing */ ;
+      201     8225    3         IF TOT$ECP.ISC.GERELC_WAIT
+
+   8225  2 000471   000005 236200 xsym               LDQ   ! TOT$ECP+5
+         2 000472   100000 316203                    CANQ  ! 32768,DU
+         2 000473   000476 600200 2                  TZE   ! s:8229
+
+      202     8226    3         THEN TOT$ECP.ISC.GERELC_WAIT = %FALSE ;
+
+   8226  2 000474   000002 236200 3                  LDQ   ! 2
+         2 000475   000005 356200 xsym               ANSQ  ! TOT$ECP+5
+
+      203     8227    3         ELSE /* Do Nothing */ ;
+      204     8228    3      END;
+
+      205     8229    2      RETURN;
+
+   8229  2 000476   200014 221300                    LDX1  ! STATUS+3,,AUTO
+         2 000477   000001 702211                    TSX2  ! 1,X1
+
+TOE_ERROR_CODE
+ Sect OctLoc
+   1     000   241705 000000                                                    ....
+
+(unnamed)
+ Sect OctLoc
+   3     000   777777 400007   000000 006000   677777 777777                    ............
+      206     8230
+      207     8231    2   END TOE$DECR_IOCOUNT;
+      208     8232    1   END TOE$EVENT_HANDLER ;
+
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:31   
+--  Include file information  --
+
+   TO_PERR_C.:E05TOU  is referenced.
+   TOT_TOLTS_M.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   CP_6_C.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure TOE$EVENT_HANDLER.
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:32   
+
+ **** Procedure blocks ****
+
+LB#    Line#s    #stmts #vars Sect# OctLoc  P A C   NP Lvl/name
+  0    36-  8232     48    26     2      0  y   y    0   1 TOE$EVENT_HANDLER
+  1  8213-  8231     12     0     2    455  y   y    0     2 TOE$DECR_IOCOUNT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:33   
+
+    **** Executable statements  ****
+
+  Exec cost Stmt Sec OctLoc Type   LB Label              Exec cost Stmt Sec OctLoc Type   LB Label
+
+              36   2      0 Proc    0                          $$  8169   2      2 Assign  0
+$$$$$$$$$$  8170   2      6 DoCase  0                              8171   2    321 Case    0
+            8172   2    321 Assign  0                              8173   2    323 Assign  0
+            8174   2    325 Assign  0                           $  8175   2    327 Assign  0
+            8176   2    333 Assign  0                              8177   2    335 Assign  0
+       $$$  8178   2    337 Call    0                              8179   2    352 Case    0
+       $$$  8180   2    352 Assign  0                              8181   2    360 Call    0
+            8182   2    362 Assign  0                              8183   2    364 Assign  0
+            8184   2    366 Assign  0                          $$  8185   2    370 Assign  0
+            8186   2    375 Assign  0                              8187   2    377 Assign  0
+       $$$  8188   2    401 Call    0                              8189   2    414 Case    0
+            8190   2    414 Call    0                              8191   2    416 Assign  0
+            8192   2    420 Assign  0                              8193   2    422 Assign  0
+            8194   2    424 Assign  0                              8195   2    425 Assign  0
+       $$$  8196   2    426 Call    0                              8198   2    441 Case    0
+            8199   2    441 Call    0                              8200   2    444 Case    0
+            8201   2    444 Assign  0                              8202   2    450 Call    0
+            8203   2    454 EndCse  0                              8204   2    454 Return  0
+            8213   2    455 Proc    1                              8217   2    456 DoInhi  1
+            8218   2    456 Assign  1                              8219   2    460 If      1
+            8220   2    461 Do      1                              8221   2    461 Assign  1
+            8222   2    465 Call    1                              8223   2    471 EndDo   1
+            8225   2    471 If      1                              8226   2    474 Assign  1
+            8228   2    476 EndInh  1                              8229   2    476 Return  1
+
+
+  **** Statement type totals  ****
+
+    23 Assign     8 Call       2 If         5 Case       2 Return     1 DoCase
+     1 Do         1 DoInhi     1 EndCse     1 EndDo      1 EndInh     2 Proc
+
+
+ # major stmts=   36 Code/major= 8.88 # stmts=   48 Code/stmt= 6.66  Point total= 90.6
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:34   
+ Cost/major stmt=  7.9 Cost/stmt=  5.9 Total cost=    284.9
+
+   0-4  $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+   4-6  $$
+   6-8  $$$$$
+  8-10  $$$$$$$$$$
+ 10-12
+ 12-14
+ 14-16
+ 16-18
+ 18-20
+ 20-22
+ 22-??  $$
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:35   
+
+ **** Variables and constants ****
+
+  ****  Section 001  Data  TOE$EVENT_HANDLER
+
+  ****  Structures  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC        r     1 TOE_ERROR_CODE
+     0-2-1/b UBIN(14)    r         2 ERR#
+
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w UBIN        r     1 EVENT_ID
+     4-0-0/w UBIN        r     1 QUEUE_ENTRY(0:2)
+     7-0-0/w UBIN        r     1 REQUEST_TYPE              10-0-0/w UBIN(18)    r     1 SERVICE_CODE
+
+  ****  Structures  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    11-0-0/w STRC(72)    r     1 STATUS
+    11-0-0/w UBIN        r         2 WD1
+    12-0-0/w UBIN        r         2 WD2
+
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$TCB$
+
+  ****  Structures  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:36   
+
+     0-0-0/d STRC(288)   r     1 TOT$DMC
+     2-0-0/d STRC(72)    r         2 TOP$TCP
+     3-0-0/b PTR         r          3 PTR$
+
+     0-0-0/w STRC(495)   r     1 TOT$ECP
+     3-0-0/w STRC(72)    r         2 IO
+     4-0-0/w SBIN        r          3 COUNT
+     5-0-0/c STRC(4)     r         2 ISC
+     5-0-2/b BIT         r          3 GERELC_WAIT
+
+
+  ****  BASED and DCB variables  ****
+
+  ****  Structures  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(144)   r     1 B$TCB
+     1-0-0/w PTR         r         2 STK$
+
+     0-0-0/w STRC(2880)  r     1 B$TDIO
+   101-0-0/w UBIN        r         2 EVID
+   105-0-0/b BIT (72)    r         2 STATUS
+
+     0-0-0/d STRC(5904)  r     1 TOP$TCP(0:7)
+    12-0-0/c STRC(6)     r         2 IO
+    12-0-4/b BIT         r          3 DONE
+
+
+
+   Procedure TOE$EVENT_HANDLER requires 320 words for executable code.
+   Procedure TOE$EVENT_HANDLER requires 18 words of local(AUTO) storage.
+
+    No errors detected in file TOE$EVENT_HANDLER.:E05TSI    .
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:37   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:38   
+          MINI XREF LISTING
+
+B$TCB.STK$
+      7846**DCL      8169>>ASSIGN   8175>>ASSIGN   8185>>ASSIGN
+B$TCB$
+      7919**DCL      8169>>ASSIGN   8175>>ASSIGN   8185>>ASSIGN
+B$TDIO.CODE
+      7851**DCL      7851--REDEF    7852--REDEF    7852--REDEF
+B$TDIO.ERR.ERR#
+      7853**DCL      7853--REDEF
+B$TDIO.EVID
+      7852**DCL      7852--REDEF    7852--REDEF    8169>>ASSIGN
+B$TDIO.FLPW
+      7858**DCL      7858--REDEF
+B$TDIO.STATUS
+      7858**DCL      8175>>ASSIGN   8185>>ASSIGN
+EVENT_ID
+      7861**DCL      8169<<ASSIGN   8170>>DOCASE   8174>>ASSIGN   8180>>ASSIGN   8184>>ASSIGN   8193>>ASSIGN
+QUEUE_ENTRY
+      7862**DCL      8174<<ASSIGN   8176<<ASSIGN   8177<<ASSIGN   8178<>CALL     8184<<ASSIGN   8186<<ASSIGN
+      8187<<ASSIGN   8188<>CALL     8193<<ASSIGN   8194<<ASSIGN   8195<<ASSIGN   8196<>CALL
+REQUEST_TYPE
+      7863**DCL      8172<<ASSIGN   8178<>CALL     8182<<ASSIGN   8188<>CALL     8191<<ASSIGN   8196<>CALL
+SERVICE_CODE
+      7864**DCL      8173<<ASSIGN   8178<>CALL     8183<<ASSIGN   8188<>CALL     8192<<ASSIGN   8196<>CALL
+STATUS
+      7865**DCL      8175<<ASSIGN   8185<<ASSIGN
+STATUS.WD1
+      7866**DCL      8176>>ASSIGN   8186>>ASSIGN
+STATUS.WD2
+      7867**DCL      8177>>ASSIGN   8187>>ASSIGN
+TOD$DISPATCHER
+      8094**DCL-ENT  8178--CALL     8188--CALL     8196--CALL
+TOE$DECR_IOCOUNT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:39   
+      8213**PROC     8181--CALL     8190--CALL     8199--CALL
+TOE_ERROR_CODE
+      7883**DCL      8202<>CALL     8222<>CALL
+TOE_ERROR_CODE.ERR#
+      7913**DCL      8201<<ASSIGN   8221<<ASSIGN
+TOP$TCP.FICCDD
+      7966**DCL      7972--REDEF    7975--REDEF
+TOP$TCP.IO.DONE
+      8005**DCL      8180<<ASSIGN
+TOT$DMC.TOP$TCP.PTR$
+      7941**DCL      7963--IMP-PTR  8180>>ASSIGN
+TOT$ECP.IO.COUNT
+      8058**DCL      8218<<ASSIGN   8218>>ASSIGN   8219>>IF
+TOT$ECP.ISC.GERELC_WAIT
+      8065**DCL      8225>>IF       8226<<ASSIGN
+TOT$ECP.TEST_REQ
+      8052**DCL      8054--REDEF
+TOX$SCREECH
+      8095**DCL-ENT  8202--CALL     8222--CALL
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:40   
+              *** CROSS REFERENCE LISTING ***
+    **     DENOTES     IDENTIFIER DEFINITION
+    <<                 IDENTIFIER'S VALUE SET
+    >>                 IDENTIFIER'S VALUE USED
+    <>                 IDENTIFIER SET AND/OR USED
+    --                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:41   
+              FULL UREF LISTING
+
+B$TCB
+      7846**DCL
+B$TCB.ALT$
+      7846**DCL
+B$TCB.CURRSZ
+      7846**DCL
+B$TCB.TCBAVSZ
+      7846**DCL
+B$TDIO
+      7851**DCL
+B$TDIO.BRKCNT
+      7852**DCL
+B$TDIO.DCB#
+      7852**DCL
+B$TDIO.ERR
+      7852**DCL
+B$TDIO.ERR.CODE
+      7853**DCL
+B$TDIO.ERR.FCG
+      7853**DCL
+B$TDIO.ERR.MID
+      7853**DCL
+B$TDIO.ERR.MON
+      7853**DCL
+B$TDIO.ERR.SEV
+      7853**DCL
+B$TDIO.EVSC
+      7852**DCL
+B$TDIO.EXTSTATUS
+      7858**DCL
+B$TDIO.EXTSTATUS.SNSBYT
+      7858**DCL
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:42   
+B$TDIO.FPT
+      7851**DCL
+B$TDIO.FPT.FCG
+      7851**DCL
+B$TDIO.FPT.PMME
+      7851**DCL
+B$TDIO.INTLVL
+      7858**DCL
+B$TDIO.LPWX
+      7858**DCL
+B$TDIO.LPWX.BASE
+      7858**DCL
+B$TDIO.LPWX.SIZE
+      7858**DCL
+B$TDIO.P#
+      7858**DCL
+B$TDIO.SSFRAME
+      7851**DCL
+B$TDIO.SUBC
+      7852**DCL
+M$ACCT
+      5544**DCL-ENT
+M$ACTIVATE
+      5547**DCL-ENT
+M$ALIB
+      5540**DCL-ENT
+M$ASUSER
+      5542**DCL-ENT
+M$ATTACH
+      5549**DCL-ENT
+M$BADPP
+      5567**DCL-ENT
+M$CGCTL
+      5548**DCL-ENT
+M$CGINFO
+      5548**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:43   
+M$CHECK
+      5529**DCL-ENT
+M$CHGUNIT
+      5587**DCL-ENT
+M$CLOSE
+      5527**DCL-ENT
+M$CLRSTK
+      5585**DCL-ENT
+M$CMDVAR
+      5596**DCL-ENT
+M$CONFIG
+      5557**DCL-ENT
+M$CORRES
+      5532**DCL-ENT
+M$CPEXIT
+      5541**DCL-ENT
+M$CVM
+      5565**DCL-ENT
+M$CVOL
+      5530**DCL-ENT
+M$DCLFLD
+      5557**DCL-ENT
+M$DEACTIVATE
+      5547**DCL-ENT
+M$DELREC
+      5529**DCL-ENT
+M$DEQ
+      5594**DCL-ENT
+M$DETACH
+      5549**DCL-ENT
+M$DEVICE
+      5531**DCL-ENT
+M$DISPLAY
+      5594**DCL-ENT
+M$DISPRES
+      5534**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:44   
+M$DLIB
+      5540**DCL-ENT
+M$DRIBBLE
+      5557**DCL-ENT
+M$DRTN
+      5585**DCL-ENT
+M$DSUSER
+      5542**DCL-ENT
+M$ENQ
+      5593**DCL-ENT
+M$EOM
+      5552**DCL-ENT
+M$ERASE
+      5558**DCL-ENT
+M$ERR
+      5539**DCL-ENT
+M$ERRMSG
+      5590**DCL-ENT
+M$EVENT
+      5582**DCL-ENT
+M$EXHUME
+      5591**DCL-ENT
+M$EXIT
+      5539**DCL-ENT
+M$EXTEND
+      5531**DCL-ENT
+M$FDP
+      5563**DCL-ENT
+M$FDS
+      5562**DCL-ENT
+M$FEBOOT
+      5555**DCL-ENT
+M$FECTL
+      5556**DCL-ENT
+M$FEDUMP
+      5555**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:45   
+M$FID
+      5590**DCL-ENT
+M$FINDPROC
+      5544**DCL-ENT
+M$FSUSER
+      5542**DCL-ENT
+M$FVP
+      5564**DCL-ENT
+M$FWCG
+      5548**DCL-ENT
+M$GBPL
+      5568**DCL-ENT
+M$GDDL
+      5564**DCL-ENT
+M$GDP
+      5563**DCL-ENT
+M$GDS
+      5562**DCL-ENT
+M$GETDCB
+      5533**DCL-ENT
+M$GETMOUSE
+      5573**DCL-ENT
+M$GETPM
+      5574**DCL-ENT
+M$GJOB
+      5592**DCL-ENT
+M$GLINEATTR
+      5552**DCL-ENT
+M$GOODPP
+      5567**DCL-ENT
+M$GPLATEN
+      5560**DCL-ENT
+M$GPROMPT
+      5559**DCL-ENT
+M$GTRMATTR
+      5553**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:46   
+M$GTRMCTL
+      5551**DCL-ENT
+M$GTRMTAB
+      5554**DCL-ENT
+M$GVP
+      5563**DCL-ENT
+M$HELP
+      5590**DCL-ENT
+M$INT
+      5582**DCL-ENT
+M$INTRTN
+      5543**DCL-ENT
+M$IOQ
+      5578**DCL-ENT
+M$JOBSTATS
+      5592**DCL-ENT
+M$KEYIN
+      5532**DCL-ENT
+M$LDEV
+      5527**DCL-ENT
+M$LDTRC
+      5540**DCL-ENT
+M$LIMIT
+      5533**DCL-ENT
+M$LINES
+      5532**DCL-ENT
+M$LINK
+      5539**DCL-ENT
+M$MADMUCK
+      5535**DCL-ENT
+M$MAKUSER
+      5566**DCL-ENT
+M$MBS
+      5534**DCL-ENT
+M$MDFFLD
+      5558**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:47   
+M$MERC
+      5583**DCL-ENT
+M$MERCS
+      5584**DCL-ENT
+M$MIRROR
+      5578**DCL-ENT
+M$MONINFO
+      5595**DCL-ENT
+M$MPL
+      5568**DCL-ENT
+M$NODEINFO
+      5559**DCL-ENT
+M$NXTUSR
+      5593**DCL-ENT
+M$OCMSG
+      5591**DCL-ENT
+M$OLAY
+      5539**DCL-ENT
+M$OPEN
+      5527**DCL-ENT
+M$PAS
+      5568**DCL-ENT
+M$PATHCON
+      5591**DCL-ENT
+M$PDS
+      5562**DCL-ENT
+M$PFIL
+      5529**DCL-ENT
+M$PLATEN
+      5553**DCL-ENT
+M$PRECORD
+      5531**DCL-ENT
+M$PROCNAME
+      5544**DCL-ENT
+M$PROFILE
+      5555**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:48   
+M$PROMPT
+      5551**DCL-ENT
+M$RACST
+      5535**DCL-ENT
+M$RDSYSLOG
+      5576**DCL-ENT
+M$READ
+      5528**DCL-ENT
+M$RELDCB
+      5533**DCL-ENT
+M$RELRES
+      5534**DCL-ENT
+M$RELSTARF
+      5536**DCL-ENT
+M$REM
+      5536**DCL-ENT
+M$RENV
+      5583**DCL-ENT
+M$REQUIRE
+      5535**DCL-ENT
+M$RETRY
+      5584**DCL-ENT
+M$RETRYS
+      5584**DCL-ENT
+M$REW
+      5530**DCL-ENT
+M$RLSFLD
+      5558**DCL-ENT
+M$RPRIV
+      5586**DCL-ENT
+M$RSPP
+      5565**DCL-ENT
+M$RSWITCH
+      5587**DCL-ENT
+M$RUE
+      5593**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:49   
+M$SAD
+      5566**DCL-ENT
+M$SAVE
+      5542**DCL-ENT
+M$SCON
+      5543**DCL-ENT
+M$SCREECH
+      5541**DCL-ENT
+M$SENV
+      5583**DCL-ENT
+M$SETFMA
+      5527**DCL-ENT
+M$SETFP
+      5556**DCL-ENT
+M$SINPUT
+      5554**DCL-ENT
+M$SLCFLD
+      5559**DCL-ENT
+M$SMOUSE
+      5573**DCL-ENT
+M$SMPRT
+      5565**DCL-ENT
+M$SPRIV
+      5586**DCL-ENT
+M$SSC
+      5566**DCL-ENT
+M$SSWITCH
+      5586**DCL-ENT
+M$STATE
+      5595**DCL-ENT
+M$STD
+      5567**DCL-ENT
+M$STIMER
+      5581**DCL-ENT
+M$STLPP
+      5564**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:50   
+M$STRAP
+      5581**DCL-ENT
+M$STRMATTR
+      5553**DCL-ENT
+M$STRMCTL
+      5551**DCL-ENT
+M$STRMTAB
+      5554**DCL-ENT
+M$SYMBIO
+      5592**DCL-ENT
+M$SYSCON
+      5578**DCL-ENT
+M$SYSID
+      5596**DCL-ENT
+M$TDCLOSE
+      5577**DCL-ENT
+M$TDIO
+      5577**DCL-ENT
+M$TDOPEN
+      5576**DCL-ENT
+M$TDREQCPU
+      5577**DCL-ENT
+M$TEMPWROC
+      5571**DCL-ENT
+M$TIME
+      5594**DCL-ENT
+M$TRAP
+      5581**DCL-ENT
+M$TRMISC
+      5556**DCL-ENT
+M$TRMPRG
+      5552**DCL-ENT
+M$TRTN
+      5585**DCL-ENT
+M$TRUNC
+      5528**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:51   
+M$TTIMER
+      5581**DCL-ENT
+M$UC
+      5551**DCL
+M$UMPL
+      5568**DCL-ENT
+M$UNFID
+      5590**DCL-ENT
+M$UNLATCH
+      5547**DCL-ENT
+M$UNSHARE
+      5544**DCL-ENT
+M$USRFIELD
+      5587**DCL-ENT
+M$VIRTUAL
+      5562**DCL-ENT
+M$WAIT
+      5585**DCL-ENT
+M$WEOF
+      5530**DCL-ENT
+M$WRITE
+      5528**DCL-ENT
+M$WRSYSLOG
+      5576**DCL-ENT
+M$XCON
+      5582**DCL-ENT
+M$XCONRTN
+      5543**DCL-ENT
+M$XEQTIME
+      5595**DCL-ENT
+M$XFLUSH
+      5536**DCL-ENT
+M$XMOUSE
+      5573**DCL-ENT
+M$XXX
+      5539**DCL-ENT
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:52   
+M$YC
+      5541**DCL-ENT
+TOE$EVENT_HANDLER
+        36**PROC
+TOE_ERROR_CODE.FCG
+      7899**DCL
+TOE_ERROR_CODE.MID
+      7912**DCL
+TOE_ERROR_CODE.MON
+      7912**DCL
+TOE_ERROR_CODE.SEV
+      7913**DCL
+TOP$TCP
+      7963**DCL
+TOP$TCP.ADR
+      7987**DCL
+TOP$TCP.ADR.CSCT
+      7990**DCL
+TOP$TCP.ADR.IOENTRY
+      7994**DCL
+TOP$TCP.ADR.PAT
+      7992**DCL
+TOP$TCP.ADR.SCT
+      7988**DCL
+TOP$TCP.BFR
+      8036**DCL
+TOP$TCP.BFR.TRAIN_IMAGE
+      8037**DCL
+TOP$TCP.BFR.VFC_IMAGE
+      8039**DCL
+TOP$TCP.DCB#
+      7985**DCL
+TOP$TCP.DEVICE_CODE
+      7983**DCL
+TOP$TCP.DEVICE_MODEL
+      7982**DCL
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:53   
+TOP$TCP.FICCDD.CHAN#
+      7970**DCL
+TOP$TCP.FICCDD.DEV#
+      7971**DCL
+TOP$TCP.FICCDD.FLAG#
+      7967**DCL
+TOP$TCP.FICCDD.FORMAT#
+      7968**DCL
+TOP$TCP.FICCDD.IOM#
+      7969**DCL
+TOP$TCP.FIRMWARE
+      8018**DCL
+TOP$TCP.FIRMWARE.CHOICE_MADE
+      8019**DCL
+TOP$TCP.FIRMWARE.LP_TYPE
+      8023**DCL
+TOP$TCP.FIRMWARE.RP_TYPE
+      8025**DCL
+TOP$TCP.FIRMWARE.TYPE
+      8021**DCL
+TOP$TCP.ICC
+      7975**DCL
+TOP$TCP.ICC.ICC#
+      7977**DCL
+TOP$TCP.ICCDD
+      7972**DCL
+TOP$TCP.ICCDD.ICCDD#
+      7974**DCL
+TOP$TCP.IN_USE
+      7964**DCL
+TOP$TCP.IO
+      7996**DCL
+TOP$TCP.IO.CC_PAID
+      8007**DCL
+TOP$TCP.IO.CONTROLLER
+      8001**DCL
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:54   
+TOP$TCP.IO.ISSUED
+      8003**DCL
+TOP$TCP.IO.ITR_INTERRUPT
+      7997**DCL
+TOP$TCP.IO.TERMINATED
+      7999**DCL
+TOP$TCP.MPC_MODEL
+      7981**DCL
+TOP$TCP.SCT
+      8009**DCL
+TOP$TCP.SCT.BIT12
+      8014**DCL
+TOP$TCP.SCT.BIT13
+      8012**DCL
+TOP$TCP.SCT.BIT17
+      8010**DCL
+TOP$TCP.SCT.TAPE_DENSITY
+      8016**DCL
+TOP$TCP.STATS
+      8027**DCL
+TOP$TCP.STATS.EDIT_NAME
+      8032**DCL
+TOP$TCP.STATS.GECALL_NAME
+      8034**DCL
+TOP$TCP.STATS.LOAD_ADDR
+      8028**DCL
+TOP$TCP.STATS.MAX_LOAD
+      8030**DCL
+TOP$TCP.TEST_TYPE
+      7979**DCL
+TOT$DMC
+      7932**DCL
+TOT$DMC.TOM$ITRTBL
+      7943**DCL
+TOT$DMC.TOM$ITRTBL.PTR$
+      7946**DCL
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:55   
+TOT$DMC.TOM$SEGTBLS
+      7948**DCL
+TOT$DMC.TOM$SEGTBLS.PTR$
+      7951**DCL
+TOT$DMC.TOO$IO_BUFFER
+      7933**DCL
+TOT$DMC.TOO$IO_BUFFER.PTR$
+      7936**DCL
+TOT$DMC.TOP$TCP
+      7938**DCL
+TOT$ECP
+      8051**DCL
+TOT$ECP.BOOT_CPU_TYPE
+      8088**DCL
+TOT$ECP.BREAK_ALLOWED
+      8084**DCL
+TOT$ECP.BREAK_RECEIVED
+      8086**DCL
+TOT$ECP.DYNAMIC_PAGE_COUNT
+      8069**DCL
+TOT$ECP.IO
+      8055**DCL
+TOT$ECP.IO.TYPE
+      8056**DCL
+TOT$ECP.ISC
+      8060**DCL
+TOT$ECP.ISC.READ_OUT
+      8061**DCL
+TOT$ECP.ISC.READ_PENDING
+      8067**DCL
+TOT$ECP.ISC.WRITE_OUT
+      8063**DCL
+TOT$ECP.SUBEXEC
+      8071**DCL
+TOT$ECP.SUBEXEC.ADDRESS
+      8074**DCL
+PL6.E3A0      #001=TOE$EVENT_HANDLER File=TOE$EVENT_HANDLER.:E05TSI              WED 07/30/97 06:21 Page:56   
+TOT$ECP.SUBEXEC.CURRENT
+      8072**DCL
+TOT$ECP.SUBEXEC.EDIT_NAME
+      8076**DCL
+TOT$ECP.SUBEXEC.TEST_PAGE_COUNT
+      8082**DCL
+TOT$ECP.SUBEXEC.WRAPUP$
+      8080**DCL
+TOT$ECP.SUBEXEC.WRAPUP_TRIED
+      8078**DCL
+TOT$ECP.TEST_REQ_
+      8054**DCL

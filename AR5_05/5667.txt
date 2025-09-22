@@ -1,0 +1,1558 @@
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMR,PLM=5,IND=3,CTI=3,SDI=3,MCL=10,CSI=0,ECI=0 */
+                                   /*
+                                        Author: D.R.Calkins, LADC
+                                        Date: 8/88
+                                                                  */
+/*M*  MOM - Master Operations Monitor for CP6 (Version C00) */
+/*X* DMR,PLM=5,IND=5,CTI=5,SDI=5,MCL=10,CSI=0,ECI=0 */
+MOM: PROC MAIN;
+/*
+              Main program for the Master Operations Monitor
+              (otherwise known as Maria [Stephen F. Austin's
+              mom]).
+ 
+              This program was written with great trial and
+              error by Frank Mayhar at SFASU.  Be thankful
+              that YOU don't have to search through what I
+              had to search through to write this monster.
+ 
+        Some notes:
+ 
+           This program uses code blatantly stolen from the CURSOR
+           routines in the X account.  I.e. the code that gets the
+           cursor-control codes.
+           Speaking of which, MOM can only handle terminals with
+           table or ANSI cursor-positioning algorithms.  The
+           terminal MUST have a clear-screen character sequence and
+           a cursor-home sequence, or strange and unexplainable
+           things may happen.  MOM also uses special screen attri-
+           butes, if present.  These characters MUST NOT take up
+           a physical screen position (i.e. ATRSCRNPOS must be NO).
+           If they do (ATRSCRNPOS is YES), MOM will issue an error
+           message to that effect and will NOT use the special
+           attributes.
+ 
+           MOM uses two main tables, the ROUTINE table and the FIELD
+           table.  A ROUTINE table entry contains the ENTADDR for the
+           particular (external) routine that gathers this data,
+           a multiplier that says how many times to sleep before
+           refreshing this field, the UTS of the last refresh, the
+           number of fields that are filled by this data-gatherer,
+           and the ADDR of each of the field-descriptions, to be
+           discussed (and, possibly, cussed) next.  For some
+           examples of how to write a data-gatherer, see the
+           routines in the file S:MOM_DG.  Incidentally, the
+           ROUTINE table is a linked-list (it's linked during
+           run-time initialization).  The fields will be updated
+           and written to the screen in the order in which they
+           are declared in the file MOM_C62.
+           The FIELD table is nothing more than a set of entries
+           describing fields on the screen.  Each entry contains
+           the X,Y coordinate of the beginning of the field,
+           the contents of the field in TEXTC form, and one word
+           describing the special screen attribute to be given to
+           that field.  These entries have no logical relationship
+           besides the obvious one, and are only grouped together
+           for convenience.
+ 
+           For more info about the ROUTINE and FIELD tables, as well
+           as the Special-Titles, Screen and STARTS tables, see the
+           files MOM_C61 and MOM_SIT.
+ 
+           MOM can handle up to ten separate screens, each of which
+           must have its own ROUTINE, FIELD and SCREEN tables,
+           optionally a Special-Titles table, and an entry in the
+           STARTS table, which contains start-pointers to each
+           table.
+ 
+           Commands are entered by first hitting break, and making
+           selections from the menu that is then displayed.
+ 
+           Error messages are standard CP6 format, contained in the
+           rununit itself, and accessed by M$ERRMSG.  To set up the
+           error messages, see MOM_CRU.  Extract the error commentary
+           in THIS file.
+ 
+           Cursor-handling routines are prefixed by 'CUH_' and are
+           named for their particular function.  Currently, the only
+           special screen attributes implemented are blink, reverse
+           video, underline, reverse video-blink, and normal display.
+           Some of these routines are duplicated as external routines
+           so that the break-handler can use them to display his
+           command menu.
+ 
+        Caveat emptor.  I would advise anyone trying to modify this
+        program to study it very carefully before doing so.
+ 
+        This does not include the data-gathering routines, which will
+        probably need to be (at least partially) recoded for each
+        new screen that is added.  See the file MOM_SIT for more info.
+ 
+        One more thing:  Currently, anyone attempting to run MOM needs
+        SPCLMM, DISPJOB, and FMDIAG privilege.  These privileges are
+        needed to get to the #SYS diskpack, to do M$CVMs, and to do
+        M$JOBSTATS calls to get the queues.  MOM attempts to turn
+        these privileges on with M$SPRIV in initialization.  To
+        change the privileges turned on, change the MOM_PRIVS EQUate
+        in the MOM_C61 file.  FMDIAG is not really needed to run MOM,
+        but you will get 'Unknown' for the number of free granules on
+        #SYS if you don't have it.
+ 
+        MOM defaults to a 15-second sleep time between screen updates.
+        To change this, change the INIT for the SYMDEFed variable
+        SLEEP_TIME in the main program, and DEFAULT_SLEEP in the
+        break-handler (MOM_BREAK), or RUM the MOM rununit and use the
+        M command to modify both variables.
+*/
+%INCLUDE MOM_C61;                       /* Contains MOM macros. */
+%INCLUDE MOM_C62;                       /* Entry DCLs for data-gatherers. */
+%INCLUDE MOM_C63;                       /* Invocations of MOM macros. */
+                                        /*    Cursor data                     */
+%INCLUDE B_SEGIDS_C;
+DCL 1 CUP_INTRO STATIC SYMDEF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(20);
+DCL CUP_BIAS UBIN(9) STATIC SYMDEF;
+DCL 1 CUP_ERASE STATIC SYMDEF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(20);
+DCL 1 CUP_HOME STATIC SYMDEF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(20);
+DCL 1 CUP_UNDLN,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(10);
+DCL 1 CUP_BLINK,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(10);
+DCL 1 CUP_RVRVID,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(10);
+DCL 1 CUP_RESTORE,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(10);
+DCL 1 CUP_ANS STATIC SYMDEF,
+         2 * CHAR(1) INIT(BITASC('033'O)),
+         2 * CHAR(1) INIT('['),
+         2 Y# CHAR(2) INIT('00'),
+         2 * CHAR(1) INIT(';'),
+         2 X# CHAR(2) INIT('00'),
+         2 * CHAR(1) INIT('H');
+DCL 1 CUP_ANSERASE STATIC SYMDEF,
+         2 L# UBIN(9) UNAL INIT(4),
+         2 C# (0:3) BIT(9) INIT('033'O,'133'O,'062'O,'112'O);
+DCL 1 CUP_ANSHOME STATIC SYMDEF,
+         2 L# UBIN(9) UNAL INIT(3),
+         2 C# (0:2) BIT(9) INIT('033'O,'133'O,'110'O);
+DCL 1 CUP_ANSUNDLN STATIC,
+         2 L# UBIN(9) UNAL INIT(4),
+         2 C# (0:3) BIT(9) INIT('033'O,'133'O,'064'O,'155'O);
+DCL 1 CUP_ANSBLINK STATIC,
+         2 L# UBIN(9) UNAL INIT(4),
+         2 C# (0:3) BIT(9) INIT('033'O,'133'O,'065'O,'155'O);
+DCL 1 CUP_ANSRVRVID STATIC,
+         2 L# UBIN(9) UNAL INIT(4),
+         2 C# (0:3) BIT(9) INIT('033'O,'133'O,'067'O,'155'O);
+DCL 1 CUP_ANSRESTORE STATIC,
+         2 L# UBIN(9) UNAL INIT(4),
+         2 C# (0:3) BIT(9) INIT('033'O,'133'O,'060'O,'155'O);
+                                        /*    SYMDEFed data                   */
+DCL REFR_MULTIPLIER UBIN STATIC SYMDEF INIT(1);
+DCL REFR_SW BIT(1) STATIC SYMDEF INIT('0'B);
+DCL SLEEP_TIME UBIN STATIC SYMDEF INIT(15);
+DCL SCREEN_INDEX UBIN STATIC SYMDEF INIT(0);
+DCL DRV_LOC REMEMBER STATIC SYMDEF;
+DCL NUM_SCREENS UBIN STATIC SYMDEF INIT(%NUMSCRNS);
+DCL BREAK_SW BIT(1) STATIC SYMDEF INIT('1'B);
+DCL TBL_BIT BIT(1) STATIC SYMDEF INIT('1'B);
+DCL CLMFRS_BIT BIT(2) STATIC SYMDEF INIT('00'B);
+DCL MEM# UBIN STATIC SYMDEF INIT  (0);
+ 
+                                        /*    STATIC data                     */
+DCL UTS# UBIN STATIC INIT(0);
+DCL ERRMSG_BUFFER CHAR(360) STATIC INIT(' ');
+                                        /*    PTRs                            */
+DCL ROUT$ PTR;
+DCL SPC$ PTR;
+                                        /*    BASED structures                */
+DCL 1 ROUT_BASED BASED(ROUT$),
+         2 RENTRY$ EPTR,
+         2 NEXT$ PTR,
+         2 LRFR UBIN,
+         2 RMLT UBIN,
+         2 OUTME BIT(1),
+         2 * BIT(35) UNAL,
+         2 NF UBIN,
+         2 FLD$ (0:99) PTR;
+DCL 1 SPC_BASED BASED(SPC$),
+         2 NXT$ PTR,
+         2 X# UBIN(18) HALIGNED,
+         2 Y# UBIN(18) HALIGNED,
+         2 HIATT UBIN(9) UNAL,
+         2 TTL,
+              3 LEN UBIN(9) UNAL,
+              3 VAL CHAR(SPC_BASED.TTL.LEN);
+                                        /*    DCBs                            */
+DCL M$DO DCB;
+DCL M$LO DCB;
+DCL M$ME DCB;
+                                   /*    MACRO invocations & INCLUDE files    */
+%EQU TBL# = 2;
+%EQU ANS# = 1;
+%SUB NEVER = "WHILE('0'B)";
+%CP6$ENTS;
+%FPT_TIME(DEST=UTS,
+        SOURCE=CLOCK,
+        TSTAMP=UTS#);
+%FPT_WAIT;
+%FPT_WRITE(FPTN=FPT_WRTRANS,
+        DCB=M$UC,
+        TRANS=YES);
+DCL INCHAR CHAR(1) STATIC INIT(' ');
+ 
+%FPT_READ(FPTN=READ_TERM,
+          DCB=M$ME,
+          BUF=INCHAR,
+          EVENT=1,
+          WAIT=NO);
+%FPT_ERRMSG(BUF=ERRMSG_BUFFER,
+        INCLCODE=NO,
+        OUTDCB1=M$DO,
+        OUTDCB2=M$LO,
+        SOURCE=ALTRET,
+        VFC='A');
+%FPT_ERRMSG(FPTN=FPT_MOMERR,
+        BUF=ERRMSG_BUFFER,
+        FILEACCT=ERRFIL_ACCT,
+        FILENAME=ERRFIL,
+        INCLCODE=NO,
+        OUTDCB1=M$DO,
+        OUTDCB2=M$LO,
+        SOURCE=PASS,
+        VFC='A');
+%VLP_NAME(FPTN=ERRFIL,NAME='MOM');
+%VLP_ACCT(FPTN=ERRFIL_ACCT);
+%VLP_VECTOR(SEGID=%DS3SID,
+            STCLASS=STATIC SYMDEF);
+ 
+%VLP_ERRCODE(FPTN=MOI_00001,
+        ERR#=1,
+        FCG=MO,
+        MID=I,
+        SEV=0);
+/*E*    ERROR: MOI-00001-0
+      MESSAGE:  You don't have the privilege needed to run MOM.
+*/
+%VLP_ERRCODE(FPTN=MOI_00002,
+        ERR#=2,
+        FCG=MO,
+        MID=I,
+        SEV=0);
+/*E*       ERROR: MOI-00002-0
+         MESSAGE:  Bad profile:  CUP_ALG is neither ANS nor TBL.
+*/
+%VLP_ERRCODE(FPTN=MOI_00003,
+        ERR#=3,
+        FCG=MO,
+        MID=I,
+        SEV=0);
+/*E*       ERROR: MOI-00003-0
+         MESSAGE:  MOM may only be run online!
+*/
+%VLP_ERRCODE(FPTN=MOI_00004,
+        ERR#=4,
+        FCG=MO,
+        MID=I,
+        SEV=0);
+/*E*       ERROR: MOI-00004-0
+         MESSAGE:  This terminal has no erase-screen character!
+*/
+%VLP_ERRCODE(FPTN=MOI_00005,
+        ERR#=5,
+        FCG=MO,
+        MID=I,
+        SEV=0);
+/*E*       ERROR: MOI-00005-0
+         MESSAGE:  This terminal has no home-cursor character!
+*/
+%VLP_ERRCODE(FPTN=MOI_00006,
+        ERR#=6,
+        FCG=MO,
+        MID=I,
+        SEV=0);
+/*E*       ERROR: MOI-00006-0
+         MESSAGE:  ACTONTRN must be OFF (do a !T ACTONTRN=NO before starting MOM).
+*/
+%VLP_ERRCODE(FPTN=MOI_00007,
+        ERR#=7,
+        FCG=MO,
+        MID=I,
+        SEV=0);
+/*E*       ERROR: MOI-00007-0
+         MESSAGE:  LABEL of 'GOTO label' is NOT the current label!
+*/
+%EJECT;
+/*
+           This is the initialization procedure.
+*/
+INITIALIZE: PROC;
+DCL IND# UBIN;
+DCL IND2# UBIN;
+DCL FOUND BIT(1);
+DCL M$LM DCB;
+DCL M$LM$ PTR;
+DCL ROUEND$ PTR;
+DCL SPCEND$ PTR;
+DCL NEXT$ PTR;
+DCL P$ PTR;
+DCL PEND$ PTR;
+DCL PP$ PTR;
+DCL PP_TYPE UBIN BYTE;
+DCL PP_SIZE UBIN BYTE;
+DCL 1 PP$STRCT BASED(PP$) CALIGNED,
+         2 TYPE UBIN BYTE CALIGNED,
+         2 SIZE UBIN BYTE CALIGNED;
+DCL KL$CCHR$ PTR;
+DCL B$JIT$ PTR SYMREF;
+DCL PROFILE_BUF CHAR(1000) STATIC;
+DCL MOM_BREAK ENTRY ASYNC;
+DCL CUH_POSBUF ENTRY(3);
+DCL DG_GETMEM ENTRY ALTRET;
+DCL M$PRO DCB;
+%INCLUDE KL_SUPER_C;
+%KL_PHDR(NAME=KL$PHDR,
+        STCLASS="BASED(P$) ALIGNED");
+%KL_CCHR(NAME=KL$CCHR,
+        STCLASS="BASED(KL$CCHR$)");
+%F$DCB;
+%FPT_GLINEATTR(DCB=M$UC,
+        LINEATTR=VLP_LINEATTR);
+%VLP_LINEATTR(STCLASS=STATIC);
+%FPT_TRMCTL(DCB=M$UC,
+        TRMCTL=VLP_TRMCTL);
+%VLP_TRMCTL;
+%FPT_TRMATTR(DCB=M$UC,
+        TRMATTR=VLP_TRMATTR);
+%VLP_TRMATTR;
+%FPT_OPEN(FPTN=OPN_PRO,
+        DCB=M$PRO,
+        ACCT=VLP_ACCT,
+        ASN=FILE,
+        NAME=VLP_NAME,
+        SHARE=ALL,
+        FUN=IN);
+%VLP_ACCT(ACCT=':SYS');
+%VLP_NAME(NAME=':PRO');
+%FPT_CLOSE(FPTN=CL_PRO,
+        DISP=SAVE,
+        DCB=M$PRO);
+%FPT_READ(FPTN=RD_PRO,
+        DCB=M$PRO,
+        BUF=PROFILE_BUF,
+        KEYS=YES,
+        KEY=VLP_LINEATTR.PROFILE#);
+%FPT_INT(UENTRY=MOM_BREAK);
+%FPT_EVENT(UENTRY=MOM_BREAK);
+%FPT_PRIV(FPTN=MYPRIVS,
+        AUTH=YES,
+        PRIV=%MOM_PRIVS);
+%EJECT;
+GET_TEXTC: PROC(TEXTC_OUT,INDEX#);
+DCL 1 TEXTC_OUT,
+         2 L# UBIN BYTE CALIGNED,
+         2 C# CHAR(TEXTC_OUT.L#);
+DCL INDEX# UBIN BYTE CALIGNED;
+DCL 1 TEXTC BASED CALIGNED,
+         2 L UBIN BYTE CALIGNED,
+         2 C CHAR(TEXTC.L);
+/*
+        Procedure
+*/
+     IF INDEX# = 0 THEN DO;
+          TEXTC_OUT.L# = 1;
+          TEXTC_OUT.C# = BINASC(0);
+        END;
+     ELSE DO;
+          TEXTC_OUT.L# = KL$CCHR.TXT_UBIN(INDEX#);
+          TEXTC_OUT.C# = ADDR(KL$CCHR.TXT_UBIN(INDEX#))->TEXTC.C;
+        END;
+     RETURN;
+END GET_TEXTC;
+%EJECT;
+PACKUP: PROC(TEXTC_OUT,ATTR);
+DCL 1 TEXTC_OUT,
+         2 C UBIN BYTE ALIGNED,
+         2 T CHAR(10);
+DCL ATTR CHAR(1);
+DCL 1 TEXTC BASED CALIGNED,
+         2 L UBIN BYTE CALIGNED,
+         2 C CHAR(TEXTC.L);
+PACK: PROC(INDEX#);
+DCL INDEX# UBIN BYTE CALIGNED;
+/*
+        Procedure
+*/
+     SUBSTR(TEXTC_OUT.T,TEXTC_OUT.C) = ADDR(KL$CCHR.TXT_UBIN(INDEX#))->TEXTC.C;
+     TEXTC_OUT.C = TEXTC_OUT.C + KL$CCHR.TXT_UBIN(INDEX#);
+     RETURN;
+END PACK;
+/*
+        Procedure
+*/
+     IF ATTR = BINASC(0) THEN DO;
+          TEXTC_OUT.C = 1;
+          TEXTC_OUT.T = BINASC(0);
+          RETURN;
+        END;
+     TEXTC_OUT.C = 0;
+     CALL PACK(KL$CCHR.DCLFRM_CHR#);
+     CALL PACK(KL$CCHR.SGRINTRO_CHR#);
+     SUBSTR(TEXTC_OUT.T,TEXTC_OUT.C,1) = ATTR;
+     TEXTC_OUT.C = TEXTC_OUT.C + 1;
+     CALL PACK(KL$CCHR.ENDDCLFRM_CHR#);
+     RETURN;
+END PACKUP;
+%EJECT;
+/*
+        Procedure
+*/
+     M$LM$ = DCBADDR(DCBNUM(M$LM));
+     ERRFIL_ACCT.ACCT# = M$LM$->F$DCB.ACCT#;
+     IF B$JIT$->B$JIT.MODE ~= %M_INT# THEN DO;
+          FPT_MOMERR.CODE_ = VECTOR(MOI_00003);
+          CALL M$ERRMSG(FPT_MOMERR);
+          CALL M$EXIT;
+        END;
+     IF NOT(B$JIT$->B$JIT.PRIV.AUTH & %PR_SPCLMM#) THEN DO;
+          FPT_MOMERR.CODE_ = VECTOR(MOI_00001);
+          CALL M$ERRMSG(FPT_MOMERR);
+          CALL M$EXIT;
+        END;
+     IF (B$JIT$->B$JIT.PRIV.ACTIVE & %MOM_PRIVS) \ %MOM_PRIVS THEN
+          CALL M$SPRIV(MYPRIVS) WHENALTRETURN DO;
+               FPT_MOMERR.CODE_ = VECTOR(MOI_00001);
+               CALL M$ERRMSG(FPT_MOMERR);
+               CALL M$EXIT;
+             END;
+/*
+              Get cursor-positioning and attribute info from profile.
+*/
+     CALL M$GLINEATTR(FPT_GLINEATTR);
+     CALL M$GTRMCTL(FPT_TRMCTL);
+     CALL M$GTRMATTR(FPT_TRMATTR);
+     IF VLP_TRMCTL.ACTONTRN# THEN DO;
+          FPT_MOMERR.CODE_ = VECTOR(MOI_00006);
+          CALL M$ERRMSG(FPT_MOMERR);
+          CALL M$EXIT;
+        END;
+     CALL M$OPEN(OPN_PRO);
+     CALL M$READ(RD_PRO);
+     CALL M$CLOSE(CL_PRO);
+     P$ = ADDR(PROFILE_BUF);
+     PEND$ = PINCRC(P$,DCBADDR(DCBNUM(M$PRO))->F$DCB.ARS#);
+     PP$ = PINCRW(P$,SIZEW(KL$PHDR));
+     DO WHILE(POFFC(PEND$,PP$)>0);
+          PP_TYPE = PP$STRCT.TYPE;
+          PP_SIZE = PP$STRCT.SIZE;
+          PP$ = PINCRC(PP$,2);
+          DO CASE(PP_TYPE);
+          CASE(3);
+                                        /*  Do nothing.                       */
+          CASE(7);
+                                        /*  Do nothing.                       */
+          CASE(15);
+             KL$CCHR$ = PP$;
+          CASE(16);
+                                        /* Do nothing.                        */
+          END;
+          PP$ = PINCRC(PP$,((PP_SIZE+1)/2)*2); /* next even byte */
+        END;
+     DO CASE(KL$CCHR.CUP_ALG);
+     CASE(%ANS#);
+        TBL_BIT = '0'B;
+     CASE(%TBL#);
+        TBL_BIT = '1'B;
+        CALL GET_TEXTC(CUP_INTRO,KL$CCHR.CUP_CHR);
+        CUP_BIAS = KL$CCHR.CUP_BIS;
+        CLMFRS_BIT = KL$CCHR.CUP_CLMFRS;
+        IF KL$CCHR.ED0_CHR = 0 THEN
+             IF KL$CCHR.ED2_CHR = 0 THEN DO;
+                  FPT_MOMERR.CODE_ = VECTOR(MOI_00004);
+                  CALL M$ERRMSG(FPT_MOMERR);
+                  CALL M$EXIT;
+                END;
+             ELSE
+                  CALL GET_TEXTC(CUP_ERASE,KL$CCHR.ED2_CHR);
+        ELSE
+             CALL GET_TEXTC(CUP_ERASE,KL$CCHR.ED0_CHR);
+        IF KL$CCHR.HOM_CHR = 0 THEN DO;
+             CALL CUH_POSBUF(1,1,CUP_HOME);
+           END;
+        ELSE
+             CALL GET_TEXTC(CUP_HOME,KL$CCHR.HOM_CHR);
+        IF KL$CCHR.SGR_ALG# = 2 AND NOT VLP_TRMATTR.ATRSCRNPOS# THEN DO;
+             CALL PACKUP(CUP_UNDLN,KL$CCHR.SGRUNDSCR_CHR#);
+             CALL PACKUP(CUP_BLINK,KL$CCHR.SGRSLWBLN_CHR#);
+             CALL PACKUP(CUP_BLINK,KL$CCHR.SGRFSTBLN_CHR#);
+             CALL PACKUP(CUP_RVRVID,KL$CCHR.SGRRVRVID_CHR#);
+             CALL PACKUP(CUP_RESTORE,KL$CCHR.RESTORE_DFLTSCRN_CHR#);
+           END;
+        ELSE DO;
+             CUP_UNDLN.L# = 1;
+             CUP_BLINK.L# = 1;
+             CUP_RVRVID.L# = 1;
+             CUP_RESTORE.L# = 1;
+             CUP_BLINK.C# = BINASC(0);
+             CUP_RVRVID.C# = BINASC(0);
+             CUP_RESTORE.C# = BINASC(0);
+           END;
+     CASE(ELSE);
+        FPT_MOMERR.CODE_ = VECTOR(MOI_00002);
+        CALL M$ERRMSG(FPT_MOMERR);
+        CALL M$EXIT;
+     END;
+/*
+                 Set break control and link lists.
+*/
+     CALL DG_GETMEM  ALTRET (NOVEC);
+NOVEC: ;
+     CALL M$INT(FPT_INT);
+     CALL M$EVENT(FPT_EVENT);
+     DO IND# = 0 TO %NUMSCRNS;
+          ROUT$ = START$.RTN.LOC$(IND#);
+          ROUEND$ = PINCRW(ROUT$,START$.RTN.SIZ#(IND#));
+          NEXT$ = PINCRW(ROUT$,ROUT_BASED.NF + 6);
+          DO WHILE(NEXT$ < ROUEND$);
+               ROUT_BASED.NEXT$ = NEXT$;
+               ROUT$ = NEXT$;
+               NEXT$ = PINCRW(ROUT$,ROUT_BASED.NF + 6);
+             END;
+          ROUT_BASED.NEXT$ = ADDR(NIL);
+          SPC$ = START$.SPC.LOC$(IND#);
+          SPCEND$ = PINCRC(SPC$,START$.SPC.SIZ#(IND#));
+          IF SPC$ ~= ADDR(NIL) THEN DO;
+DXT:           DO WHILE(SPC$ < SPCEND$);
+                    NEXT$ = PINCRC(SPC$,10);
+                    IND2# = SPC_BASED.TTL.LEN;
+                    IND2# = MOD(IND2#,4);
+                    DO CASE(IND2#);
+                    CASE(0);
+                       NEXT$ = PINCRC(NEXT$,SPC_BASED.TTL.LEN+2);
+                    CASE(1);
+                       NEXT$ = PINCRC(NEXT$,SPC_BASED.TTL.LEN+1);
+                    CASE(2);
+                       NEXT$ = PINCRC(NEXT$,SPC_BASED.TTL.LEN);
+                    CASE(3);
+                       NEXT$ = PINCRC(NEXT$,SPC_BASED.TTL.LEN+3);
+                    END;
+                    IF NEXT$ >= SPCEND$ THEN DO;
+                         SPC_BASED.NXT$ = ADDR(NIL);
+                         EXIT DXT;
+                       END;
+                    SPC_BASED.NXT$ = NEXT$;
+                    SPC$ = NEXT$;
+                  END DXT;
+             END;
+        END;
+     SCREEN_INDEX = 0;
+     CALL PROCESS_OPTIONS;
+     RETURN;
+END INITIALIZE;
+%EJECT;
+/*   MOM SIMULATION
+ 
+     THIS WILL SIMULATE THE NODE PARSING AND INVOCATION
+     OF THOSE NODES FOR MOM.X.
+ 
+     DENNIS CALKINS       AUG 16, 1988
+ 
+*/
+ 
+PROCESS_OPTIONS: PROC;
+%SUB FALSE#='0'B;
+ 
+%INCLUDE XU_MACRO_C;
+%INCLUDE XU_SUBS_C;
+%INCLUDE XU_PERR_C;
+ 
+DCL M$SI DCB;
+DCL M$LO DCB;
+ 
+DCL NUM_SCREENS UBIN SYMREF;
+DCL SCREEN_INDEX UBIN SYMREF;
+DCL SLEEP_TIME UBIN SYMREF;
+DCL BREAK_SW BIT(1) SYMREF;
+DCL MOM_NODES SBIN WORD SYMREF;
+DCL X$PARSE ENTRY(1) ALTRET;
+ 
+DCL B$JIT$ PTR SYMREF;
+%F$DCB;
+ 
+ 
+DCL BUFF CHAR(1024) CALIGNED STATIC INIT (' ');
+ 
+%FPT_WAIT;
+ 
+%FPT_EXIT;
+ 
+%FPT_WRITE( DCB=M$LO,
+            BUF=OUTBUF);
+DCL 1  OUTBUF CHAR(80) STATIC CALIGNED;
+ 
+ 
+%P_PCB(NAME=MOM_PCB,
+       STCLASS=STATIC,
+       R=NIL,
+       W=MOM_WS,
+       U$=NIL,
+       WSZ=520,
+       N#=0);
+ 
+DCL MOM_WS(0:520) UBIN WORD STATIC ;
+ 
+%PARSE$SYM     (NAME=MOM$SYM,
+                STCLASS=BASED);
+ 
+%PARSE$OUT     (NAME=MOM$OUTBLK,
+                STCLASS=BASED);
+ 
+ 
+ 
+DCL LABEL      SBIN WORD STATIC INIT (-1);
+DCL NODE       UBIN WORD STATIC INIT (0);
+DCL LOOP       UBIN WORD STATIC ;
+DCL TEMP       UBIN WORD AUTO;
+DCL LABEL_NAME CHAR(8) STATIC INIT (' ');
+DCL 1 LABEL_TABLE(0:10) STATIC ,
+         2 NAME CHAR(8) INIT (' '),
+         2 NODE# UBIN INIT (0),
+         2 COUNT# UBIN INIT (0);
+ 
+/* BORROWED FROM PARSE.X */
+ 
+DCL ERMSG(0:7) CONSTANT            CHAR(16) INIT(
+    '..Unused input->','<-Syntax error->',
+    'Null root       ','Bad node        ',
+    'Workarea overflo','Small work area ',
+    'Unknown error   ','Null U$ routine ');
+ 
+%EJECT;
+ 
+ 
+GET_DECIMAL: PROC(SUB,NUM);
+ 
+DCL SUB UBIN PARAM;
+DCL NUM UBIN PARAM;
+ 
+ 
+     NUM = 0;
+     IF MOM_PCB.OUT$ -> MOM$OUTBLK.SUBLK$(NODE) ->
+          MOM$OUTBLK.NSUBLKS > SUB THEN
+          CALL CHARBIN(NUM,MOM_PCB.OUT$ -> MOM$OUTBLK.SUBLK$(NODE)
+               -> MOM$OUTBLK.SUBLK$(SUB)->MOM$SYM.TEXT);
+ 
+     RETURN;
+ 
+END GET_DECIMAL;
+ 
+%EJECT;
+GET_LABEL: PROC(TEXT);
+ 
+DCL TEXT CHAR(8) PARAM;
+ 
+     TEXT = MOM_PCB.OUT$ -> MOM$OUTBLK.SUBLK$(NODE) ->
+          MOM$OUTBLK.SUBLK$(0)->MOM$SYM.TEXT;
+     RETURN;
+ 
+END GET_LABEL;
+ 
+%EJECT;
+ 
+READ_OPTIONS: PROC(NUM) ALTRET;
+ 
+DCL NUM UBIN PARAM;
+DCL COUNT UBIN AUTO;
+DCL LOOP UBIN AUTO;
+DCL TEMP UBIN AUTO;
+DCL LINE CHAR(256) STATIC INIT (' ');
+DCL TABLE(0:511) UBIN(9) CALIGNED STATIC INIT(0*33,1*95,0*0);
+ 
+%FPT_OPEN(FPTN=CONT,
+          DCB=M$SI,
+          FUN=IN,
+          NAME=CONT_NAME,
+          ASN=FILE);
+ 
+%VLP_NAME(FPTN=CONT_NAME,
+          NAME='*CONTINUATION_COMMANDS');
+ 
+%FPT_READ(DCB=M$SI,
+          BUF=LINE);
+ 
+%FPT_CLOSE(DCB=M$SI);
+ 
+ 
+MOVE: PROC(INBUF,OFFSET) ALTRET;
+ 
+DCL INBUF CHAR(256) PARAM;
+DCL OFFSET UBIN PARAM;
+ 
+     CALL SEARCHR(TEMP,LOOP,TABLE,INBUF) ALTRET(ALT);
+     DO LOOP = OFFSET TO TEMP;
+          SUBSTR(BUFF,COUNT,1)=SUBSTR(INBUF,LOOP,1);
+          COUNT = COUNT + 1;
+        END;                            /* MOVED INBUF INTO BUFF */
+     RETURN;
+ALT:                                    /* NO CHARACTERS TO PROCESS */
+     ALTRETURN;
+END MOVE;
+ 
+ 
+     COUNT = 0;
+     IF B$JIT$ -> B$JIT.CCARS > B$JIT$ -> B$JIT.CCDISP
+     THEN DO;                           /*   OPTIONS ON THE COMMAND LINE */
+          CALL MOVE(B$JIT$ -> B$JIT.CCBUF,B$JIT$ -> B$JIT.CCDISP+1);
+          CALL M$OPEN(CONT) ALTRET(EOF); /* CONTINUE? */
+          CALL M$READ(FPT_READ);        /* THROW CCBUF  AWAY */
+        END;
+     ELSE IF DCBADDR(DCBNUM(M$SI))->F$DCB.ASN#=1 /* %FILE# */
+          THEN DO;                      /* PROCESS FIRST LINE OF FILE */
+               LINE = ' ';
+               CALL M$READ(FPT_READ)  ALTRET(EOF);
+               CALL MOVE(LINE,0);
+             END;
+ 
+     IF COUNT = 0 THEN ALTRETURN;       /* NO OPTIONS */
+READ: IF (SUBSTR(BUFF,COUNT-1,1))~=';' THEN GOTO EOF;
+     COUNT = COUNT - 1;                 /* THROW THE SEMICOLON AWAY */
+     LINE = ' ';
+     CALL M$READ(FPT_READ) ALTRET (EOF);
+     CALL MOVE(LINE,0) ALTRET(EOF);
+     GOTO READ;
+EOF:
+     NUM = COUNT;
+     CALL M$CLOSE(FPT_CLOSE);
+     RETURN;
+END READ_OPTIONS;
+ 
+%EJECT;
+/* ************************************************************
+   ***                                                      ***
+   ***  Begin   M O M.X   main program                      ***
+   ***                                                      ***
+   ************************************************************ */
+ 
+ 
+     MOM_PCB.ROOT$ = ADDR(MOM_NODES);
+ 
+     CALL READ_OPTIONS(TEMP)
+     WHENALTRETURN DO;
+                                        /* NO OPTIONS FOUND */
+          RETURN;                       /* AND CONTINUE NORMALLY */
+        END ;
+ 
+XP:  MOM_PCB.TEXT$ = ADDR(BUFF);
+     MOM_PCB.NCHARS = TEMP;
+ 
+     CALL X$PARSE (MOM_PCB) ALTRET (XPERR);
+ 
+     DO WHILE (FALSE#);
+        /* BORROWED FROM PARSE.X */
+XPERR:    ;
+          IF MOM_PCB.ERROR.CODE>1 THEN MOM_PCB.NCHARS=0;
+          IF MOM_PCB.HI_CHAR<10 THEN TEMP=0;
+          ELSE TEMP=MOM_PCB.HI_CHAR-10;
+          LOOP=MOM_PCB.HI_CHAR+10;
+          IF LOOP>MOM_PCB.NCHARS THEN
+               LOOP=MOM_PCB.NCHARS;
+          CALL CONCAT(OUTBUF,SUBSTR(BUFF,TEMP,MOM_PCB.HI_CHAR-TEMP),
+               ERMSG(MOM_PCB.ERROR.CODE),SUBSTR(BUFF,MOM_PCB.HI_CHAR,LOOP-MOM_PCB.HI_CHAR));
+          CALL M$WRITE(FPT_WRITE);
+          IF MOM_PCB.ERROR.CODE=1 THEN DO;
+               MOM_PCB.NXT='1'B;
+               CALL X$PARSE(MOM_PCB);
+               MOM_PCB.NXT='0'B;
+               FPT_EXIT.V.STEPCC# = BITBIN(BINBIT(FPT_EXIT.V.STEPCC#,3)|'2'O);
+             END;
+          ELSE FPT_EXIT.V.STEPCC# = BITBIN(BINBIT(FPT_EXIT.V.STEPCC#,3)|'4'O);
+          CALL M$EXIT(FPT_EXIT);
+        END;                            /* DO WHILE PARSE ERROR */
+ 
+     CALL M$READ(READ_TERM);
+     DO WHILE (NODE < MOM_PCB.OUT$ -> MOM$OUTBLK.NSUBLKS);
+ 
+          DO CASE (MOM_PCB.OUT$ -> MOM$OUTBLK.SUBLK$(NODE) ->
+               MOM$OUTBLK.CODE);
+ 
+          CASE (1);                     /* INTERVAL = DECIMAL */
+             CALL GET_DECIMAL(0,SLEEP_TIME);
+ 
+          CASE (2);                     /* GO SCREEN DEC [DEC TIMES] */
+             CALL GET_DECIMAL(0,TEMP);
+             IF (TEMP > NUM_SCREENS)    /* SCREEN # OUT OF RANGE */
+             THEN
+                  SCREEN_INDEX=0;
+             ELSE
+                  SCREEN_INDEX=TEMP;
+             CALL GET_DECIMAL(1,TEMP);
+             LOOP = MAXIMUM (1,TEMP);
+             BREAK_SW = '1'B;
+             CALL PROCESS_SCREEN_TABLE;
+             DO TEMP = 1 TO LOOP;
+                  CALL M$TIME(FPT_TIME);
+                  CALL PROCESS_ROUTINE_TABLE;
+                  CALL PROCESS_FIELD_TABLE;
+                  FPT_WAIT.V.UNITS# = SLEEP_TIME;
+                  CALL M$WAIT(FPT_WAIT);
+                  BREAK_SW = '0'B;
+                END ;                   /* DO SCREEN LOOP TIMES */
+ 
+          CASE (3);
+             GOTO DONE;                 /* DONE PROCESSING */
+ 
+          CASE (4);                     /* label:                  */
+             LABEL = LABEL + 1;
+             CALL GET_LABEL(LABEL_TABLE.NAME(LABEL));
+             LABEL_TABLE.COUNT#(LABEL) = 0;
+             LABEL_TABLE.NODE#(LABEL) = NODE;
+          CASE (5);                     /* GOTO label [DEC TIMES] */
+             CALL GET_LABEL(LABEL_NAME);
+ 
+             IF (LABEL >= 0) AND
+                  (LABEL_NAME = LABEL_TABLE.NAME(LABEL))
+             THEN DO CASE (LABEL_TABLE.COUNT#(LABEL));
+ 
+             CASE (0);                  /* FIRST TIME HERE  */
+                CALL GET_DECIMAL(1,TEMP);
+                TEMP = MAXIMUM (1,TEMP);
+                LABEL_TABLE.COUNT#(LABEL) = TEMP;
+                NODE = LABEL_TABLE.NODE#(LABEL);
+ 
+             CASE (1);
+                LABEL = LABEL - 1;
+ 
+             CASE (ELSE);
+                LABEL_TABLE.COUNT#(LABEL) =
+                     LABEL_TABLE.COUNT#(LABEL) - 1;
+                NODE = LABEL_TABLE.NODE#(LABEL);
+                                        /* MINUS 1 BECAUSE OF INCREMENT */
+ 
+             END ;                      /* DO CASE COUNT#(LABEL) */
+             ELSE DO;                   /* ERR: LABEL NOT VISIBLE */
+                  OUTBUF = ' ';
+                  CALL CONCAT(OUTBUF,'AT INSTRUCTION:   GOTO ',LABEL_NAME);
+                  CALL M$WRITE(FPT_WRITE);
+                  FPT_MOMERR.CODE_ = VECTOR(MOI_00007);
+                  CALL M$ERRMSG(FPT_MOMERR);
+                  CALL M$EXIT;
+                END;                    /* IF LABEL_NAME = NAME(LABEL) */
+ 
+          END;                          /* DO CASE NODE CODE */
+          NODE = NODE + 1;              /* PROCESS NEXT NODE */
+        END ;                           /* DO WHILE MORE NODES */
+ 
+DONE:  /*  DONE PROCESSING COMMAND LANGUAGE */
+     CALL CUH_ERASE;
+     CALL CUH_POS(1,24);
+     CALL M$EXIT;
+ 
+END PROCESS_OPTIONS;
+%EJECT;
+/*
+           These are the cursor-handling routines.
+*/
+CUH_ERASE: PROC;
+     IF TBL_BIT THEN DO;
+          FPT_WRTRANS.BUF_.BOUND = CUP_HOME.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_HOME.C#);
+          CALL M$WRITE(FPT_WRTRANS);
+          FPT_WRTRANS.BUF_.BOUND = CUP_ERASE.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ERASE.C#);
+          CALL M$WRITE(FPT_WRTRANS);
+        END;
+     ELSE DO;
+          FPT_WRTRANS.BUF_.BOUND = CUP_ANSHOME.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSHOME.C#);
+          CALL M$WRITE(FPT_WRTRANS);
+          FPT_WRTRANS.BUF_.BOUND = CUP_ANSERASE.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSERASE.C#);
+          CALL M$WRITE(FPT_WRTRANS);
+        END;
+     RETURN;
+END CUH_ERASE;
+%SPACE 3;
+CUH_HOME: PROC;
+     IF TBL_BIT THEN DO;
+          FPT_WRTRANS.BUF_.BOUND = CUP_HOME.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_HOME.C#);
+        END;
+     ELSE DO;
+          FPT_WRTRANS.BUF_.BOUND = CUP_ANSHOME.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSHOME.C#);
+        END;
+     CALL M$WRITE(FPT_WRTRANS);
+     RETURN;
+END CUH_HOME;
+%SPACE 3;
+CUH_RESTORE: PROC;
+     IF TBL_BIT THEN DO;
+          FPT_WRTRANS.BUF_.BOUND = CUP_RESTORE.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_RESTORE.C#);
+        END;
+     ELSE DO;
+          FPT_WRTRANS.BUF_.BOUND = CUP_ANSRESTORE.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSRESTORE.C#);
+        END;
+     CALL M$WRITE(FPT_WRTRANS);
+     RETURN;
+END CUH_RESTORE;
+%SPACE 3;
+CUH_POS: PROC(XPOS,YPOS);
+DCL XPOS UBIN;
+DCL YPOS UBIN;
+DCL REALX UBIN;
+DCL REALY UBIN;
+DCL 1 XYOUT,
+         2 Y# CHAR(1),
+         2 X# CHAR(1);
+DCL CHR CHAR(1);
+     IF TBL_BIT THEN DO;
+          REALX = XPOS + CUP_BIAS;
+          REALY = YPOS + CUP_BIAS;
+          XYOUT.X# = BINASC(REALX);
+          XYOUT.Y# = BINASC(REALY);
+          IF CLMFRS_BIT THEN DO;
+               CHR = XYOUT.X#;
+               XYOUT.X# = XYOUT.Y#;
+               XYOUT.Y# = CHR;
+             END;
+          FPT_WRTRANS.BUF_.BOUND = CUP_INTRO.L# - 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_INTRO.C#);
+          CALL M$WRITE(FPT_WRTRANS);
+          FPT_WRTRANS.BUF_.BOUND = 1;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(XYOUT);
+          CALL M$WRITE(FPT_WRTRANS);
+        END;
+     ELSE DO;
+          CALL BINCHAR(CUP_ANS.Y#,YPOS);
+          CALL BINCHAR(CUP_ANS.X#,XPOS);
+          FPT_WRTRANS.BUF_.BOUND = 7;
+          FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANS);
+          CALL M$WRITE(FPT_WRTRANS);
+        END;
+     RETURN;
+END CUH_POS;
+%SPACE 3;
+CUH_ATT: PROC(ATT);
+DCL ATT UBIN;
+     IF TBL_BIT THEN DO;
+          DO CASE(ATT);
+          CASE(%NONE#);
+                                        /*  Do nothing.                       */
+          CASE(%BLINK#);
+             FPT_WRTRANS.BUF_.BOUND = CUP_BLINK.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_BLINK.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+          CASE(%RVRVD#);
+             FPT_WRTRANS.BUF_.BOUND = CUP_RVRVID.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_RVRVID.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+          CASE(%UNDLN#);
+             FPT_WRTRANS.BUF_.BOUND = CUP_UNDLN.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_UNDLN.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+          CASE(%RVRBLN#);
+             FPT_WRTRANS.BUF_.BOUND = CUP_RVRVID.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_RVRVID.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+             FPT_WRTRANS.BUF_.BOUND = CUP_BLINK.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_BLINK.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+          CASE(ELSE);
+                                        /*  Do nothing.                       */
+          END;
+        END;
+     ELSE DO;
+          DO CASE(ATT);
+          CASE(%NONE#);
+                                        /*  Do nothing.                       */
+          CASE(%BLINK#);
+             FPT_WRTRANS.BUF_.BOUND = CUP_ANSBLINK.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSBLINK.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+          CASE(%RVRVD#);
+             FPT_WRTRANS.BUF_.BOUND = CUP_ANSRVRVID.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSRVRVID.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+          CASE(%UNDLN#);
+             FPT_WRTRANS.BUF_.BOUND = CUP_ANSUNDLN.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSUNDLN.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+          CASE(%RVRBLN#);
+             FPT_WRTRANS.BUF_.BOUND = CUP_ANSRVRVID.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSRVRVID.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+             FPT_WRTRANS.BUF_.BOUND = CUP_ANSBLINK.L# - 1;
+             FPT_WRTRANS.BUF_.BUF$ = ADDR(CUP_ANSBLINK.C#);
+             CALL M$WRITE(FPT_WRTRANS);
+          CASE(ELSE);
+                                        /*  Do nothing.                       */
+          END;
+        END;
+     RETURN;
+END CUH_ATT;
+%SPACE 3;
+CUH_WRITE: PROC(LEN,TXT);
+DCL LEN UBIN;
+DCL TXT CHAR(LEN);
+     FPT_WRTRANS.BUF_.BOUND = LEN - 1;
+     FPT_WRTRANS.BUF_.BUF$ = ADDR(TXT);
+     CALL M$WRITE(FPT_WRTRANS);
+     RETURN;
+END CUH_WRITE;
+%EJECT;
+PROCESS_SCREEN_TABLE: PROC;
+DCL IND# UBIN;
+DCL IND2# UBIN;
+DCL SCRN$ PTR;
+DCL SCREEN@ (0:23) CHAR(80) BASED(SCRN$);
+/*
+        Procedure
+*/
+     SCRN$ = START$.SCN$(SCREEN_INDEX);
+     CALL CUH_ERASE;
+     DO IND# = 0 TO 22;
+          CALL CUH_POS(1,IND#+1);
+          CALL CUH_WRITE(80,SCREEN@(IND#));
+        END;
+     CALL CUH_POS(1,24);
+     CALL CUH_WRITE(79,SCREEN@(IND#));
+     CALL CUH_HOME;
+     SPC$ = START$.SPC.LOC$(SCREEN_INDEX);
+     DO WHILE(SPC$ ~= ADDR(NIL));
+          IND# = SPC_BASED.X#;
+          IND2# = SPC_BASED.Y#;
+          CALL CUH_POS(IND#,IND2#);
+          IND# = SPC_BASED.HIATT;
+          CALL CUH_ATT(IND#);
+          IND# = SPC_BASED.TTL.LEN;
+          CALL CUH_WRITE(IND#,SPC_BASED.TTL.VAL);
+          CALL CUH_RESTORE;
+          SPC$ = SPC_BASED.NXT$;
+        END;
+     CALL CUH_HOME;
+     RETURN;
+END PROCESS_SCREEN_TABLE;
+%EJECT;
+PROCESS_ROUTINE_TABLE: PROC;
+%INCLUDE XUD_UTS_M;
+%XUD$UTS_ENTRIES;
+%XUD_UTS_EQU;
+DCL ELAPSED# UBIN;
+DCL ACTIM# UBIN;
+/*
+        Procedure
+*/
+     ROUT$ = START$.RTN.LOC$(SCREEN_INDEX);
+     DO WHILE(ROUT$ ~= ADDR(NIL));
+          CALL XUD$UTS_DIFF_25TH (ELAPSED#, UTS#, ROUT_BASED.LRFR);
+          IF REFR_SW THEN DO;
+               ACTIM# = SLEEP_TIME * %UTS_25TH_SEC# * REFR_MULTIPLIER;
+             END;
+          ELSE DO;
+               ACTIM# = SLEEP_TIME * %UTS_25TH_SEC# * ROUT_BASED.RMLT;
+             END;
+          IF ELAPSED# >= ACTIM# THEN DO;
+               IF ROUT_BASED.RENTRY$ ~= ENTADDR(NIL) THEN
+                    CALL ROUT_BASED.RENTRY$(ROUT$);
+               ROUT_BASED.OUTME = '1'B;
+               ROUT_BASED.LRFR = UTS#;
+             END;
+          ROUT$ = ROUT_BASED.NEXT$;
+        END;
+     RETURN;
+END PROCESS_ROUTINE_TABLE;
+%EJECT;
+PROCESS_FIELD_TABLE: PROC;
+DCL IND# UBIN;
+DCL IND2# UBIN;
+DCL IND3# UBIN;
+DCL HIVAL UBIN;
+DCL DO_ME BIT(1);
+DCL FLD$ PTR;
+DCL 1 FLD_BASED BASED(FLD$),
+         2 HILITE BIT(1),
+         2 HIATT UBIN(35) UNAL,
+         2 X# UBIN(18) HALIGNED,
+         2 Y# UBIN(18) HALIGNED,
+         2 OLDVAL# CHAR(16),
+         2 CVAL,
+              3 L# UBIN(9) UNAL,
+              3 C# CHAR(FLD_BASED.CVAL.L#);
+/*
+        Procedure
+*/
+     ROUT$ = START$.RTN.LOC$(SCREEN_INDEX);
+     DO WHILE(ROUT$ ~= ADDR(NIL));
+          IF ROUT_BASED.OUTME OR BREAK_SW THEN DO;
+               ROUT_BASED.OUTME = '0'B;
+               DO IND# = 0 TO ROUT_BASED.NF - 1;
+                    FLD$ = ROUT_BASED.FLD$(IND#);
+                    IF FLD_BASED.CVAL.L# >= 16 THEN
+                         IF SUBSTR(FLD_BASED.CVAL.C#,0,16) = FLD_BASED.OLDVAL# THEN
+                              DO_ME = '0'B;
+                         ELSE DO;
+                              DO_ME = '1'B;
+                              FLD_BASED.OLDVAL# = SUBSTR(FLD_BASED.CVAL.C#,0,16);
+                            END;
+                    ELSE
+                         IF FLD_BASED.CVAL.C# = SUBSTR(FLD_BASED.OLDVAL#,0,FLD_BASED.CVAL.L#) THEN
+                              DO_ME = '0'B;
+                         ELSE DO;
+                              DO_ME = '1'B;
+                              SUBSTR(FLD_BASED.OLDVAL#,0,FLD_BASED.CVAL.L#) = FLD_BASED.CVAL.C#;
+                            END;
+                    IF DO_ME OR BREAK_SW THEN DO;
+                         IND2# = FLD_BASED.X#;
+                         IND3# = FLD_BASED.Y#;
+                         CALL CUH_POS(IND2#,IND3#);
+                         IF FLD_BASED.HILITE THEN DO;
+                              HIVAL = FLD_BASED.HIATT;
+                              CALL CUH_ATT(HIVAL);
+                            END;
+                         IND2# = FLD_BASED.CVAL.L#;
+                         CALL CUH_WRITE(IND2#,FLD_BASED.CVAL.C#);
+                         IF FLD_BASED.HILITE THEN
+                              CALL CUH_RESTORE;
+                       END;
+                  END;
+             END;
+          ROUT$ = ROUT_BASED.NEXT$;
+        END;
+     BREAK_SW = '0'B;
+     CALL CUH_HOME;
+     RETURN;
+END PROCESS_FIELD_TABLE;
+%EJECT;
+/*
+        Main procedure (driver)
+*/
+     REMEMBER BRK IN DRV_LOC;
+     CALL INITIALIZE;
+BRK: CALL PROCESS_SCREEN_TABLE;
+     CALL M$READ(READ_TERM);
+LP:  CALL M$TIME(FPT_TIME);
+     CALL PROCESS_ROUTINE_TABLE;
+     CALL PROCESS_FIELD_TABLE;
+     FPT_WAIT.V.UNITS# = SLEEP_TIME;
+     CALL M$WAIT(FPT_WAIT);
+     GOTO LP;
+END MOM;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+MOM_BREAK: PROC ASYNC;
+DCL IN_BREAK BIT(1) STATIC INIT('0'B);
+DCL MASK BIT(9) STATIC INIT('001111111'B);
+DCL CUH_HOME ENTRY;
+DCL CUH_ERASE ENTRY;
+DCL CUH_POS ENTRY(2);
+DCL CUH_WRITE ENTRY(2);
+DCL CUH_READ ENTRY(1);
+DCL REFR_MULTIPLIER UBIN SYMREF;
+DCL REFR_SW BIT(1) SYMREF;
+DCL SLEEP_TIME UBIN SYMREF;
+DCL DEFAULT_SLEEP UBIN STATIC SYMDEF INIT(15);
+DCL SCREEN_INDEX UBIN SYMREF;
+DCL DRV_LOC REMEMBER SYMREF;
+DCL NUM_SCREENS UBIN SYMREF;
+DCL BREAK_SW BIT(1) SYMREF;
+DCL CHR CHAR(1) STATIC INIT(' ');
+DCL BEL CHAR(1) STATIC INIT(BITASC('007'O));
+DCL INT# SBIN;
+DCL CHR3# CHAR(3);
+DCL EDIT3 (0:1) BIT(9) CONSTANT INIT('102'O,'321'O);
+%CP6$ENTS;
+%FPT_READ(BUF=CHR,
+        DCB=M$UC,
+        TRANS=YES);
+%FPT_TRMPRG(DCB=M$UC,
+        RSTBRK=YES);
+/*
+        Procedure
+*/
+     CALL M$TRMPRG(FPT_TRMPRG);
+     IF IN_BREAK THEN
+          RETURN;
+     IN_BREAK = '1'B;
+     BREAK_SW = '1'B;
+     CALL CUH_ERASE;
+     CALL CUH_HOME;
+     CALL CUH_POS(28,4);
+     CALL CUH_WRITE(16,'MOM COMMAND MENU');
+     CALL CUH_POS(25,7);
+     CALL CUH_WRITE(40,'1  Change sleep time.          Current: ');
+     CALL CUH_POS(25,8);
+     CALL CUH_WRITE(40,'2  Change refresh multiplier.  Current: ');
+     CALL CUH_POS(25,9);
+     CALL CUH_WRITE(40,'3  Change screen.              Current: ');
+     CALL CUH_POS(25,10);
+     CALL CUH_WRITE(20,'4  Return to display');
+     CALL CUH_POS(24,11);
+     CALL CUH_WRITE(13,'5/X  Exit MOM');
+     CALL BINCHAR(CHR3#,SLEEP_TIME);
+     CALL EDITCHAR(CHR3#,,,EDIT3,CHR3#);
+     CALL CUH_POS(66,7);
+     CALL CUH_WRITE(3,CHR3#);
+     IF REFR_SW THEN DO;
+          CALL BINCHAR(CHR3#,REFR_MULTIPLIER);
+          CALL EDITCHAR(CHR3#,,,EDIT3,CHR3#);
+          CALL CUH_POS(66,8);
+          CALL CUH_WRITE(3,CHR3#);
+        END;
+     ELSE DO;
+          CALL CUH_POS(66,8);
+          CALL CUH_WRITE(9,'<default>');
+        END;
+     CALL BINCHAR(CHR3#,SCREEN_INDEX);
+     CALL EDITCHAR(CHR3#,,,EDIT3,CHR3#);
+     CALL CUH_POS(66,9);
+     CALL CUH_WRITE(3,CHR3#);
+LP:  CALL CUH_POS(24,13);
+     CALL CUH_WRITE(14,'Command:      ');
+     CALL CUH_POS(33,13);
+     CALL M$READ(FPT_READ);
+     CHR = BITASC(ASCBIT(CHR) & MASK);
+     CALL CUH_POS(33,13);
+     CALL CUH_WRITE(1,CHR);
+     DO SELECT(CHR);
+     SELECT('1');
+        CALL CUH_POS(23,14);
+        CALL CUH_WRITE(15,'New sleep time:');
+        CALL CUH_POS(38,14);
+        CALL CUH_READ(INT#);
+        IF INT# >= 0 THEN
+             SLEEP_TIME = INT#;
+        ELSE
+             SLEEP_TIME = DEFAULT_SLEEP;
+        CALL CUH_POS(23,14);
+        CALL CUH_WRITE(25,'                         ');
+        CALL BINCHAR(CHR3#,SLEEP_TIME);
+        CALL EDITCHAR(CHR3#,,,EDIT3,CHR3#);
+        CALL CUH_POS(66,7);
+        CALL CUH_WRITE(3,CHR3#);
+     SELECT('2');
+        CALL CUH_POS(2,14);
+        CALL CUH_WRITE(50,'New refresh multiplier (CR for preset multiplier):');
+        CALL CUH_READ(INT#);
+        IF INT# < 0 THEN
+             REFR_SW = '0'B;
+        ELSE DO;
+             REFR_SW = '1'B;
+             REFR_MULTIPLIER = INT#;
+           END;
+        CALL CUH_POS(2,14);
+        CALL CUH_WRITE(60,'                                                            ');
+        CALL CUH_POS(66,8);
+        CALL CUH_WRITE(9,'         ');
+        CALL CUH_POS(66,8);
+        IF REFR_SW THEN DO;
+             CALL BINCHAR(CHR3#,REFR_MULTIPLIER);
+             CALL EDITCHAR(CHR3#,,,EDIT3,CHR3#);
+             CALL CUH_WRITE(3,CHR3#);
+           END;
+        ELSE
+             CALL CUH_WRITE(9,'<default>');
+     SELECT('3');
+        CALL CUH_POS(23,14);
+        CALL CUH_WRITE(14,'Screen number:');
+        CALL CUH_READ(INT#);
+        IF INT# <= NUM_SCREENS AND INT# >= 0 THEN
+             SCREEN_INDEX = INT#;
+        ELSE
+             SCREEN_INDEX = 0;
+        CALL CUH_POS(23,14);
+        CALL CUH_WRITE(24,'                        ');
+        CALL BINCHAR(CHR3#,SCREEN_INDEX);
+        CALL EDITCHAR(CHR3#,,,EDIT3,CHR3#);
+        CALL CUH_POS(66,9);
+        CALL CUH_WRITE(3,CHR3#);
+        IN_BREAK = '0'B;
+        CALL M$CLRSTK ALTRET(IGN1);
+IGN1:   UNWIND TO DRV_LOC;
+     SELECT('4');
+        IN_BREAK = '0'B;
+        CALL M$CLRSTK ALTRET(IGN);
+IGN:    UNWIND TO DRV_LOC;
+     SELECT('5','X');
+        CALL CUH_POS(1,23);
+        CALL M$EXIT;
+     SELECT(ELSE);
+        CALL CUH_WRITE(1,BEL);
+     END;
+     GOTO LP;
+END MOM_BREAK;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+CUH_ERASE: PROC;
+DCL TBL_BIT BIT(1) SYMREF;
+DCL 1 CUP_HOME SYMREF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(20);
+DCL 1 CUP_ERASE SYMREF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(20);
+DCL 1 CUP_ANSHOME SYMREF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(3);
+DCL 1 CUP_ANSERASE SYMREF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(4);
+%CP6$ENTS;
+%FPT_WRITE(DCB=M$UC,
+        TRANS=YES);
+     IF TBL_BIT THEN DO;
+          FPT_WRITE.BUF_.BOUND = CUP_HOME.L# - 1;
+          FPT_WRITE.BUF_.BUF$ = ADDR(CUP_HOME.C#);
+          CALL M$WRITE(FPT_WRITE);
+          FPT_WRITE.BUF_.BOUND = CUP_ERASE.L# - 1;
+          FPT_WRITE.BUF_.BUF$ = ADDR(CUP_ERASE.C#);
+          CALL M$WRITE(FPT_WRITE);
+        END;
+     ELSE DO;
+          FPT_WRITE.BUF_.BOUND = CUP_ANSHOME.L# - 1;
+          FPT_WRITE.BUF_.BUF$ = ADDR(CUP_ANSHOME.C#);
+          CALL M$WRITE(FPT_WRITE);
+          FPT_WRITE.BUF_.BOUND = CUP_ANSERASE.L# - 1;
+          FPT_WRITE.BUF_.BUF$ = ADDR(CUP_ANSERASE.C#);
+          CALL M$WRITE(FPT_WRITE);
+        END;
+     RETURN;
+END CUH_ERASE;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+CUH_HOME: PROC;
+DCL TBL_BIT BIT(1) SYMREF;
+DCL 1 CUP_HOME SYMREF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(20);
+DCL 1 CUP_ANSHOME SYMREF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(3);
+%CP6$ENTS;
+%FPT_WRITE(DCB=M$UC,
+        TRANS=YES);
+     IF TBL_BIT THEN DO;
+          FPT_WRITE.BUF_.BOUND = CUP_HOME.L# - 1;
+          FPT_WRITE.BUF_.BUF$ = ADDR(CUP_HOME.C#);
+        END;
+     ELSE DO;
+          FPT_WRITE.BUF_.BOUND = CUP_ANSHOME.L# - 1;
+          FPT_WRITE.BUF_.BUF$ = ADDR(CUP_ANSHOME.C#);
+        END;
+     CALL M$WRITE(FPT_WRITE);
+     RETURN;
+END CUH_HOME;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+CUH_POS: PROC(XPOS,YPOS);
+DCL XPOS UBIN;
+DCL YPOS UBIN;
+DCL REALX UBIN;
+DCL REALY UBIN;
+DCL 1 XYOUT,
+         2 Y# CHAR(1),
+         2 X# CHAR(1);
+DCL CHR CHAR(1);
+DCL CUP_BIAS UBIN(9) SYMREF;
+DCL 1 CUP_INTRO SYMREF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(20);
+DCL 1 CUP_ANS SYMREF,
+         2 * CHAR(2),
+         2 Y# CHAR(2),
+         2 * CHAR(1),
+         2 X# CHAR(2),
+         2 * CHAR(1);
+DCL TBL_BIT BIT(1) SYMREF;
+DCL CLMFRS_BIT BIT(2) SYMREF;
+%CP6$ENTS;
+%FPT_WRITE(DCB=M$UC,
+        TRANS=YES);
+     IF TBL_BIT THEN DO;
+          REALX = XPOS + CUP_BIAS;
+          REALY = YPOS + CUP_BIAS;
+          XYOUT.X# = BINASC(REALX);
+          XYOUT.Y# = BINASC(REALY);
+          IF CLMFRS_BIT THEN DO;
+               CHR = XYOUT.X#;
+               XYOUT.X# = XYOUT.Y#;
+               XYOUT.Y# = CHR;
+             END;
+          FPT_WRITE.BUF_.BOUND = CUP_INTRO.L# - 1;
+          FPT_WRITE.BUF_.BUF$ = ADDR(CUP_INTRO.C#);
+          CALL M$WRITE(FPT_WRITE);
+          FPT_WRITE.BUF_.BOUND = 1;
+          FPT_WRITE.BUF_.BUF$ = ADDR(XYOUT);
+          CALL M$WRITE(FPT_WRITE);
+        END;
+     ELSE DO;
+          CALL BINCHAR(CUP_ANS.Y#,YPOS);
+          CALL BINCHAR(CUP_ANS.X#,XPOS);
+          FPT_WRITE.BUF_.BOUND = 7;
+          FPT_WRITE.BUF_.BUF$ = ADDR(CUP_ANS);
+          CALL M$WRITE(FPT_WRITE);
+        END;
+     RETURN;
+END CUH_POS;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+CUH_POSBUF: PROC(XPOS,YPOS,POSBUF);
+DCL XPOS UBIN;
+DCL YPOS UBIN;
+DCL 1 POSBUF CALIGNED,
+         2 L# UBIN(9) CALIGNED,
+         2 C# CHAR(20) CALIGNED;
+DCL REALX UBIN;
+DCL REALY UBIN;
+DCL 1 XYOUT CALIGNED,
+         2 Y# CHAR(1) CALIGNED,
+         2 X# CHAR(1) CALIGNED;
+DCL CHR CHAR(1);
+DCL CUP_BIAS UBIN(9) SYMREF;
+DCL 1 CUP_INTRO SYMREF,
+         2 L# UBIN(9) UNAL,
+         2 C# CHAR(20);
+DCL 1 CUP_ANS SYMREF,
+         2 * CHAR(2),
+         2 Y# CHAR(2),
+         2 * CHAR(1),
+         2 X# CHAR(2),
+         2 * CHAR(1);
+DCL CUP_ANSC REDEF CUP_ANS CHAR(8);
+DCL TBL_BIT BIT(1) SYMREF;
+DCL CLMFRS_BIT BIT(2) SYMREF;
+     IF TBL_BIT THEN DO;
+          POSBUF = CUP_INTRO;
+          REALX = XPOS + CUP_BIAS;
+          REALY = YPOS + CUP_BIAS;
+          XYOUT.X# = BINASC(REALX);
+          XYOUT.Y# = BINASC(REALY);
+          IF CLMFRS_BIT THEN DO;
+               CHR = XYOUT.X#;
+               XYOUT.X# = XYOUT.Y#;
+               XYOUT.Y# = CHR;
+             END;
+          CALL INSERT (POSBUF.C#,POSBUF.L#+0,1,XYOUT.Y#);
+          CALL INSERT (POSBUF.C#,POSBUF.L#+1,1,XYOUT.X#);
+          POSBUF.L#=POSBUF.L#+2;
+        END;
+     ELSE DO;
+          CALL BINCHAR(CUP_ANS.Y#,YPOS);
+          CALL BINCHAR(CUP_ANS.X#,XPOS);
+          POSBUF.L#=8;
+          CALL INSERT(POSBUF.C#,1,8,CUP_ANSC);
+        END;
+     RETURN;
+END CUH_POSBUF;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+CUH_WRITE: PROC(LEN,TXT);
+DCL LEN UBIN;
+DCL TXT CHAR(LEN);
+%CP6$ENTS;
+%FPT_WRITE(DCB=M$UC,
+        TRANS=YES);
+     FPT_WRITE.BUF_.BOUND = LEN - 1;
+     FPT_WRITE.BUF_.BUF$ = ADDR(TXT);
+     CALL M$WRITE(FPT_WRITE);
+     RETURN;
+END CUH_WRITE;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+CUH_READ: PROC(INT#);
+DCL INC# CHAR(10);
+DCL ST# UBIN;
+DCL NX# UBIN;
+DCL INT# SBIN;
+DCL ZEROS CHAR(10) STATIC INIT('0000000000');
+DCL MASK BIT(9) STATIC INIT('001111111'B);
+DCL IND# SBIN;
+DCL CHR CHAR(1) STATIC INIT(' ');
+DCL BEL CHAR(1) STATIC INIT(BITASC('007'O));
+DCL DEL_SIM (0:2) CHAR(1) STATIC INIT(BITASC('010'O),' ',BITASC('010'O));
+DCL CUH_WRITE ENTRY(2);
+%EQU CR = BITASC('015'O);
+%EQU DEL = BITASC('177'O);
+%CP6$ENTS;
+%FPT_READ(BUF=CHR,
+        DCB=M$UC,
+        TRANS=YES);
+     INC# = '0000000000';
+     ST# = 0;
+LP:  CALL M$READ(FPT_READ);
+     CHR = BITASC(ASCBIT(CHR) & MASK);
+     DO SELECT(CHR);
+     SELECT('1','2','3','4','5','6','7','8','9','0');
+        IF ST# < 10 THEN DO;
+             CALL CUH_WRITE(1,CHR);
+             SUBSTR(INC#,ST#,1) = CHR;
+             ST# = ST# + 1;
+           END;
+     SELECT(%CR);
+        IF ST# ~= 10 AND ST# ~= 0 THEN DO;
+             ST# = ST# - 1;
+             NX# = 9;
+             DO IND# = ST# DOWNTO 0 BY -1;
+                  SUBSTR(INC#,NX#,1) = SUBSTR(INC#,IND#,1);
+                  NX# = NX# - 1;
+                END;
+             SUBSTR(INC#,0,NX#+1) = SUBSTR(ZEROS,0,NX#+1);
+             CALL CHARBIN(INT#,INC#);
+           END;
+        ELSE IF ST# = 0 THEN
+                  INT# = -1;
+        RETURN;
+     SELECT(%DEL);
+        IF ST# > 0 THEN DO;
+             CALL CUH_WRITE(3,DEL_SIM);
+             ST# = ST# - 1;
+             SUBSTR(INC#,ST#,1) = '0';
+           END;
+     SELECT(ELSE);
+        CALL CUH_WRITE(1,BEL);
+     END;
+     GOTO LP;
+END CUH_READ;

@@ -1,0 +1,1645 @@
+VERSION E05
+
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:1    
+        1        1        /*M* VXU$SETUP - To setup within the image formation buffers a portion of the progra
+                 1        m to be formed.*/
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR,PLM=6,IND=4,CSU=2,EXM=0,ECU=2,MOC,DCI=4,CRT=4,CTI=8,CCC */
+        8        8        /*F* NAME:        VXU$SETUP
+        9        9         PURPOSE:     To setup within the image formation buffers a portion of the program t
+                 9        o be formed.
+       10       10             DESCRIPTION:
+       11       11         VXU$SETUP is entered with 5 parameters. The first is a returned variable which
+       12       12        is a word pointer to the appropriate buffer where setup has occurred. The
+       13       13        second parameter is the buffer type. It may only acquire the values 0, 1, and 2
+       14       14        (For data, procedure, and read-only respectively). The fourth parameter is the
+       15       15        size in words which needs to be setup. This value has a range restriction. It
+       16       16        cay only acquire the values of 1 through @BUF_SIZE(CURRENTLY 1024). The last
+       17       17        paramater is an index into a section x(cross) node mapping vector. This
+       18       18        parameter has a restricted range of from 0 through VX_NODE_NUMBER (# of nodes
+       19       19        less 1). Indexing with this value into the run-time generated map yields a
+       20       20        pointer to a node in the tree in which the section was allocated. The second
+       21       21        through fifth parameters only pass values to VXT$FIMAGE. Only the first
+       22       22        parameter returns a pointer which locates the desired area.
+       23       23        The image formation buffers are first classified as to type; being data,
+       24       24        procedure or read-only. Each type employs a double buffering scheme to ensure
+       25       25        relocation/lay-in is properly handled at a page boundary. Given a type,
+       26       26        VXU$SETUP next inquires the pair of buffers as to whether either of them has the
+       27       27        appropriate page image for the node. If the first buffer has the request
+       28       28        resident, the extent is checked to see if the entire area is resident within
+       29       29        the buffer. If it is then the locator is computed and a return is made. If not,
+       30       30        then the second buffer is checked to see if it contains the "NEXT" page of the
+       31       31        node. If it does then the locator is computed and a return made. If the extent
+       32       32        is not presint in the second buffer then a swap-out/swap-in sequence is initiated.
+       33       33        If the first buffer does not contain the starting page then the second buffer is
+       34       34        checked to see if the starting page and extent reside fully within the buffer.
+       35       35        If so, a return is made; else if the second buffer contains the starting page
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:2    
+       36       36        but not the full extent then the second buffer is moved to the first (after
+       37       37        a swap-out of the first) and extention is performed in the second buffer.
+       38       38        If the second buffer contains neither the starting page nor the extention
+       39       39        then a swap-out/swap-in sequence is initiated.
+       40       40                                                                        */
+       41       41        VXU$SETUP:
+       42       42              PROC( INDEX$, BUFTYP, WHERE, SIZE, NODE_INX );
+       43       43        %INCLUDE VX_INC_C;
+       44    10759        %VX$NODE;
+
+             10771    1   /*******************************************************************************
+             10772    1   *                                                                              *
+             10773    1   *                          VX$NODE                                                 *
+             10774    1   *                                                                              *
+             10775    1   *******************************************************************************/
+
+             10791    1   DCL 1 VX$NODE      ALIGNED    BASED,
+             10792    1         2 SON$ PTR /*(ADDR(NIL))*/, /* Son pointer                      */
+             10793    1         2 BROTHER$ PTR /*(ADDR(NIL))*/, /* Brother pointer              */
+             10794    1         2 FATHER$ PTR /*(ADDR(NIL))*/, /* Father pointer                */
+             10795    1         2 PATH$ PTR /*(ADDR(NIL))*/, /* Path   pointer                  */
+             10796    1         2 HEAD$       PTR /*(ADDR(NIL))*/, /* Head pointer to
+             10797                              to list of file nodes for this node            */
+             10798    1         2 TAIL$ PTR /*(ADDR(NIL))*/, /* Tail pointer to list            */
+             10799    1         2 SHARED_LIB_HEAD$ PTR /*(ADDR(NIL))*/,
+             10799                  /* Head pointer to shared library list */
+             10800    1         2 LIB_HEAD$         PTR /*(ADDR(NIL))*/,
+             10800                  /* Head pointer to list of shared libraries
+             10801                                          which have been mapped to included libraries */
+             10802    1         2 NUM          UBIN(36)  UNAL,    /* Node number                        */
+             10803    1         2 DEPTH          UBIN(36)  UNAL,  /* Depth; ROOT=0*/
+             10804    1         2 ADDR_START_A(0:2/*@ROS*/) SBIN WORD /*(0*3)*/, /* Array            */
+             10805    1         2 ADDR_START REDEF  ADDR_START_A,
+             10806    1           3 RDATA       SBIN WORD,   /* First address for this node in data     */
+             10807    1           3 RPROC       SBIN WORD,   /* First address for this node in proc     */
+             10808    1           3 ROS       SBIN WORD,          /* Last address for program in ros    */
+             10809    1         2 ADDR_STOP_A(0:2/*@ROS*/) SBIN WORD /*(-1*3)*/, /* Array            */
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:3    
+             10810    1         2 ADDR_STOP  REDEF  ADDR_STOP_A,
+             10811    1           3 RDATA       SBIN WORD,        /* Last address for this node in data */
+             10812    1           3 RPROC       SBIN WORD,        /* Last address for this node in proc */
+             10813    1           3 ROS       SBIN WORD,          /* Last address for program in ros    */
+             10814    1         2 START_PAGE#_A(0:2/*@ROS*/) SBIN WORD /*(0*3)*/, /* Array           */
+             10815    1         2 START_PAGE# REDEF START_PAGE#_A,
+             10816    1           3 RDATA       SBIN WORD,   /* First page    for this node in data     */
+             10817    1           3 RPROC       SBIN WORD,   /* First page    for this node in proc     */
+             10818    1           3 ROS       SBIN WORD,          /* First page   for program in ros    */
+             10819    1         2 STOP_PAGE#_A(0:2/*@ROS*/) SBIN WORD /*(-1*3)*/, /* Array*/
+             10820    1         2 STOP_PAGE#  REDEF STOP_PAGE#_A,
+             10821    1           3 RDATA       SBIN WORD,   /* Last  page    for this node in data     */
+             10822    1           3 RPROC       SBIN WORD,   /* Last  page    for this node in proc     */
+             10823    1           3 ROS       SBIN WORD,          /* Last  page   for program in ros    */
+             10824    1         2 START_SC_ALL$ PTR /*(ADDR(NIL))*/,
+             10824                  /* Starting pointer for common sections for this node */
+             10825    1         2 STOP_SC_ALL$ PTR /*(ADDR(NIL))*/,
+             10825                  /* Stopping pointer for common sections for this node */
+             10826    1         2 L_START,
+             10827    1           3 SN$ PTR /*(ADDR(NIL))*/, /* Segment definition names        */
+             10828    1           3 DN$ PTR /*(ADDR(NIL))*/, /* Def names                       */
+             10829    1           3 RN$ PTR /*(ADDR(NIL))*/, /* Ref names                       */
+             10830    1           3 SC$ PTR /*(ADDR(NIL))*/, /* Sections                        */
+             10831    1           3 ED$ PTR /*(ADDR(NIL))*/, /* Entry defs*/
+             10832    1           3 ER$ PTR /*(ADDR(NIL))*/, /* Entry refs*/
+             10833    1           3 DD$ PTR /*(ADDR(NIL))*/, /* Data defs                       */
+             10834    1           3 DR$ PTR /*(ADDR(NIL))*/, /* Data refs                       */
+             10835    1           3 SD$ PTR /*(ADDR(NIL))*/, /* Seg defs                        */
+             10836    1           3 SR$ PTR /*(ADDR(NIL))*/, /* Seg refs                        */
+             10837    1         2 L_START_A$(0:9)     REDEF L_START PTR,
+             10838    1         2 L_STOP,
+             10839    1           3 SN$ PTR /*(ADDR(NIL))*/, /* Segment definition names        */
+             10840    1           3 DN$ PTR /*(ADDR(NIL))*/, /* Def names                       */
+             10841    1           3 RN$ PTR /*(ADDR(NIL))*/, /* Ref names                       */
+             10842    1           3 SC$ PTR /*(ADDR(NIL))*/, /* Sections                        */
+             10843    1           3 ED$ PTR /*(ADDR(NIL))*/, /* Entry defs*/
+             10844    1           3 ER$ PTR /*(ADDR(NIL))*/, /* Entry refs*/
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:4    
+             10845    1           3 DD$ PTR /*(ADDR(NIL))*/, /* Data defs                       */
+             10846    1           3 DR$ PTR /*(ADDR(NIL))*/, /* Data refs                       */
+             10847    1           3 SD$ PTR /*(ADDR(NIL))*/, /* Seg defs                        */
+             10848    1           3 SR$ PTR /*(ADDR(NIL))*/, /* Seg refs                        */
+             10849    1         2 L_STOP_A$(0:9) REDEF   L_STOP    PTR,
+             10850    1         2 L_SIZE,
+             10851    1           3 SN      UBIN /*(0)*/, /* Segment definition names           */
+             10852    1           3 DN      UBIN /*(0)*/, /* Def names                          */
+             10853    1           3 RN      UBIN /*(0)*/, /* Ref names                          */
+             10854    1           3 SC      UBIN /*(0)*/, /* Sections                           */
+             10855    1           3 ED      UBIN /*(0)*/, /* Entry defs*/
+             10856    1           3 ER      UBIN /*(0)*/, /* Entry refs*/
+             10857    1           3 DD      UBIN /*(0)*/, /* Data defs                          */
+             10858    1           3 DR      UBIN /*(0)*/, /* Data refs                          */
+             10859    1           3 SD      UBIN /*(0)*/, /* Seg defs                           */
+             10860    1           3 SR      UBIN /*(0)*/, /* Seg refs                           */
+             10861    1         2 L_SIZE_A(0:9)  REDEF   L_SIZE    UBIN,
+             10862    1         2 L_PREV_SIZE,
+             10863    1           3 SN      UBIN /*(0)*/, /* Segment definition names           */
+             10864    1           3 DN      UBIN /*(0)*/, /* Def names                          */
+             10865    1           3 RN      UBIN /*(0)*/, /* Ref names                          */
+             10866    1           3 SC      UBIN /*(0)*/, /* Sections                           */
+             10867    1           3 ED      UBIN /*(0)*/, /* Entry defs*/
+             10868    1           3 ER      UBIN /*(0)*/, /* Entry refs*/
+             10869    1           3 DD      UBIN /*(0)*/, /* Data defs                          */
+             10870    1           3 DR      UBIN /*(0)*/, /* Data refs                          */
+             10871    1           3 SD      UBIN /*(0)*/, /* Seg defs                           */
+             10872    1           3 SR      UBIN /*(0)*/, /* Seg refs                           */
+             10873    1         2 L_PREV_SIZE_A(0:9)  REDEF   L_PREV_SIZE    UBIN,
+             10874    1         2 BIT_MAP                ALIGNED,
+             10875    1           3 DATA                  ALIGNED,
+             10876    1             4 BITS(0:255)          BIT(1)    UNAL /*('0'B*256)*/,
+             10877    1           3 RPROC                 ALIGNED,
+             10878    1             4 BITS(0:255)          BIT(1)    UNAL /*('0'B*256)*/,
+             10879    1           3 ROS                   ALIGNED,
+             10880    1             4 BITS(0:255)          BIT(1)    UNAL /*('0'B*256)*/,
+             10881    1         2 L_SC_START,
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:5    
+             10882    1           3 SC_BLK_COM$ PTR /*(ADDR(NIL))*/, /* Blank common            */
+             10883    1           3 SC_ROOT_LBL_COM$ PTR /*(ADDR(NIL))*/, /* Root labelled common */
+             10884    1           3 SC_LBL_COM$ PTR /*(ADDR(NIL))*/, /* Labelled common         */
+             10885    1           3 SC_DCB$ PTR /*(ADDR(NIL))*/, /* Dcbs                        */
+             10886    1         2 L_SC_START_A$(0:3)  REDEF L_SC_START PTR,
+             10887    1         2 L_SC_STOP,
+             10888    1           3 SC_BLK_COM$ PTR /*(ADDR(NIL))*/, /* Blank common            */
+             10889    1           3 SC_ROOT_LBL_COM$ PTR /*(ADDR(NIL))*/, /* Root labelled common */
+             10890    1           3 SC_LBL_COM$ PTR /*(ADDR(NIL))*/, /* Labelled common         */
+             10891    1           3 SC_DCB$ PTR /*(ADDR(NIL))*/, /* Dcbs                        */
+             10892    1         2 L_SC_STOP_A$(0:3)   REDEF L_SC_STOP  PTR,
+             10893    1         2 PROMOTE_HEAD,
+             10894    1           3 BLK_COM$              PTR /*(ADDR(NIL))*/,
+             10895    1           3 LBL_COM$              PTR /*(ADDR(NIL))*/,
+             10896    1         2 PROMOTE_HEAD_A$(0:1) REDEF PROMOTE_HEAD     PTR,
+             10897    1         2 PROMOTE_TAIL,
+             10898    1           3 BLK_COM$              PTR /*(ADDR(NIL))*/,
+             10899    1           3 LBL_COM$              PTR /*(ADDR(NIL))*/,
+             10900    1         2 PROMOTE_TAIL_A$(0:1) REDEF PROMOTE_TAIL     PTR,
+             10901    1         2 HAVE_ASL          BIT(1)    UNAL /*('0'B)*/,
+             10902    1         2 ALL_BLK_COM          BIT(1)    UNAL /*('0'B)*/,
+             10903    1         2 USE_NODE          BIT(1)    UNAL /*('0'B)*/,
+             10904    1         2 *                 BIT(33)   UNAL /*('0'B)*/,
+             10905    1         2 BLANK_COMMON$     PTR       ALIGNED /*(ADDR(NIL))*/;
+
+       45    10909        %SET LISTMAC='1'B;
+       46    10910        %SET LISTEXP='1'B;
+       47    10911        %SET LISTSUB='1'B;
+       48    10912        %E;
+             10913        %LSET LISTDIR='0'B;
+
+             10920    1   /*******************************************************************************
+             10921    1   *                                                                              *
+             10922    1   *                          ENTRY                                                 *
+             10923    1   *                                                                              *
+             10924    1   *******************************************************************************/
+
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:6    
+       49    10928    1   DCL VXU$PAGEOUT          ENTRY(3);
+       50    10929    1   DCL VXU$PAGEIN           ENTRY(4);
+       51    10930        %ENTRIES;
+             10931    1   DCL VXE$ERROR       ENTRY(4);
+             10932    1   DCL VXE$ERR         ENTRY(3);
+             10933    1   DCL VXE$MERC        ENTRY;
+             10934    1   DCL VXE$ERRMSG      ENTRY(3);
+             10935    1   DCL VXR$READ        ENTRY( 3 );
+             10936    1   DCL VXW$WRITE       ENTRY( 3 );
+             10937    1   DCL VXW$WRITE_DO    ENTRY( 2 );
+             10938    1   DCL VXD$B2C         ENTRY( 5 );
+             10939    1   DCL VXD$C2B         ENTRY( 3 );
+             10940    1   DCL VXA$GET         ENTRY( 3 );
+             10941    1   DCL VXF$FREE        ENTRY( 3 );
+             10942    1   DCL VXQ$SORT        ENTRY( 7 );
+             10943    1   DCL VXY$YESNO       ENTRY( 1 );
+       52    10945        %IMAGE_BUFFERS( NAME=VX$IMAGE, STCLASS="BASED(VX_IMAGE$)");
+             10946    1   DCL 1 VX$IMAGE           ALIGNED        BASED(VX_IMAGE$),
+             10947    1         2 CPAGE#_A(0:1) SBIN WORD ALIGNED, /* Current page # in buffer # */
+             10948    1         2 CPAGE# REDEF CPAGE#_A,
+             10949    1           3 BUF0                  SBIN WORD ALIGNED,
+             10950    1           3 BUF1                  SBIN WORD ALIGNED,
+             10951    1         2 START_A$(0:1) PTR ALIGNED, /* Pointer to start of buffer #    */
+             10952    1         2 START$ REDEF START_A$,
+             10953    1           3 BUF0$                 PTR       ALIGNED,
+             10954    1           3 BUF1$                 PTR       ALIGNED,
+             10955    1         2 STOP_A$(0:1)           PTR       ALIGNED,
+             10956    1         2 STOP$  REDEF STOP_A$,           /* Pointer to end of buffer #         */
+             10957    1           3 BUF0$                 PTR       ALIGNED,
+             10958    1           3 BUF1$                 PTR       ALIGNED,
+             10959    1         2 NODE_A$(0:1) PTR ALIGNED, /* Pointer to node  of buffer #     */
+             10960    1         2 NODE$  REDEF NODE_A$,
+             10961    1           3 BUF0$                 PTR       ALIGNED,
+             10962    1           3 BUF1$                 PTR       ALIGNED,
+             10963    1         2 BEGIN$                 PTR       ALIGNED,
+             10964    1         2 END$                   PTR       ALIGNED,
+             10965    1         2 SPAGE#                 UBIN(36)  ALIGNED,
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:7    
+             10966    1         2 EPAGE#                 UBIN(36)  ALIGNED;
+       53    10968        %MOVE_TMPLT;
+             10969    1   DCL VX$TARGET_B           BIT( VX_TARGET_COUNT ) ALIGNED    BASED;
+             10970    1   DCL VX$SOURCE_B           BIT( VX_SOURCE_COUNT ) ALIGNED    BASED;
+             10971    1   DCL VX$TARGET_C         CHAR( VX_TARGET_COUNT ) ALIGNED BASED;
+             10972    1   DCL VX$SOURCE_C         CHAR( VX_SOURCE_COUNT ) ALIGNED BASED;
+       54    10974        %P;
+             10975        %LSET LISTDIR='0'B;
+
+             10982    1   /*******************************************************************************
+             10983    1   *                                                                              *
+             10984    1   *                          PARAMETERS                                              *
+             10985    1   *                                                                              *
+             10986    1   *******************************************************************************/
+
+       55    10990    1   DCL INDEX$               PTR  ALIGNED;
+       56    10991    1   DCL BUFTYP               UBIN(36)  ALIGNED;
+       57    10992    1   DCL WHERE                UBIN(36)  ALIGNED;
+       58    10993    1   DCL SIZE                 UBIN(36)  ALIGNED;
+       59    10994    1   DCL NODE_INX             UBIN(36)  ALIGNED;
+       60    10995        %PTR;
+             10996        %LSET LISTDIR='0'B;
+
+             11003    1   /*******************************************************************************
+             11004    1   *                                                                              *
+             11005    1   *                          PTR                                                 *
+             11006    1   *                                                                              *
+             11007    1   *******************************************************************************/
+
+       61    11011    1   DCL NODE$           PTR  ALIGNED   AUTO;
+       62    11012    1   DCL NODE# REDEF NODE$ UBIN ALIGNED;
+       63    11013        %VX$PTR$;
+             11014    1   DCL VX$PTR$(0:0)         PTR  ALIGNED   BASED( VX_SC_X_NODE$ );
+             11015                                      /* Section allocated NODE# to node pointer map  */
+       64    11017        %U;
+             11018        %LSET LISTDIR='0'B;
+
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:8    
+             11025    1   /*******************************************************************************
+             11026    1   *                                                                              *
+             11027    1   *                          UBIN                                                 *
+             11028    1   *                                                                              *
+             11029    1   *******************************************************************************/
+
+       65    11033    1   DCL SPAGE#               UBIN(36)  ALIGNED   AUTO;
+       66    11034    1   DCL EPAGE#               UBIN(36)  ALIGNED   AUTO;
+       67    11035    1   DCL IBUFNUM              UBIN(36)  ALIGNED   AUTO;
+       68    11036    1   DCL LAST_ADR             UBIN(36)  ALIGNED;
+       69    11037    1   DCL EXTENT               UBIN(36)  ALIGNED   AUTO;
+       70    11038    1   DCL START_ADDR           UBIN(36)  ALIGNED   AUTO;
+       71    11039    1   DCL STOP_ADDR            UBIN(36)  ALIGNED   AUTO;
+       72    11040        %PLIST;
+       73    11041        %SET LISTSUB='0'B;
+       74    11042        %EJECT;
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:9    
+       75    11043    1         EXTENT = SIZE - 1;
+       76    11044    1         LAST_ADR = WHERE + EXTENT;
+       77    11045    1         SPAGE# = WHERE/ @BUF_SIZE;        /* Compute starting page */
+       78    11046    1         EPAGE# =  LAST_ADR / @BUF_SIZE;   /* Compute ending page # */
+       79    11047    1         VX_IMAGE$ = VX_IMAGE_PTR$(BUFTYP);
+             11047                  /* Get pointer to appropriate buffer variables */
+       80    11048    2         IF BUFTYP >= @DATA_SEGMENT THEN DO;
+       81    11049    2             NODE# = VX_SEGID ( BUFTYP - @DATA_SEGMENT );
+       82    11050    2             START_ADDR = 0;
+       83    11051    2             STOP_ADDR  = VX_SEG_SIZE( BUFTYP - @DATA_SEGMENT );
+       84    11052    2            END;
+       85    11053    2         ELSE DO;
+       86    11054    2             NODE$ = VX_SC_X_NODE$ -> VX$PTR$( NODE_INX ); /* Map to allocation node */
+       87    11055    2             START_ADDR = NODE$ -> VX$NODE.ADDR_START_A(BUFTYP);
+       88    11056    2             STOP_ADDR  = NODE$ -> VX$NODE.ADDR_STOP_A(BUFTYP);
+       89    11057    2            END;
+       90    11058    2         IF WHERE < START_ADDR OR WHERE > STOP_ADDR THEN DO;
+       91    11059        /*E*  ERROR: VXU-E$INTERNAL_SETUP_BAD_ADDR_VX-0
+       92    11060              MESSAGE: Internal link error; VXU$SETUP called with bad address
+       93    11061                       range: %U1 - %U2.
+       94    11062              DESCRIPTION: Self-explanatory.
+       95    11063        */
+       96    11064                  %NUMBER(
+       97    11065                  NUM1= WHERE, SIZE1=6, BASE1=8,
+       98    11066                  NUM2=LAST_ADR, SIZE2=6, BASE2=8);
+       99    11083                  %SCREAM(
+      100    11084                  ERR#=E$INTERNAL_SETUP_BAD_ADDR_VX,
+      101    11085                  LEVEL=@E$F_VX,
+      102    11086                  MID="'U'",
+      103    11087                  AUX=@E$OUOF_VX);
+      104    11090    2            END;
+      105    11091    1   SET_BUF0:;
+      106    11092    1         IBUFNUM = 0;
+      107    11093    1   CHECK_BUF0:
+      108    11094        /* Check if starting page is in buffer # 0 */
+      109    11095    1         IF VX$IMAGE.NODE$.BUF0$ ~= NODE$ OR VX$IMAGE.CPAGE#.BUF0 ~= SPAGE# THEN GOTO
+             11095                  CHECK_BUF1;
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:10   
+      110    11096    1   CHECK_EXTENT:
+      111    11097        /* Yeap; check if entire area resides in the buffer */
+      112    11098    1         IF SPAGE# = EPAGE# THEN GOTO ALL_SETUP;
+      113    11099        /* Nope, check if extension is in the second buffer */
+      114    11100    1         IF VX$IMAGE.NODE$.BUF1$ ~= NODE$ OR VX$IMAGE.CPAGE#.BUF1 ~= EPAGE# THEN GOTO
+             11100                  EXTEND_BUF1;
+      115    11101        /* => both buffers are valid */
+      116    11102    1   ALL_SETUP:;
+      117    11103    1         VX$IMAGE.NODE_A$(IBUFNUM) = NODE$;
+      118    11104        /* Set current PAGE#                     */
+      119    11105    1         VX$IMAGE.CPAGE#_A(IBUFNUM) = SPAGE#;
+      120    11106        /* Compute ptr to return                 */
+      121    11107    1         INDEX$ = PINCRW( VX$IMAGE.START_A$(IBUFNUM),
+      122    11108    1                 MOD( WHERE, @BUF_SIZE  )    );
+      123    11109    1         RETURN;
+      124    11110    1   CHECK_BUF1:;
+      125    11111        /* First buffer does not contain starting page; check if second contains
+      126    11112           entire area */
+      127    11113    1         IBUFNUM = 1;
+      128    11114    1         IF VX$IMAGE.NODE$.BUF1$ ~= NODE$ OR VX$IMAGE.CPAGE#.BUF1 ~= SPAGE# THEN GOTO
+             11114                  NEITHER;
+      129    11115        /* Second contains starting page; now check if the entire area
+      130    11116           resides within the second buffer                */
+      131    11117    1         IF SPAGE# = EPAGE# THEN GOTO ALL_SETUP;
+      132    11118        /* Nope; swap out the first    */
+      133    11119    1         IF VX$IMAGE.CPAGE#.BUF1 >= 0 THEN
+      134    11120    1             CALL VXU$PAGEOUT( NODE$, BUFTYP, 0 );
+      135    11121        /* Move second buffer into the first */
+      136    11122    1         VX_TARGET_COUNT =   @BUF_SIZE * @CHAR_WORD ;
+      137    11123    1         VX_SOURCE_COUNT =   VX_TARGET_COUNT;
+      138    11124    1         VX$IMAGE.START$.BUF0$ -> VX$TARGET_C
+      139    11125    1                 =
+      140    11126    1                 VX$IMAGE.START$.BUF1$ -> VX$SOURCE_C;
+      141    11127        /* Set 1ST buffer as current */
+      142    11128    1         IBUFNUM = 0;
+      143    11129    1         VX$IMAGE.CPAGE#.BUF0     =    VX$IMAGE.CPAGE#.BUF1;
+      144    11130    1         VX$IMAGE.NODE$.BUF0$     =    VX$IMAGE.NODE$.BUF1$;
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:11   
+      145    11131    1         GOTO CHECK_EXTENT;
+      146    11132    1   NEITHER:
+      147    11133        /* Neither buffer has desired page */
+      148    11134        /* Page out the first buffer */
+      149    11135    1         IF VX$IMAGE.CPAGE#.BUF0 >= 0 THEN
+      150    11136    1             CALL VXU$PAGEOUT( NODE$, BUFTYP, 0 );
+      151    11137        /* And page in the desired first buffer */
+      152    11138    1         CALL VXU$PAGEIN( NODE$, BUFTYP, 0, SPAGE# );
+      153    11139        /* And check extention */
+      154    11140    1         GOTO SET_BUF0;
+      155    11141    1   EXTEND_BUF1:;
+      156    11142        /* Extention needed for buf 0; buf 1 needs to be swapped */
+      157    11143    1         IF VX$IMAGE.CPAGE#.BUF1 >= 0 THEN
+      158    11144    1             CALL VXU$PAGEOUT( NODE$, BUFTYP, 1 );
+      159    11145        /* Now page in the extention */
+      160    11146    1         CALL VXU$PAGEIN( NODE$, BUFTYP, 1, EPAGE# );
+      161    11147    1         IBUFNUM = 0;
+      162    11148    1         GOTO ALL_SETUP;
+      163    11149    1   END VXU$SETUP;
+
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:12   
+--  Include file information  --
+
+   F_DCB_D.:E05TOU  is referenced.
+   VX_DCB_R.:E05TOU  cannot be made into a system file and is referenced.
+   VX_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   VX_FIXED_R.:E05TOU  cannot be made into a system file and is referenced.
+   XU_MACRO_C.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   VX_MACRO_C.:E05TOU  is referenced.
+   VX_PERR_C.:E05TOU  is referenced.
+   VX_SUBS_C.:E05TOU  is referenced.
+   VX_SWITCH_C.:E05TOU  is referenced.
+   B$OBJECT_C.:E05TOU  is referenced.
+   VX_INC_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure VXU$SETUP.
+
+   Procedure VXU$SETUP requires 205 words for executable code.
+   Procedure VXU$SETUP requires 22 words of local(AUTO) storage.
+
+    No errors detected in file VXU$SETUP.:E05TSI    .
+
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:13   
+
+ Object Unit name= VXU$SETUP                                  File name= VXU$SETUP.:E05TOU
+ UTS= JUL 30 '97 08:46:17.68 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   DCB   even  none     0      0  M$UC
+    1  LblCom even  none    96    140  VX_CONST_DCB
+    2   Proc  even  none   205    315  VXU$SETUP
+    3  RoData even  none    15     17  VXU$SETUP
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes            yes      Std        5  VXU$SETUP
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       5 VXD$B2C
+         yes           Std       4 VXE$ERROR
+         yes           Std       3 VXU$PAGEOUT
+         yes           Std       4 VXU$PAGEIN
+                       nStd      0 X66_AUTO_5
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:14   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     M$UC                                  VX_IMAGE_PTR$                         VX_OU_HEAD
+     VX_ERRORS                             VX_EFIELD1                            VX_EFIELD2
+     VX_IMAGE$                             VX_TARGET_COUNT                       VX_SOURCE_COUNT
+     VX_SC_X_NODE$                         VX_SEG_SIZE                           VX_SEGID
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     NULLSID                               ISSID
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:15   
+
+
+        1        1       /*M* VXU$SETUP - To setup within the image formation buffers a portion of the progra
+                 1        m to be formed.*/
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR,PLM=6,IND=4,CSU=2,EXM=0,ECU=2,MOC,DCI=4,CRT=4,CTI=8,CCC */
+        8        8        /*F* NAME:        VXU$SETUP
+        9        9         PURPOSE:    To setup within the image formation buffers a portion of the program t
+                 9        o be formed.
+       10       10             DESCRIPTION:
+       11       11         VXU$SETUP is entered with 5 parameters. The first is a returned variable which
+       12       12        is a word pointer to the appropriate buffer where setup has occurred. The
+       13       13        second parameter is the buffer type. It may only acquire the values 0, 1, and 2
+       14       14        (For data, procedure, and read-only respectively). The fourth parameter is the
+       15       15        size in words which needs to be setup. This value has a range restriction. It
+       16       16        cay only acquire the values of 1 through @BUF_SIZE(CURRENTLY 1024). The last
+       17       17        paramater is an index into a section x(cross) node mapping vector. This
+       18       18        parameter has a restricted range of from 0 through VX_NODE_NUMBER (# of nodes
+       19       19        less 1). Indexing with this value into the run-time generated map yields a
+       20       20        pointer to a node in the tree in which the section was allocated. The second
+       21       21        through fifth parameters only pass values to VXT$FIMAGE. Only the first
+       22       22        parameter returns a pointer which locates the desired area.
+       23       23        The image formation buffers are first classified as to type; being data,
+       24       24        procedure or read-only. Each type employs a double buffering scheme to ensure
+       25       25        relocation/lay-in is properly handled at a page boundary. Given a type,
+       26       26        VXU$SETUP next inquires the pair of buffers as to whether either of them has the
+       27       27        appropriate page image for the node. If the first buffer has the request
+       28       28        resident, the extent is checked to see if the entire area is resident within
+       29       29        the buffer. If it is then the locator is computed and a return is made. If not,
+       30       30        then the second buffer is checked to see if it contains the "NEXT" page of the
+       31       31        node. If it does then the locator is computed and a return made. If the extent
+       32       32        is not presint in the second buffer then a swap-out/swap-in sequence is initiated.
+       33       33        If the first buffer does not contain the starting page then the second buffer is
+       34       34        checked to see if the starting page and extent reside fully within the buffer.
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:16   
+       35       35        If so, a return is made; else if the second buffer contains the starting page
+       36       36        but not the full extent then the second buffer is moved to the first (after
+       37       37        a swap-out of the first) and extention is performed in the second buffer.
+       38       38        If the second buffer contains neither the starting page nor the extention
+       39       39        then a swap-out/swap-in sequence is initiated.
+       40       40                                                                        */
+       41       41        VXU$SETUP:
+       42       42              PROC( INDEX$, BUFTYP, WHERE, SIZE, NODE_INX );
+
+     42  2 000000   000000 700200 xent  VXU$SETUP    TSX0  ! X66_AUTO_5
+         2 000001   000026 000005                    ZERO    22,5
+
+       43       43        %INCLUDE VX_INC_C;
+       44    10759        %VX$NODE;
+
+             10771    1   /*******************************************************************************
+             10772    1   *                                                                              *
+             10773    1   *                          VX$NODE                                                *
+             10774    1   *                                                                              *
+             10775    1   *******************************************************************************/
+
+             10791    1   DCL 1 VX$NODE      ALIGNED    BASED,
+             10792    1         2 SON$ PTR /*(ADDR(NIL))*/, /* Son pointer                      */
+             10793    1         2 BROTHER$ PTR /*(ADDR(NIL))*/, /* Brother pointer              */
+             10794    1         2 FATHER$ PTR /*(ADDR(NIL))*/, /* Father pointer                */
+             10795    1         2 PATH$ PTR /*(ADDR(NIL))*/, /* Path   pointer                  */
+             10796    1         2 HEAD$       PTR /*(ADDR(NIL))*/, /* Head pointer to
+             10797                              to list of file nodes for this node            */
+             10798    1         2 TAIL$ PTR /*(ADDR(NIL))*/, /* Tail pointer to list            */
+             10799    1         2 SHARED_LIB_HEAD$ PTR /*(ADDR(NIL))*/,
+             10799                  /* Head pointer to shared library list */
+             10800    1         2 LIB_HEAD$         PTR /*(ADDR(NIL))*/,
+             10800                  /* Head pointer to list of shared libraries
+             10801                                          which have been mapped to included libraries */
+             10802    1         2 NUM          UBIN(36)  UNAL,    /* Node number                        */
+             10803    1         2 DEPTH          UBIN(36)  UNAL,  /* Depth; ROOT=0*/
+             10804    1         2 ADDR_START_A(0:2/*@ROS*/) SBIN WORD /*(0*3)*/, /* Array            */
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:17   
+             10805    1         2 ADDR_START REDEF  ADDR_START_A,
+             10806    1           3 RDATA       SBIN WORD,   /* First address for this node in data     */
+             10807    1           3 RPROC       SBIN WORD,   /* First address for this node in proc     */
+             10808    1           3 ROS       SBIN WORD,          /* Last address for program in ros    */
+             10809    1         2 ADDR_STOP_A(0:2/*@ROS*/) SBIN WORD /*(-1*3)*/, /* Array            */
+             10810    1         2 ADDR_STOP  REDEF  ADDR_STOP_A,
+             10811    1           3 RDATA       SBIN WORD,        /* Last address for this node in data */
+             10812    1           3 RPROC       SBIN WORD,        /* Last address for this node in proc */
+             10813    1           3 ROS       SBIN WORD,          /* Last address for program in ros    */
+             10814    1         2 START_PAGE#_A(0:2/*@ROS*/) SBIN WORD /*(0*3)*/, /* Array           */
+             10815    1         2 START_PAGE# REDEF START_PAGE#_A,
+             10816    1           3 RDATA       SBIN WORD,   /* First page    for this node in data     */
+             10817    1           3 RPROC       SBIN WORD,   /* First page    for this node in proc     */
+             10818    1           3 ROS       SBIN WORD,          /* First page   for program in ros    */
+             10819    1         2 STOP_PAGE#_A(0:2/*@ROS*/) SBIN WORD /*(-1*3)*/, /* Array*/
+             10820    1         2 STOP_PAGE#  REDEF STOP_PAGE#_A,
+             10821    1           3 RDATA       SBIN WORD,   /* Last  page    for this node in data     */
+             10822    1           3 RPROC       SBIN WORD,   /* Last  page    for this node in proc     */
+             10823    1           3 ROS       SBIN WORD,          /* Last  page   for program in ros    */
+             10824    1         2 START_SC_ALL$ PTR /*(ADDR(NIL))*/,
+             10824                  /* Starting pointer for common sections for this node */
+             10825    1         2 STOP_SC_ALL$ PTR /*(ADDR(NIL))*/,
+             10825                  /* Stopping pointer for common sections for this node */
+             10826    1         2 L_START,
+             10827    1           3 SN$ PTR /*(ADDR(NIL))*/, /* Segment definition names        */
+             10828    1           3 DN$ PTR /*(ADDR(NIL))*/, /* Def names                       */
+             10829    1           3 RN$ PTR /*(ADDR(NIL))*/, /* Ref names                       */
+             10830    1           3 SC$ PTR /*(ADDR(NIL))*/, /* Sections                        */
+             10831    1           3 ED$ PTR /*(ADDR(NIL))*/, /* Entry defs*/
+             10832    1           3 ER$ PTR /*(ADDR(NIL))*/, /* Entry refs*/
+             10833    1           3 DD$ PTR /*(ADDR(NIL))*/, /* Data defs                       */
+             10834    1           3 DR$ PTR /*(ADDR(NIL))*/, /* Data refs                       */
+             10835    1           3 SD$ PTR /*(ADDR(NIL))*/, /* Seg defs                        */
+             10836    1           3 SR$ PTR /*(ADDR(NIL))*/, /* Seg refs                        */
+             10837    1         2 L_START_A$(0:9)     REDEF L_START PTR,
+             10838    1         2 L_STOP,
+             10839    1           3 SN$ PTR /*(ADDR(NIL))*/, /* Segment definition names        */
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:18   
+             10840    1           3 DN$ PTR /*(ADDR(NIL))*/, /* Def names                       */
+             10841    1           3 RN$ PTR /*(ADDR(NIL))*/, /* Ref names                       */
+             10842    1           3 SC$ PTR /*(ADDR(NIL))*/, /* Sections                        */
+             10843    1           3 ED$ PTR /*(ADDR(NIL))*/, /* Entry defs*/
+             10844    1           3 ER$ PTR /*(ADDR(NIL))*/, /* Entry refs*/
+             10845    1           3 DD$ PTR /*(ADDR(NIL))*/, /* Data defs                       */
+             10846    1           3 DR$ PTR /*(ADDR(NIL))*/, /* Data refs                       */
+             10847    1           3 SD$ PTR /*(ADDR(NIL))*/, /* Seg defs                        */
+             10848    1           3 SR$ PTR /*(ADDR(NIL))*/, /* Seg refs                        */
+             10849    1         2 L_STOP_A$(0:9) REDEF   L_STOP    PTR,
+             10850    1         2 L_SIZE,
+             10851    1           3 SN      UBIN /*(0)*/, /* Segment definition names           */
+             10852    1           3 DN      UBIN /*(0)*/, /* Def names                          */
+             10853    1           3 RN      UBIN /*(0)*/, /* Ref names                          */
+             10854    1           3 SC      UBIN /*(0)*/, /* Sections                           */
+             10855    1           3 ED      UBIN /*(0)*/, /* Entry defs*/
+             10856    1           3 ER      UBIN /*(0)*/, /* Entry refs*/
+             10857    1           3 DD      UBIN /*(0)*/, /* Data defs                          */
+             10858    1           3 DR      UBIN /*(0)*/, /* Data refs                          */
+             10859    1           3 SD      UBIN /*(0)*/, /* Seg defs                           */
+             10860    1           3 SR      UBIN /*(0)*/, /* Seg refs                           */
+             10861    1         2 L_SIZE_A(0:9)  REDEF   L_SIZE    UBIN,
+             10862    1         2 L_PREV_SIZE,
+             10863    1           3 SN      UBIN /*(0)*/, /* Segment definition names           */
+             10864    1           3 DN      UBIN /*(0)*/, /* Def names                          */
+             10865    1           3 RN      UBIN /*(0)*/, /* Ref names                          */
+             10866    1           3 SC      UBIN /*(0)*/, /* Sections                           */
+             10867    1           3 ED      UBIN /*(0)*/, /* Entry defs*/
+             10868    1           3 ER      UBIN /*(0)*/, /* Entry refs*/
+             10869    1           3 DD      UBIN /*(0)*/, /* Data defs                          */
+             10870    1           3 DR      UBIN /*(0)*/, /* Data refs                          */
+             10871    1           3 SD      UBIN /*(0)*/, /* Seg defs                           */
+             10872    1           3 SR      UBIN /*(0)*/, /* Seg refs                           */
+             10873    1         2 L_PREV_SIZE_A(0:9)  REDEF   L_PREV_SIZE    UBIN,
+             10874    1         2 BIT_MAP                ALIGNED,
+             10875    1           3 DATA                  ALIGNED,
+             10876    1             4 BITS(0:255)          BIT(1)    UNAL /*('0'B*256)*/,
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:19   
+             10877    1           3 RPROC                 ALIGNED,
+             10878    1             4 BITS(0:255)          BIT(1)    UNAL /*('0'B*256)*/,
+             10879    1           3 ROS                   ALIGNED,
+             10880    1             4 BITS(0:255)          BIT(1)    UNAL /*('0'B*256)*/,
+             10881    1         2 L_SC_START,
+             10882    1           3 SC_BLK_COM$ PTR /*(ADDR(NIL))*/, /* Blank common            */
+             10883    1           3 SC_ROOT_LBL_COM$ PTR /*(ADDR(NIL))*/, /* Root labelled common */
+             10884    1           3 SC_LBL_COM$ PTR /*(ADDR(NIL))*/, /* Labelled common         */
+             10885    1           3 SC_DCB$ PTR /*(ADDR(NIL))*/, /* Dcbs                        */
+             10886    1         2 L_SC_START_A$(0:3)  REDEF L_SC_START PTR,
+             10887    1         2 L_SC_STOP,
+             10888    1           3 SC_BLK_COM$ PTR /*(ADDR(NIL))*/, /* Blank common            */
+             10889    1           3 SC_ROOT_LBL_COM$ PTR /*(ADDR(NIL))*/, /* Root labelled common */
+             10890    1           3 SC_LBL_COM$ PTR /*(ADDR(NIL))*/, /* Labelled common         */
+             10891    1           3 SC_DCB$ PTR /*(ADDR(NIL))*/, /* Dcbs                        */
+             10892    1         2 L_SC_STOP_A$(0:3)   REDEF L_SC_STOP  PTR,
+             10893    1         2 PROMOTE_HEAD,
+             10894    1           3 BLK_COM$              PTR /*(ADDR(NIL))*/,
+             10895    1           3 LBL_COM$              PTR /*(ADDR(NIL))*/,
+             10896    1         2 PROMOTE_HEAD_A$(0:1) REDEF PROMOTE_HEAD     PTR,
+             10897    1         2 PROMOTE_TAIL,
+             10898    1           3 BLK_COM$              PTR /*(ADDR(NIL))*/,
+             10899    1           3 LBL_COM$              PTR /*(ADDR(NIL))*/,
+             10900    1         2 PROMOTE_TAIL_A$(0:1) REDEF PROMOTE_TAIL     PTR,
+             10901    1         2 HAVE_ASL          BIT(1)    UNAL /*('0'B)*/,
+             10902    1         2 ALL_BLK_COM          BIT(1)    UNAL /*('0'B)*/,
+             10903    1         2 USE_NODE          BIT(1)    UNAL /*('0'B)*/,
+             10904    1         2 *                 BIT(33)   UNAL /*('0'B)*/,
+             10905    1         2 BLANK_COMMON$     PTR       ALIGNED /*(ADDR(NIL))*/;
+
+       45    10909        %SET LISTMAC='1'B;
+       46    10910        %SET LISTEXP='1'B;
+       47    10911        %SET LISTSUB='1'B;
+       48    10912        %E;
+             10913        %LSET LISTDIR='0'B;
+
+             10920    1   /*******************************************************************************
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:20   
+             10921    1   *                                                                              *
+             10922    1   *                          ENTRY                                                 *
+             10923    1   *                                                                              *
+             10924    1   *******************************************************************************/
+
+       49    10928    1   DCL VXU$PAGEOUT          ENTRY(3);
+       50    10929    1   DCL VXU$PAGEIN           ENTRY(4);
+       51    10930        %ENTRIES;
+             10931    1   DCL VXE$ERROR       ENTRY(4);
+             10932    1   DCL VXE$ERR         ENTRY(3);
+             10933    1   DCL VXE$MERC        ENTRY;
+             10934    1   DCL VXE$ERRMSG      ENTRY(3);
+             10935    1   DCL VXR$READ        ENTRY( 3 );
+             10936    1   DCL VXW$WRITE       ENTRY( 3 );
+             10937    1   DCL VXW$WRITE_DO    ENTRY( 2 );
+             10938    1   DCL VXD$B2C         ENTRY( 5 );
+             10939    1   DCL VXD$C2B         ENTRY( 3 );
+             10940    1   DCL VXA$GET         ENTRY( 3 );
+             10941    1   DCL VXF$FREE        ENTRY( 3 );
+             10942    1   DCL VXQ$SORT        ENTRY( 7 );
+             10943    1   DCL VXY$YESNO       ENTRY( 1 );
+       52    10945        %IMAGE_BUFFERS( NAME=VX$IMAGE, STCLASS="BASED(VX_IMAGE$)");
+             10946    1   DCL 1 VX$IMAGE           ALIGNED        BASED(VX_IMAGE$),
+             10947    1         2 CPAGE#_A(0:1) SBIN WORD ALIGNED, /* Current page # in buffer # */
+             10948    1         2 CPAGE# REDEF CPAGE#_A,
+             10949    1           3 BUF0                  SBIN WORD ALIGNED,
+             10950    1           3 BUF1                  SBIN WORD ALIGNED,
+             10951    1         2 START_A$(0:1) PTR ALIGNED, /* Pointer to start of buffer #    */
+             10952    1         2 START$ REDEF START_A$,
+             10953    1           3 BUF0$                 PTR       ALIGNED,
+             10954    1           3 BUF1$                 PTR       ALIGNED,
+             10955    1         2 STOP_A$(0:1)           PTR       ALIGNED,
+             10956    1         2 STOP$  REDEF STOP_A$,           /* Pointer to end of buffer #         */
+             10957    1           3 BUF0$                 PTR       ALIGNED,
+             10958    1           3 BUF1$                 PTR       ALIGNED,
+             10959    1         2 NODE_A$(0:1) PTR ALIGNED, /* Pointer to node  of buffer #     */
+             10960    1         2 NODE$  REDEF NODE_A$,
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:21   
+             10961    1           3 BUF0$                 PTR       ALIGNED,
+             10962    1           3 BUF1$                 PTR       ALIGNED,
+             10963    1         2 BEGIN$                 PTR       ALIGNED,
+             10964    1         2 END$                   PTR       ALIGNED,
+             10965    1         2 SPAGE#                 UBIN(36)  ALIGNED,
+             10966    1         2 EPAGE#                 UBIN(36)  ALIGNED;
+       53    10968        %MOVE_TMPLT;
+             10969    1   DCL VX$TARGET_B           BIT( VX_TARGET_COUNT ) ALIGNED    BASED;
+             10970    1   DCL VX$SOURCE_B           BIT( VX_SOURCE_COUNT ) ALIGNED    BASED;
+             10971    1   DCL VX$TARGET_C         CHAR( VX_TARGET_COUNT ) ALIGNED BASED;
+             10972    1   DCL VX$SOURCE_C         CHAR( VX_SOURCE_COUNT ) ALIGNED BASED;
+       54    10974        %P;
+             10975        %LSET LISTDIR='0'B;
+
+             10982    1   /*******************************************************************************
+             10983    1   *                                                                              *
+             10984    1   *                          PARAMETERS                                             *
+             10985    1   *                                                                              *
+             10986    1   *******************************************************************************/
+
+       55    10990    1   DCL INDEX$               PTR  ALIGNED;
+       56    10991    1   DCL BUFTYP               UBIN(36)  ALIGNED;
+       57    10992    1   DCL WHERE                UBIN(36)  ALIGNED;
+       58    10993    1   DCL SIZE                 UBIN(36)  ALIGNED;
+       59    10994    1   DCL NODE_INX             UBIN(36)  ALIGNED;
+       60    10995        %PTR;
+             10996        %LSET LISTDIR='0'B;
+
+             11003    1   /*******************************************************************************
+             11004    1   *                                                                              *
+             11005    1   *                          PTR                                                 *
+             11006    1   *                                                                              *
+             11007    1   *******************************************************************************/
+
+       61    11011    1   DCL NODE$           PTR  ALIGNED   AUTO;
+       62    11012    1   DCL NODE# REDEF NODE$ UBIN ALIGNED;
+       63    11013        %VX$PTR$;
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:22   
+             11014    1   DCL VX$PTR$(0:0)         PTR  ALIGNED   BASED( VX_SC_X_NODE$ );
+             11015                                      /* Section allocated NODE# to node pointer map  */
+       64    11017        %U;
+             11018        %LSET LISTDIR='0'B;
+
+             11025    1   /*******************************************************************************
+             11026    1   *                                                                              *
+             11027    1   *                          UBIN                                                 *
+             11028    1   *                                                                              *
+             11029    1   *******************************************************************************/
+
+       65    11033    1   DCL SPAGE#               UBIN(36)  ALIGNED   AUTO;
+       66    11034    1   DCL EPAGE#               UBIN(36)  ALIGNED   AUTO;
+       67    11035    1   DCL IBUFNUM              UBIN(36)  ALIGNED   AUTO;
+       68    11036    1   DCL LAST_ADR             UBIN(36)  ALIGNED;
+       69    11037    1   DCL EXTENT               UBIN(36)  ALIGNED   AUTO;
+       70    11038    1   DCL START_ADDR           UBIN(36)  ALIGNED   AUTO;
+       71    11039    1   DCL STOP_ADDR            UBIN(36)  ALIGNED   AUTO;
+       72    11040        %PLIST;
+       73    11041        %SET LISTSUB='0'B;
+       74    11042        %EJECT;
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:23   
+       75    11043    1         EXTENT = SIZE - 1;
+
+  11043  2 000002   200006 470500                    LDP0    @SIZE,,AUTO
+         2 000003   000000 235100                    LDA     0,,PR0
+         2 000004   000001 135007                    SBLA    1,DL
+         2 000005   200015 755100                    STA     EXTENT,,AUTO
+
+       76    11044    1         LAST_ADR = WHERE + EXTENT;
+
+  11044  2 000006   200005 471500                    LDP1    @WHERE,,AUTO
+         2 000007   100000 236100                    LDQ     0,,PR1
+         2 000010   200015 036100                    ADLQ    EXTENT,,AUTO
+         2 000011   200014 756100                    STQ     LAST_ADR,,AUTO
+
+       77    11045    1         SPAGE# = WHERE/ @BUF_SIZE;        /* Compute starting page */
+
+  11045  2 000012   100000 236100                    LDQ     0,,PR1
+         2 000013   000012 772000                    QRL     10
+         2 000014   200011 756100                    STQ     SPAGE#,,AUTO
+
+       78    11046    1         EPAGE# =  LAST_ADR / @BUF_SIZE;   /* Compute ending page # */
+
+  11046  2 000015   200014 236100                    LDQ     LAST_ADR,,AUTO
+         2 000016   000012 772000                    QRL     10
+         2 000017   200012 756100                    STQ     EPAGE#,,AUTO
+
+       79    11047    1         VX_IMAGE$ = VX_IMAGE_PTR$(BUFTYP);
+             11047                  /* Get pointer to appropriate buffer variables */
+
+  11047  2 000020   200004 473500                    LDP3    @BUFTYP,,AUTO
+         2 000021   300000 720100                    LXL0    0,,PR3
+         2 000022   000000 236010 xsym               LDQ     VX_IMAGE_PTR$,X0
+         2 000023   000000 756000 xsym               STQ     VX_IMAGE$
+
+       80    11048    2         IF BUFTYP >= @DATA_SEGMENT THEN DO;
+
+  11048  2 000024   300000 235100                    LDA     0,,PR3
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:24   
+         2 000025   000003 115007                    CMPA    3,DL
+         2 000026   000037 602000 2                  TNC     s:11054
+
+       81    11049    2             NODE# = VX_SEGID ( BUFTYP - @DATA_SEGMENT );
+
+  11049  2 000027   300000 720100                    LXL0    0,,PR3
+         2 000030   777775 235010 xsym               LDA     VX_SEGID-3,X0
+         2 000031   200010 755100                    STA     NODE$,,AUTO
+
+       82    11050    2             START_ADDR = 0;
+
+  11050  2 000032   200016 450100                    STZ     START_ADDR,,AUTO
+
+       83    11051    2             STOP_ADDR  = VX_SEG_SIZE( BUFTYP - @DATA_SEGMENT );
+
+  11051  2 000033   300000 720100                    LXL0    0,,PR3
+         2 000034   777775 235010 xsym               LDA     VX_SEG_SIZE-3,X0
+         2 000035   200017 755100                    STA     STOP_ADDR,,AUTO
+
+       84    11052    2            END;
+
+  11052  2 000036   000052 710000 2                  TRA     s:11058
+
+       85    11053    2         ELSE DO;
+
+       86    11054    2            NODE$ = VX_SC_X_NODE$ -> VX$PTR$( NODE_INX ); /* Map to allocation node */
+
+  11054  2 000037   200007 474500                    LDP4    @NODE_INX,,AUTO
+         2 000040   400000 720100                    LXL0    0,,PR4
+         2 000041   000000 475400 xsym               LDP5    VX_SC_X_NODE$
+         2 000042   500000 236110                    LDQ     0,X0,PR5
+         2 000043   200010 756100                    STQ     NODE$,,AUTO
+
+       87    11055    2             START_ADDR = NODE$ -> VX$NODE.ADDR_START_A(BUFTYP);
+
+  11055  2 000044   300000 720100                    LXL0    0,,PR3
+         2 000045   200010 476500                    LDP6    NODE$,,AUTO
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:25   
+         2 000046   600012 235110                    LDA     10,X0,PR6
+         2 000047   200016 755100                    STA     START_ADDR,,AUTO
+
+       88    11056    2             STOP_ADDR  = NODE$ -> VX$NODE.ADDR_STOP_A(BUFTYP);
+
+  11056  2 000050   600015 235110                    LDA     13,X0,PR6
+         2 000051   200017 755100                    STA     STOP_ADDR,,AUTO
+
+       89    11057    2            END;
+
+       90    11058    2         IF WHERE < START_ADDR OR WHERE > STOP_ADDR THEN DO;
+
+  11058  2 000052   100000 236100                    LDQ     0,,PR1
+         2 000053   200016 116100                    CMPQ    START_ADDR,,AUTO
+         2 000054   000060 602000 2                  TNC     s:11072
+         2 000055   200017 116100                    CMPQ    STOP_ADDR,,AUTO
+         2 000056   000113 602000 2                  TNC     SET_BUF0
+         2 000057   000113 600000 2                  TZE     SET_BUF0
+
+       91    11059        /*E*  ERROR: VXU-E$INTERNAL_SETUP_BAD_ADDR_VX-0
+       92    11060              MESSAGE: Internal link error; VXU$SETUP called with bad address
+       93    11061                       range: %U1 - %U2.
+       94    11062              DESCRIPTION: Self-explanatory.
+       95    11063        */
+       96    11064                  %NUMBER(
+       97    11065                  NUM1= WHERE, SIZE1=6, BASE1=8,
+       98    11066                  NUM2=LAST_ADR, SIZE2=6, BASE2=8);
+
+  11072  2 000060   000000 236000 3                  LDQ     0
+         2 000061   200024 756100                    STQ     STOP_ADDR+5,,AUTO
+         2 000062   200005 236100                    LDQ     @WHERE,,AUTO
+         2 000063   000001 235000 3                  LDA     1
+         2 000064   200022 757100                    STAQ    STOP_ADDR+3,,AUTO
+         2 000065   000002 237000 3                  LDAQ    2
+         2 000066   200020 757100                    STAQ    STOP_ADDR+1,,AUTO
+         2 000067   200020 630500                    EPPR0   STOP_ADDR+1,,AUTO
+         2 000070   000023 631400 xsym               EPPR1   B_VECTNIL+19
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:26   
+         2 000071   000000 701000 xent               TSX1    VXD$B2C
+         2 000072   000000 011000                    NOP     0
+
+  11076  2 000073   000000 236000 3                  LDQ     0
+         2 000074   200024 756100                    STQ     STOP_ADDR+5,,AUTO
+         2 000075   200014 630500                    EPPR0   LAST_ADR,,AUTO
+         2 000076   200023 450500                    STP0    STOP_ADDR+4,,AUTO
+         2 000077   000005 236000 3                  LDQ     5
+         2 000100   200022 756100                    STQ     STOP_ADDR+3,,AUTO
+         2 000101   000006 237000 3                  LDAQ    6
+         2 000102   200020 757100                    STAQ    STOP_ADDR+1,,AUTO
+         2 000103   200020 630500                    EPPR0   STOP_ADDR+1,,AUTO
+         2 000104   000023 631400 xsym               EPPR1   B_VECTNIL+19
+         2 000105   000000 701000 xent               TSX1    VXD$B2C
+         2 000106   000000 011000                    NOP     0
+
+       99    11083                  %SCREAM(
+      100    11084                  ERR#=E$INTERNAL_SETUP_BAD_ADDR_VX,
+      101    11085                  LEVEL=@E$F_VX,
+      102    11086                  MID="'U'",
+      103    11087                  AUX=@E$OUOF_VX);
+
+  11088  2 000107   000012 630400 3                  EPPR0   10
+         2 000110   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         2 000111   000000 701000 xent               TSX1    VXE$ERROR
+         2 000112   000000 011000                    NOP     0
+
+      104    11090    2            END;
+
+  11088  2 000113                       SET_BUF0     null
+      105    11091    1   SET_BUF0:;
+      106    11092    1         IBUFNUM = 0;
+
+  11092  2 000113   200013 450100                    STZ     IBUFNUM,,AUTO
+
+      107    11093    1   CHECK_BUF0:
+      108    11094        /* Check if starting page is in buffer # 0 */
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:27   
+      109    11095    1         IF VX$IMAGE.NODE$.BUF0$ ~= NODE$ OR VX$IMAGE.CPAGE#.BUF0 ~= SPAGE# THEN GOTO
+             11095                  CHECK_BUF1;
+
+  11095  2 000114   000000 470400 xsym  CHECK_BUF0   LDP0    VX_IMAGE$
+         2 000115   000006 236100                    LDQ     6,,PR0
+         2 000116   200010 116100                    CMPQ    NODE$,,AUTO
+         2 000117   000157 601000 2                  TNZ     CHECK_BUF1
+         2 000120   000000 236100                    LDQ     0,,PR0
+         2 000121   000157 604000 2                  TMI     CHECK_BUF1
+         2 000122   200011 116100                    CMPQ    SPAGE#,,AUTO
+         2 000123   000157 601000 2                  TNZ     CHECK_BUF1
+
+      110    11096    1   CHECK_EXTENT:
+      111    11097        /* Yeap; check if entire area resides in the buffer */
+      112    11098    1         IF SPAGE# = EPAGE# THEN GOTO ALL_SETUP;
+
+  11098  2 000124   200011 236100       CHECK_EXTENT LDQ     SPAGE#,,AUTO
+         2 000125   200012 116100                    CMPQ    EPAGE#,,AUTO
+         2 000126   000137 600000 2                  TZE     ALL_SETUP
+
+      113    11099        /* Nope, check if extension is in the second buffer */
+      114    11100    1         IF VX$IMAGE.NODE$.BUF1$ ~= NODE$ OR VX$IMAGE.CPAGE#.BUF1 ~= EPAGE# THEN GOTO
+             11100                  EXTEND_BUF1;
+
+  11100  2 000127   000000 470400 xsym               LDP0    VX_IMAGE$
+         2 000130   000007 236100                    LDQ     7,,PR0
+         2 000131   200010 116100                    CMPQ    NODE$,,AUTO
+         2 000132   000263 601000 2                  TNZ     EXTEND_BUF1
+         2 000133   000001 236100                    LDQ     1,,PR0
+         2 000134   000263 604000 2                  TMI     EXTEND_BUF1
+         2 000135   200012 116100                    CMPQ    EPAGE#,,AUTO
+         2 000136   000263 601000 2                  TNZ     EXTEND_BUF1
+
+  11100  2 000137                       ALL_SETUP    null
+      115    11101        /* => both buffers are valid */
+      116    11102    1   ALL_SETUP:;
+      117    11103    1         VX$IMAGE.NODE_A$(IBUFNUM) = NODE$;
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:28   
+
+  11103  2 000137   200010 236100                    LDQ     NODE$,,AUTO
+         2 000140   000000 470400 xsym               LDP0    VX_IMAGE$
+         2 000141   200013 720100                    LXL0    IBUFNUM,,AUTO
+         2 000142   000006 756110                    STQ     6,X0,PR0
+
+      118    11104        /* Set current PAGE#                     */
+      119    11105    1         VX$IMAGE.CPAGE#_A(IBUFNUM) = SPAGE#;
+
+  11105  2 000143   200011 235100                    LDA     SPAGE#,,AUTO
+         2 000144   000000 470400 xsym               LDP0    VX_IMAGE$
+         2 000145   000000 755110                    STA     0,X0,PR0
+
+      120    11106        /* Compute ptr to return                 */
+      121    11107    1         INDEX$ = PINCRW( VX$IMAGE.START_A$(IBUFNUM),
+
+  11107  2 000146   200005 470500                    LDP0    @WHERE,,AUTO
+         2 000147   000000 236100                    LDQ     0,,PR0
+         2 000150   001777 376007                    ANQ     1023,DL
+         2 000151   000000 471400 xsym               LDP1    VX_IMAGE$
+         2 000152   100002 473510                    LDP3    2,X0,PR1
+         2 000153   300000 634506                    EPPR4   0,QL,PR3
+         2 000154   200003 475500                    LDP5    @INDEX$,,AUTO
+         2 000155   500000 454500                    STP4    0,,PR5
+
+      122    11108    1                 MOD( WHERE, @BUF_SIZE  )    );
+      123    11109    1         RETURN;
+
+  11109  2 000156   000000 702200 xent               TSX2  ! X66_ARET
+
+  11107  2 000157                       CHECK_BUF1   null
+      124    11110    1   CHECK_BUF1:;
+      125    11111        /* First buffer does not contain starting page; check if second contains
+      126    11112           entire area */
+      127    11113    1         IBUFNUM = 1;
+
+  11113  2 000157   000001 235007                    LDA     1,DL
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:29   
+         2 000160   200013 755100                    STA     IBUFNUM,,AUTO
+
+      128    11114    1         IF VX$IMAGE.NODE$.BUF1$ ~= NODE$ OR VX$IMAGE.CPAGE#.BUF1 ~= SPAGE# THEN GOTO
+             11114                  NEITHER;
+
+  11114  2 000161   000007 236100                    LDQ     7,,PR0
+         2 000162   200010 116100                    CMPQ    NODE$,,AUTO
+         2 000163   000232 601000 2                  TNZ     NEITHER
+         2 000164   000001 236100                    LDQ     1,,PR0
+         2 000165   000232 604000 2                  TMI     NEITHER
+         2 000166   200011 116100                    CMPQ    SPAGE#,,AUTO
+         2 000167   000232 601000 2                  TNZ     NEITHER
+
+      129    11115        /* Second contains starting page; now check if the entire area
+      130    11116           resides within the second buffer                */
+      131    11117    1         IF SPAGE# = EPAGE# THEN GOTO ALL_SETUP;
+
+  11117  2 000170   200011 236100                    LDQ     SPAGE#,,AUTO
+         2 000171   200012 116100                    CMPQ    EPAGE#,,AUTO
+         2 000172   000137 600000 2                  TZE     ALL_SETUP
+
+      132    11118        /* Nope; swap out the first    */
+      133    11119    1         IF VX$IMAGE.CPAGE#.BUF1 >= 0 THEN
+
+  11119  2 000173   000001 235100                    LDA     1,,PR0
+         2 000174   000207 604000 2                  TMI     s:11122
+
+      134    11120    1             CALL VXU$PAGEOUT( NODE$, BUFTYP, 0 );
+
+  11120  2 000175   000003 236000 3                  LDQ     3
+         2 000176   200022 756100                    STQ     STOP_ADDR+3,,AUTO
+         2 000177   200004 236100                    LDQ     @BUFTYP,,AUTO
+         2 000200   200021 756100                    STQ     STOP_ADDR+2,,AUTO
+         2 000201   200010 631500                    EPPR1   NODE$,,AUTO
+         2 000202   200020 451500                    STP1    STOP_ADDR+1,,AUTO
+         2 000203   200020 630500                    EPPR0   STOP_ADDR+1,,AUTO
+         2 000204   000021 631400 xsym               EPPR1   B_VECTNIL+17
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:30   
+         2 000205   000000 701000 xent               TSX1    VXU$PAGEOUT
+         2 000206   000000 011000                    NOP     0
+
+      135    11121        /* Move second buffer into the first */
+      136    11122    1         VX_TARGET_COUNT =   @BUF_SIZE * @CHAR_WORD ;
+
+  11122  2 000207   010000 235007                    LDA     4096,DL
+         2 000210   000000 755000 xsym               STA     VX_TARGET_COUNT
+
+      137    11123    1         VX_SOURCE_COUNT =   VX_TARGET_COUNT;
+
+  11123  2 000211   000000 755000 xsym               STA     VX_SOURCE_COUNT
+
+      138    11124    1         VX$IMAGE.START$.BUF0$ -> VX$TARGET_C
+
+  11124  2 000212   000000 470400 xsym               LDP0    VX_IMAGE$
+         2 000213   000002 471500                    LDP1    2,,PR0
+         2 000214   000003 473500                    LDP3    3,,PR0
+         2 000215   000000 620005                    EAX0    0,AL
+         2 000216   000000 721000 xsym               LXL1    VX_TARGET_COUNT
+         2 000217   040140 100540                    MLR     fill='040'O
+         2 000220   300000 000010                    ADSC9   0,,PR3                   cn=0,n=*X0
+         2 000221   100000 000011                    ADSC9   0,,PR1                   cn=0,n=*X1
+
+      139    11125    1                 =
+      140    11126    1                 VX$IMAGE.START$.BUF1$ -> VX$SOURCE_C;
+      141    11127        /* Set 1ST buffer as current */
+      142    11128    1         IBUFNUM = 0;
+
+  11128  2 000222   200013 450100                    STZ     IBUFNUM,,AUTO
+
+      143    11129    1         VX$IMAGE.CPAGE#.BUF0     =    VX$IMAGE.CPAGE#.BUF1;
+
+  11129  2 000223   000000 470400 xsym               LDP0    VX_IMAGE$
+         2 000224   000001 235100                    LDA     1,,PR0
+         2 000225   000000 755100                    STA     0,,PR0
+
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:31   
+      144    11130    1         VX$IMAGE.NODE$.BUF0$     =    VX$IMAGE.NODE$.BUF1$;
+
+  11130  2 000226   000000 470400 xsym               LDP0    VX_IMAGE$
+         2 000227   000007 236100                    LDQ     7,,PR0
+         2 000230   000006 756100                    STQ     6,,PR0
+
+      145    11131    1         GOTO CHECK_EXTENT;
+
+  11131  2 000231   000124 710000 2                  TRA     CHECK_EXTENT
+
+      146    11132    1   NEITHER:
+      147    11133        /* Neither buffer has desired page */
+      148    11134        /* Page out the first buffer */
+      149    11135    1         IF VX$IMAGE.CPAGE#.BUF0 >= 0 THEN
+
+  11135  2 000232   000000 235100       NEITHER      LDA     0,,PR0
+         2 000233   000246 604000 2                  TMI     s:11138
+
+      150    11136    1             CALL VXU$PAGEOUT( NODE$, BUFTYP, 0 );
+
+  11136  2 000234   000003 236000 3                  LDQ     3
+         2 000235   200022 756100                    STQ     STOP_ADDR+3,,AUTO
+         2 000236   200004 236100                    LDQ     @BUFTYP,,AUTO
+         2 000237   200021 756100                    STQ     STOP_ADDR+2,,AUTO
+         2 000240   200010 631500                    EPPR1   NODE$,,AUTO
+         2 000241   200020 451500                    STP1    STOP_ADDR+1,,AUTO
+         2 000242   200020 630500                    EPPR0   STOP_ADDR+1,,AUTO
+         2 000243   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         2 000244   000000 701000 xent               TSX1    VXU$PAGEOUT
+         2 000245   000000 011000                    NOP     0
+
+      151    11137        /* And page in the desired first buffer */
+      152    11138    1         CALL VXU$PAGEIN( NODE$, BUFTYP, 0, SPAGE# );
+
+  11138  2 000246   200011 630500                    EPPR0   SPAGE#,,AUTO
+         2 000247   200023 450500                    STP0    STOP_ADDR+4,,AUTO
+         2 000250   000003 236000 3                  LDQ     3
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:32   
+         2 000251   200022 756100                    STQ     STOP_ADDR+3,,AUTO
+         2 000252   200004 236100                    LDQ     @BUFTYP,,AUTO
+         2 000253   200021 756100                    STQ     STOP_ADDR+2,,AUTO
+         2 000254   200010 631500                    EPPR1   NODE$,,AUTO
+         2 000255   200020 451500                    STP1    STOP_ADDR+1,,AUTO
+         2 000256   200020 630500                    EPPR0   STOP_ADDR+1,,AUTO
+         2 000257   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         2 000260   000000 701000 xent               TSX1    VXU$PAGEIN
+         2 000261   000000 011000                    NOP     0
+
+      153    11139        /* And check extention */
+      154    11140    1         GOTO SET_BUF0;
+
+  11140  2 000262   000113 710000 2                  TRA     SET_BUF0
+
+  11135  2 000263                       EXTEND_BUF1  null
+      155    11141    1   EXTEND_BUF1:;
+      156    11142        /* Extention needed for buf 0; buf 1 needs to be swapped */
+      157    11143    1         IF VX$IMAGE.CPAGE#.BUF1 >= 0 THEN
+
+  11143  2 000263   000001 235100                    LDA     1,,PR0
+         2 000264   000277 604000 2                  TMI     s:11146
+
+      158    11144    1             CALL VXU$PAGEOUT( NODE$, BUFTYP, 1 );
+
+  11144  2 000265   000016 236000 3                  LDQ     14
+         2 000266   200022 756100                    STQ     STOP_ADDR+3,,AUTO
+         2 000267   200004 236100                    LDQ     @BUFTYP,,AUTO
+         2 000270   200021 756100                    STQ     STOP_ADDR+2,,AUTO
+         2 000271   200010 631500                    EPPR1   NODE$,,AUTO
+         2 000272   200020 451500                    STP1    STOP_ADDR+1,,AUTO
+         2 000273   200020 630500                    EPPR0   STOP_ADDR+1,,AUTO
+         2 000274   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         2 000275   000000 701000 xent               TSX1    VXU$PAGEOUT
+         2 000276   000000 011000                    NOP     0
+
+      159    11145        /* Now page in the extention */
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:33   
+      160    11146    1         CALL VXU$PAGEIN( NODE$, BUFTYP, 1, EPAGE# );
+
+  11146  2 000277   200012 630500                    EPPR0   EPAGE#,,AUTO
+         2 000300   200023 450500                    STP0    STOP_ADDR+4,,AUTO
+         2 000301   000016 236000 3                  LDQ     14
+         2 000302   200022 756100                    STQ     STOP_ADDR+3,,AUTO
+         2 000303   200004 236100                    LDQ     @BUFTYP,,AUTO
+         2 000304   200021 756100                    STQ     STOP_ADDR+2,,AUTO
+         2 000305   200010 631500                    EPPR1   NODE$,,AUTO
+         2 000306   200020 451500                    STP1    STOP_ADDR+1,,AUTO
+         2 000307   200020 630500                    EPPR0   STOP_ADDR+1,,AUTO
+         2 000310   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         2 000311   000000 701000 xent               TSX1    VXU$PAGEIN
+         2 000312   000000 011000                    NOP     0
+
+      161    11147    1         IBUFNUM = 0;
+
+  11147  2 000313   200013 450100                    STZ     IBUFNUM,,AUTO
+
+      162    11148    1         GOTO ALL_SETUP;
+
+  11148  2 000314   000137 710000 2                  TRA     ALL_SETUP
+      163    11149    1   END VXU$SETUP;
+
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:34   
+--  Include file information  --
+
+   F_DCB_D.:E05TOU  is referenced.
+   VX_DCB_R.:E05TOU  cannot be made into a system file and is referenced.
+   VX_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   VX_FIXED_R.:E05TOU  cannot be made into a system file and is referenced.
+   XU_MACRO_C.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   VX_MACRO_C.:E05TOU  is referenced.
+   VX_PERR_C.:E05TOU  is referenced.
+   VX_SUBS_C.:E05TOU  is referenced.
+   VX_SWITCH_C.:E05TOU  is referenced.
+   B$OBJECT_C.:E05TOU  is referenced.
+   VX_INC_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure VXU$SETUP.
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:35   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @BUFTYP                    3-0-0/w PTR         r     1 @INDEX$
+     7-0-0/w PTR         r     1 @NODE_INX                  6-0-0/w PTR         r     1 @SIZE
+     5-0-0/w PTR         r     1 @WHERE                    *0-0-0/w UBIN        r     1 BUFTYP
+    12-0-0/w UBIN        r     1 EPAGE#                    15-0-0/w UBIN        r     1 EXTENT
+    13-0-0/w UBIN        r     1 IBUFNUM                   *0-0-0/w PTR         r     1 INDEX$
+    14-0-0/w UBIN        r     1 LAST_ADR                  10-0-0/w UBIN        r     1 NODE#
+    10-0-0/w PTR         r     1 NODE$                     *0-0-0/w UBIN        r     1 NODE_INX
+    *0-0-0/w UBIN        r     1 SIZE                      11-0-0/w UBIN        r     1 SPAGE#
+    16-0-0/w UBIN        r     1 START_ADDR                17-0-0/w UBIN        r     1 STOP_ADDR
+    *0-0-0/w UBIN        r     1 WHERE
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(720)   r     1 VX_EFIELD1                 0-0-0/w STRC(720)   r     1 VX_EFIELD2
+     0-0-0/w PTR         r     1 VX_IMAGE$
+     0-0-0/w PTR         r     1 VX_IMAGE_PTR$(0:8)
+     0-0-0/w PTR         r     1 VX_SC_X_NODE$
+     0-0-0/w UBIN        r     1 VX_SEGID(0:5)
+     0-0-0/w SBIN        r     1 VX_SEG_SIZE(0:5)
+     0-0-0/w UBIN        r     1 VX_SOURCE_COUNT            0-0-0/w UBIN        r     1 VX_TARGET_COUNT
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(432)   r     1 VX$IMAGE                   0-0-0/w STRC(3672)  r     1 VX$NODE
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:36   
+     0-0-0/w PTR         r     1 VX$PTR$(0:0)
+     0-0-0/w ACHR        r     1 VX$SOURCE_C                0-0-0/w ACHR        r     1 VX$TARGET_C
+
+
+   Procedure VXU$SETUP requires 205 words for executable code.
+   Procedure VXU$SETUP requires 22 words of local(AUTO) storage.
+
+    No errors detected in file VXU$SETUP.:E05TSI    .
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:37   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:38   
+          MINI XREF LISTING
+
+ALL_SETUP
+     11100**LABEL   11098--GOTO    11117--GOTO    11148--GOTO
+BUFTYP
+     10991**DCL        41--PROC    11047>>ASSIGN  11048>>IF      11049>>ASSIGN  11051>>ASSIGN  11055>>ASSIGN
+     11056>>ASSIGN  11120<>CALL    11136<>CALL    11138<>CALL    11144<>CALL    11146<>CALL
+CHECK_BUF1
+     11107**LABEL   11095--GOTO
+CHECK_EXTENT
+     11098**LABEL   11131--GOTO
+EPAGE#
+     11034**DCL     11046<<ASSIGN  11098>>IF      11100>>IF      11117>>IF      11146<>CALL
+EXTEND_BUF1
+     11135**LABEL   11100--GOTO
+EXTENT
+     11037**DCL     11043<<ASSIGN  11044>>ASSIGN
+IBUFNUM
+     11035**DCL     11092<<ASSIGN  11103>>ASSIGN  11105>>ASSIGN  11107>>ASSIGN  11113<<ASSIGN  11128<<ASSIGN
+     11147<<ASSIGN
+INDEX$
+     10990**DCL        41--PROC    11107<<ASSIGN
+LAST_ADR
+     11036**DCL     11044<<ASSIGN  11046>>ASSIGN  11076<>CALL
+NEITHER
+     11135**LABEL   11114--GOTO
+NODE#
+     11012**DCL     11049<<ASSIGN
+NODE$
+     11011**DCL     11012--REDEF   11054<<ASSIGN  11055>>ASSIGN  11056>>ASSIGN  11095>>IF      11100>>IF
+     11103>>ASSIGN  11114>>IF      11120<>CALL    11136<>CALL    11138<>CALL    11144<>CALL    11146<>CALL
+NODE_INX
+     10994**DCL        41--PROC    11054>>ASSIGN
+SET_BUF0
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:39   
+     11088**LABEL   11140--GOTO
+SIZE
+     10993**DCL        41--PROC    11043>>ASSIGN
+SPAGE#
+     11033**DCL     11045<<ASSIGN  11095>>IF      11098>>IF      11105>>ASSIGN  11114>>IF      11117>>IF
+     11138<>CALL
+START_ADDR
+     11038**DCL     11050<<ASSIGN  11055<<ASSIGN  11058>>IF
+STOP_ADDR
+     11039**DCL     11051<<ASSIGN  11056<<ASSIGN  11058>>IF
+VX$IMAGE.CPAGE#.BUF0
+     10949**DCL     11095>>IF      11129<<ASSIGN  11135>>IF
+VX$IMAGE.CPAGE#.BUF1
+     10950**DCL     11100>>IF      11114>>IF      11119>>IF      11129>>ASSIGN  11143>>IF
+VX$IMAGE.CPAGE#_A
+     10947**DCL     10948--REDEF   11105<<ASSIGN
+VX$IMAGE.NODE$.BUF0$
+     10961**DCL     11095>>IF      11130<<ASSIGN
+VX$IMAGE.NODE$.BUF1$
+     10962**DCL     11100>>IF      11114>>IF      11130>>ASSIGN
+VX$IMAGE.NODE_A$
+     10959**DCL     10960--REDEF   11103<<ASSIGN
+VX$IMAGE.START$.BUF0$
+     10953**DCL     11124>>ASSIGN
+VX$IMAGE.START$.BUF1$
+     10954**DCL     11124>>ASSIGN
+VX$IMAGE.START_A$
+     10951**DCL     10952--REDEF   11107>>ASSIGN
+VX$IMAGE.STOP_A$
+     10955**DCL     10956--REDEF
+VX$NODE.ADDR_START_A
+     10804**DCL     10805--REDEF   11055>>ASSIGN
+VX$NODE.ADDR_STOP_A
+     10809**DCL     10810--REDEF   11056>>ASSIGN
+VX$NODE.L_PREV_SIZE
+     10862**DCL     10873--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:40   
+VX$NODE.L_SC_START
+     10881**DCL     10886--REDEF
+VX$NODE.L_SC_STOP
+     10887**DCL     10892--REDEF
+VX$NODE.L_SIZE
+     10850**DCL     10861--REDEF
+VX$NODE.L_START
+     10826**DCL     10837--REDEF
+VX$NODE.L_STOP
+     10838**DCL     10849--REDEF
+VX$NODE.PROMOTE_HEAD
+     10893**DCL     10896--REDEF
+VX$NODE.PROMOTE_TAIL
+     10897**DCL     10900--REDEF
+VX$NODE.START_PAGE#_A
+     10814**DCL     10815--REDEF
+VX$NODE.STOP_PAGE#_A
+     10819**DCL     10820--REDEF
+VX$PTR$
+     11014**DCL     11054>>ASSIGN
+VX$SOURCE_C
+     10972**DCL     11124>>ASSIGN
+VX$TARGET_C
+     10971**DCL     11124<<ASSIGN
+VXD$B2C
+     10938**DCL-ENT 11072--CALL    11076--CALL
+VXE$ERROR
+     10931**DCL-ENT 11088--CALL
+VXU$PAGEIN
+     10929**DCL-ENT 11138--CALL    11146--CALL
+VXU$PAGEOUT
+     10928**DCL-ENT 11120--CALL    11136--CALL    11144--CALL
+VX_BIAS.A
+      9609**DCL      9610--REDEF
+VX_CBUF.CHARS_A
+      9543**DCL      9544--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:41   
+VX_CONST_DCB.ACTPOS
+     10725**DCL     10725--REDEF
+VX_CONST_DCB.ARS#
+     10684**DCL     10684--REDEF
+VX_CONST_DCB.ATTR#
+     10714**DCL     10714--REDEF   10716--REDEF
+VX_CONST_DCB.BORROW
+     10736**DCL     10736--REDEF   10736--REDEF   10736--REDEF
+VX_CONST_DCB.EOMCHAR#
+     10691**DCL     10692--REDEF
+VX_CONST_DCB.FLDID
+     10728**DCL     10729--REDEF
+VX_CONST_DCB.FORM$
+     10720**DCL     10720--REDEF
+VX_CONST_DCB.FSECT
+     10743**DCL     10743--REDEF
+VX_CONST_DCB.FSN#
+     10710**DCL     10710--REDEF   10710--REDEF   10711--REDEF
+VX_CONST_DCB.HEADER$
+     10719**DCL     10720--REDEF
+VX_CONST_DCB.IXTNSIZE#
+     10716**DCL     10717--REDEF
+VX_CONST_DCB.LASTSTA$
+     10700**DCL     10700--REDEF
+VX_CONST_DCB.LVL
+     10737**DCL     10737--REDEF
+VX_CONST_DCB.NAME#.C
+     10700**DCL     10701--REDEF
+VX_CONST_DCB.NOEOF
+     10732**DCL     10732--REDEF
+VX_CONST_DCB.NRECS#
+     10717**DCL     10717--REDEF
+VX_CONST_DCB.NRECX
+     10744**DCL     10744--REDEF
+VX_CONST_DCB.OHDR
+     10733**DCL     10733--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:42   
+VX_CONST_DCB.ORG#
+     10708**DCL     10709--REDEF
+VX_CONST_DCB.PRECNO
+     10741**DCL     10741--REDEF
+VX_CONST_DCB.RCSZ
+     10749**DCL     10749--REDEF
+VX_CONST_DCB.RES#
+     10702**DCL     10702--REDEF
+VX_CONST_DCB.SETX
+     10721**DCL     10721--REDEF
+VX_CONST_DCB.TAB$
+     10720**DCL     10720--REDEF
+VX_CONST_DCB.TDA
+     10740**DCL     10741--REDEF
+VX_CONST_DCB.WSN#
+     10702**DCL     10703--REDEF
+VX_EBUF.CHARS_A
+     10132**DCL     10133--REDEF
+VX_EFIELD1.CHARS
+     10141**DCL     10142--REDEF
+VX_EFIELD1.CHARS_A
+     10142**DCL     11072<>CALL
+VX_EFIELD2.CHARS
+     10145**DCL     10146--REDEF
+VX_EFIELD2.CHARS_A
+     10146**DCL     11076<>CALL
+VX_EFIELD3.CHARS
+     10149**DCL     10150--REDEF
+VX_EI_KEY_BUF.KEY
+     10525**DCL     10526--REDEF
+VX_ERRORS
+      9586**DCL      9597--REDEF
+VX_ERRORS.CONFLICT_A
+      9592**DCL      9593--REDEF
+VX_ERRORS.UNSAT_A
+      9588**DCL      9589--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:43   
+VX_IMAGE$
+     10154**DCL     10946--IMP-PTR 11047<<ASSIGN  11095>>IF      11095>>IF      11100>>IF      11100>>IF
+     11103>>ASSIGN  11105>>ASSIGN  11107>>ASSIGN  11114>>IF      11114>>IF      11119>>IF      11124>>ASSIGN
+     11124>>ASSIGN  11129>>ASSIGN  11129>>ASSIGN  11130>>ASSIGN  11130>>ASSIGN  11135>>IF      11143>>IF
+VX_IMAGE_DATA.CPAGE#_A
+      8723**DCL      8724--REDEF
+VX_IMAGE_DATA.NODE_A$
+      8735**DCL      8736--REDEF
+VX_IMAGE_DATA.START_A$
+      8727**DCL      8728--REDEF
+VX_IMAGE_DATA.STOP_A$
+      8731**DCL      8732--REDEF
+VX_IMAGE_DS3.CPAGE#_A
+      8792**DCL      8793--REDEF
+VX_IMAGE_DS3.NODE_A$
+      8804**DCL      8805--REDEF
+VX_IMAGE_DS3.START_A$
+      8796**DCL      8797--REDEF
+VX_IMAGE_DS3.STOP_A$
+      8800**DCL      8801--REDEF
+VX_IMAGE_DS4.CPAGE#_A
+      8815**DCL      8816--REDEF
+VX_IMAGE_DS4.NODE_A$
+      8827**DCL      8828--REDEF
+VX_IMAGE_DS4.START_A$
+      8819**DCL      8820--REDEF
+VX_IMAGE_DS4.STOP_A$
+      8823**DCL      8824--REDEF
+VX_IMAGE_DS5.CPAGE#_A
+      8838**DCL      8839--REDEF
+VX_IMAGE_DS5.NODE_A$
+      8850**DCL      8851--REDEF
+VX_IMAGE_DS5.START_A$
+      8842**DCL      8843--REDEF
+VX_IMAGE_DS5.STOP_A$
+      8846**DCL      8847--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:44   
+VX_IMAGE_DS6.CPAGE#_A
+      8861**DCL      8862--REDEF
+VX_IMAGE_DS6.NODE_A$
+      8873**DCL      8874--REDEF
+VX_IMAGE_DS6.START_A$
+      8865**DCL      8866--REDEF
+VX_IMAGE_DS6.STOP_A$
+      8869**DCL      8870--REDEF
+VX_IMAGE_DS7.CPAGE#_A
+      8884**DCL      8885--REDEF
+VX_IMAGE_DS7.NODE_A$
+      8896**DCL      8897--REDEF
+VX_IMAGE_DS7.START_A$
+      8888**DCL      8889--REDEF
+VX_IMAGE_DS7.STOP_A$
+      8892**DCL      8893--REDEF
+VX_IMAGE_DS8.CPAGE#_A
+      8907**DCL      8908--REDEF
+VX_IMAGE_DS8.NODE_A$
+      8919**DCL      8920--REDEF
+VX_IMAGE_DS8.START_A$
+      8911**DCL      8912--REDEF
+VX_IMAGE_DS8.STOP_A$
+      8915**DCL      8916--REDEF
+VX_IMAGE_PROC.CPAGE#_A
+      8746**DCL      8747--REDEF
+VX_IMAGE_PROC.NODE_A$
+      8758**DCL      8759--REDEF
+VX_IMAGE_PROC.START_A$
+      8750**DCL      8751--REDEF
+VX_IMAGE_PROC.STOP_A$
+      8754**DCL      8755--REDEF
+VX_IMAGE_PTR$
+      8929**DCL     11047>>ASSIGN
+VX_IMAGE_ROS.CPAGE#_A
+      8769**DCL      8770--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:45   
+VX_IMAGE_ROS.NODE_A$
+      8781**DCL      8782--REDEF
+VX_IMAGE_ROS.START_A$
+      8773**DCL      8774--REDEF
+VX_IMAGE_ROS.STOP_A$
+      8777**DCL      8778--REDEF
+VX_M_VECTOR.F
+      8574**DCL      8578--REDEF
+VX_M_VECTOR_DP.F
+      8609**DCL      8613--REDEF
+VX_O.ACCTN_A$
+      9738**DCL      9739--REDEF
+VX_O.DCB_MATCH_A$
+      9747**DCL      9748--REDEF
+VX_O.DCB_MATCH_HIT_A
+      9753**DCL      9754--REDEF
+VX_O.FIDN_A$
+      9732**DCL      9733--REDEF
+VX_O.FID_A$
+      9724**DCL      9725--REDEF
+VX_O.INCLUDE_A$
+      9744**DCL      9745--REDEF
+VX_O.MAP_A
+      9718**DCL      9719--REDEF
+VX_O.NODCB_A
+      9775**DCL      9776--REDEF
+VX_O.NUM_A
+      9663**DCL      9665--REDEF
+VX_O.OPT_A
+      9763**DCL      9764--REDEF
+VX_O.PRIV_A
+      9679**DCL      9681--REDEF
+VX_O.SIN_A
+      9632**DCL      9633--REDEF
+VX_O.TCB_A
+      9759**DCL      9760--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:46   
+VX_OD.ACCTN_A$
+      9936**DCL      9937--REDEF
+VX_OD.DCB_MATCH_A$
+      9945**DCL      9946--REDEF
+VX_OD.FIDN_A$
+      9930**DCL      9931--REDEF
+VX_OD.FID_A$
+      9922**DCL      9923--REDEF
+VX_OD.INCLUDE_A$
+      9942**DCL      9943--REDEF
+VX_OD.MAP_A
+      9916**DCL      9917--REDEF
+VX_OD.NODCB_A
+      9960**DCL      9961--REDEF
+VX_OD.NUM_A
+      9863**DCL      9864--REDEF
+VX_OD.PRIV_A
+      9878**DCL      9879--REDEF
+VX_OD.SIN_A
+      9832**DCL      9833--REDEF
+VX_OD.VECTOR_A$
+      9951**DCL      9952--REDEF
+VX_OL.MAX_A
+      9807**DCL      9809--REDEF
+VX_OL.MIN_A
+      9792**DCL      9793--REDEF
+VX_ON.ACCTN_A$
+     10081**DCL     10083--REDEF
+VX_ON.DCB_MATCH_A$
+     10092**DCL     10094--REDEF
+VX_ON.FIDN_A$
+     10074**DCL     10076--REDEF
+VX_ON.FID_A$
+     10065**DCL     10067--REDEF
+VX_ON.INCLUDE_A$
+     10088**DCL     10090--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:47   
+VX_ON.MAP_A
+     10058**DCL     10060--REDEF
+VX_ON.NODCB_A$
+     10108**DCL     10109--REDEF
+VX_ON.NUM_A
+     10003**DCL     10005--REDEF
+VX_ON.PRIV_A
+     10019**DCL     10021--REDEF
+VX_ON.SIN_A
+      9971**DCL      9973--REDEF
+VX_ON.VECTOR_A$
+     10099**DCL     10100--REDEF
+VX_OUHEAD.VERSION
+      9418**DCL      9420--REDEF
+VX_OU_HEAD
+      9361**DCL      9400--REDEF
+VX_OU_HEAD.REC_A
+      9373**DCL      9376--REDEF
+VX_O_KEY_BUF.FORM0
+      8622**DCL      8625--REDEF    8632--REDEF
+VX_O_KEY_BUF_L.FORM0
+      8645**DCL      8648--REDEF    8655--REDEF
+VX_PASS2_REF.OU.L_START
+     10311**DCL     10316--REDEF
+VX_PASS2_REF.OU.L_STOP
+     10317**DCL     10322--REDEF
+VX_PASS2_REF.OU.MAX
+     10305**DCL     10310--REDEF
+VX_PASS2_REF.OU.SIZE
+     10323**DCL     10328--REDEF
+VX_PASS2_REF.SAT.COUNT
+     10350**DCL     10356--REDEF
+VX_PASS2_REF.SAT.ENT_SIZE
+     10357**DCL     10363--REDEF
+VX_PASS2_REF.SAT.L_START
+     10336**DCL     10342--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:48   
+VX_PASS2_REF.SAT.L_STOP
+     10343**DCL     10349--REDEF
+VX_PASS2_REF.SAT.MAX
+     10330**DCL     10335--REDEF
+VX_PASS2_REF.UNSAT.L_START
+     10398**DCL     10403--REDEF
+VX_PASS2_REF.UNSAT.L_STOP
+     10404**DCL     10409--REDEF
+VX_PASS2_REF.UNSAT.L_WHERE
+     10410**DCL     10415--REDEF
+VX_PASS2_REF.UNSAT.MAX
+     10392**DCL     10397--REDEF
+VX_PASS2_REF.UNSAT.PAGE#
+     10422**DCL     10427--REDEF
+VX_PASS2_REF.UNSAT.SIZE
+     10416**DCL     10421--REDEF
+VX_PHRASE.PHRASE
+      9824**DCL      9826--REDEF
+VX_PROGRAM_BIAS.A
+      9602**DCL      9603--REDEF
+VX_R_KEY_BUF.FORM0
+      8671**DCL      8675--REDEF    8681--REDEF
+VX_SC_X_NODE$
+     10225**DCL     11014--IMP-PTR 11054>>ASSIGN
+VX_SD.A
+      8299**DCL      8300--REDEF
+VX_SEGID
+     10435**DCL     11049>>ASSIGN
+VX_SEG_SIZE
+     10434**DCL     11051>>ASSIGN
+VX_SOURCE_COUNT
+     10158**DCL     10970--IMP-SIZ 10972--IMP-SIZ 11123<<ASSIGN  11124>>ASSIGN
+VX_SPC.B$.MINE
+     10493**DCL     10499--REDEF
+VX_SPC.B$.NAME
+     10472**DCL     10478--REDEF
+PL6.E3A0      #001=VXU$SETUP File=VXU$SETUP.:E05TSI                              WED 07/30/97 08:46 Page:49   
+VX_SPC.B$.SKIP
+     10486**DCL     10492--REDEF
+VX_SPC.B$.VALUE
+     10479**DCL     10485--REDEF
+VX_SPC.SEG.NAME
+     10441**DCL     10447--REDEF
+VX_SPC.SEG.VALUE
+     10448**DCL     10454--REDEF
+VX_TARGET_COUNT
+     10157**DCL     10969--IMP-SIZ 10971--IMP-SIZ 11122<<ASSIGN  11123>>ASSIGN  11124>>ASSIGN
+VX_TSX0_OVERLAY.H
+     10216**DCL     10219--REDEF
+WHERE
+     10992**DCL        41--PROC    11044>>ASSIGN  11045>>ASSIGN  11058>>IF      11058>>IF      11072<>CALL
+     11107>>ASSIGN

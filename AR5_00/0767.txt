@@ -1,0 +1,2376 @@
+VERSION E05
+
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:1    
+        1        1        /*M* GDA$SATYR - Standalone Async (SATYR)                                     */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*P* NAME:    GDA$SATYR
+        8        8             PURPOSE: This module contains the standalone async handler
+        9        9                      (SATYR), which is used for communication between the
+       10       10                      FEP resident debug code and the host resident debugger
+       11       11                      in FEPANLZ.  FEPANLZ communicates with the local FEP
+       12       12                      which in turn communicates with the FEP being debugged
+       13       13                      over a special channel.  SATYR acts as a handler for
+       14       14                      this channel.  When a message is received over this channel
+       15       15                      it is converted from line format to normal character
+       16       16                      format and passed to the debugger interface, which will
+       17       17                      figure out what type of message it is and perform the
+       18       18                      indicated operation (display memory, modify memory, etc.).
+       19       19                      When the necessary information is obtained (or the action
+       20       20                      is taken), the FEP resident debugger will call SATYR to
+       21       21                      convert its responce from character format to line format
+       22       22                      and pass it over the link to the local FEP, where it will
+       23       23                      be shipped back up to the host.
+       24       24                                                                                      */
+       25       25        %EJECT;
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:2    
+       26       26        /*F* NAME:      GDA$RCVENT
+       27       27             PURPOSE:   This routine fields receive interrupts
+       28       28             CALL:      This routine is called from L6ASM code when a receive
+       29       29                        interrupt is detected.  The L6ASM code is called when
+       30       30                        the interrupt is received, and it sets up our stack
+       31       31                        frame before calling us.
+       32       32             DESCRIPTION: This routine is entered when data has come in off the
+       33       33                          line and has been placed in SATYR's receive buffer
+       34       34                          by the receive CCP.  It converts the data to character
+       35       35                          (8 bit) format and calls the debugger interface to
+       36       36                          handle the request.
+       37       37                                                                                      */
+       38       38        GDA$RCVENT: PROC ;
+       39       39                                                /* INCLUDES                           */
+       40       40 S      %INCLUDE G_LCP6_E;                      /* Various LCP6 EQUs                  */
+       41       41        %INCLUDE GD_STATIC_DATA;
+       42      514        %INCLUDE GH_HARDWARE_M;                 /* Macros to do IO's and LEV's        */
+       43      612        %INCLUDE GH_IOFNC_E;                    /* IO function equs                   */
+       44      681                                                /* SYMREFS                            */
+       45      682    1   DCL GD_CHN UBIN(10) SYMREF;
+       46      683                                                /* Locals                             */
+       47      684    1   DCL SIZE UBIN;                          /* Number of bytes received           */
+       48      685    1   DCL I UBIN;
+       49      686                                                /* BASED TEMPLATES                    */
+       50      687        %GH_IO (FPTN=GH$IO, STCLASS=AUTO);
+       51      703    1   DCL ERROR UBIN;
+       52      704    1   DCL 1 FEDBUF BASED ALIGNED,             /* Format of data when it is          */
+       53      705    1         2 BUF(0:999),                     /* stripped of control info           */
+       54      706    1           3 CHR BIT(6) UNAL;
+       55      707    1   DCL 1 LINEBUF BASED ALIGNED,            /* Format of data when it comes       */
+       56      708    1         2 BUF(0:999),                     /* off the line                       */
+       57      709    1           3 * BIT(2) UNAL,
+       58      710    1           3 CHR BIT(6) UNAL;
+       59      711                                                /* ENTRYS                             */
+       60      712    1   DCL GDA$RCVIOLD ENTRY ;                 /* Do IOLD's                          */
+       61      713    1   DCL GDI$DECODE_MSG ENTRY(2) ALTRET;           /* Called with a complete message
+       62      714                                                  which tells the debugger what
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:3    
+       63      715                                                  it needs to do                      */
+       64      716    1   DCL GHH$IO_IN ENTRY(1) ALTRET;          /* Does I/O instructions              */
+       65      717    1   DCL GDI$SEND_ERROR_RESPONSE ENTRY(3);   /* Send error responce to host        */
+       66      718              %EJECT;
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:4    
+       67      719    1           ERROR=0;
+       68      720        /*
+       69      721          Setup GH$IO.CAS.CHN for later use
+       70      722                                                                                      */
+       71      723    1           GH$IO.CAS.CHN=GD_CHN;
+       72      724        /*
+       73      725          Move status pointer to next CCB and get its status
+       74      726                                                                                      */
+       75      727    1           GH$IO.CAS.FNC=%GH#IO_INPNXTCCBSTT;
+       76      728    1           CALL GHH$IO_IN(GH$IO) ALTRET(NAK);
+       77      729        /*
+       78      730          Make sure that there were no I/O errors
+       79      731                                                                                      */
+       80      732    1           IF NOT(GH$IO.STATUS & %GDA#IOCHK) THEN
+       81      733    2           DO;
+       82      734        /*
+       83      735           Get range of the CCB just input
+       84      736                                                                                      */
+       85      737    2              GH$IO.CAS.FNC=%GH#IO_INPRNG;
+       86      738    2              CALL GHH$IO_IN(GH$IO) ALTRET(NAK);
+       87      739        /*
+       88      740           Figure out how big the message we just got is
+       89      741                                                                                      */
+       90      742    2              SIZE=(%GD_MSG_MSIZE*2-1)-GH$IO.RANGE;
+       91      743        /*
+       92      744           The last byte of the buffer indicates whether or not the I/O
+       93      745           was successful
+       94      746                                                                                      */
+       95      747    2              IF GD_DATA.GDA.RCV.BFR(SIZE) = %GDA#GOODIO THEN
+       96      748    3              DO;
+       97      749    3                 GD_DATA.GDA.CONNECTFLG = %G_ON#;
+       98      750        /*
+       99      751          Convert characters from line format to normal character format expected
+      100      752          by the debugger
+      101      753                                                                                      */
+      102      754    4                 DO I=0 TO SIZE-3;
+      103      755    4                    PINCRW(ADDR(GD_DATA.GDA.RCV.BFR),1)->FEDBUF.BUF.CHR(I)=
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:5    
+      104      756    4                      PINCRW(ADDR(GD_DATA.GDA.RCV.BFR),1)->LINEBUF.BUF.CHR(I);
+      105      757    4                    END;
+      106      758        /*
+      107      759          Set the GD_BFRFULL flag to indicate that a complete buffer is ready
+      108      760          for processing.  This is necessary since we may be spinning in
+      109      761          GDI$DECODE_MSG waiting for a full buffer allready.  If this is
+      110      762          the case, the following call will not be made.
+      111      763                                                                                      */
+      112      764    3                 GD_DATA.GD.BFRFULL=%G_YES#;
+      113      765        /*
+      114      766          If we are not stopped waiting for the user to type GO, call the
+      115      767          debugger interface to process the data.  If we are stopped, it is
+      116      768          not necessary to call the debugger, since the trap handler will
+      117      769          have done it for us.
+      118      770                                                                                      */
+      119      771    3                 IF NOT(GD_DATA.GD.STOPT) THEN
+      120      772    3                 CALL GDI$DECODE_MSG(SIZE,GD_DATA.GDA.RCV.BFR);
+      121      773    3                  RETURN;
+      122      774    3                 END;
+      123      775        /*
+      124      776           Otherwise, some type of error occurred
+      125      777                                                                                      */
+      126      778    2              ELSE
+      127      779    2                 ERROR=GD_DATA.GDA.RCV.BFR(SIZE);
+      128      780    2              END;
+      129      781        /*
+      130      782           Otherwise, some type of transmission error occurred
+      131      783                                                                                      */
+      132      784    1           ELSE
+      133      785    1              ERROR=GH$IO.RANGE;
+      134      786        /*
+      135      787          Check to see if we got NAKed and if we did, bump a counter
+      136      788                                                                                      */
+      137      789    1   NAK:    IF ERROR=0 THEN
+      138      790    1              GD_DATA.GDA.NAKCNT=GD_DATA.GDA.NAKCNT+1;
+      139      791        /*
+      140      792          If we got an error, report it through the debugger
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:6    
+      141      793                                                                                      */
+      142      794    1           GD_DATA.GDA.RCV.BFR(0) = MOD(ERROR,64);
+      143      795    1           CALL GDI$SEND_ERROR_RESPONSE(SIZE,GD_DATA.GDA.RCV.BFR,%GD#RSPBADMSG);
+      144      796        /*
+      145      797          Call routine to load next CCB
+      146      798                                                                                      */
+      147      799    1           CALL GDA$RCVIOLD;
+      148      800        /*
+      149      801          Go to sleep
+      150      802                                                                                      */
+      151      803    1           RETURN;
+      152      804    1   END GDA$RCVENT;
+      153      805              %EOD;
+
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:7    
+--  Include file information  --
+
+   GH_IOFNC_E.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GDA$RCVENT.
+
+   Procedure GDA$RCVENT requires 189 words for executable code.
+   Procedure GDA$RCVENT requires 16 words of local(AUTO) storage.
+
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:8    
+
+ Object Unit name= GDA$RCVENT                                 File name= GDA$SATYR.:E05TOU
+ UTS= JUL 29 '97 21:21:01.80 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   189     BD  GDA$RCVENT
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        0  GDA$RCVENT
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 GHH$IO_IN
+         yes           Std       0 GDA$RCVIOLD
+ yes     yes           Std       2 GDI$DECODE_MSG
+         yes           Std       3 GDI$SEND_ERROR_RESPONSE
+                       nStd      0 X6A_AUTO_0
+                       nStd      0 X6B_BLR
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     GD$DELTA_DATA$                        GD_CHN                           r    G$ROS$
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:9    
+
+
+        1        1        /*M* GDA$SATYR - Standalone Async (SATYR)                                     */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*P* NAME:    GDA$SATYR
+        8        8             PURPOSE: This module contains the standalone async handler
+        9        9                      (SATYR), which is used for communication between the
+       10       10                      FEP resident debug code and the host resident debugger
+       11       11                      in FEPANLZ.  FEPANLZ communicates with the local FEP
+       12       12                      which in turn communicates with the FEP being debugged
+       13       13                      over a special channel.  SATYR acts as a handler for
+       14       14                      this channel.  When a message is received over this channel
+       15       15                      it is converted from line format to normal character
+       16       16                      format and passed to the debugger interface, which will
+       17       17                      figure out what type of message it is and perform the
+       18       18                      indicated operation (display memory, modify memory, etc.).
+       19       19                      When the necessary information is obtained (or the action
+       20       20                      is taken), the FEP resident debugger will call SATYR to
+       21       21                      convert its responce from character format to line format
+       22       22                      and pass it over the link to the local FEP, where it will
+       23       23                      be shipped back up to the host.
+       24       24                                                                                      */
+       25       25        %EJECT;
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:10   
+       26       26        /*F* NAME:      GDA$RCVENT
+       27       27             PURPOSE:   This routine fields receive interrupts
+       28       28             CALL:      This routine is called from L6ASM code when a receive
+       29       29                        interrupt is detected.  The L6ASM code is called when
+       30       30                        the interrupt is received, and it sets up our stack
+       31       31                        frame before calling us.
+       32       32             DESCRIPTION: This routine is entered when data has come in off the
+       33       33                          line and has been placed in SATYR's receive buffer
+       34       34                          by the receive CCP.  It converts the data to character
+       35       35                          (8 bit) format and calls the debugger interface to
+       36       36                          handle the request.
+       37       37                                                                                      */
+       38       38        GDA$RCVENT: PROC ;
+
+     38   0 000000  D380 0000 0000  xent GDA$RCVENT      LNJ,B5   X6A_AUTO_0
+          0 000003       0010 0000                       DC       16,0
+
+       39       39                                                /* INCLUDES                           */
+       40       40 S      %INCLUDE G_LCP6_E;                      /* Various LCP6 EQUs                  */
+       41       41        %INCLUDE GD_STATIC_DATA;
+       42      514        %INCLUDE GH_HARDWARE_M;                 /* Macros to do IO's and LEV's        */
+       43      612        %INCLUDE GH_IOFNC_E;                    /* IO function equs                   */
+       44      681                                                /* SYMREFS                            */
+       45      682    1   DCL GD_CHN UBIN(10) SYMREF;
+       46      683                                                /* Locals                             */
+       47      684    1   DCL SIZE UBIN;                          /* Number of bytes received           */
+       48      685    1   DCL I UBIN;
+       49      686                                                /* BASED TEMPLATES                    */
+       50      687        %GH_IO (FPTN=GH$IO, STCLASS=AUTO);
+       51      703    1   DCL ERROR UBIN;
+       52      704    1   DCL 1 FEDBUF BASED ALIGNED,             /* Format of data when it is          */
+       53      705    1         2 BUF(0:999),                     /* stripped of control info           */
+       54      706    1           3 CHR BIT(6) UNAL;
+       55      707    1   DCL 1 LINEBUF BASED ALIGNED,            /* Format of data when it comes       */
+       56      708    1         2 BUF(0:999),                     /* off the line                       */
+       57      709    1           3 * BIT(2) UNAL,
+       58      710    1           3 CHR BIT(6) UNAL;
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:11   
+       59      711                                                /* ENTRYS                             */
+       60      712    1   DCL GDA$RCVIOLD ENTRY ;                 /* Do IOLD's                          */
+       61      713    1   DCL GDI$DECODE_MSG ENTRY(2) ALTRET;           /* Called with a complete message
+       62      714                                                  which tells the debugger what
+       63      715                                                  it needs to do                      */
+       64      716    1   DCL GHH$IO_IN ENTRY(1) ALTRET;          /* Does I/O instructions              */
+       65      717    1   DCL GDI$SEND_ERROR_RESPONSE ENTRY(3);   /* Send error responce to host        */
+       66      718              %EJECT;
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:12   
+       67      719    1           ERROR=0;
+
+    719   0 000005  8747 0008                            CL       ERROR,AUTO
+
+       68      720        /*
+       69      721          Setup GH$IO.CAS.CHN for later use
+       70      722                                                                                      */
+       71      723    1           GH$IO.CAS.CHN=GD_CHN;
+
+    723   0 000007  E800 0000 0000  xsym                 LDR,R6   GD_CHN
+          0 00000A  EAC7 0006                            SRM,R6,'FFC0'X    GH$IO,AUTO
+          0 00000C       FFC0
+
+       72      724        /*
+       73      725          Move status pointer to next CCB and get its status
+       74      726                                                                                      */
+       75      727    1           GH$IO.CAS.FNC=%GH#IO_INPNXTCCBSTT;
+
+    727   0 00000D  5C1A                                 LDV,R5   26
+          0 00000E  DAC7 0006                            SRM,R5,'003F'X    GH$IO,AUTO
+          0 000010       003F
+
+       76      728    1           CALL GHH$IO_IN(GH$IO) ALTRET(NAK);
+
+    728   0 000011  EBC7 0006                            LAB,B6   GH$IO,AUTO
+          0 000013  EFC7 000A                            STB,B6   ERROR+2,AUTO
+          0 000015  BBC7 000A                            LAB,B3   ERROR+2,AUTO
+          0 000017  CBF0 0100                            LAB,B4   256,IMO
+          0 000019  E380 0000 0000  xent                 LNJ,B6   GHH$IO_IN
+          0 00001C       0074                            DC       s:789,PREL
+
+       77      729        /*
+       78      730          Make sure that there were no I/O errors
+       79      731                                                                                      */
+       80      732    1           IF NOT(GH$IO.STATUS & %GDA#IOCHK) THEN
+
+    732   0 00001D  E847 0007                            LDR,R6   GH$IO+1,AUTO
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:13   
+          0 00001F  E570 0807                            AND,R6   2055,IMO
+          0 000021  6981 006A                            BNEZ,R6  s:785,PREL
+
+       81      733    2           DO;
+
+       82      734        /*
+       83      735           Get range of the CCB just input
+       84      736                                                                                      */
+       85      737    2              GH$IO.CAS.FNC=%GH#IO_INPRNG;
+
+    737   0 000023  6C0C                                 LDV,R6   12
+          0 000024  EAC7 0006                            SRM,R6,'003F'X    GH$IO,AUTO
+          0 000026       003F
+
+       86      738    2              CALL GHH$IO_IN(GH$IO) ALTRET(NAK);
+
+    738   0 000027  EBC7 0006                            LAB,B6   GH$IO,AUTO
+          0 000029  EFC7 000A                            STB,B6   ERROR+2,AUTO
+          0 00002B  BBC7 000A                            LAB,B3   ERROR+2,AUTO
+          0 00002D  CBF0 0100                            LAB,B4   256,IMO
+          0 00002F  E380 0000 0000  xent                 LNJ,B6   GHH$IO_IN
+          0 000032       005E                            DC       s:789,PREL
+
+       87      739        /*
+       88      740           Figure out how big the message we just got is
+       89      741                                                                                      */
+       90      742    2              SIZE=(%GD_MSG_MSIZE*2-1)-GH$IO.RANGE;
+
+    742   0 000033  E847 0007                            LDR,R6   GH$IO+1,AUTO
+          0 000035  8256                                 NEG      R6
+          0 000036  EA70 01A1                            ADD,R6   417,IMO
+          0 000038  EF47 0004                            STR,R6   SIZE,AUTO
+
+       91      743        /*
+       92      744           The last byte of the buffer indicates whether or not the I/O
+       93      745           was successful
+       94      746                                                                                      */
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:14   
+       95      747    2              IF GD_DATA.GDA.RCV.BFR(SIZE) = %GDA#GOODIO THEN
+
+    747   0 00003A  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00003D  B856                                 LDR,R3   R6
+          0 00003E  3E1A                                 ADV,R3   26
+          0 00003F  D2B6                                 LLH,R5   ,B6,R3
+          0 000040  5D40                                 CMV,R5   64
+          0 000041  0981 0046                            BNE      s:779,PREL
+
+       96      748    3              DO;
+
+       97      749    3                 GD_DATA.GDA.CONNECTFLG = %G_ON#;
+
+    749   0 000043  8946 0009                            LBT,'8000'X       9,B6
+    749   0 000045       8000
+
+       98      750        /*
+       99      751          Convert characters from line format to normal character format expected
+      100      752          by the debugger
+      101      753                                                                                      */
+      102      754    4                 DO I=0 TO SIZE-3;
+
+    754   0 000046  8747 0005                            CL       I,AUTO
+          0 000048  0F81 0019                            B        s:757+2,PREL
+
+      103      755    4                    PINCRW(ADDR(GD_DATA.GDA.RCV.BFR),1)->FEDBUF.BUF.CHR(I)=
+
+    755   0 00004A  AC80 0000 0000  xsym                 LDB,B2   GD$DELTA_DATA$
+          0 00004D  ABC2 000E                            LAB,B2   14,B2
+          0 00004F  A847 0005                            LDR,R2   I,AUTO
+          0 000051  2003                                 SOL,R2   3
+          0 000052  2E02                                 ADV,R2   2
+          0 000053  6C06                                 LDV,R6   6
+          0 000054  BC80 0000 0000  xsym                 LDB,B3   GD$DELTA_DATA$
+          0 000057  BBC3 000E                            LAB,B3   14,B3
+          0 000059  B847 0005                            LDR,R3   I,AUTO
+          0 00005B  3F06                                 MLV,R3   6
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:15   
+          0 00005C  7C06                                 LDV,R7   6
+          0 00005D  D380 0000 0000  xent                 LNJ,B5   X6B_BLR
+
+      104      756    4                      PINCRW(ADDR(GD_DATA.GDA.RCV.BFR),1)->LINEBUF.BUF.CHR(I);
+      105      757    4                    END;
+
+    757   0 000060  8AC7 0005                            INC      I,AUTO
+          0 000062  E847 0004                            LDR,R6   SIZE,AUTO
+          0 000064  6EFD                                 ADV,R6   -3
+          0 000065  6801 0004                            BLZ,R6   s:764,PREL
+          0 000067  E947 0005                            CMR,R6   I,AUTO
+          0 000069  02E1                                 BGE      s:755,SPREL
+
+      106      758        /*
+      107      759          Set the GD_BFRFULL flag to indicate that a complete buffer is ready
+      108      760          for processing.  This is necessary since we may be spinning in
+      109      761          GDI$DECODE_MSG waiting for a full buffer allready.  If this is
+      110      762          the case, the following call will not be made.
+      111      763                                                                                      */
+      112      764    3                 GD_DATA.GD.BFRFULL=%G_YES#;
+
+    764   0 00006A  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00006D  8946 014C                            LBT,'2000'X       332,B6
+          0 00006F       2000
+
+      113      765        /*
+      114      766          If we are not stopped waiting for the user to type GO, call the
+      115      767          debugger interface to process the data.  If we are stopped, it is
+      116      768          not necessary to call the debugger, since the trap handler will
+      117      769          have done it for us.
+      118      770                                                                                      */
+      119      771    3                 IF NOT(GD_DATA.GD.STOPT) THEN
+
+    771   0 000070  82C6 014C                            LB,'0004'X        332,B6
+    771   0 000072       0004
+          0 000073  0501 0011                            BBT      s:773,PREL
+
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:16   
+      120      772    3                 CALL GDI$DECODE_MSG(SIZE,GD_DATA.GDA.RCV.BFR);
+
+    772   0 000075  DBC6 000D                            LAB,B5   13,B6
+          0 000077  DFC7 000C                            STB,B5   ERROR+4,AUTO
+          0 000079  CBC7 0004                            LAB,B4   SIZE,AUTO
+          0 00007B  CFC7 000A                            STB,B4   ERROR+2,AUTO
+          0 00007D  BBC7 000A                            LAB,B3   ERROR+2,AUTO
+          0 00007F  CBF0 0200                            LAB,B4   512,IMO
+          0 000081  E380 0000 0000  xent                 LNJ,B6   GDI$DECODE_MSG
+          0 000084       0001                            DC       s:773,PREL
+
+      121      773    3                  RETURN;
+
+    773   0 000085  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      122      774    3                 END;
+      123      775        /*
+      124      776           Otherwise, some type of error occurred
+      125      777                                                                                      */
+      126      778    2              ELSE
+      127      779    2                 ERROR=GD_DATA.GDA.RCV.BFR(SIZE);
+
+    779   0 000088  DF47 0008                            STR,R5   ERROR,AUTO
+
+      128      780    2              END;
+
+    780   0 00008A  0F81 0005                            B        s:789,PREL
+
+      129      781        /*
+      130      782           Otherwise, some type of transmission error occurred
+      131      783                                                                                      */
+      132      784    1           ELSE
+      133      785    1              ERROR=GH$IO.RANGE;
+
+    785   0 00008C  E847 0007                            LDR,R6   GH$IO+1,AUTO
+          0 00008E  EF47 0008                            STR,R6   ERROR,AUTO
+
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:17   
+      134      786        /*
+      135      787          Check to see if we got NAKed and if we did, bump a counter
+      136      788                                                                                      */
+      137      789    1   NAK:    IF ERROR=0 THEN
+
+    789   0 000090  E847 0008            NAK             LDR,R6   ERROR,AUTO
+          0 000092  6981 0006                            BNEZ,R6  s:794,PREL
+
+      138      790    1              GD_DATA.GDA.NAKCNT=GD_DATA.GDA.NAKCNT+1;
+
+    790   0 000094  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 000097  8AC6 000C                            INC      12,B6
+
+      139      791        /*
+      140      792          If we got an error, report it through the debugger
+      141      793                                                                                      */
+      142      794    1           GD_DATA.GDA.RCV.BFR(0) = MOD(ERROR,64);
+
+    794   0 000099  E570 003F                            AND,R6   63,IMO
+          0 00009B  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00009E  E7C6 000D                            STH,R6   13,B6
+
+      143      795    1           CALL GDI$SEND_ERROR_RESPONSE(SIZE,GD_DATA.GDA.RCV.BFR,%GD#RSPBADMSG);
+
+    795   0 0000A0  DBF0 0030                            LAB,B5   48,IMO
+          0 0000A2  DFC7 000E                            STB,B5   ERROR+6,AUTO
+          0 0000A4  CBC6 000D                            LAB,B4   13,B6
+          0 0000A6  CFC7 000C                            STB,B4   ERROR+4,AUTO
+          0 0000A8  BBC7 0004                            LAB,B3   SIZE,AUTO
+          0 0000AA  BFC7 000A                            STB,B3   ERROR+2,AUTO
+          0 0000AC  BBC7 000A                            LAB,B3   ERROR+2,AUTO
+          0 0000AE  CBF0 0300                            LAB,B4   768,IMO
+          0 0000B0  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          0 0000B3       0001                            DC       s:799,PREL
+
+      144      796        /*
+      145      797          Call routine to load next CCB
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:18   
+      146      798                                                                                      */
+      147      799    1           CALL GDA$RCVIOLD;
+
+    799   0 0000B4  CBF0 0000                            LAB,B4   0,IMO
+          0 0000B6  E380 0000 0000  xent                 LNJ,B6   GDA$RCVIOLD
+          0 0000B9       0001                            DC       s:803,PREL
+
+      148      800        /*
+      149      801          Go to sleep
+      150      802                                                                                      */
+      151      803    1           RETURN;
+
+    803   0 0000BA  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      152      804    1   END GDA$RCVENT;
+      153      805              %EOD;
+
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:19   
+--  Include file information  --
+
+   GH_IOFNC_E.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GDA$RCVENT.
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:20   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     8-0-0/w UBIN(16)    r     1 ERROR                      6-0-0/w STRC(32)    r     1 GH$IO
+     5-0-0/w UBIN(16)    r     1 I                          4-0-0/w UBIN(16)    r     1 SIZE
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 GD$DELTA_DATA$             0-0-0/w UBIN(10)    r     1 GD_CHN
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(6000)  r     1 FEDBUF                     0-0-0/w STRC(16704) r     1 GD_DATA
+     0-0-0/w STRC(8000)  r     1 LINEBUF
+
+
+   Procedure GDA$RCVENT requires 189 words for executable code.
+   Procedure GDA$RCVENT requires 16 words of local(AUTO) storage.
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:21   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:22   
+          MINI XREF LISTING
+
+ERROR
+       703**DCL       719<<ASSIGN    779<<ASSIGN    785<<ASSIGN    789>>IF        794>>ASSIGN
+FEDBUF.BUF.CHR
+       706**DCL       755<<ASSIGN
+GD$DELTA_DATA$
+       467**DCL       481--IMP-PTR   747>>IF        749>>ASSIGN    755>>ASSIGN    755>>ASSIGN    764>>ASSIGN
+       771>>IF        772>>CALL      779>>ASSIGN    790>>ASSIGN    790>>ASSIGN    794>>ASSIGN    795>>CALL
+GDA$RCVIOLD
+       712**DCL-ENT   799--CALL
+GDI$DECODE_MSG
+       713**DCL-ENT   772--CALL
+GDI$SEND_ERROR_RESPONSE
+       717**DCL-ENT   795--CALL
+GD_CHN
+       682**DCL       723>>ASSIGN
+GD_DATA.GD.BFRFULL
+       488**DCL       764<<ASSIGN
+GD_DATA.GD.DYNSP$
+       494**DCL       494--REDEF
+GD_DATA.GD.STEP_BRKPNT.ADR$
+       495**DCL       496--REDEF
+GD_DATA.GD.STEP_BRKPNT.START$
+       496**DCL       496--REDEF
+GD_DATA.GD.STOPT
+       491**DCL       771>>IF
+GD_DATA.GDA.CONNECTFLG
+       482**DCL       749<<ASSIGN
+GD_DATA.GDA.NAKCNT
+       483**DCL       790<<ASSIGN    790>>ASSIGN
+GD_DATA.GDA.RCV.BFR
+       484**DCL       747>>IF        755--ASSIGN    755--ASSIGN    772<>CALL      779>>ASSIGN    794<<ASSIGN
+       795<>CALL
+PL6.E3A0      #001=GDA$RCVENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:23   
+GH$IO
+       698**DCL       728<>CALL      738<>CALL
+GH$IO.CAS.CHN
+       698**DCL       698--REDEF     723<<ASSIGN
+GH$IO.CAS.FNC
+       699**DCL       727<<ASSIGN    737<<ASSIGN
+GH$IO.DAS
+       699**DCL       700--REDEF     701--REDEF
+GH$IO.RANGE
+       700**DCL       742>>ASSIGN    785>>ASSIGN
+GH$IO.STATUS
+       701**DCL       732>>IF
+GHH$IO_IN
+       716**DCL-ENT   728--CALL      738--CALL
+I
+       685**DCL       754<<DOINDEX   755>>ASSIGN    755>>ASSIGN
+LINEBUF.BUF.CHR
+       710**DCL       755>>ASSIGN
+NAK
+       789**LABEL     728--CALLALT   738--CALLALT
+SIZE
+       684**DCL       742<<ASSIGN    747>>IF        754>>DOINDEX   772<>CALL      779>>ASSIGN    795<>CALL
+
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:24   
+      154        1        /*T***********************************************************/
+      155        2        /*T*                                                         */
+      156        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      157        4        /*T*                                                         */
+      158        5        /*T***********************************************************/
+      159        6              %EJECT;
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:25   
+      160        7        /*F* NAME:     GDA$TRNENT
+      161        8             PURPOSE:  The purpose of this routine is to field transmitt interrupts
+      162        9                       caused by the transmitt CCP after it has shipped a
+      163       10                       block of data down the line.
+      164       11             CALL:     This routine is called by L6ASM code when a transmitt
+      165       12                       interrupt is detected.  This code allocates a stack frame
+      166       13                       and then calls us.  The L6ASM code is entered by the hardware
+      167       14                       when an transmitt interrupt is detected.
+      168       15             DESCRIPTION: This routine is entered after an interrupt occurrs
+      169       16                          indicating a CCB has just been shipped down the line
+      170       17                          or some type of error occurred or data set status
+      171       18                          has changed (the line dropped for example).  This
+      172       19                          routine figures out why it was entered and then
+      173       20                          takes appropriate action.
+      174       21                                                                                      */
+      175       22        GDA$TRNENT: PROC ;
+      176       23                                                /* INCLUDES                           */
+      177       24 S      %INCLUDE G_LCP6_E;                      /* Various LCP6 EQUs                  */
+      178       25        %INCLUDE GD_STATIC_DATA;
+      179      498        %INCLUDE GH_HARDWARE_M;                 /* Macros for doing IO's, IOLD's, LEVs*/
+      180      596        %INCLUDE GH_IOFNC_E;                    /* I/O function EQUs                  */
+      181      665        %INCLUDE GDA$MACS_M;                    /* LCT related structures             */
+      182      687        %INCLUDE KW_ALCT_E;
+      183      877        %INCLUDE KH$IO;
+      184     1124                                                /* SYMREFS                            */
+      185     1125    1   DCL GD_CHN UBIN(10) SYMREF;
+      186     1126    1   DCL GD_LINSPD UBIN SYMREF;
+      187     1127        %KH$DWNLODLCT(NAME=GD_DWNLODLCT,STCLASS=SYMREF);
+      188     1151                                                /* BASED ITEMS                        */
+      189     1152        %GH_IO (FPTN=GH$IO, STCLASS=AUTO);
+      190     1168        %KH$DWNLODLCT(NAME=GD$DWNLODLCT,STCLASS=AUTO);
+      191     1192                                                /* ENTRYS                             */
+      192     1193    1   DCL GDA$RCVIOLD ENTRY ;                 /* Routine that does a receive IOLD to
+      193     1194                                                  get next input buffer               */
+      194     1195    1   DCL GDB$KILL_ALLBRKPNTS ENTRY;
+      195     1196    1   DCL GDB$RESET_BRKPNT ENTRY;
+      196     1197    1   DCL GDA$TRNIOLD ENTRY ;          /* Routine that does a tranmitt
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:26   
+      197     1198                                                  IOLD to ship a buffer down the line*/
+      198     1199    1   DCL GHH$IO_IN ENTRY(1) ALTRET;          /* Routine to do I/O                  */
+      199     1200    1   DCL KHI$DWNLODLCT ENTRY(1) ALTRET;
+      200     1201              %EJECT;
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:27   
+      201     1202        /*
+      202     1203          This is the overall transmitt interrupt handler.  We enter this
+      203     1204           code for one of three reasons:  1).  Data set status has
+      204     1205           changed 2). An I/O error has occurred or 3). Data transmission
+      205     1206           has completed
+      206     1207                                                                                      */
+      207     1208        /*
+      208     1209          Load the SATYR debug channel into the structure passed to
+      209     1210          do I/O so we won't have to do it many times later on
+      210     1211                                                                                      */
+      211     1212    1           GH$IO.CAS.CHN=GD_CHN;
+      212     1213    1           GH$IO.CAS.XCHN.OUTPUT=%G_YES#;
+      213     1214        /*
+      214     1215          If the transmitt CCP is active, check for I/O errors or
+      215     1216          transmission complete as the cause of the interrupt
+      216     1217                                                                                      */
+      217     1218    1           IF GD_DATA.GDA.XMITFLG THEN
+      218     1219    2           DO;
+      219     1220    2              GH$IO.CAS.FNC=%GH#IO_INPNXTCCBSTT;
+      220     1221    2              CALL GHH$IO_IN(GH$IO) ALTRET(NAK);
+      221     1222    2              IF NOT(GH$IO.STATUS & %GDA#DS_STATUS_CHANGE) THEN
+      222     1223    3              DO;
+      223     1224        /*
+      224     1225          The dataset status has not changed so an I/O error occurred
+      225     1226          or we just got transmitt complete
+      226     1227                                                                                      */
+      227     1228    3                 IF GH$IO.STATUS & %GDA#IOCHK THEN
+      228     1229    4                 DO;
+      229     1230        /*
+      230     1231          It was an I/O error
+      231     1232                                                                                      */
+      232     1233    4                    GD_DATA.GDA.IOERRCNT=GD_DATA.GDA.IOERRCNT+1;
+      233     1234        /*N* SHOULD WE TELL THE DEBUGGER                                              */
+      234     1235    4                    END;
+      235     1236    3                       GD_DATA.GDA.XMITFLG=%G_OFF#;
+      236     1237    3                    RETURN;
+      237     1238    3                 END;
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:28   
+      238     1239    2              END;
+      239     1240        /*
+      240     1241          If no I/O error occurred, the dataset status must have
+      241     1242          changed
+      242     1243                                                                                      */
+      243     1244        /*
+      244     1245          Start by checking for disconnect
+      245     1246                                                                                      */
+      246     1247    1              GH$IO.CAS.FNC=%GH#IO_INPDATSETSTT;
+      247     1248    1              CALL GHH$IO_IN(GH$IO) ALTRET(NAK);
+      248     1249    1              IF (GH$IO.STATUS & %(GDA#CD | GDA#CTS)) ~= %(GDA#CD | GDA#CTS) THEN
+      249     1250    2              DO;
+      250     1251        /*
+      251     1252          A disconnect has occurred.  If we were connected, reinit
+      252     1253          the line and restart I/O to the channel
+      253     1254                                                                                      */
+      254     1255    2                 IF GD_DATA.GDA.CONNECTFLG THEN
+      255     1256    3                 DO;
+      256     1257    3                    GD_DATA.GDA.CONNECTFLG=%G_OFF#;
+      257     1258    3                 CALL GDB$RESET_BRKPNT;
+      258     1259    3                 CALL GDB$KILL_ALLBRKPNTS;
+      259     1260    3                    GD_DATA.GDA.XMITFLG=%G_OFF#;
+      260     1261    3                    GD$DWNLODLCT = GD_DWNLODLCT;
+      261     1262    3                    GD$DWNLODLCT.CHN$ = ADDR(GD_CHN);
+      262     1263    3                    CALL KHI$DWNLODLCT(GD$DWNLODLCT) ALTRET(SLEEP);
+      263     1264    3                    GH$IO.CAS.FNC=%GH#IO_OTPLCTBYT;
+      264     1265    3                    GH$IO.DAS.LCTDAT=GD_LINSPD;
+      265     1266    3                    GH$IO.DAS.LCTADR=%KW#PWA8;
+      266     1267    3                    GH$IO.CAS.XCHN.OUTPUT=%G_NO#;
+      267     1268    3                    CALL GHH$IO_IN (GH$IO) ALTRET(NAK);
+      268     1269    3                    GH$IO.CAS.FNC=%GH#IO_OTPCHNCTR;
+      269     1270    3                    GH$IO.STATUS='4000'X;
+      270     1271    3                    CALL GHH$IO_IN (GH$IO) ALTRET (NAK);
+      271     1272    3                    END;
+      272     1273    2                 END;
+      273     1274    1              ELSE
+      274     1275    2              DO;
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:29   
+      275     1276        /*
+      276     1277          Since there was no disconnect, but dataset status changed we must
+      277     1278          be newly connected.  Since its possible to get multiple transmitt
+      278     1279          interrupts before we actually get going, make sure we only setup
+      279     1280          the initial receive IOLD once.
+      280     1281                                                                                      */
+      281     1282    2                 IF NOT(GD_DATA.GDA.CONNECTFLG) THEN
+      282     1283    3                 DO;
+      283     1284    3                    GD_DATA.GDA.CONNECTFLG=%G_ON#;
+      284     1285    3                    CALL GDA$RCVIOLD;
+      285     1286    3                    END;
+      286     1287    2                 ELSE
+      287     1288    2                    GD_DATA.GDA.CONNECTFLG=%G_ON#;
+      288     1289    2              END;
+      289     1290        /*
+      290     1291           If we altretedt anywhere above, note it here and go to
+      291     1292           sleep for a while
+      292     1293                                                                                      */
+      293     1294    1   NAK:    ;
+      294     1295    1              GD_DATA.GDA.NAKCNT=GD_DATA.GDA.NAKCNT+1;
+      295     1296    1   SLEEP:  RETURN;
+      296     1297    1   END GDA$TRNENT;
+      297     1298        %EOD;
+
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:30   
+--  Include file information  --
+
+   KH$IO.:E05TOU  is referenced.
+   KW_ALCT_E.:E05TOU  is referenced.
+   GDA$MACS_M.:E05TOU  is referenced.
+   GH_IOFNC_E.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GDA$TRNENT.
+
+   Procedure GDA$TRNENT requires 220 words for executable code.
+   Procedure GDA$TRNENT requires 16 words of local(AUTO) storage.
+
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:31   
+
+ Object Unit name= GDA$TRNENT                                 File name= GDA$SATYR.:E05TOU
+ UTS= JUL 29 '97 21:21:34.96 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   220     DC  GDA$TRNENT
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        0  GDA$TRNENT
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 GHH$IO_IN
+         yes           Std       0 GDB$RESET_BRKPNT
+         yes           Std       0 GDB$KILL_ALLBRKPNTS
+         yes           Std       0 GDA$RCVIOLD
+ yes     yes           Std       1 KHI$DWNLODLCT
+                       nStd      0 X6A_AUTO_0
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     GD$DELTA_DATA$                        GD_CHN                                GD_LINSPD
+     GD_DWNLODLCT                     r    G$ROS$
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:32   
+
+
+      154        1        /*T***********************************************************/
+      155        2        /*T*                                                         */
+      156        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      157        4        /*T*                                                         */
+      158        5        /*T***********************************************************/
+      159        6              %EJECT;
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:33   
+      160        7        /*F* NAME:     GDA$TRNENT
+      161        8             PURPOSE:  The purpose of this routine is to field transmitt interrupts
+      162        9                       caused by the transmitt CCP after it has shipped a
+      163       10                       block of data down the line.
+      164       11             CALL:     This routine is called by L6ASM code when a transmitt
+      165       12                       interrupt is detected.  This code allocates a stack frame
+      166       13                       and then calls us.  The L6ASM code is entered by the hardware
+      167       14                       when an transmitt interrupt is detected.
+      168       15             DESCRIPTION: This routine is entered after an interrupt occurrs
+      169       16                          indicating a CCB has just been shipped down the line
+      170       17                          or some type of error occurred or data set status
+      171       18                          has changed (the line dropped for example).  This
+      172       19                          routine figures out why it was entered and then
+      173       20                          takes appropriate action.
+      174       21                                                                                      */
+      175       22        GDA$TRNENT: PROC ;
+
+     22   0 000000  D380 0000 0000  xent GDA$TRNENT      LNJ,B5   X6A_AUTO_0
+          0 000003       0010 0000                       DC       16,0
+
+      176       23                                                /* INCLUDES                           */
+      177       24 S      %INCLUDE G_LCP6_E;                      /* Various LCP6 EQUs                  */
+      178       25        %INCLUDE GD_STATIC_DATA;
+      179      498        %INCLUDE GH_HARDWARE_M;                 /* Macros for doing IO's, IOLD's, LEVs*/
+      180      596        %INCLUDE GH_IOFNC_E;                    /* I/O function EQUs                  */
+      181      665        %INCLUDE GDA$MACS_M;                    /* LCT related structures             */
+      182      687        %INCLUDE KW_ALCT_E;
+      183      877        %INCLUDE KH$IO;
+      184     1124                                                /* SYMREFS                            */
+      185     1125    1   DCL GD_CHN UBIN(10) SYMREF;
+      186     1126    1   DCL GD_LINSPD UBIN SYMREF;
+      187     1127        %KH$DWNLODLCT(NAME=GD_DWNLODLCT,STCLASS=SYMREF);
+      188     1151                                                /* BASED ITEMS                        */
+      189     1152        %GH_IO (FPTN=GH$IO, STCLASS=AUTO);
+      190     1168        %KH$DWNLODLCT(NAME=GD$DWNLODLCT,STCLASS=AUTO);
+      191     1192                                                /* ENTRYS                             */
+      192     1193    1   DCL GDA$RCVIOLD ENTRY ;                 /* Routine that does a receive IOLD to
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:34   
+      193     1194                                                  get next input buffer               */
+      194     1195    1   DCL GDB$KILL_ALLBRKPNTS ENTRY;
+      195     1196    1   DCL GDB$RESET_BRKPNT ENTRY;
+      196     1197    1   DCL GDA$TRNIOLD ENTRY ;          /* Routine that does a tranmitt
+      197     1198                                                  IOLD to ship a buffer down the line*/
+      198     1199    1   DCL GHH$IO_IN ENTRY(1) ALTRET;          /* Routine to do I/O                  */
+      199     1200    1   DCL KHI$DWNLODLCT ENTRY(1) ALTRET;
+      200     1201              %EJECT;
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:35   
+      201     1202        /*
+      202     1203          This is the overall transmitt interrupt handler.  We enter this
+      203     1204           code for one of three reasons:  1).  Data set status has
+      204     1205           changed 2). An I/O error has occurred or 3). Data transmission
+      205     1206           has completed
+      206     1207                                                                                      */
+      207     1208        /*
+      208     1209          Load the SATYR debug channel into the structure passed to
+      209     1210          do I/O so we won't have to do it many times later on
+      210     1211                                                                                      */
+      211     1212    1           GH$IO.CAS.CHN=GD_CHN;
+
+   1212   0 000005  E800 0000 0000  xsym                 LDR,R6   GD_CHN
+          0 000008  EAC7 0004                            SRM,R6,'FFC0'X    GH$IO,AUTO
+          0 00000A       FFC0
+
+      212     1213    1           GH$IO.CAS.XCHN.OUTPUT=%G_YES#;
+
+   1213   0 00000B  8947 0004                            LBT,'0040'X       GH$IO,AUTO
+   1213   0 00000D       0040
+
+      213     1214        /*
+      214     1215          If the transmitt CCP is active, check for I/O errors or
+      215     1216          transmission complete as the cause of the interrupt
+      216     1217                                                                                      */
+      217     1218    1           IF GD_DATA.GDA.XMITFLG THEN
+
+   1218   0 00000E  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 000011  82C6 0009                            LB,'4000'X        9,B6
+          0 000013       4000
+          0 000014  0581 002B                            BBF      s:1247,PREL
+
+      218     1219    2           DO;
+
+      219     1220    2              GH$IO.CAS.FNC=%GH#IO_INPNXTCCBSTT;
+
+   1220   0 000016  5C1A                                 LDV,R5   26
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:36   
+          0 000017  DAC7 0004                            SRM,R5,'003F'X    GH$IO,AUTO
+          0 000019       003F
+
+      220     1221    2              CALL GHH$IO_IN(GH$IO) ALTRET(NAK);
+
+   1221   0 00001A  DBC7 0004                            LAB,B5   GH$IO,AUTO
+          0 00001C  DFC7 000E                            STB,B5   GD$DWNLODLCT+8,AUTO
+          0 00001E  BBC7 000E                            LAB,B3   GD$DWNLODLCT+8,AUTO
+          0 000020  CBF0 0100                            LAB,B4   256,IMO
+          0 000022  E380 0000 0000  xent                 LNJ,B6   GHH$IO_IN
+          0 000025       00AF                            DC       s:1289,PREL
+
+      221     1222    2              IF NOT(GH$IO.STATUS & %GDA#DS_STATUS_CHANGE) THEN
+
+   1222   0 000026  E847 0005                            LDR,R6   GH$IO+1,AUTO
+          0 000028  E570 0010                            AND,R6   16,IMO
+          0 00002A  6981 0015                            BNEZ,R6  s:1247,PREL
+
+      222     1223    3              DO;
+
+      223     1224        /*
+      224     1225          The dataset status has not changed so an I/O error occurred
+      225     1226          or we just got transmitt complete
+      226     1227                                                                                      */
+      227     1228    3                 IF GH$IO.STATUS & %GDA#IOCHK THEN
+
+   1228   0 00002C  E847 0005                            LDR,R6   GH$IO+1,AUTO
+          0 00002E  E570 0807                            AND,R6   2055,IMO
+          0 000030  6901 0006                            BEZ,R6   s:1236,PREL
+
+      228     1229    4                 DO;
+
+      229     1230        /*
+      230     1231          It was an I/O error
+      231     1232                                                                                      */
+      232     1233    4                    GD_DATA.GDA.IOERRCNT=GD_DATA.GDA.IOERRCNT+1;
+
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:37   
+   1233   0 000032  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 000035  8AC6 000A                            INC      10,B6
+
+      233     1234        /*N* SHOULD WE TELL THE DEBUGGER                                              */
+      234     1235    4                    END;
+
+      235     1236    3                       GD_DATA.GDA.XMITFLG=%G_OFF#;
+
+   1236   0 000037  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00003A  8846 0009                            LBF,'4000'X       9,B6
+          0 00003C       4000
+
+      236     1237    3                    RETURN;
+
+   1237   0 00003D  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      237     1238    3                 END;
+      238     1239    2              END;
+      239     1240        /*
+      240     1241          If no I/O error occurred, the dataset status must have
+      241     1242          changed
+      242     1243                                                                                      */
+      243     1244        /*
+      244     1245          Start by checking for disconnect
+      245     1246                                                                                      */
+      246     1247    1              GH$IO.CAS.FNC=%GH#IO_INPDATSETSTT;
+
+   1247   0 000040  6C1C                                 LDV,R6   28
+          0 000041  EAC7 0004                            SRM,R6,'003F'X    GH$IO,AUTO
+          0 000043       003F
+
+      247     1248    1              CALL GHH$IO_IN(GH$IO) ALTRET(NAK);
+
+   1248   0 000044  EBC7 0004                            LAB,B6   GH$IO,AUTO
+          0 000046  EFC7 000E                            STB,B6   GD$DWNLODLCT+8,AUTO
+          0 000048  BBC7 000E                            LAB,B3   GD$DWNLODLCT+8,AUTO
+          0 00004A  CBF0 0100                            LAB,B4   256,IMO
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:38   
+          0 00004C  E380 0000 0000  xent                 LNJ,B6   GHH$IO_IN
+          0 00004F       0085                            DC       s:1289,PREL
+
+      248     1249    1              IF (GH$IO.STATUS & %(GDA#CD | GDA#CTS)) ~= %(GDA#CD | GDA#CTS) THEN
+
+   1249   0 000050  E847 0005                            LDR,R6   GH$IO+1,AUTO
+          0 000052  E570 6000                            AND,R6   24576,IMO
+          0 000054  E970 6000                            CMR,R6   24576,IMO
+          0 000056  0901 0068                            BE       s:1282,PREL
+
+      249     1250    2              DO;
+
+      250     1251        /*
+      251     1252          A disconnect has occurred.  If we were connected, reinit
+      252     1253          the line and restart I/O to the channel
+      253     1254                                                                                      */
+      254     1255    2                 IF GD_DATA.GDA.CONNECTFLG THEN
+
+   1255   0 000058  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00005B  89C6 0009                            CMZ      9,B6
+          0 00005D  0881 0076                            BAGE     s:1289,PREL
+
+      255     1256    3                 DO;
+
+      256     1257    3                    GD_DATA.GDA.CONNECTFLG=%G_OFF#;
+
+   1257   0 00005F  8846 0009                            LBF,'8000'X       9,B6
+   1257   0 000061       8000
+
+      257     1258    3                 CALL GDB$RESET_BRKPNT;
+
+   1258   0 000062  CBF0 0000                            LAB,B4   0,IMO
+          0 000064  E380 0000 0000  xent                 LNJ,B6   GDB$RESET_BRKPNT
+          0 000067       0001                            DC       s:1259,PREL
+
+      258     1259    3                 CALL GDB$KILL_ALLBRKPNTS;
+
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:39   
+   1259   0 000068  CBF0 0000                            LAB,B4   0,IMO
+          0 00006A  E380 0000 0000  xent                 LNJ,B6   GDB$KILL_ALLBRKPNTS
+          0 00006D       0001                            DC       s:1260,PREL
+
+      259     1260    3                    GD_DATA.GDA.XMITFLG=%G_OFF#;
+
+   1260   0 00006E  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 000071  8846 0009                            LBF,'4000'X       9,B6
+          0 000073       4000
+
+      260     1261    3                    GD$DWNLODLCT = GD_DWNLODLCT;
+
+   1261   0 000074  AB80 0000 0000  xsym                 LAB,B2   GD_DWNLODLCT
+          0 000077  2C00                                 LDV,R2   0
+          0 000078  6C0E                                 LDV,R6   14
+          0 000079  BB87                                 LAB,B3   ,AUTO
+          0 00007A  3C0C                                 LDV,R3   12
+          0 00007B  0008                                 MMM
+
+      261     1262    3                    GD$DWNLODLCT.CHN$ = ADDR(GD_CHN);
+
+   1262   0 00007C  EB80 0000 0000  xsym                 LAB,B6   GD_CHN
+          0 00007F  EFC7 0006                            STB,B6   GD$DWNLODLCT,AUTO
+
+      262     1263    3                    CALL KHI$DWNLODLCT(GD$DWNLODLCT) ALTRET(SLEEP);
+
+   1263   0 000081  DBC7 0006                            LAB,B5   GD$DWNLODLCT,AUTO
+          0 000083  DFC7 000E                            STB,B5   GD$DWNLODLCT+8,AUTO
+          0 000085  BBC7 000E                            LAB,B3   GD$DWNLODLCT+8,AUTO
+          0 000087  CBF0 0100                            LAB,B4   256,IMO
+          0 000089  E380 0000 0000  xent                 LNJ,B6   KHI$DWNLODLCT
+          0 00008C       004D                            DC       s:1296,PREL
+
+      263     1264    3                    GH$IO.CAS.FNC=%GH#IO_OTPLCTBYT;
+
+   1264   0 00008D  6C0B                                 LDV,R6   11
+          0 00008E  EAC7 0004                            SRM,R6,'003F'X    GH$IO,AUTO
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:40   
+          0 000090       003F
+
+      264     1265    3                    GH$IO.DAS.LCTDAT=GD_LINSPD;
+
+   1265   0 000091  D800 0000 0000  xsym                 LDR,R5   GD_LINSPD
+          0 000094  D7C7 0005                            STH,R5   GH$IO+1,AUTO
+
+      265     1266    3                    GH$IO.DAS.LCTADR=%KW#PWA8;
+
+   1266   0 000096  4C1E                                 LDV,R4   30
+          0 000097  CAC7 0005                            SRM,R4,'00FF'X    GH$IO+1,AUTO
+          0 000099       00FF
+
+      266     1267    3                    GH$IO.CAS.XCHN.OUTPUT=%G_NO#;
+
+   1267   0 00009A  8847 0004                            LBF,'0040'X       GH$IO,AUTO
+   1267   0 00009C       0040
+
+      267     1268    3                    CALL GHH$IO_IN (GH$IO) ALTRET(NAK);
+
+   1268   0 00009D  EBC7 0004                            LAB,B6   GH$IO,AUTO
+          0 00009F  EFC7 000E                            STB,B6   GD$DWNLODLCT+8,AUTO
+          0 0000A1  BBC7 000E                            LAB,B3   GD$DWNLODLCT+8,AUTO
+          0 0000A3  CBF0 0100                            LAB,B4   256,IMO
+          0 0000A5  E380 0000 0000  xent                 LNJ,B6   GHH$IO_IN
+          0 0000A8       002C                            DC       s:1289,PREL
+
+      268     1269    3                    GH$IO.CAS.FNC=%GH#IO_OTPCHNCTR;
+
+   1269   0 0000A9  6C05                                 LDV,R6   5
+          0 0000AA  EAC7 0004                            SRM,R6,'003F'X    GH$IO,AUTO
+          0 0000AC       003F
+
+      269     1270    3                    GH$IO.STATUS='4000'X;
+
+   1270   0 0000AD  D870 4000                            LDR,R5   16384,IMO
+          0 0000AF  DF47 0005                            STR,R5   GH$IO+1,AUTO
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:41   
+
+      270     1271    3                    CALL GHH$IO_IN (GH$IO) ALTRET (NAK);
+
+   1271   0 0000B1  EBC7 0004                            LAB,B6   GH$IO,AUTO
+          0 0000B3  EFC7 000E                            STB,B6   GD$DWNLODLCT+8,AUTO
+          0 0000B5  BBC7 000E                            LAB,B3   GD$DWNLODLCT+8,AUTO
+          0 0000B7  CBF0 0100                            LAB,B4   256,IMO
+          0 0000B9  E380 0000 0000  xent                 LNJ,B6   GHH$IO_IN
+          0 0000BC       0018                            DC       s:1289,PREL
+
+      271     1272    3                    END;
+
+      272     1273    2                 END;
+
+   1273   0 0000BD  0F81 0016                            B        s:1289,PREL
+
+      273     1274    1              ELSE
+      274     1275    2              DO;
+
+      275     1276        /*
+      276     1277          Since there was no disconnect, but dataset status changed we must
+      277     1278          be newly connected.  Since its possible to get multiple transmitt
+      278     1279          interrupts before we actually get going, make sure we only setup
+      279     1280          the initial receive IOLD once.
+      280     1281                                                                                      */
+      281     1282    2                 IF NOT(GD_DATA.GDA.CONNECTFLG) THEN
+
+   1282   0 0000BF  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 0000C2  89C6 0009                            CMZ      9,B6
+          0 0000C4  0801 000C                            BAL      s:1288,PREL
+
+      282     1283    3                 DO;
+
+      283     1284    3                    GD_DATA.GDA.CONNECTFLG=%G_ON#;
+
+   1284   0 0000C6  8946 0009                            LBT,'8000'X       9,B6
+   1284   0 0000C8       8000
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:42   
+
+      284     1285    3                    CALL GDA$RCVIOLD;
+
+   1285   0 0000C9  CBF0 0000                            LAB,B4   0,IMO
+          0 0000CB  E380 0000 0000  xent                 LNJ,B6   GDA$RCVIOLD
+          0 0000CE       0001                            DC       s:1286,PREL
+
+      285     1286    3                    END;
+
+   1286   0 0000CF  0F81 0004                            B        s:1289,PREL
+
+      286     1287    2                 ELSE
+      287     1288    2                    GD_DATA.GDA.CONNECTFLG=%G_ON#;
+
+   1288   0 0000D1  8946 0009                            LBT,'8000'X       9,B6
+   1288   0 0000D3       8000
+
+      288     1289    2              END;
+
+   1284   0                              NAK             null
+      289     1290        /*
+      290     1291           If we altretedt anywhere above, note it here and go to
+      291     1292           sleep for a while
+      292     1293                                                                                      */
+      293     1294    1   NAK:    ;
+      294     1295    1              GD_DATA.GDA.NAKCNT=GD_DATA.GDA.NAKCNT+1;
+
+   1295   0 0000D4  EC80 0000 0000  xsym NAK             LDB,B6   GD$DELTA_DATA$
+          0 0000D7  8AC6 000C                            INC      12,B6
+
+      295     1296    1   SLEEP:  RETURN;
+
+   1296   0 0000D9  C380 0000 0000  xent SLEEP           LNJ,B4   X6A_ARET
+      296     1297    1   END GDA$TRNENT;
+      297     1298        %EOD;
+
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:43   
+--  Include file information  --
+
+   KH$IO.:E05TOU  is referenced.
+   KW_ALCT_E.:E05TOU  is referenced.
+   GDA$MACS_M.:E05TOU  is referenced.
+   GH_IOFNC_E.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GDA$TRNENT.
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:44   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w STRC(112)   r     1 GD$DWNLODLCT               4-0-0/w STRC(32)    r     1 GH$IO
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 GD$DELTA_DATA$             0-0-0/w UBIN(10)    r     1 GD_CHN
+     0-0-0/w STRC(112)   r     1 GD_DWNLODLCT               0-0-0/w UBIN(16)    r     1 GD_LINSPD
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(16704) r     1 GD_DATA
+
+
+   Procedure GDA$TRNENT requires 220 words for executable code.
+   Procedure GDA$TRNENT requires 16 words of local(AUTO) storage.
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:45   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:46   
+          MINI XREF LISTING
+
+GD$DELTA_DATA$
+       451**DCL       465--IMP-PTR  1218>>IF       1233>>ASSIGN   1233>>ASSIGN   1236>>ASSIGN   1255>>IF
+      1257>>ASSIGN   1260>>ASSIGN   1282>>IF       1284>>ASSIGN   1288>>ASSIGN   1295>>ASSIGN   1295>>ASSIGN
+GD$DWNLODLCT
+      1182**DCL      1261<<ASSIGN   1263<>CALL
+GD$DWNLODLCT.CHN$
+      1188**DCL      1262<<ASSIGN
+GDA$RCVIOLD
+      1193**DCL-ENT  1285--CALL
+GDB$KILL_ALLBRKPNTS
+      1195**DCL-ENT  1259--CALL
+GDB$RESET_BRKPNT
+      1196**DCL-ENT  1258--CALL
+GD_CHN
+      1125**DCL      1212>>ASSIGN   1262--ASSIGN
+GD_DATA.GD.DYNSP$
+       478**DCL       478--REDEF
+GD_DATA.GD.STEP_BRKPNT.ADR$
+       479**DCL       480--REDEF
+GD_DATA.GD.STEP_BRKPNT.START$
+       480**DCL       480--REDEF
+GD_DATA.GDA.CONNECTFLG
+       466**DCL      1255>>IF       1257<<ASSIGN   1282>>IF       1284<<ASSIGN   1288<<ASSIGN
+GD_DATA.GDA.IOERRCNT
+       467**DCL      1233<<ASSIGN   1233>>ASSIGN
+GD_DATA.GDA.NAKCNT
+       467**DCL      1295<<ASSIGN   1295>>ASSIGN
+GD_DATA.GDA.XMITFLG
+       466**DCL      1218>>IF       1236<<ASSIGN   1260<<ASSIGN
+GD_DWNLODLCT
+      1141**DCL      1261>>ASSIGN
+GD_LINSPD
+PL6.E3A0      #002=GDA$TRNENT File=GDA$SATYR.:E05TSI                             TUE 07/29/97 21:21 Page:47   
+      1126**DCL      1265>>ASSIGN
+GH$IO
+      1163**DCL      1221<>CALL     1248<>CALL     1268<>CALL     1271<>CALL
+GH$IO.CAS.CHN
+      1163**DCL      1163--REDEF    1212<<ASSIGN
+GH$IO.CAS.FNC
+      1164**DCL      1220<<ASSIGN   1247<<ASSIGN   1264<<ASSIGN   1269<<ASSIGN
+GH$IO.CAS.XCHN.OUTPUT
+      1164**DCL      1213<<ASSIGN   1267<<ASSIGN
+GH$IO.DAS
+      1164**DCL      1165--REDEF    1166--REDEF
+GH$IO.DAS.LCTADR
+      1165**DCL      1266<<ASSIGN
+GH$IO.DAS.LCTDAT
+      1164**DCL      1265<<ASSIGN
+GH$IO.STATUS
+      1166**DCL      1222>>IF       1228>>IF       1249>>IF       1270<<ASSIGN
+GHH$IO_IN
+      1199**DCL-ENT  1221--CALL     1248--CALL     1268--CALL     1271--CALL
+KHI$DWNLODLCT
+      1200**DCL-ENT  1263--CALL
+NAK
+      1284**LABEL    1221--CALLALT  1248--CALLALT  1268--CALLALT  1271--CALLALT
+SLEEP
+      1296**LABEL    1263--CALLALT
+
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:48   
+      298        1        /*T***********************************************************/
+      299        2        /*T*                                                         */
+      300        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      301        4        /*T*                                                         */
+      302        5        /*T***********************************************************/
+      303        6        %EJECT;
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:49   
+      304        7        /*F*    NAME: GDA$XMT
+      305        8                PURPOSE: This routine is passed a buffer to be sent
+      306        9                         down the debug link to the local FEP where it
+      307       10                         will be sent off to the host resident debugger.
+      308       11                CALL: CALL GDA$XMT (SIZE,BUFFER) ALTRET(label);
+      309       12                DESCRIPTION: This routine is called by the debugging routines
+      310       13                             resident in this FEP to ship data down the
+      311       14                             debug link.  The data is converted from
+      312       15                             normal character format to line format, placed
+      313       16                             into the SATYR output buffer and then a routine
+      314       17                             is called to setup and issue the IOLD to send the
+      315       18                             data down the line.
+      316       19                                                                                      */
+      317       20        GDA$XMT: PROC(SIZE,BUFFER)  ALTRET;
+      318       21                                                /* INCLUDES                           */
+      319       22 S      %INCLUDE G_LCP6_E;                      /* Various LCP6 EQUs                  */
+      320       23        %INCLUDE GD_STATIC_DATA;
+      321      496        %INCLUDE GH_HARDWARE_M;                 /* Structures to do I/Os and LEVs     */
+      322      594        %INCLUDE GH_IOFNC_E;                    /* I/O function code equs             */
+      323      663                                                /* SYMREFS                            */
+      324      664    1   DCL G$SATYR_TRNISA$ PTR SYMREF;
+      325      665                                                /* ARGS                               */
+      326      666    1   DCL BUFFER CHAR(SIZE) ALIGNED;         /* Buffer to be passed                */
+      327      667    1   DCL ERROR UBIN;                         /* Error code passed back             */
+      328      668    1   DCL SIZE UBIN;                          /* Byte size of BUFFER                */
+      329      669                                                /* ENTRYS                             */
+      330      670    1   DCL GDA$TRNIOLD ENTRY ;                 /* Do an output IOLD                  */
+      331      671    1   DCL GHH$DISABLE ENTRY(1);               /* Conditional disable.               */
+      332      672    1   DCL GHH$ENABLE ENTRY;
+      333      673                                                /* BASED ITEMS                        */
+      334      674    1   DCL 1 FEDBUF BASED ALIGNED,             /* Template for BUFFER                */
+      335      675    1         2 BUF(0:999),
+      336      676    1           3 CHR BIT(6) UNAL;
+      337      677    1   DCL 1 LINEBUF BASED ALIGNED,            /* Data as it goes down the line      */
+      338      678    1         2 BUF(0:999),
+      339      679    1           3 BYTE8 UBIN BYTE UNAL,
+      340      680    1           3 CHAR8 REDEF BYTE8,
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:50   
+      341      681    1             4 CTL BIT(2) UNAL,            /* Control info                       */
+      342      682    1             4 CHR BIT(6) UNAL;            /* The character                      */
+      343      683                                                /* LOCAL                              */
+      344      684    1   DCL I UBIN;
+      345      685    1   DCL CALLVL UBIN;
+      346      686              %EJECT;
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:51   
+      347      687        /*
+      348      688          Insure that there is no transmission in progress and that SATYR's
+      349      689          buffer is large enough to transmitt the data
+      350      690                                                                                      */
+      351      691    1           IF SIZE > %GDA#TRNBFRSIZ-2
+      352      692    1             OR GD_DATA.GDA.XMITFLG THEN
+      353      693    1              ALTRETURN;
+      354      694        /*
+      355      695           Go to the SATYR inhibit level if we arent allready there or
+      356      696           currently below it
+      357      697                                                                                      */
+      358      698    1           CALLVL=%G_IL_SATYR_INH#;
+      359      699    1           CALL GHH$DISABLE (CALLVL);
+      360      700        /*
+      361      701          Init the transmitt buffer to 0
+      362      702                                                                                      */
+      363      703    1           GD_DATA.GDA.TRN.BFR='0'B;
+      364      704        /*
+      365      705          The transmission protocol is rather simple and is made up of
+      366      706           an STX followed by a function code, followed by a subfunction code
+      367      707           followed by data followed by an ETX.  Start by setting up the
+      368      708           first three bytes of data, which will not get converted to
+      369      709           line format
+      370      710                                                                                      */
+      371      711    1           GD_DATA.GDA.TRN.BFR(0)=BITBIN(%GDA#STX);
+      372      712    1           GD_DATA.GDA.TRN.BFR(1)=ADDR(BUFFER)->LINEBUF.BUF.BYTE8(0);
+      373      713    1           GD_DATA.GDA.TRN.BFR(2)=ADDR(BUFFER)->LINEBUF.BUF.BYTE8(1);
+      374      714        /*
+      375      715          Figure out how big the transmitt buffer will be, taking into acount
+      376      716          the 8 bit to 6 bit conversion for line format
+      377      717                                                                                      */
+      378      718    1           GD_DATA.GDA.IOLDSIZE=((((SIZE-2)*8)+5)/6)+3;
+      379      719        /*
+      380      720          Move the data characters from FED's buffer to the transmitt buffer
+      381      721          6 bits at a time
+      382      722                                                                                      */
+      383      723    2           DO I=0 TO GD_DATA.GDA.IOLDSIZE-4;
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:52   
+      384      724    2              ADDR(GD_DATA.GDA.TRN.BFR)->LINEBUF.BUF.CHAR8.CHR(I+3)=
+      385      725    2                PINCRW(ADDR(BUFFER),1)->FEDBUF.BUF.CHR(I);
+      386      726    2              END;
+      387      727        /*
+      388      728          Stuff the last control byte
+      389      729                                                                                      */
+      390      730    1           ADDR(GD_DATA.GDA.TRN.BFR)->
+      391      731    1             LINEBUF.BUF.BYTE8(GD_DATA.GDA.IOLDSIZE)=BITBIN(%GDA#ETX);
+      392      732    1           GD_DATA.GDA.IOLDSIZE=GD_DATA.GDA.IOLDSIZE+1;
+      393      733        /*
+      394      734          Ship it
+      395      735                                                                                      */
+      396      736    1           GOTO DO_IOLD;
+      397      737    1   GDA$REXMT: ENTRY(SIZE,BUFFER) ALTRET;
+      398      738
+      399      739    1            CALLVL = %G_IL_SATYR_INH#;
+      400      740    1            CALL GHH$DISABLE (CALLVL);
+      401      741    1   DO_IOLD: CALL GDA$TRNIOLD;
+      402      742        /*
+      403      743          Enable the level that called us
+      404      744                                                                                      */
+      405      745    1           IF CALLVL > %G_IL_SATYR_INH# THEN
+      406      746    1           CALL GHH$ENABLE;
+      407      747        /* */
+      408      748    1           RETURN;
+      409      749    1   END GDA$XMT;
+      410      750              %EOD;
+
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:53   
+--  Include file information  --
+
+   GH_IOFNC_E.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GDA$XMT.
+
+   Procedure GDA$XMT requires 168 words for executable code.
+   Procedure GDA$XMT requires 14 words of local(AUTO) storage.
+
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:54   
+
+ Object Unit name= GDA$XMT                                    File name= GDA$SATYR.:E05TOU
+ UTS= JUL 29 '97 21:21:46.08 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   168     A8  GDA$XMT
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes    yes     yes      Std        2  GDA$XMT
+     0     80          yes     yes      Std        2  GDA$REXMT
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 GHH$DISABLE
+         yes           Std       0 GHH$ENABLE
+         yes           Std       0 GDA$TRNIOLD
+                       nStd      0 X6A_AUTO_2
+                       nStd      0 X6A_AALT
+                       nStd      0 X6B_BLR
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     GD$DELTA_DATA$                   r    G$ROS$
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:55   
+
+
+      298        1        /*T***********************************************************/
+      299        2        /*T*                                                         */
+      300        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      301        4        /*T*                                                         */
+      302        5        /*T***********************************************************/
+      303        6        %EJECT;
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:56   
+      304        7        /*F*    NAME: GDA$XMT
+      305        8                PURPOSE: This routine is passed a buffer to be sent
+      306        9                         down the debug link to the local FEP where it
+      307       10                         will be sent off to the host resident debugger.
+      308       11                CALL: CALL GDA$XMT (SIZE,BUFFER) ALTRET(label);
+      309       12                DESCRIPTION: This routine is called by the debugging routines
+      310       13                             resident in this FEP to ship data down the
+      311       14                             debug link.  The data is converted from
+      312       15                             normal character format to line format, placed
+      313       16                             into the SATYR output buffer and then a routine
+      314       17                             is called to setup and issue the IOLD to send the
+      315       18                             data down the line.
+      316       19                                                                                      */
+      317       20        GDA$XMT: PROC(SIZE,BUFFER)  ALTRET;
+
+     20   0 000000  D380 0000 0000  xent GDA$XMT         LNJ,B5   X6A_AUTO_2
+          0 000003       000E 0002                       DC       14,2
+
+      318       21                                                /* INCLUDES                           */
+      319       22 S      %INCLUDE G_LCP6_E;                      /* Various LCP6 EQUs                  */
+      320       23        %INCLUDE GD_STATIC_DATA;
+      321      496        %INCLUDE GH_HARDWARE_M;                 /* Structures to do I/Os and LEVs     */
+      322      594        %INCLUDE GH_IOFNC_E;                    /* I/O function code equs             */
+      323      663                                                /* SYMREFS                            */
+      324      664    1   DCL G$SATYR_TRNISA$ PTR SYMREF;
+      325      665                                                /* ARGS                               */
+      326      666    1   DCL BUFFER CHAR(SIZE) ALIGNED;         /* Buffer to be passed                */
+      327      667    1   DCL ERROR UBIN;                         /* Error code passed back             */
+      328      668    1   DCL SIZE UBIN;                          /* Byte size of BUFFER                */
+      329      669                                                /* ENTRYS                             */
+      330      670    1   DCL GDA$TRNIOLD ENTRY ;                 /* Do an output IOLD                  */
+      331      671    1   DCL GHH$DISABLE ENTRY(1);               /* Conditional disable.               */
+      332      672    1   DCL GHH$ENABLE ENTRY;
+      333      673                                                /* BASED ITEMS                        */
+      334      674    1   DCL 1 FEDBUF BASED ALIGNED,             /* Template for BUFFER                */
+      335      675    1         2 BUF(0:999),
+      336      676    1           3 CHR BIT(6) UNAL;
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:57   
+      337      677    1   DCL 1 LINEBUF BASED ALIGNED,            /* Data as it goes down the line      */
+      338      678    1         2 BUF(0:999),
+      339      679    1           3 BYTE8 UBIN BYTE UNAL,
+      340      680    1           3 CHAR8 REDEF BYTE8,
+      341      681    1             4 CTL BIT(2) UNAL,            /* Control info                       */
+      342      682    1             4 CHR BIT(6) UNAL;            /* The character                      */
+      343      683                                                /* LOCAL                              */
+      344      684    1   DCL I UBIN;
+      345      685    1   DCL CALLVL UBIN;
+      346      686              %EJECT;
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:58   
+      347      687        /*
+      348      688          Insure that there is no transmission in progress and that SATYR's
+      349      689          buffer is large enough to transmitt the data
+      350      690                                                                                      */
+      351      691    1           IF SIZE > %GDA#TRNBFRSIZ-2
+
+    691   0 000005  ECC7 0004                            LDB,B6   @SIZE,AUTO
+          0 000007  E806                                 LDR,R6   ,B6
+          0 000008  E970 00A2                            CMR,R6   162,IMO
+          0 00000A  0301 0009                            BG       s:693,PREL
+          0 00000C  DC80 0000 0000  xsym                 LDB,B5   GD$DELTA_DATA$
+          0 00000F  82C5 0009                            LB,'4000'X        9,B5
+          0 000011       4000
+          0 000012  0581 0004                            BBF      s:698,PREL
+
+      352      692    1             OR GD_DATA.GDA.XMITFLG THEN
+      353      693    1              ALTRETURN;
+
+    693   0 000014  C380 0000 0000  xent                 LNJ,B4   X6A_AALT
+
+      354      694        /*
+      355      695           Go to the SATYR inhibit level if we arent allready there or
+      356      696           currently below it
+      357      697                                                                                      */
+      358      698    1           CALLVL=%G_IL_SATYR_INH#;
+
+    698   0 000017  5C06                                 LDV,R5   6
+          0 000018  DF47 000A                            STR,R5   CALLVL,AUTO
+
+      359      699    1           CALL GHH$DISABLE (CALLVL);
+
+    699   0 00001A  CBC7 000A                            LAB,B4   CALLVL,AUTO
+          0 00001C  CFC7 000C                            STB,B4   CALLVL+2,AUTO
+          0 00001E  BBC7 000C                            LAB,B3   CALLVL+2,AUTO
+          0 000020  CBF0 0100                            LAB,B4   256,IMO
+          0 000022  E380 0000 0000  xent                 LNJ,B6   GHH$DISABLE
+          0 000025       0001                            DC       s:703,PREL
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:59   
+
+      360      700        /*
+      361      701          Init the transmitt buffer to 0
+      362      702                                                                                      */
+      363      703    1           GD_DATA.GDA.TRN.BFR='0'B;
+
+    703   0 000026  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 000029  D870 00A4                            LDR,R5   164,IMO
+          0 00002B  0021                                 ALR      ;
+          0 00002C       4178 0000                                ALPHANUM('0000'X,IMO,,1),;
+          0 00002E       4006 00DE                                ALPHANUM(222,B6,,R5,FILL)
+
+      364      704        /*
+      365      705          The transmission protocol is rather simple and is made up of
+      366      706           an STX followed by a function code, followed by a subfunction code
+      367      707           followed by data followed by an ETX.  Start by setting up the
+      368      708           first three bytes of data, which will not get converted to
+      369      709           line format
+      370      710                                                                                      */
+      371      711    1           GD_DATA.GDA.TRN.BFR(0)=BITBIN(%GDA#STX);
+
+    711   0 000030  6C42                                 LDV,R6   66
+          0 000031  437F                                 CSYNC    s:711,SPREL
+          0 000032  E7C6 00DE                            STH,R6   222,B6
+
+      372      712    1           GD_DATA.GDA.TRN.BFR(1)=ADDR(BUFFER)->LINEBUF.BUF.BYTE8(0);
+
+    712   0 000034  DCC7 0006                            LDB,B5   @BUFFER,AUTO
+          0 000036  C285                                 LLH,R4   ,B5
+          0 000037  CAC6 00DE                            SRM,R4,'00FF'X    222,B6
+          0 000039       00FF
+
+      373      713    1           GD_DATA.GDA.TRN.BFR(2)=ADDR(BUFFER)->LINEBUF.BUF.BYTE8(1);
+
+    713   0 00003A  C805                                 LDR,R4   ,B5
+          0 00003B  C570 00FF                            AND,R4   255,IMO
+          0 00003D  C7C6 00DF                            STH,R4   223,B6
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:60   
+
+      374      714        /*
+      375      715          Figure out how big the transmitt buffer will be, taking into acount
+      376      716          the 8 bit to 6 bit conversion for line format
+      377      717                                                                                      */
+      378      718    1           GD_DATA.GDA.IOLDSIZE=((((SIZE-2)*8)+5)/6)+3;
+
+    718   0 00003F  CCC7 0004                            LDB,B4   @SIZE,AUTO
+          0 000041  F804                                 LDR,R7   ,B4
+          0 000042  6C00                                 LDV,R6   0
+          0 000043  7083                                 DOL,R7   3
+          0 000044  8470 FFFF FFF5                       AID      -11,IMO
+          0 000047  F370 0006                            DIV,R7   6,IMO
+          0 000049  E857                                 LDR,R6   R7
+          0 00004A  6E03                                 ADV,R6   3
+          0 00004B  EF46 000B                            STR,R6   11,B6
+
+      379      719        /*
+      380      720          Move the data characters from FED's buffer to the transmitt buffer
+      381      721          6 bits at a time
+      382      722                                                                                      */
+      383      723    2           DO I=0 TO GD_DATA.GDA.IOLDSIZE-4;
+
+    723   0 00004D  8747 0009                            CL       I,AUTO
+          0 00004F  0F81 0017                            B        s:726+2,PREL
+
+      384      724    2              ADDR(GD_DATA.GDA.TRN.BFR)->LINEBUF.BUF.CHAR8.CHR(I+3)=
+
+    724   0 000051  ACC7 0006                            LDB,B2   @BUFFER,AUTO
+          0 000053  A847 0009                            LDR,R2   I,AUTO
+          0 000055  2F06                                 MLV,R2   6
+          0 000056  2E10                                 ADV,R2   16
+          0 000057  6C06                                 LDV,R6   6
+          0 000058  BC80 0000 0000  xsym                 LDB,B3   GD$DELTA_DATA$
+          0 00005B  BBC3 00DF                            LAB,B3   223,B3
+          0 00005D  B847 0009                            LDR,R3   I,AUTO
+          0 00005F  3003                                 SOL,R3   3
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:61   
+          0 000060  3E0A                                 ADV,R3   10
+          0 000061  7C06                                 LDV,R7   6
+          0 000062  D380 0000 0000  xent                 LNJ,B5   X6B_BLR
+
+      385      725    2                PINCRW(ADDR(BUFFER),1)->FEDBUF.BUF.CHR(I);
+      386      726    2              END;
+
+    726   0 000065  8AC7 0009                            INC      I,AUTO
+          0 000067  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00006A  E846 000B                            LDR,R6   11,B6
+          0 00006C  6EFC                                 ADV,R6   -4
+          0 00006D  6801 0004                            BLZ,R6   s:730,PREL
+          0 00006F  E947 0009                            CMR,R6   I,AUTO
+          0 000071  02E0                                 BGE      s:724,SPREL
+
+      387      727        /*
+      388      728          Stuff the last control byte
+      389      729                                                                                      */
+      390      730    1           ADDR(GD_DATA.GDA.TRN.BFR)->
+
+    730   0 000072  B846 000B                            LDR,R3   11,B6
+          0 000074  D870 00C3                            LDR,R5   195,IMO
+          0 000076  DBC6 00DE                            LAB,B5   222,B6
+          0 000078  D7B5                                 STH,R5   ,B5,R3
+
+      391      731    1             LINEBUF.BUF.BYTE8(GD_DATA.GDA.IOLDSIZE)=BITBIN(%GDA#ETX);
+      392      732    1           GD_DATA.GDA.IOLDSIZE=GD_DATA.GDA.IOLDSIZE+1;
+
+    732   0 000079  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00007C  8AC6 000B                            INC      11,B6
+
+      393      733        /*
+      394      734          Ship it
+      395      735                                                                                      */
+      396      736    1           GOTO DO_IOLD;
+
+    736   0 00007E  0F81 0015                            B        s:741,PREL
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:62   
+
+      397      737    1   GDA$REXMT: ENTRY(SIZE,BUFFER) ALTRET;
+
+    737   0 000080  D380 0000 0000  xent GDA$REXMT       LNJ,B5   X6A_AUTO_2
+          0 000083       000E 0002                       DC       14,2
+
+      398      738
+      399      739    1            CALLVL = %G_IL_SATYR_INH#;
+
+    739   0 000085  6C06                                 LDV,R6   6
+          0 000086  EF47 000A                            STR,R6   CALLVL,AUTO
+
+      400      740    1            CALL GHH$DISABLE (CALLVL);
+
+    740   0 000088  EBC7 000A                            LAB,B6   CALLVL,AUTO
+          0 00008A  EFC7 000C                            STB,B6   CALLVL+2,AUTO
+          0 00008C  BBC7 000C                            LAB,B3   CALLVL+2,AUTO
+          0 00008E  CBF0 0100                            LAB,B4   256,IMO
+          0 000090  E380 0000 0000  xent                 LNJ,B6   GHH$DISABLE
+          0 000093       0001                            DC       s:741,PREL
+
+      401      741    1   DO_IOLD: CALL GDA$TRNIOLD;
+
+    741   0 000094  CBF0 0000            DO_IOLD         LAB,B4   0,IMO
+          0 000096  E380 0000 0000  xent                 LNJ,B6   GDA$TRNIOLD
+          0 000099       0001                            DC       s:745,PREL
+
+      402      742        /*
+      403      743          Enable the level that called us
+      404      744                                                                                      */
+      405      745    1           IF CALLVL > %G_IL_SATYR_INH# THEN
+
+    745   0 00009A  E847 000A                            LDR,R6   CALLVL,AUTO
+          0 00009C  6D06                                 CMV,R6   6
+          0 00009D  0381 0007                            BLE      s:748,PREL
+
+      406      746    1           CALL GHH$ENABLE;
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:63   
+
+    746   0 00009F  CBF0 0000                            LAB,B4   0,IMO
+          0 0000A1  E380 0000 0000  xent                 LNJ,B6   GHH$ENABLE
+          0 0000A4       0001                            DC       s:748,PREL
+
+      407      747        /* */
+      408      748    1           RETURN;
+
+    748   0 0000A5  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      409      749    1   END GDA$XMT;
+      410      750              %EOD;
+
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:64   
+--  Include file information  --
+
+   GH_IOFNC_E.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GDA$XMT.
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:65   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w PTR         r     1 @BUFFER                    4-0-0/w PTR         r     1 @SIZE
+    *0-0-0/w ACHR        r     1 BUFFER                     A-0-0/w UBIN(16)    r     1 CALLVL
+     9-0-0/w UBIN(16)    r     1 I                         *0-0-0/w UBIN(16)    r     1 SIZE
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 GD$DELTA_DATA$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(6000)  r     1 FEDBUF                     0-0-0/w STRC(16704) r     1 GD_DATA
+     0-0-0/w STRC(8000)  r     1 LINEBUF
+
+
+   Procedure GDA$XMT requires 168 words for executable code.
+   Procedure GDA$XMT requires 14 words of local(AUTO) storage.
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:66   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:67   
+          MINI XREF LISTING
+
+BUFFER
+       666**DCL        20--PROC      712--ASSIGN    713--ASSIGN    724--ASSIGN    737--ENTRY
+CALLVL
+       685**DCL       698<<ASSIGN    699<>CALL      739<<ASSIGN    740<>CALL      745>>IF
+DO_IOLD
+       741**LABEL     736--GOTO
+FEDBUF.BUF.CHR
+       676**DCL       724>>ASSIGN
+GD$DELTA_DATA$
+       449**DCL       463--IMP-PTR   691>>IF        703>>ASSIGN    711>>ASSIGN    712>>ASSIGN    713>>ASSIGN
+       718>>ASSIGN    723>>DOINDEX   724>>ASSIGN    730>>ASSIGN    730>>ASSIGN    732>>ASSIGN    732>>ASSIGN
+GDA$TRNIOLD
+       670**DCL-ENT   741--CALL
+GD_DATA.GD.DYNSP$
+       476**DCL       476--REDEF
+GD_DATA.GD.STEP_BRKPNT.ADR$
+       477**DCL       478--REDEF
+GD_DATA.GD.STEP_BRKPNT.START$
+       478**DCL       478--REDEF
+GD_DATA.GDA.IOLDSIZE
+       465**DCL       718<<ASSIGN    723>>DOINDEX   730>>ASSIGN    732<<ASSIGN    732>>ASSIGN
+GD_DATA.GDA.TRN.BFR
+       466**DCL       703<<ASSIGN    711<<ASSIGN    712<<ASSIGN    713<<ASSIGN    724--ASSIGN    730--ASSIGN
+GD_DATA.GDA.XMITFLG
+       464**DCL       691>>IF
+GHH$DISABLE
+       671**DCL-ENT   699--CALL      740--CALL
+GHH$ENABLE
+       672**DCL-ENT   746--CALL
+I
+       684**DCL       723<<DOINDEX   724>>ASSIGN    724>>ASSIGN
+LINEBUF.BUF.BYTE8
+PL6.E3A0      #003=GDA$XMT File=GDA$SATYR.:E05TSI                                TUE 07/29/97 21:21 Page:68   
+       679**DCL       680--REDEF     712>>ASSIGN    713>>ASSIGN    730<<ASSIGN
+LINEBUF.BUF.CHAR8.CHR
+       682**DCL       724<<ASSIGN
+SIZE
+       668**DCL        20--PROC      666--IMP-SIZ   691>>IF        718>>ASSIGN    737--ENTRY
+
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:69   
+      411        1        /*T***********************************************************/
+      412        2        /*T*                                                         */
+      413        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      414        4        /*T*                                                         */
+      415        5        /*T***********************************************************/
+      416        6              %EJECT;
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:70   
+      417        7        /*F* NAME:      GDA$IOLD
+      418        8             PURPOSE:   This routine is called to do transmitt and
+      419        9                        receive IOLD's.
+      420       10             CALL:      CALL GDA$TRNIOLD or
+      421       11                        CALL GDA$RCVIOLD
+      422       12             DESCRIPTION:  The routine sets up for and executes the
+      423       13                           correct type of IOLD instruction and then
+      424       14                           cleans up.  In the case of a transmitt IOLD
+      425       15                           the global cells GDA_IOLDIDX and GDA_IOLDSIZE
+      426       16                           are assumed to have been setup.  NAKs are
+      427       17                           noted in the cell GDA_NAKCNT
+      428       18                                                                                      */
+      429       19        GDA$IOLD: PROC ;
+      430       20                                                /* INCLUDES                           */
+      431       21 S      %INCLUDE G_LCP6_E;                      /* Various LCP6 equates               */
+      432       22        %INCLUDE GD_STATIC_DATA;
+      433      495        %INCLUDE GH_HARDWARE_M;                 /* Macros for doing IO's, IOLD's LEV'S*/
+      434      593        %INCLUDE GH_IOFNC_E;                    /* I/O function codes                 */
+      435      662                                                /* SYMREFS                            */
+      436      663    1   DCL GD_CHN UBIN(10) SYMREF;
+      437      664                                                /* BASED                              */
+      438      665                                                /* AUTO                           */
+      439      666        %GH_IO (FPTN=GH$IO, STCLASS=AUTO);
+      440      682        %GH_IOLD (FPTN=GH$IOLD,STCLASS=AUTO);
+      441      697                                                /* ENTRYS                             */
+      442      698    1   DCL GHH$IO_IN ENTRY(1) ALTRET;          /* To do IO's                         */
+      443      699    1   DCL GHH$IOLD ENTRY(1) ALTRET;           /* To do IOLD's                       */
+      444      700              %EJECT;
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:71   
+      445      701        /*
+      446      702          Enter here to do a transmitt IOLD.  Setup buffer size and index
+      447      703                                                                                      */
+      448      704    1   GDA$TRNIOLD: ENTRY ;
+      449      705        /* */
+      450      706    1              GD_DATA.GDA.XMITFLG=%G_ON#;
+      451      707    1              GH$IOLD.BUF$=ADDR(GD_DATA.GDA.TRN.BFR);
+      452      708    1              GH$IOLD.BUFSIZE=GD_DATA.GDA.IOLDSIZE;
+      453      709    1              GH$IOLD.CHN=GD_CHN;
+      454      710    1              GH$IOLD.XCHN.OUTPUT=%G_YES#;
+      455      711    1           GOTO COMMON;
+      456      712        /*
+      457      713          Enter here to do a receive IOLD.  Its really all setup allready,
+      458      714          we just have to stuff the cannel and go off and do it
+      459      715                                                                                      */
+      460      716    1   GDA$RCVIOLD: ENTRY;
+      461      717        /* */
+      462      718    1           GH$IOLD.BUF$=ADDR(GD_DATA.GDA.RCV.BFR);
+      463      719    1           GH$IOLD.CHN=GD_CHN;
+      464      720    1           GH$IOLD.BUFSIZE=SIZEC(GD_DATA.GDA.RCV.BFR);
+      465      721    1   COMMON:;
+      466      722        /*
+      467      723          This code is common to both transmitt and receive IOLD's
+      468      724                                                                                      */
+      469      725    1           GH$IOLD.FNC=%GH#IO_IOLD;
+      470      726    1           GH$IOLD.BYTX=0;
+      471      727    1           IF GD_DATA.GDA.CONNECTFLG THEN
+      472      728    1           CALL GHH$IOLD(GH$IOLD) ALTRET(NAKED);
+      473      729    1           ELSE
+      474      730    1              RETURN;
+      475      731    1           GH$IO.CAS.CHN=GH$IOLD.CHN;
+      476      732        /*
+      477      733          Setup an output CCB control to interrupt when CCB complete
+      478      734          and valid
+      479      735                                                                                      */
+      480      736    1           GH$IO.CAS.FNC=%GH#IO_OTPCCBCTR;
+      481      737    1           GH$IO.STATUS = '00C0'X;
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:72   
+      482      738    1           CALL GHH$IO_IN (GH$IO) ALTRET(NAKED);
+      483      739        /*
+      484      740          Start I/O to channel
+      485      741                                                                                      */
+      486      742    1           GH$IO.CAS.FNC=%GH#IO_OTPCHNCTR;
+      487      743    1           GH$IO.STATUS='4000'X;
+      488      744    1           CALL GHH$IO_IN(GH$IO) ALTRET(NAKED);
+      489      745    2           DO WHILE (%G_NO#);
+      490      746    2   NAKED:     GD_DATA.GDA.NAKCNT=GD_DATA.GDA.NAKCNT+1;
+      491      747    2              END;
+      492      748        /* */
+      493      749    1           RETURN;
+      494      750    1   END GDA$IOLD;
+
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:73   
+--  Include file information  --
+
+   GH_IOFNC_E.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GDA$IOLD.
+
+   Procedure GDA$IOLD requires 141 words for executable code.
+   Procedure GDA$IOLD requires 14 words of local(AUTO) storage.
+
+    No errors detected in file GDA$SATYR.:E05TSI    .
+
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:74   
+
+ Object Unit name= GDA$IOLD                                   File name= GDA$SATYR.:E05TOU
+ UTS= JUL 29 '97 21:21:53.88 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   141     8D  GDA$IOLD
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        0  GDA$IOLD
+     0      7                  yes      Std        0  GDA$TRNIOLD
+     0     25                  yes      Std        0  GDA$RCVIOLD
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 GHH$IOLD
+ yes     yes           Std       1 GHH$IO_IN
+                       nStd      0 X6A_AUTO_0
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     GD$DELTA_DATA$                        GD_CHN                           r    G$ROS$
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:75   
+
+
+      411        1        /*T***********************************************************/
+      412        2        /*T*                                                         */
+      413        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      414        4        /*T*                                                         */
+      415        5        /*T***********************************************************/
+      416        6              %EJECT;
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:76   
+      417        7        /*F* NAME:      GDA$IOLD
+      418        8             PURPOSE:   This routine is called to do transmitt and
+      419        9                        receive IOLD's.
+      420       10             CALL:      CALL GDA$TRNIOLD or
+      421       11                        CALL GDA$RCVIOLD
+      422       12             DESCRIPTION:  The routine sets up for and executes the
+      423       13                           correct type of IOLD instruction and then
+      424       14                           cleans up.  In the case of a transmitt IOLD
+      425       15                           the global cells GDA_IOLDIDX and GDA_IOLDSIZE
+      426       16                           are assumed to have been setup.  NAKs are
+      427       17                           noted in the cell GDA_NAKCNT
+      428       18                                                                                      */
+      429       19        GDA$IOLD: PROC ;
+
+     19   0 000000  D380 0000 0000  xent GDA$IOLD        LNJ,B5   X6A_AUTO_0
+          0 000003       000E 0000                       DC       14,0
+          0 000005  0F81 0006                            B        s:706,PREL
+
+      430       20                                                /* INCLUDES                           */
+      431       21 S      %INCLUDE G_LCP6_E;                      /* Various LCP6 equates               */
+      432       22        %INCLUDE GD_STATIC_DATA;
+      433      495        %INCLUDE GH_HARDWARE_M;                 /* Macros for doing IO's, IOLD's LEV'S*/
+      434      593        %INCLUDE GH_IOFNC_E;                    /* I/O function codes                 */
+      435      662                                                /* SYMREFS                            */
+      436      663    1   DCL GD_CHN UBIN(10) SYMREF;
+      437      664                                                /* BASED                              */
+      438      665                                                /* AUTO                           */
+      439      666        %GH_IO (FPTN=GH$IO, STCLASS=AUTO);
+      440      682        %GH_IOLD (FPTN=GH$IOLD,STCLASS=AUTO);
+      441      697                                                /* ENTRYS                             */
+      442      698    1   DCL GHH$IO_IN ENTRY(1) ALTRET;          /* To do IO's                         */
+      443      699    1   DCL GHH$IOLD ENTRY(1) ALTRET;           /* To do IOLD's                       */
+      444      700              %EJECT;
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:77   
+      445      701        /*
+      446      702          Enter here to do a transmitt IOLD.  Setup buffer size and index
+      447      703                                                                                      */
+      448      704    1   GDA$TRNIOLD: ENTRY ;
+
+    704   0 000007  D380 0000 0000  xent GDA$TRNIOLD     LNJ,B5   X6A_AUTO_0
+          0 00000A       000E 0000                       DC       14,0
+
+      449      705        /* */
+      450      706    1              GD_DATA.GDA.XMITFLG=%G_ON#;
+
+    706   0 00000C  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00000F  8946 0009                            LBT,'4000'X       9,B6
+          0 000011       4000
+
+      451      707    1              GH$IOLD.BUF$=ADDR(GD_DATA.GDA.TRN.BFR);
+
+    707   0 000012  DBC6 00DE                            LAB,B5   222,B6
+          0 000014  DFC7 0007                            STB,B5   GH$IOLD+1,AUTO
+
+      452      708    1              GH$IOLD.BUFSIZE=GD_DATA.GDA.IOLDSIZE;
+
+    708   0 000016  E846 000B                            LDR,R6   11,B6
+          0 000018  EF47 000A                            STR,R6   GH$IOLD+4,AUTO
+
+      453      709    1              GH$IOLD.CHN=GD_CHN;
+
+    709   0 00001A  D800 0000 0000  xsym                 LDR,R5   GD_CHN
+          0 00001D  DAC7 0006                            SRM,R5,'FFC0'X    GH$IOLD,AUTO
+          0 00001F       FFC0
+
+      454      710    1              GH$IOLD.XCHN.OUTPUT=%G_YES#;
+
+    710   0 000020  8947 0006                            LBT,'0040'X       GH$IOLD,AUTO
+    710   0 000022       0040
+
+      455      711    1           GOTO COMMON;
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:78   
+
+    711   0 000023  0F81 0017                            B        s:720,PREL
+
+      456      712        /*
+      457      713          Enter here to do a receive IOLD.  Its really all setup allready,
+      458      714          we just have to stuff the cannel and go off and do it
+      459      715                                                                                      */
+      460      716    1   GDA$RCVIOLD: ENTRY;
+
+    716   0 000025  D380 0000 0000  xent GDA$RCVIOLD     LNJ,B5   X6A_AUTO_0
+          0 000028       000E 0000                       DC       14,0
+
+      461      717        /* */
+      462      718    1           GH$IOLD.BUF$=ADDR(GD_DATA.GDA.RCV.BFR);
+
+    718   0 00002A  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          0 00002D  DBC6 000D                            LAB,B5   13,B6
+          0 00002F  DFC7 0007                            STB,B5   GH$IOLD+1,AUTO
+
+      463      719    1           GH$IOLD.CHN=GD_CHN;
+
+    719   0 000031  E800 0000 0000  xsym                 LDR,R6   GD_CHN
+          0 000034  EAC7 0006                            SRM,R6,'FFC0'X    GH$IOLD,AUTO
+          0 000036       FFC0
+
+      464      720    1           GH$IOLD.BUFSIZE=SIZEC(GD_DATA.GDA.RCV.BFR);
+
+    720   0 000037  D870 01A2                            LDR,R5   418,IMO
+          0 000039  DF47 000A                            STR,R5   GH$IOLD+4,AUTO
+
+    720   0                              COMMON          null
+      465      721    1   COMMON:;
+      466      722        /*
+      467      723          This code is common to both transmitt and receive IOLD's
+      468      724                                                                                      */
+      469      725    1           GH$IOLD.FNC=%GH#IO_IOLD;
+
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:79   
+    725   0 00003B  6C09                 COMMON          LDV,R6   9
+          0 00003C  EAC7 0006                            SRM,R6,'003F'X    GH$IOLD,AUTO
+          0 00003E       003F
+
+      470      726    1           GH$IOLD.BYTX=0;
+
+    726   0 00003F  8747 0009                            CL       GH$IOLD+3,AUTO
+
+      471      727    1           IF GD_DATA.GDA.CONNECTFLG THEN
+
+    727   0 000041  89C6 0009                            CMZ      9,B6
+          0 000043  0881 000F                            BAGE     s:730,PREL
+
+      472      728    1           CALL GHH$IOLD(GH$IOLD) ALTRET(NAKED);
+
+    728   0 000045  CBC7 0006                            LAB,B4   GH$IOLD,AUTO
+          0 000047  CFC7 000C                            STB,B4   GH$IOLD+6,AUTO
+          0 000049  BBC7 000C                            LAB,B3   GH$IOLD+6,AUTO
+          0 00004B  CBF0 0100                            LAB,B4   256,IMO
+          0 00004D  E380 0000 0000  xent                 LNJ,B6   GHH$IOLD
+          0 000050       0035                            DC       s:746,PREL
+          0 000051  0F81 0004                            B        s:731,PREL
+
+      473      729    1           ELSE
+      474      730    1              RETURN;
+
+    730   0 000053  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      475      731    1           GH$IO.CAS.CHN=GH$IOLD.CHN;
+
+    731   0 000056  E847 0006                            LDR,R6   GH$IOLD,AUTO
+          0 000058  EAC7 0004                            SRM,R6,'FFC0'X    GH$IO,AUTO
+          0 00005A       FFC0
+
+      476      732        /*
+      477      733          Setup an output CCB control to interrupt when CCB complete
+      478      734          and valid
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:80   
+      479      735                                                                                      */
+      480      736    1           GH$IO.CAS.FNC=%GH#IO_OTPCCBCTR;
+
+    736   0 00005B  5C0F                                 LDV,R5   15
+          0 00005C  DAC7 0004                            SRM,R5,'003F'X    GH$IO,AUTO
+          0 00005E       003F
+
+      481      737    1           GH$IO.STATUS = '00C0'X;
+
+    737   0 00005F  C870 00C0                            LDR,R4   192,IMO
+          0 000061  CF47 0005                            STR,R4   GH$IO+1,AUTO
+
+      482      738    1           CALL GHH$IO_IN (GH$IO) ALTRET(NAKED);
+
+    738   0 000063  EBC7 0004                            LAB,B6   GH$IO,AUTO
+          0 000065  EFC7 000C                            STB,B6   GH$IOLD+6,AUTO
+          0 000067  BBC7 000C                            LAB,B3   GH$IOLD+6,AUTO
+          0 000069  CBF0 0100                            LAB,B4   256,IMO
+          0 00006B  E380 0000 0000  xent                 LNJ,B6   GHH$IO_IN
+          0 00006E       0017                            DC       s:746,PREL
+
+      483      739        /*
+      484      740          Start I/O to channel
+      485      741                                                                                      */
+      486      742    1           GH$IO.CAS.FNC=%GH#IO_OTPCHNCTR;
+
+    742   0 00006F  6C05                                 LDV,R6   5
+          0 000070  EAC7 0004                            SRM,R6,'003F'X    GH$IO,AUTO
+          0 000072       003F
+
+      487      743    1           GH$IO.STATUS='4000'X;
+
+    743   0 000073  D870 4000                            LDR,R5   16384,IMO
+          0 000075  DF47 0005                            STR,R5   GH$IO+1,AUTO
+
+      488      744    1           CALL GHH$IO_IN(GH$IO) ALTRET(NAKED);
+
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:81   
+    744   0 000077  EBC7 0004                            LAB,B6   GH$IO,AUTO
+          0 000079  EFC7 000C                            STB,B6   GH$IOLD+6,AUTO
+          0 00007B  BBC7 000C                            LAB,B3   GH$IOLD+6,AUTO
+          0 00007D  CBF0 0100                            LAB,B4   256,IMO
+          0 00007F  E380 0000 0000  xent                 LNJ,B6   GHH$IO_IN
+          0 000082       0003                            DC       s:746,PREL
+
+      489      745    2           DO WHILE (%G_NO#);
+
+    745   0 000083  0F81 0006                            B        s:749,PREL
+
+      490      746    2   NAKED:     GD_DATA.GDA.NAKCNT=GD_DATA.GDA.NAKCNT+1;
+
+    746   0 000085  EC80 0000 0000  xsym NAKED           LDB,B6   GD$DELTA_DATA$
+          0 000088  8AC6 000C                            INC      12,B6
+
+      491      747    2              END;
+
+      492      748        /* */
+      493      749    1           RETURN;
+
+    749   0 00008A  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      494      750    1   END GDA$IOLD;
+
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:82   
+--  Include file information  --
+
+   GH_IOFNC_E.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   KI_CP6.:E05TOU  was found in the system file and is never referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure GDA$IOLD.
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:83   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w STRC(32)    r     1 GH$IO                      6-0-0/w STRC(80)    r     1 GH$IOLD
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 GD$DELTA_DATA$             0-0-0/w UBIN(10)    r     1 GD_CHN
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(16704) r     1 GD_DATA
+
+
+   Procedure GDA$IOLD requires 141 words for executable code.
+   Procedure GDA$IOLD requires 14 words of local(AUTO) storage.
+
+    No errors detected in file GDA$SATYR.:E05TSI    .
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:84   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:85   
+          MINI XREF LISTING
+
+COMMON
+       720**LABEL     711--GOTO
+GD$DELTA_DATA$
+       448**DCL       462--IMP-PTR   706>>ASSIGN    707>>ASSIGN    708>>ASSIGN    718>>ASSIGN    727>>IF
+       746>>ASSIGN    746>>ASSIGN
+GD_CHN
+       663**DCL       709>>ASSIGN    719>>ASSIGN
+GD_DATA.GD.DYNSP$
+       475**DCL       475--REDEF
+GD_DATA.GD.STEP_BRKPNT.ADR$
+       476**DCL       477--REDEF
+GD_DATA.GD.STEP_BRKPNT.START$
+       477**DCL       477--REDEF
+GD_DATA.GDA.CONNECTFLG
+       463**DCL       727>>IF
+GD_DATA.GDA.IOLDSIZE
+       464**DCL       708>>ASSIGN
+GD_DATA.GDA.NAKCNT
+       464**DCL       746<<ASSIGN    746>>ASSIGN
+GD_DATA.GDA.RCV.BFR
+       465**DCL       718--ASSIGN    720--ASSIGN
+GD_DATA.GDA.TRN.BFR
+       465**DCL       707--ASSIGN
+GD_DATA.GDA.XMITFLG
+       463**DCL       706<<ASSIGN
+GH$IO
+       677**DCL       738<>CALL      744<>CALL
+GH$IO.CAS.CHN
+       677**DCL       677--REDEF     731<<ASSIGN
+GH$IO.CAS.FNC
+       678**DCL       736<<ASSIGN    742<<ASSIGN
+GH$IO.DAS
+PL6.E3A0      #004=GDA$IOLD File=GDA$SATYR.:E05TSI                               TUE 07/29/97 21:21 Page:86   
+       678**DCL       679--REDEF     680--REDEF
+GH$IO.STATUS
+       680**DCL       737<<ASSIGN    743<<ASSIGN
+GH$IOLD
+       693**DCL       728<>CALL
+GH$IOLD.BUF$
+       694**DCL       707<<ASSIGN    718<<ASSIGN
+GH$IOLD.BUFSIZE
+       695**DCL       708<<ASSIGN    720<<ASSIGN
+GH$IOLD.BYTX
+       694**DCL       726<<ASSIGN
+GH$IOLD.CHN
+       693**DCL       693--REDEF     709<<ASSIGN    719<<ASSIGN    731>>ASSIGN
+GH$IOLD.FNC
+       694**DCL       725<<ASSIGN
+GH$IOLD.XCHN.OUTPUT
+       694**DCL       710<<ASSIGN
+GHH$IOLD
+       699**DCL-ENT   728--CALL
+GHH$IO_IN
+       698**DCL-ENT   738--CALL      744--CALL
+NAKED
+       746**LABEL     728--CALLALT   738--CALLALT   744--CALLALT

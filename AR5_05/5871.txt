@@ -1,0 +1,740 @@
+/*M* PMON -- Debugger to gather performance data on user programs */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMC */
+/*P* NAME: PMON
+     PURPOSE:  PMON runs as a debugger and gathers performance data
+               on user programs.  It works by putting a small piece
+               of code into the users ISR (at DELTA's special location)
+               that continuesly sets a short M$STIMER interval.  Each
+               time the timer interval ends, PMON records the IC value
+               and the overlay node number that the IC is located in.
+               This data is accumulated and written to a disk file, to
+               be later read and analyzed by PMDISP.
+*/
+/*  Note that this program makes lots of assumptions about the way
+  things are.  For example, it assumes that all programs have a DELTA
+  special location that always starts at location 2 and goes for 10 words
+  It also assumes that nobody is going to use DELTA's special location
+  or the PIA except PMON. (At least while PMON is around.)
+  At the moment, PMON also uses location 1, which is not technicaly
+  allowed, but works.
+  PMON is not very smart when it comes to programs that dont work right,
+  but if your program doesnt work, why do you care how fast it runs?
+ 
+ 
+ 
+  PMON is probably not completely error-free, but remember what
+  Shakespeare said about programming:
+ 
+        We but teach Bloody instructions, which,
+          being taught, return to plague the inventor.
+                                     Macbeth I/vii.
+ 
+ 
+*/
+ 
+PMON:   PROC;
+ 
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B$JIT;
+%INCLUDE B_SEGIDS_C;
+%INCLUDE B$OBJECT_C;
+%INCLUDE B$ROSEG;
+ 
+%B$TCB;
+%B$ALT;
+DCL B$JIT$ PTR SYMREF READONLY;
+DCL B$TCB$ PTR SYMREF READONLY;
+DCL B$ROS$ PTR SYMREF READONLY;
+DCL 1 B$SPCL5_ CONSTANT,  /* Pointer to the users ISR */
+      2 OFFSET UBIN(24) UNAL INIT(0),
+      2 SID BIT(12) UNAL INIT(%SPCL5SID);
+DCL B$SPCL5$ REDEF B$SPCL5_ PTR;
+%B$EXCFR;
+%B$ECCB;
+%B$FLT;
+%B$HEAD (STCLASS=AUTO);
+%B$RUBIRTH (STCLASS=AUTO,COUNTINIT=" ");
+DCL 1 BIRTH_INFO AUTO ALIGNED,
+      2 W1 UBIN WORD,
+      2 W2 UBIN WORD,
+      2 UTS UBIN WORD,
+      2 RU_TYPE UBIN WORD;
+%RU_FLAVORS;
+%EJECT;
+%LIST;
+%SUB_EXC;
+%SUB_ECCDELTA;
+%PLIST;
+%EJECT;
+%B$TREE_TABLE;
+%FPT_DRTN (FPTN=FPT_DRTN, STCLASS=CONSTANT, ECC=%ECC_DELTA#,
+         SETECC=YES, EVENT=NO);
+%FPT_DRTN (FPTN=DRTN, STCLASS=AUTO);
+DCL 1 D_ CONSTANT, /* pointer to our fake static data area */
+      2 * BIT(24) UNAL INIT('0'B),
+      2 * BIT(12) UNAL INIT(%DS3SID);
+DCL D$ REDEF D_ PTR;
+%FPT_GDS (FPTN=FPT_GDS,STCLASS=CONSTANT);
+%FPT_GDS (FPTN=GDS,STCLASS=AUTO);
+%VLP_VECTOR (FPTN=GDS_RES,STCLASS=AUTO);
+%FPT_OPEN (FPTN=OPEN_DO,STCLASS=CONSTANT,FUN=CREATE,ORG=UR);
+%FPT_OPEN (FPTN=OPEN,STCLASS=AUTO);
+%FPT_WRITE (FPTN=FPT_WRITE,STCLASS=CONSTANT);
+%FPT_WRITE (FPTN=WRITE,STCLASS=AUTO);
+%FPT_WRITE (FPTN=WRITE_PM,STCLASS=AUTO);
+%FPT_READ (FPTN=FPT_READ,STCLASS=CONSTANT);
+%FPT_READ (FPTN=READ,STCLASS=AUTO);
+%FPT_GETDCB (FPTN=FPT_GETDCB,STCLASS=CONSTANT,MERGE=NO);
+%FPT_GETDCB (FPTN=GETDCB,STCLASS=AUTO);
+%FPT_OPEN (FPTN=FPT_OPEN,STCLASS=CONSTANT,FUN=CREATE,
+            EXIST=OLDFILE,ASN=FILE,CTG=YES,TYPE='D ');
+%FPT_OPEN (FPTN=OPEN_PM,STCLASS=AUTO);
+%FPT_CLOSE (FPTN=FPT_CLOSE,STCLASS=CONSTANT,DISP=SAVE);
+%FPT_CLOSE (FPTN=CLOSE,STCLASS=AUTO);
+DCL PMON_TRAP ENTRY ASYNC;
+%FPT_TRAP (FPTN=TRAP,ARITHMETIC=PMON_TRAP,ERRORS=PMON_TRAP,PROGRAMMED=PMON_TRAP,
+           DIVIDE_CHECK=TRAP,OVERFLOW=TRAP,COMMAND=TRAP,
+           IPR=TRAP,LOCKUP=TRAP,MEMORY=TRAP,MISSING_PAGE=TRAP,
+           MISSING_SEG=TRAP,SECURITY_1=TRAP,SECURITY_2=TRAP,
+           DERAIL=TRAP,FAULT_TAG=TRAP,MME=TRAP,STCLASS=CONSTANT);
+%FPT_TRMPRG (FPTN=TRMPRG,STCLASS=CONSTANT,RSTBRK=YES);
+%FPT_ERRMSG (FPTN=ERRMSG,STCLASS=AUTO );
+%FPT_ERRMSG (FPTN=ERRMSG_CONST, STCLASS=CONSTANT);
+%B$RUHEADKEY (STCLASS=CONSTANT);
+DCL 1 BIRTHKEY CONSTANT,
+      2 * UBIN BYTE CALIGNED INIT(5),
+      2 * CHAR(5) CALIGNED INIT('BIRTH');
+%VLP_NAME (FPTN=PMON_DCBNAME,NAME='PMON_DCB',STCLASS=CONSTANT);
+%VLP_NAME (FPTN=PMON_FILE,NAME='*PM_DATA',STCLASS=CONSTANT);
+%VLR_SITEINFO (FPTN=VLR$SITEINFO,STCLASS=);
+%FPT_MONINFO (STCLASS=CONSTANT);
+%FPT_MONINFO (FPTN=FPT$MONINFO, STCLASS=);
+%INCLUDE B_STRINGS_C;
+ 
+ 
+DCL SALUT CHAR(0) CONSTANT INIT(' PMON version B01.');
+DCL WRON_RU CHAR(0) CONSTANT INIT ( 'PMON can not monitor this type of run unit; try FEPMON' );
+DCL NOT_YC CHAR(0) CONSTANT INIT(' PMON must be associated at program start-up');
+DCL HELP_MESS CHAR(0) CONSTANT INIT(' PMON must have a program to monitor!');
+DCL HOPELESS CHAR(0) CONSTANT INIT(' Help! PMON is going crazy!!!');
+DCL NO_MEM CHAR(0) CONSTANT INIT(
+  ' Not enough memory to run PMON.  Use ORES/RES to increase it.');
+DCL OLAY_MESS CHAR(0) CONSTANT INIT(
+ ' PMON notes that this program is overlaid.');
+DCL BRK1 CHAR(0) CONSTANT INIT(
+ ' PMON doesn''t like it when you pound on the break key!');
+DCL BRK2 CHAR(0) CONSTANT INIT(
+ ' Hey, buddy! Can''t you read?  PMON doesn''t want your breaks.');
+DCL BRK3 CHAR(0) CONSTANT INIT(
+ ' Thats the third break.  PMON isn''t very happy.');
+DCL BRK4 CHAR(0) CONSTANT INIT(
+ ' Break, break, break.  PMON has had it.  He will ignore your breaks.');
+DCL BRK5 CHAR(0) CONSTANT INIT(
+ ' Break!');
+DCL ALREADY CHAR(0) CONSTANT INIT(
+ ' PMON is already associated with your program.');
+DCL FIN_MESS CHAR(0) CONSTANT INIT(
+ ' PMON sez:  Everything finished up ok.');
+DCL BAD_END CHAR(0) CONSTANT INIT(
+ ' PMON sez:  Your program didn''t work so hot.');
+DCL NASTY CHAR(0) CONSTANT INIT(
+ ' Your program stomped on DELTAs special location.  I quit.');
+DCL LINKOUT CHAR(0) CONSTANT INIT(
+ ' PMON sez:  we are linking out........');
+DCL LINKBACK CHAR(0) CONSTANT INIT(
+ ' .....PMON sez: we made it back ok.');
+ 
+DCL TEMP CHAR(8) AUTO DALIGNED;
+DCL 1 D BASED(D$) DALIGNED,  /* Our fake 'static' data */
+      2 USER_IC UBIN WORD ALIGNED,
+      2 WHERE SBIN WORD,
+      2 BREAK_COUNT SBIN WORD,
+      2 DCB# UBIN WORD, /* dcb# of PMON_DCB */
+      2 OVERLAID BIT(1) ALIGNED, /* '1'b = yes */
+      2 ERROR BIT(1) ALIGNED,
+      2 DPS90 BIT(1) ALIGNED,
+      2 ROOT_MAX SBIN WORD, /* highest address in program root */
+      2 MAX_ADDR SBIN WORD, /* highest address in any overlay */
+      2 TIMEBUF,
+        3 * UBIN WORD,
+        3 EXEC UBIN WORD, /* cpu time used (UTS) */
+        3 SERV SBIN WORD,
+      2 PM_INDEX SBIN WORD, /* index to PM_BUF */
+      2 PM_BUF (0:1999) ALIGNED,
+        3 OVERLAY# UBIN HALF HALIGNED,
+        3 IC UBIN HALF HALIGNED,
+      2 ERRMSG_BUF CHAR(120) ALIGNED;
+DCL ECC SBIN WORD; /* Read about ECC and SUBC in the monitor services manul*/
+DCL SUBC SBIN WORD; /* under the M$DRTN description */
+DCL P1$ PTR;
+DCL P2$ PTR;
+DCL I SBIN;
+DCL IC SBIN WORD;
+DCL TCB_STK$ PTR;
+%EJECT;
+ /* First-time program to put in DELTA's sepcial location.
+    Starts the timer, and then derails.  */
+DCL TIMER_PGM1(0:7) BIT(36) ALIGNED CONSTANT INIT(
+ '000006630600'O,  /* EPPR0! FPT_TIMER */
+ '010000713600'O,  /* CLIMB! STIMER  */
+ '400000401760'O,  /* NVECTORS = 1 */
+ '000000002200'O,  /* DRL! 0 */
+ '000001777640'O,  /* FPT_TIMER  */
+ '000010006000'O,  /* V_ #*/
+ '000002006000'O,  /* UENTRY# #*/
+ '000000000024'O   /* UNITS=20 */);
+DCL TIMER_PGM1_DPS90(0:7) BIT(36) ALIGNED CONSTANT INIT(
+ '000006630600'O,  /* EPPR0! FPT_TIMER */
+ '010000713600'O,  /* CLIMB! STIMER  */
+ '400000401760'O,  /* NVECTORS = 1 */
+ '000000002200'O,  /* DRL! 0 */
+ '000001777640'O,  /* FPT_TIMER  */
+ '000010006000'O,  /* V_ #*/
+ '000002006000'O,  /* UENTRY# #*/
+ '000000000002'O   /* UNITS=2 */);
+ 
+ 
+ /* Program segment to put in DELTA's special location.  Restart the
+    timer, and then continue executing the users program. */
+DCL TIMER_PGM_A(0:7) BIT(36) ALIGNED CONSTANT INIT(
+ '010013713600'O,  /* CLIMB! CLRSTK */
+ '000000401760'O,  /* NVECTORS= 0 */
+ '000016630600'O,  /* EPPR0! FPT_TIMER */
+ '010000713600'O,  /* CLIMB! STIMER */
+ '400000401760'O,  /* NVECTORS = 1 */
+ '000011470600'O,  /* LDP0! .11 */
+ '000000710200'O,  /* TRA! 0 */
+ '000000006000'O   /* ? */);
+DCL TIMER_PGM_B(0:3) BIT(36) ALIGNED CONSTANT INIT(
+ '000001777640'O,  /* FPT_TIMER     */
+ '000020006000'O,  /* V_ #*/
+ '000002006000'O,  /* UENTRY# #*/
+ '000000000024'O   /* UNITS=20 */);
+DCL TIMER_PGM_B_DPS90(0:3) BIT(36) ALIGNED CONSTANT INIT(
+ '000001777640'O,  /* FPT_TIMER     */
+ '000020006000'O,  /* V_ #*/
+ '000002006000'O,  /* UENTRY# #*/
+ '000000000002'O   /* UNITS=2 */);
+ 
+ /* Program to just do a trtn without restarting the timer */
+DCL TIMER_PGMX (0:1) BIT(36) ALIGNED CONSTANT INIT(
+  '010012713600'O,  /* CLIMB! TRTN */
+  '000000401760'O   /* NVECTORS=0 */);
+ 
+ /* Based defenitions used to move TIMER_PGM and TIMER_PGM1 */
+DCL BASED$TIMER_PGM1(0:7) BIT(36) ALIGNED BASED;
+DCL BASED$TIMER_PGM_A(0:7) BIT(36) ALIGNED BASED;
+DCL BASED$TIMER_PGM_B(0:3) BIT(36) ALIGNED BASED;
+DCL BASED$TIMER_PGMX(0:1) BIT(36) ALIGNED BASED;
+DCL BASED$PTR PTR ALIGNED BASED;
+DCL 1 BASED$WORD ALIGNED BASED,
+      2 UH UBIN HALF HALIGNED,
+      2 LH UBIN HALF HALIGNED;
+%EJECT;
+ /* First time entry point -- after that we go to PMON2 */
+        CALL M$TRAP(TRAP);
+ 
+        GDS = FPT_GDS;  /* Now get our fake static data area */
+        GDS.V_ = VECTOR(GDS.V);
+        GDS.RESULTS_ = VECTOR(GDS_RES);
+        GDS.V.SEGSIZE# = 3072;          /* THREE PAGES                        */
+        GDS_RES.W2.SEGID# = %DS3SID;
+        CALL M$GDS(GDS) ALTRET(NO_MEM_ERR);
+ 
+        TCB_STK$ = B$TCB$->B$TCB.STK$; /* Get this once to save time */
+        OPEN = OPEN_DO;  /* Start by opening M$DO to write messages with*/
+        OPEN.V_ = VECTOR(OPEN.V);
+        OPEN.V.DCB# = %M$DO#;
+        CALL M$OPEN (OPEN) ALTRET(BAD_ERR);
+ 
+        WRITE = FPT_WRITE;  /* Tell em we are here */
+        WRITE.V_ = VECTOR(WRITE.V);
+        WRITE.BUF_ = VECTOR(SALUT);
+        WRITE.V.DCB# = %M$DO#;
+        CALL M$WRITE(WRITE) ALTRET(BAD_ERR);
+ 
+        D  = '0'B; /* clear all of our data */
+ 
+        FPT$MONINFO = FPT_MONINFO;
+        FPT$MONINFO.SITEINFO_ = VECTOR(VLR$SITEINFO);
+        CALL M$MONINFO (FPT$MONINFO);
+        IF VLR$SITEINFO.CPU_TYPE# = %DPS90 THEN D.DPS90 = '1'B;
+        IF VLR$SITEINFO.CPU_TYPE# = %DPS90XA THEN D.DPS90 = '1'B;
+        GETDCB = FPT_GETDCB; /* Now get a dcb to write PM data to */
+        GETDCB.V_ = VECTOR(GETDCB.V);
+        GETDCB.DCBNAME_ = VECTOR(PMON_DCBNAME);
+        GETDCB.DCBNUM_ = VECTOR(D.DCB#);
+        CALL M$GETDCB(GETDCB) ALTRET(BAD_ERR);
+ 
+        D.TIMEBUF.EXEC = B$JIT.TUEXT; /* remember the current cpu times*/
+        D.TIMEBUF.SERV = B$JIT.TUSVT;
+ 
+        ECC = TCB_STK$->B$EXCFR.ECC;
+        SUBC = TCB_STK$->B$EXCFR.SUBC;
+ 
+        IF ECC=%ECC_DELTA# AND SUBC=%SC_STARTU# THEN DO;
+         /* User started his program under PMON */
+           OPEN_PM = FPT_OPEN;  /* Open PMON_DCB to a disk file */
+           OPEN_PM.V_ = VECTOR(OPEN_PM.V);
+           OPEN_PM.V.DCB# = D.DCB#;
+           OPEN_PM.NAME_ = VECTOR(PMON_FILE);
+           OPEN_PM.V.SETDCB# = '1'B;
+           CALL M$OPEN(OPEN_PM) ALTRET(BAD_ERR);
+           OPEN_PM.NAME_ = VECTOR(NIL);
+           OPEN_PM.V.SETDCB# = '0'B;
+           OPEN_PM.V.INITZ.REASSIGN# = '1'B;
+           CALL M$OPEN(OPEN_PM) ALTRET(BAD_ERR);
+ 
+           READ= FPT_READ;  /* Read the RU's head to get start addr */
+           READ.V_ = VECTOR(READ.V);
+           READ.BUF_ = VECTOR(B$HEAD);
+           READ.V.DCB# = %M$LM#;
+           READ.KEY_ = VECTOR(B$RUHEADKEY);
+           READ.V.KEYS# = '1'B;
+           CALL M$READ(READ);
+ 
+           D.USER_IC = B$HEAD.START; /* save start addr*/
+           D.PM_BUF.IC(0) = D.USER_IC; /* Also record it as PM data */
+           D.PM_BUF.OVERLAY#(0) = 0; /* assume start addr in root */
+           D.PM_INDEX = 1;
+ 
+           READ.BUF_ = VECTOR(B$RUBIRTH); /* Read birth record */
+           READ.KEY_ = VECTOR(BIRTHKEY);
+           READ.V.KEYS# = '1'B;
+           CALL M$READ(READ);
+           BIRTH_INFO.W1 = 0; /* W1+W2 are so PMDISP knows that this is*/
+           BIRTH_INFO.W2 = BITBIN('400000000000'O); /* the birth info */
+           BIRTH_INFO.UTS = B$RUBIRTH.CREATE_UTS;
+           IF B$HEAD.FLAVOR = %FEP_RU
+           THEN DO;
+              WRITE = FPT_WRITE;
+              WRITE.V_ = VECTOR ( WRITE.V );
+              WRITE.BUF_ = VECTOR ( WRON_RU );
+              WRITE.V.DCB# = %M$DO#;
+              CALL M$WRITE ( WRITE ) ALTRET ( BAD_ERR );
+              CALL M$ERR;
+              END;
+           ELSE BIRTH_INFO.RU_TYPE = B$HEAD.FLAVOR;
+           WRITE_PM = FPT_WRITE; /* And write it out for PMDISP to use */
+           WRITE_PM.V_ = VECTOR(WRITE_PM.V);
+           WRITE_PM.BUF_ = VECTOR(BIRTH_INFO);
+           WRITE_PM.V.DCB# = D.DCB#;
+           CALL M$WRITE(WRITE_PM);
+ 
+           D.WHERE = 0;
+ 
+           D.OVERLAID = '0'B;
+ 
+           IF B$ROS$->B$ROSEG.TREE$ ~= ADDR(NIL) THEN
+              IF B$ROS$->B$ROSEG.TREE$->B$TREE_HEADER.NODES > 1
+              THEN DO;
+                 D.OVERLAID = '1'B;
+                 P1$ = PINCRW(B$ROS$->B$ROSEG.TREE$,SIZEW(B$TREE_HEADER));
+                 D.ROOT_MAX = P1$->B$TREE_NODE.PADDR + P1$->B$TREE_NODE.PSIZE;
+                 D.MAX_ADDR = D.ROOT_MAX;
+                 DO I = 1 TO B$ROS$->B$ROSEG.TREE$->B$TREE_HEADER.NODES - 1;
+                    P1$ = PINCRW(P1$,SIZEW(B$TREE_NODE));
+                    IF P1$->B$TREE_NODE.PADDR + P1$->B$TREE_NODE.PSIZE > D.MAX_ADDR THEN
+                       D.MAX_ADDR = P1$->B$TREE_NODE.PADDR+P1$->B$TREE_NODE.PSIZE;
+                    END;
+                 END;
+ 
+           IF D.OVERLAID THEN DO;
+              WRITE.BUF_ = VECTOR(OLAY_MESS);
+              CALL M$WRITE(WRITE);
+              END;
+ 
+           IF D.DPS90
+           THEN PINCRW(B$SPCL5$,2)->BASED$TIMER_PGM1 = TIMER_PGM1_DPS90; /* move into user ISR*/
+           ELSE PINCRW(B$SPCL5$,2)->BASED$TIMER_PGM1 = TIMER_PGM1; /* move into user ISR*/
+           DRTN=FPT_DRTN;
+           DRTN.V_ = VECTOR(DRTN.V);
+           DRTN.V.IC# = 2;
+           DRTN.V.ECC# = %ECC_DELTA#;
+           DRTN.V.SETECC# = '1'B; /* start executing at that location */
+           CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+           END;
+ 
+ 
+        ELSE IF ECC=%ECC_DELTA# THEN DO;
+              IF SUBC = %SC_YC# THEN
+                 WRITE.BUF_ = VECTOR(NOT_YC);
+              ELSE
+                 WRITE.BUF_ = VECTOR(HELP_MESS);
+              CALL M$WRITE(WRITE);
+              DRTN=FPT_DRTN;
+              DRTN.V_ = VECTOR(DRTN.V);
+              DRTN.V.IC# = 0;
+              DRTN.V.ECC# = %ECC_DELTA#;
+              DRTN.V.SETECC# = '1'B;
+              DRTN.V.KLDELTA# = '1'B;
+              DRTN.V.QUIT# = '1'B;
+              CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+              END;
+        CALL M$ERR;
+%EJECT;
+/* This routine checks to make sure the timer is still running */
+CHECK_TIMER: PROC;
+DCL UECCB$ PTR;
+DCL TWO_TIMING CHAR(0) CONSTANT INIT(
+ ' Hey!  Your program used M$STIMER!  PMON hates your guts!');
+DCL STOP_IT CHAR(0) CONSTANT INIT(
+ ' Ooops, the timer stopped.');
+DCL ZIPPO CHAR(0) CONSTANT INIT(
+ ' Hmmmm.  This looks real strange.  The timer is set to zero.');
+ 
+        UECCB$ = ADDR(B$ROS$->B$ROSEG.ECCB);
+        IF UECCB$->B$ECCB.STIMER ~=2 OR
+          B$JIT.UTIMER = 0 OR
+          ( (NOT UECCB$->B$ECCB.FLAGS.TMRSET) AND
+          (TCB_STK$->B$EXCFR.IC < 2 OR
+          TCB_STK$->B$EXCFR.IC >= 5)) THEN DO;
+           IF UECCB$->B$ECCB.STIMER ~= 2 THEN DO;
+              WRITE.BUF_ = VECTOR(TWO_TIMING);
+              CALL M$WRITE(WRITE);
+              END;
+           ELSE IF B$JIT.UTIMER = 0 THEN DO;
+                 WRITE.BUF_ = VECTOR(ZIPPO);
+                 CALL M$WRITE(WRITE);
+                 END;
+              ELSE DO;
+                 WRITE.BUF_ = VECTOR(STOP_IT);
+                 CALL M$WRITE(WRITE);
+                 END;
+ 
+           D.WHERE = 0;                 /*BACK TO GROUND ZERO*/
+          /* Restart the timer as if we were just begining */
+           D.USER_IC = TCB_STK$->B$EXCFR.IC;
+           IF D.DPS90
+           THEN PINCRW(B$SPCL5$,2)->BASED$TIMER_PGM1 = TIMER_PGM1_DPS90;
+           ELSE PINCRW(B$SPCL5$,2)->BASED$TIMER_PGM1 = TIMER_PGM1;
+           DRTN.V.IC# = 2;
+           DRTN.V.SETECC# = '1'B;
+           END;
+END CHECK_TIMER;
+%EJECT;
+/* This routine records the value of IC in the buffer */
+RECORD_IC: PROC;
+        IC = TCB_STK$->B$EXCFR.IC - 1;
+        IF TCB_STK$->B$EXCFR.IRBIT.MIR THEN DO;
+           IC = IC + 1;
+           END;
+        D.PM_BUF.IC (D.PM_INDEX) = IC;
+        IF IC ~= 0 THEN DO;
+           D.PM_BUF.OVERLAY#(D.PM_INDEX) = 0;
+           IF D.OVERLAID THEN /* Figure out which overlay node we are in*/
+              IF IC<D.ROOT_MAX OR IC>D.MAX_ADDR THEN D.PM_BUF.OVERLAY#(D.PM_INDEX) = 0;
+              ELSE DO;
+                 P1$ = PINCRW(B$ROS$->B$ROSEG.TREE$,SIZEW(B$TREE_HEADER));
+                 DO I = 1 TO B$ROS$->B$ROSEG.TREE$->B$TREE_HEADER.NODES - 1;
+                    P1$ = PINCRW(P1$,SIZEW(B$TREE_NODE));
+                    IF P1$->B$TREE_NODE.FLGS.NOW_IN THEN
+                       IF IC >= P1$->B$TREE_NODE.PADDR AND
+                         IC < P1$->B$TREE_NODE.PADDR + P1$->B$TREE_NODE.PSIZE THEN DO;
+                          D.PM_BUF.OVERLAY#(D.PM_INDEX) = I;
+                          GOTO READY;
+                          END;
+                    END;
+                 END;
+READY:     ;
+ 
+           IF D.PM_INDEX < 1999 THEN
+              D.PM_INDEX = D.PM_INDEX + 1;
+           ELSE DO;
+              WRITE_PM = FPT_WRITE; /* Buffer full, time to write */
+              WRITE_PM.V_ = VECTOR(WRITE_PM.V);
+              WRITE_PM.BUF_ = VECTOR(D.PM_BUF);
+              WRITE_PM.V.DCB# = D.DCB#;
+              CALL M$WRITE(WRITE_PM);
+              D.PM_INDEX = 0;
+              END;
+           END;
+END RECORD_IC;
+%EJECT;
+/* This is the normal entry point.  First time only goes to PMON */
+PMON2:  ENTRY;
+        TCB_STK$ = B$TCB$->B$TCB.STK$; /* Get this once to save ptr loads */
+        DRTN=FPT_DRTN;
+        DRTN.V_ = VECTOR(DRTN.V);
+        ECC = TCB_STK$->B$EXCFR.ECC;
+        IF ECC = %ECC_TIMER# THEN DO; /* Fast path for timer runouts */
+ 
+           /* M$STIMER interval ran out, record IC and return */
+           CALL RECORD_IC;
+           PINCRW(B$SPCL5$,8)->BASED$WORD.UH = TCB_STK$->B$EXCFR.IC;
+           PINCRW(B$SPCL5$,9)->BASED$PTR = TCB_STK$->B$EXCFR.PRS(0);
+           DRTN.V.IR# = TCB_STK$->B$EXCFR.IR;
+           DRTN.V.SETIR# = '1'B;
+           DRTN.V.SETECC# = '0'B;
+           CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+           END;
+ 
+ 
+        WRITE =FPT_WRITE;
+        WRITE.V_ = VECTOR(WRITE.V);
+        WRITE.V.DCB# = %M$DO#;
+        SUBC = TCB_STK$->B$EXCFR.SUBC;
+        DRTN.V.SETECC# = '1'B;
+        DRTN.V.ECC# = %ECC_DELTA#;
+ 
+ 
+ 
+        DO CASE(ECC);
+ 
+ 
+         CASE(%ECC_DELTA#);
+           CALL M$ERR; /* Should never happen, but...*/
+ 
+ 
+         CASE(%ECC_OLAY#);
+           /* Overlay node loaded, make sure the timer is still running
+              and let him keep running */
+           CALL CHECK_TIMER;
+           DRTN.V.SETECC# ='1'B;
+           CALL M$DRTN(DRTN) ALTRET(WRAP_UP);
+ 
+ 
+         CASE(%ECC_EVENT#);
+         /* User event.  Ignore it and continue */
+           CALL CHECK_TIMER;
+           DRTN.V.SETECC# = '0'B; /* Let him see his event */
+           DRTN.V.IC# = 0;
+           CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+ 
+ 
+         CASE(%ECC_LRTN#);
+           /* Return from linked-to program.  Restart the timer */
+           WRITE.BUF_ = VECTOR(LINKBACK);
+           CALL M$WRITE(WRITE);
+           D.WHERE = 0;
+           D.USER_IC = TCB_STK$->B$EXCFR.IC;
+           IF D.DPS90
+           THEN PINCRW(B$SPCL5$,2)->BASED$TIMER_PGM1 = TIMER_PGM1_DPS90;
+           ELSE PINCRW(B$SPCL5$,2)->BASED$TIMER_PGM1 = TIMER_PGM1;
+           DRTN.V.IC# = 2;
+           DRTN.V.SETECC# = '1'B;
+           CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+ 
+ 
+         CASE(%ECC_LINK#);
+           /* Linking out to some other program.  Nothing special */
+           WRITE.BUF_ = VECTOR(LINKOUT);
+           CALL M$WRITE(WRITE);
+           DRTN.V.IC# = 0;
+           CALL CHECK_TIMER;
+           DRTN.V.SETECC# = '1'B;
+           CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+ 
+ 
+         CASE(%ECC_EXCRTN#);
+           /* Exit control return.  If final exit, go wrap up, otherwise
+              make sure the timer is still running and return */
+           IF SUBC = %SC_XCONXIT# THEN GOTO WRAP_UP;
+ 
+           DRTN.V.IC# = 0;
+           CALL CHECK_TIMER;
+           DRTN.V.ECC# = %ECC_DELTA#;
+           DRTN.V.SETECC# = '1'B;
+           DRTN.V.IR# = TCB_STK$->B$EXCFR.IR;
+           DRTN.V.SETIR# = '1'B;
+           CALL M$DRTN(DRTN) ALTRET(WRAP_UP);
+ 
+ 
+         CASE(%ECC_INT#);
+           /* User hit break.  Give control to users break routine if he
+              has one, otherwise keep him amused. */
+           CALL CHECK_TIMER;
+           IF SUBC = %SC_BRK# THEN DO;
+              D.BREAK_COUNT = D.BREAK_COUNT + 1;
+              DRTN.V.SETECC# = '0'B;
+              CALL M$DRTN(DRTN) ALTRET(NO_BRK);
+NO_BRK:       ;
+ 
+              IF D.BREAK_COUNT = 1 THEN
+                 WRITE.BUF_ = VECTOR(BRK1);
+              ELSE IF D.BREAK_COUNT = 2 THEN
+                    WRITE.BUF_ = VECTOR(BRK2);
+                 ELSE IF D.BREAK_COUNT = 3 THEN
+                       WRITE.BUF_ = VECTOR(BRK3);
+                    ELSE IF D.BREAK_COUNT = 4 THEN
+                          WRITE.BUF_ = VECTOR(BRK4);
+                       ELSE
+                          WRITE.BUF_ = VECTOR(BRK5);
+              CALL M$WRITE(WRITE);
+              CALL M$TRMPRG(TRMPRG);
+              DRTN.V.SETECC# = '1'B;
+              DRTN.V.IR# = TCB_STK$->B$EXCFR.IR;
+              DRTN.V.SETIR# = '1'B;
+              CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+              END;
+           ELSE DO;
+              WRITE.BUF_ = VECTOR(ALREADY);
+              CALL M$WRITE(WRITE);
+              CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+              END;
+ 
+ 
+         CASE(%ECC_PROG#);
+           /* Programmed fault -- If this is a derail and WHERE was
+              zero, it means that TIMER_PGM1 did his job and is returning.
+              Otherwise, the users program screwed up */
+           D.WHERE = D.WHERE + 1;
+           IF D.WHERE = 1 AND SUBC = %SC_DRAIL# THEN DO;
+              PINCRW(B$SPCL5$,2)->BASED$TIMER_PGM_A = TIMER_PGM_A;
+              IF D.DPS90
+              THEN PINCRW(B$SPCL5$,14)->BASED$TIMER_PGM_B = TIMER_PGM_B_DPS90;
+              ELSE PINCRW(B$SPCL5$,14)->BASED$TIMER_PGM_B = TIMER_PGM_B;
+              DRTN.V.IC# = D.USER_IC;
+              DRTN.V.ECC# = %ECC_DELTA#;
+              DRTN.V.SETECC# = '1'B;
+              CALL M$DRTN(DRTN);
+              END;
+           ELSE DO;
+              CALL CHECK_TIMER;
+              IF D.USER_IC >= 2 AND D.USER_IC <=12 THEN DO;
+                 WRITE.BUF_ = VECTOR(NASTY);
+                 CALL M$WRITE(WRITE);
+                 CALL M$ERR;
+                 END;
+              D.ERROR = '1'B;
+              DRTN.V.SETECC# = '0'B;
+              DRTN.V.IC# = 0;
+              CALL M$DRTN(DRTN) ALTRET(WRAP_UP);
+              END;
+ 
+ 
+         CASE(%ECC_XCON#);
+           /* Users program wants to quit -- Time to wrap it up */
+           GOTO WRAP_UP;
+ 
+ 
+         CASE(ELSE,%ECC_PMME#,%ECC_ERROR#,%ECC_ARITH#,%ECC_DBRK#);
+           /* Something strange going on with the users program.  Give
+              control to him if he will take it, else go wrap up */
+           D.USER_IC = TCB_STK$->B$EXCFR.IC;
+           CALL CHECK_TIMER;
+           DRTN.V.SETECC# = '0'B;
+           DRTN.V.IC# = 0;
+           IF D.USER_IC >= 2 AND D.USER_IC <=12 THEN DO;
+              WRITE.BUF_ = VECTOR(NASTY); /* He touched our code */
+              CALL M$WRITE(WRITE);
+              CALL M$ERR;
+              END;
+           D.ERROR = '1'B;
+           CALL M$DRTN(DRTN) ALTRET(WRAP_UP);
+         END; /* DO CASE */
+%EJECT;
+WRAP_UP: ;
+        D.USER_IC = TCB_STK$->B$EXCFR.IC;
+        IC = D.USER_IC;
+        CALL RECORD_IC; /* record exit location */
+        CALL CHECK_TIMER; /* check to see if anything went wrong */
+ 
+        IF NOT D.ERROR AND (ECC=%ECC_XCON# OR ECC=%ECC_EXCRTN#) THEN DO;
+           WRITE.BUF_ = VECTOR(FIN_MESS); /* Program exited normaly (we hope)*/
+           CALL M$WRITE(WRITE);
+           END;
+        ELSE DO;
+           WRITE.BUF_ = VECTOR(BAD_END); /* Something wasnt quite right*/
+           CALL M$WRITE(WRITE);
+           CALL BINCHAR(TEMP,ECC);
+           WRITE.BUF_ = VECTOR(TEMP);
+           CALL M$WRITE(WRITE);
+           CALL BINCHAR(TEMP,SUBC);
+           CALL M$WRITE(WRITE);
+           END;
+ 
+ 
+        IF D.PM_INDEX > 0 THEN DO;
+           WRITE_PM = FPT_WRITE; /* write the final, part-full buffer */
+           WRITE_PM.V_ = VECTOR(WRITE_PM.V);
+           WRITE_PM.BUF_ = VECTOR(D.PM_BUF);
+           WRITE_PM.V.DCB# = D.DCB#;
+           WRITE_PM.BUF_.BOUND = (D.PM_INDEX*4)-1;
+           CALL M$WRITE(WRITE_PM);
+           D.PM_INDEX = 0;
+           END;
+        D.TIMEBUF.EXEC = B$JIT.TUEXT - D.TIMEBUF.EXEC;
+        D.TIMEBUF.SERV = B$JIT.TUSVT - D.TIMEBUF.SERV;
+        WRITE_PM = FPT_WRITE; /* write the cpu times used */
+        WRITE_PM.V_ = VECTOR(WRITE_PM.V);
+        WRITE_PM.BUF_ = VECTOR(D.TIMEBUF);
+        WRITE_PM.V.DCB# = D.DCB#;
+        CALL M$WRITE(WRITE_PM);
+        CLOSE= FPT_CLOSE; /* Close and save the PM data */
+        CLOSE.V_ = VECTOR(CLOSE.V);
+        CLOSE.V.DCB# = D.DCB#;
+        CALL M$CLOSE(CLOSE);
+ 
+        PINCRW(B$SPCL5$,2)->BASED$TIMER_PGMX = TIMER_PGMX; /* because timer is still running*/
+ 
+        DRTN.V.IC# = 0;
+        DRTN.V.SETECC# = '1'B;
+        DRTN.V.ECC# = %ECC_DELTA#;
+        DRTN.V.KLDELTA# = '1'B; /* Get rid of us, we are done */
+        CALL M$DRTN(DRTN) ALTRET(BAD_ERR);
+ 
+ 
+BAD_ERR: ;
+        WRITE =FPT_WRITE;
+        WRITE.V_ = VECTOR(WRITE.V);
+        WRITE.V.DCB# = %M$DO#;
+        WRITE.BUF_ = VECTOR(HOPELESS);  /* Very strange .... */
+        CALL M$WRITE(WRITE) ALTRET(BAD_ERR2);
+        CALL BINCHAR(TEMP,B$TCB$->B$TCB.ALT$->B$EXCFR.IC);
+        WRITE.BUF_ = VECTOR(TEMP);
+        CALL M$WRITE(WRITE);
+        ERRMSG = ERRMSG_CONST;
+        ERRMSG.V_ = VECTOR(ERRMSG.V);
+        ERRMSG.BUF_ = VECTOR(D.ERRMSG_BUF);
+        ERRMSG.CODE_ = VECTOR(B$TCB$->B$TCB.ALT$->B$ALT.ERR);
+        ERRMSG.V.OUTDCB1# = %M$DO#;
+        CALL M$ERRMSG(ERRMSG);
+BAD_ERR2:
+        CALL M$ERR;
+NO_MEM_ERR:
+        WRITE = FPT_WRITE;
+        WRITE.V_ = VECTOR(WRITE.V);
+        WRITE.BUF_ = VECTOR(NO_MEM);
+        WRITE.V.DCB# = %M$DO#;
+        CALL M$WRITE(WRITE);
+        CALL M$ERR;
+END PMON;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+PMON_TRAP: PROC ASYNC;
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+DCL B$TCB$ PTR SYMREF READONLY;
+%B$TCB;
+%B$EXCFR;
+%FPT_WRITE (FPTN=FPT_WRITE,STCLASS=CONSTANT);
+%FPT_WRITE (FPTN=WRITE,STCLASS=AUTO);
+%FPT_TRAP (FPTN=NO_TRAP,ARITHMETIC=NIL,ERRORS=NIL,PROGRAMMED=NIL,
+           DIVIDE_CHECK=ABORT,OVERFLOW=ABORT,COMMAND=ABORT,
+           IPR=ABORT,LOCKUP=ABORT,MEMORY=ABORT,MISSING_PAGE=ABORT,
+           MISSING_SEG=ABORT,SECURITY_1=ABORT,SECURITY_2=ABORT,
+           DERAIL=ABORT,FAULT_TAG=ABORT,MME=ABORT,STCLASS=CONSTANT);
+DCL DEATH_MESSAGE CHAR(0) CONSTANT INIT(
+  ' PMON screws up! location (in decimal):');
+DCL TEMP CHAR(8) AUTO DALIGNED;
+        WRITE = FPT_WRITE;
+        WRITE.V_ = VECTOR(WRITE.V);
+        WRITE.V.DCB# = %M$DO#;
+        WRITE.BUF_ = VECTOR(DEATH_MESSAGE);
+        CALL M$WRITE(WRITE);
+        CALL BINCHAR(TEMP,B$TCB$->B$TCB.STK$->B$EXCFR.IC);
+        WRITE.BUF_ = VECTOR(TEMP);
+        CALL M$WRITE(WRITE);
+        CALL M$TRAP(NO_TRAP);
+END PMON_TRAP;

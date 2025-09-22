@@ -1,0 +1,1726 @@
+VERSION A02
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:1    
+        1        1        /*M* FUG$GARBCOL - NFS's garbage collector - flushes older data */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*P*  NAME: FUG$GARBCOL
+        8        8              Purpose:
+        9        9                    To get more free memory for NFS to use.
+       10       10        */
+       11       11        /*F*  NAME: FUG$GARBCOL
+       12       12              Purpose:
+       13       13                    To flush all of the UCTX and FCTX blocks that were last used before
+       14       14                    a certain time, so that the number of blocks will be within the
+       15       15                    limits (for the various types of limits).
+       16       16        */
+       17       17        /*D*  NAME: FUG$GARBCOL
+       18       18              Inputs:
+       19       19                    ARRAY - a chunk of memory with enough room to sort all of the
+       20       20                            UCTX and FCTX blocks used.  (require 1 word each).
+       21       21              Algorithm:
+       22       22        */
+       23       23        FUG$GARBCOL: PROC(ARRAY) NOAUTO;
+       24       24
+       25       25    1   DCL ARRAY(0:0) UBIN ALIGNED;
+       26       26    1   DCL 1 ARRAYH(0:0) REDEF ARRAY ALIGNED,2 HI UBIN(18) UNAL,2 LO UBIN(18) UNAL;
+       27       27    1   DCL 1 ARRAYB(0:0) REDEF ARRAY ALIGNED,2 * BIT(18),
+       28       28    1     2 * BIT(7),
+       29       29    1     2 U UBIN(1) UNAL, /* UCTX flag */
+       30       30    1     2 D UBIN(1) UNAL, /* FCTD w/ dcb flag */
+       31       31    1     2 PROC# UBIN(9) UNAL;
+       32       32    1   DCL N UBIN;
+       33       33    1   DCL NS REDEF N SBIN;
+       34       34    1   DCL AGELIM UBIN;
+       35       35        %EQU CUTOFF = 262143;  /* the sorting time cutoff - about 3 hours */
+       36       36    1   DCL I SBIN;
+       37       37    1   DCL J SBIN;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:2    
+       38       38    1   DCL T$ PTR;
+       39       39    1   DCL UCTX$ PTR;
+       40       40    1   DCL UCNT REDEF UCTX$ SBIN;
+       41       41    1   DCL FCTX$ PTR;
+       42       42    1   DCL FCNT REDEF FCTX$ SBIN;
+       43       43
+       44       44
+       45       45
+       46       46
+       47       47        %INCLUDE FU_NFS_M;
+       48      562        %FU$NFSDS( NAME=DS, STCLASS="BASED(B$DS8)");
+       49      592
+       50      593        %FU$FCTX( NAME=FCTX, STCLASS="BASED(FCTX$)");
+       51      696        %FU$UCTX( NAME=UCTX, STCLASS="BASED(UCTX$)");
+       52      749        %FU$HCTX( NAME=HCTX, STCLASS="BASED(UCTX$)");
+       53      772
+       54      773    1   DCL B$DS8 PTR SYMREF READONLY;
+       55      774    1   DCL FU_CTXHD$ PTR SYMREF;
+       56      775    1   DCL FU_FCTX$ PTR SYMREF;
+       57      776    1   DCL FU_PROC# UBIN SYMREF;
+       58      777    1   DCL FU_TIME UBIN SYMREF;
+       59      778
+       60      779    1   DCL FUI$MEMFREE ENTRY(1);
+       61      780    1   DCL FUN$RELDCB ENTRY(1);
+       62      781
+       63      782
+       64      783
+       65      784
+       66      785
+       67      786        /* Fill in ARRAY with all of the UCTX / FCTX data (the array will be sorted
+       68      787           by the age of the blocks).
+       69      788        */
+       70      789    1      N = 0;
+       71      790    1      AGELIM = FU_TIME - %CUTOFF;
+       72      791    1      FCTX$ = DS.FCTX$;
+       73      792    2      DO WHILE (FCTX$ ~= ADDR( NIL));
+       74      793    2         NS = NS + 1;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:3    
+       75      794    2         ARRAY( N) = 0;
+       76      795    2         IF FCTX.AGE > AGELIM THEN ARRAY( N) = FCTX.AGE - AGELIM;
+       77      796    2         ARRAY( N) = ARRAY( N)*262144 + FCTX.PROC#; /* Fctx is type 0 */
+       78      797    2         IF FCTX.DCB# ~= 0 THEN ARRAYB.D( N) = 1;            /* W/dcb is type 1 */
+       79      798    2         UCTX$ = FCTX.UCTX$;
+       80      799    3         DO WHILE (UCTX$ ~= ADDR( NIL));
+       81      800    3            NS = NS + 1;
+       82      801    3            ARRAY( N) = 0;
+       83      802    3            IF UCTX.AGE > AGELIM THEN ARRAY( N) = UCTX.AGE - AGELIM;
+       84      803    3            ARRAY( N) = ARRAY( N)*262144 + FCTX.PROC# + 1024; /* Uctx is type 2 */
+       85      804    3            UCTX$ = UCTX.FLNK$;
+       86      805    3            END;
+       87      806    2         FCTX$ = FCTX.LNK$;
+       88      807    2         END;
+       89      808
+       90      809    1      CALL HEAPSORT;       /* now sort 'em */
+       91      810
+       92      811        %EJECT;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:4    
+       93      812        /* For each process, if its over its limit for FCTXs or UCTXs, figure out
+       94      813           what AGE cutoff to use to get the over-limit blocks out.
+       95      814        */
+       96      815    1      I = 0;
+       97      816    2      DO UNTIL DS.P.SYSID( I) = 0;
+       98      817    2         IF DS.P.FCNT( I) >= DS.DCBLIM OR DS.P.UCNT( I) >= DS.BUFLIM
+       99      818    3          THEN DO;
+      100      819    3            FCNT = DS.DCBLIM/2 - DS.P.FCNT( I);
+      101      820    3            UCNT = DS.BUFLIM/2 - DS.P.UCNT( I);
+      102      821    4            DO J = 1 TO N;
+      103      822    4               IF ARRAYB.PROC#( J) = I
+      104      823    5                THEN DO;
+      105      824    5                  FCNT = FCNT + ARRAYB.D( J);
+      106      825    5                  UCNT = UCNT + ARRAYB.U( J);
+      107      826    5                  END;
+      108      827    4               IF FCNT >= 0 AND UCNT >= 0 THEN EXIT;
+      109      828    4               END;
+      110      829
+      111      830    3            ARRAYH.HI( 0) = MAXIMUM( ARRAYH.HI( J), ARRAYH.HI( 0));
+      112      831    3            END;
+      113      832    2         I = I + 1;
+      114      833    2         END;  /* do until (DS.P.SYSID( I) = 0) */
+      115      834
+      116      835        /* If we need to cut down overall, figure out the age cutoff for that.
+      117      836        */
+      118      837    1      N = DS.FCNT + DS.UCNT + DS.MCNT + DS.HCNT;
+      119      838    2      IF N >= DS.CTXLIM THEN DO;
+      120      839    2         N = N - DS.CTXLIM + DS.CTXLIM/4;
+      121      840    2         ARRAYH.HI( 0) = MAXIMUM( ARRAYH.HI( N), ARRAYH.HI( 0));
+      122      841    2         END;
+      123      842
+      124      843        /* Release all FCTXs and UCTXs that are too old
+      125      844        */
+      126      845    1      AGELIM = AGELIM + ARRAYH.HI( 0);
+      127      846    1      FCTX$ = ADDR( DS.FCTX$);
+      128      847    2      DO WHILE FCTX.LNK$ ~= ADDR( NIL);
+      129      848                                                  /* Release any UCTX blocks that need it */
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:5    
+      130      849    2         UCTX$ = PINCRW( ADDR( FCTX.LNK$-> FCTX.UCTX$), -2);
+               849                  /* FLNK$ is the third word */
+      131      850    3         DO WHILE UCTX.FLNK$ ~= ADDR( NIL);
+      132      851    3            IF UCTX.FLNK$-> UCTX.AGE > AGELIM THEN UCTX$ = UCTX.FLNK$;
+      133      852    4            ELSE DO;  /* release the UCTX from the HLNK and FCTX.UCTX chains */
+      134      853    4               T$ = ADDR( UCTX.FLNK$-> UCTX.HCTX$-> HCTX.UCTX$);
+      135      854    5               DO WHILE T$-> UCTX.HLNK$ ~= UCTX.FLNK$;
+      136      855    5                  T$ = T$-> UCTX.HLNK$;
+      137      856    5                  END;
+      138      857    4               T$-> UCTX.HLNK$ = UCTX.FLNK$-> UCTX.HLNK$;
+      139      858    4               T$ = UCTX.FLNK$;
+      140      859    4               UCTX.FLNK$ = UCTX.FLNK$-> UCTX.FLNK$;
+      141      860    4               DS.UCNT = DS.UCNT - 1;
+      142      861    4               T$-> UCTX.HLNK$ = DS.P.UPRG$( FCTX.LNK$-> FCTX.PROC#);
+      143      862    4               DS.P.UPRG$( FCTX.LNK$-> FCTX.PROC#) = T$;
+      144      863    4               END;
+      145      864    3            END;
+      146      865
+      147      866    2         IF FCTX.LNK$-> FCTX.AGE > AGELIM THEN FCTX$ = FCTX.LNK$;
+      148      867    3         ELSE DO;  /* release the FCTX from the DS.FCTX chain */
+      149      868    3            T$ = FCTX.LNK$;
+      150      869    3            FCTX.LNK$ = FCTX.LNK$-> FCTX.LNK$;
+      151      870    3            DS.FCNT = DS.FCNT - 1;
+      152      871    3            T$-> FCTX.LNK$ = DS.P.FPRG$( T$->FCTX.PROC#);
+      153      872    3            DS.P.FPRG$( T$->FCTX.PROC#) = T$;
+      154      873    3            END;
+      155      874    2         END;
+      156      875    1      IF FU_PROC# ~= 0 THEN RETURN;
+      157      876
+      158      877        %EJECT;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:6    
+      159      878    1   FUG$PURGEP: ENTRY;
+      160      879    1      UCTX$ = DS.P.UPRG$( FU_PROC#);
+      161      880    2      IF UCTX$ ~= ADDR( NIL) THEN DO WHILE '1'B;
+      162      881    3         IF UCTX.BUF$ ~= ADDR( NIL) THEN DO;
+      163      882    3            CALL FUI$MEMFREE( UCTX.BUF$);
+      164      883    3            DS.P.UCNT( FU_PROC#) = DS.P.UCNT( FU_PROC#) - 1;
+      165      884    3            END;
+      166      885    3         IF UCTX.HLNK$ = ADDR( NIL) THEN DO;
+      167      886    3            UCTX.HLNK$ = FU_CTXHD$;
+      168      887    3            FU_CTXHD$ = DS.P.UPRG$( FU_PROC#);
+      169      888    3            DS.P.UPRG$( FU_PROC#) = ADDR( NIL);
+      170      889    3            GOTO FPRG;
+      171      890    3            END;
+      172      891    2         UCTX$ = UCTX.HLNK$;
+      173      892    2         END;
+      174      893
+      175      894    1   FPRG: ;
+      176      895    1      FCTX$ = DS.P.FPRG$( FU_PROC#);
+      177      896    2      IF FCTX$ ~= ADDR( NIL) THEN DO WHILE '1'B;
+      178      897    3         IF FCTX.DCB# ~= 0 THEN DO;
+      179      898    3            CALL FUN$RELDCB( FCTX);
+      180      899    3            DS.P.FCNT( FU_PROC#) = DS.P.FCNT( FU_PROC#) - 1;
+      181      900    3            END;
+      182      901    3         IF FCTX.LNK$ = ADDR( NIL) THEN DO;
+      183      902    3            FCTX.LNK$ = FU_CTXHD$;
+      184      903    3            FU_CTXHD$ = DS.P.FPRG$( FU_PROC#);
+      185      904    3            DS.P.FPRG$( FU_PROC#) = ADDR( NIL);
+      186      905    3            RETURN;
+      187      906    3            END;
+      188      907    2         FCTX$ = FCTX.LNK$;
+      189      908    2         END;
+      190      909    1      RETURN;
+      191      910
+      192      911        %EJECT;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:7    
+      193      912        /*F*  NAME: FUG$REMOVE_FCTX
+      194      913              Purpose:
+      195      914                    To remove the given FCTX block and associated UCTX blocks from
+      196      915                    the chains they are in.
+      197      916        */
+      198      917        /*D*  NAME: FUG$REMOVE_FCTX
+      199      918              Inputs:
+      200      919                    ARRAY - actually the FCTX block to remove.
+      201      920        */
+      202      921    1   FUG$REMOVE_FCTX: ENTRY( ARRAY);
+      203      922
+      204      923    1      FCTX$ = ADDR( ARRAY);
+      205      924                                           /* Release any associated UCTX blocks   */
+      206      925    1      UCTX$ = FCTX.UCTX$;
+      207      926    2      DO WHILE UCTX$ ~= ADDR( NIL);
+      208      927    2         T$ = ADDR( UCTX.HCTX$-> HCTX.UCTX$);
+      209      928    3         DO WHILE T$-> UCTX.HLNK$ ~= UCTX$;
+      210      929    3            T$ = T$-> UCTX.HLNK$;
+      211      930    3            END;
+      212      931    2         T$-> UCTX.HLNK$ = UCTX.HLNK$;
+      213      932    2         DS.UCNT = DS.UCNT - 1;
+      214      933    2         UCTX.HLNK$ = FU_CTXHD$;
+      215      934    2         FU_CTXHD$ = UCTX$;
+      216      935    3         IF UCTX.BUF$ ~= ADDR( NIL) THEN DO;
+      217      936    3            CALL FUI$MEMFREE( UCTX.BUF$);
+      218      937    3            DS.P.UCNT( FU_PROC#) = DS.P.UCNT( FU_PROC#) - 1;
+      219      938    3            END;
+      220      939    2         UCTX$ = UCTX.FLNK$;
+      221      940    2         END;
+      222      941
+      223      942                                             /* Look for the FCTX block and release  */
+      224      943    1      FCTX$ = ADDR( FU_FCTX$);
+      225      944    2      DO WHILE FCTX.LNK$ ~= ADDR( ARRAY);
+      226      945    2         FCTX$ = FCTX.LNK$;
+      227      946    2         END;
+      228      947    1      T$ = FCTX.LNK$;
+      229      948    1      FCTX.LNK$ = FCTX.LNK$-> FCTX.LNK$;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:8    
+      230      949    1      DS.FCNT = DS.FCNT - 1;
+      231      950    1      T$-> FCTX.LNK$ = FU_CTXHD$;
+      232      951    1      FU_CTXHD$ = T$;
+      233      952    2      IF T$->FCTX.DCB# ~= 0 THEN DO;
+      234      953    2         CALL FUN$RELDCB( T$->FCTX);
+      235      954    2         DS.P.FCNT( FU_PROC#) = DS.P.FCNT( FU_PROC#) - 1;
+      236      955    2         END;
+      237      956
+      238      957    1      RETURN;
+      239      958        %EJECT;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:9    
+      240      959        /*I*  NAME:      HEAPSORT
+      241      960              Purpose:   to sort ARRAY.
+      242      961              Inputs:    ARRAY
+      243      962              Outputs:   ARRAY - sorted in ascending order
+      244      963              Algorithm: This is a HEAPSORT, taken from the book ALGORITHMS + DATA
+      245      964                         STRUCTURES = PROGRAMS by Nicolas Wirth.
+      246      965        */
+      247      966    1   HEAPSORT: PROC;
+      248      967    2      DCL L SBIN;
+      249      968    2      DCL R SBIN;
+      250      969    2      DCL TEMP UBIN;
+      251      970
+      252      971    2      L = ( N / 2) + 1;
+      253      972    2      R = N;
+      254      973    3      DO WHILE (L > 1);
+      255      974    3         L = L - 1;
+      256      975    3         CALL SIFT;
+      257      976    3         END;
+      258      977    3      DO WHILE (R > 1);
+      259      978    3         TEMP = ARRAY( 1);
+      260      979    3         ARRAY( 1) = ARRAY( R);
+      261      980    3         ARRAY( R) = TEMP;
+      262      981    3         R = R - 1;
+      263      982    3         CALL SIFT;
+      264      983    3         END;
+      265      984
+      266      985    2   SIFT: PROC;
+      267      986    3      DCL I SBIN;
+      268      987    3      DCL J SBIN;
+      269      988
+      270      989    3      I = L;
+      271      990    3      J = I * 2;
+      272      991    3      TEMP = ARRAY(I);
+      273      992    4      DO WHILE (J <= R);
+      274      993    4         IF (J < R) AND ARRAY( J) < ARRAY( J+1) THEN J = J + 1;
+      275      994    4         IF TEMP >= ARRAY( J) THEN EXIT;
+      276      995    4         ARRAY( I) = ARRAY( J);
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:10   
+      277      996    4         I = J;
+      278      997    4         J = I * 2;
+      279      998    4         END;
+      280      999    3      ARRAY( I) = TEMP;
+      281     1000    3   END SIFT;
+      282     1001    2   END HEAPSORT;
+      283     1002
+      284     1003    1   END FUG$GARBCOL;
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:11   
+--  Include file information  --
+
+   FU_NFS_M.:FUA2TOU  is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure FUG$GARBCOL.
+
+   Procedure FUG$GARBCOL requires 510 words for executable code.
+   Procedure FUG$GARBCOL is declared NOAUTO and requires 18 words of local(STATIC) storage.
+
+    No errors detected in file FUG$GARBCOL.:FUA2TSI    .
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:12   
+
+ Object Unit name= FUG$GARBCOL                                File name= FUG$GARBCOL.:FUA2TOU
+ UTS= NOV 21 '97 11:31:22.96 FRI                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Data  even  none    18     22  FUG$GARBCOL
+    1   Proc  even  none   510    776  FUG$GARBCOL
+    2  RoData even  none     2      2  FUG$GARBCOL
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        1  FUG$GARBCOL
+     1    410                  yes      Std        0  FUG$PURGEP
+     1    527                  yes      Std        1  FUG$REMOVE_FCTX
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 FUI$MEMFREE
+         yes           Std       1 FUN$RELDCB
+                       nStd      0 X66_STATIC_1
+                       Std       0 B_CONSPOOL_D
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:13   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+r    B$DS8                                 FU_CTXHD$                             FU_FCTX$
+     FU_PROC#                              FU_TIME                               B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:14   
+
+
+        1        1        /*M* FUG$GARBCOL - NFS's garbage collector - flushes older data */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*P*  NAME: FUG$GARBCOL
+        8        8              Purpose:
+        9        9                    To get more free memory for NFS to use.
+       10       10        */
+       11       11        /*F*  NAME: FUG$GARBCOL
+       12       12              Purpose:
+       13       13                    To flush all of the UCTX and FCTX blocks that were last used before
+       14       14                    a certain time, so that the number of blocks will be within the
+       15       15                    limits (for the various types of limits).
+       16       16        */
+       17       17        /*D*  NAME: FUG$GARBCOL
+       18       18              Inputs:
+       19       19                    ARRAY - a chunk of memory with enough room to sort all of the
+       20       20                            UCTX and FCTX blocks used.  (require 1 word each).
+       21       21              Algorithm:
+       22       22        */
+       23       23        FUG$GARBCOL: PROC(ARRAY) NOAUTO;
+
+     23  1 000000   000000 700200 xent  FUG$GARBCOL  TSX0  ! X66_STATIC_1
+         1 000001   000000 000001 0                  ZERO    0,1
+
+       24       24
+       25       25    1   DCL ARRAY(0:0) UBIN ALIGNED;
+       26       26    1   DCL 1 ARRAYH(0:0) REDEF ARRAY ALIGNED,2 HI UBIN(18) UNAL,2 LO UBIN(18) UNAL;
+       27       27    1   DCL 1 ARRAYB(0:0) REDEF ARRAY ALIGNED,2 * BIT(18),
+       28       28    1     2 * BIT(7),
+       29       29    1     2 U UBIN(1) UNAL, /* UCTX flag */
+       30       30    1     2 D UBIN(1) UNAL, /* FCTD w/ dcb flag */
+       31       31    1     2 PROC# UBIN(9) UNAL;
+       32       32    1   DCL N UBIN;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:15   
+       33       33    1   DCL NS REDEF N SBIN;
+       34       34    1   DCL AGELIM UBIN;
+       35       35        %EQU CUTOFF = 262143;  /* the sorting time cutoff - about 3 hours */
+       36       36    1   DCL I SBIN;
+       37       37    1   DCL J SBIN;
+       38       38    1   DCL T$ PTR;
+       39       39    1   DCL UCTX$ PTR;
+       40       40    1   DCL UCNT REDEF UCTX$ SBIN;
+       41       41    1   DCL FCTX$ PTR;
+       42       42    1   DCL FCNT REDEF FCTX$ SBIN;
+       43       43
+       44       44
+       45       45
+       46       46
+       47       47        %INCLUDE FU_NFS_M;
+       48      562        %FU$NFSDS( NAME=DS, STCLASS="BASED(B$DS8)");
+       49      592
+       50      593        %FU$FCTX( NAME=FCTX, STCLASS="BASED(FCTX$)");
+       51      696        %FU$UCTX( NAME=UCTX, STCLASS="BASED(UCTX$)");
+       52      749        %FU$HCTX( NAME=HCTX, STCLASS="BASED(UCTX$)");
+       53      772
+       54      773    1   DCL B$DS8 PTR SYMREF READONLY;
+       55      774    1   DCL FU_CTXHD$ PTR SYMREF;
+       56      775    1   DCL FU_FCTX$ PTR SYMREF;
+       57      776    1   DCL FU_PROC# UBIN SYMREF;
+       58      777    1   DCL FU_TIME UBIN SYMREF;
+       59      778
+       60      779    1   DCL FUI$MEMFREE ENTRY(1);
+       61      780    1   DCL FUN$RELDCB ENTRY(1);
+       62      781
+       63      782
+       64      783
+       65      784
+       66      785
+       67      786        /* Fill in ARRAY with all of the UCTX / FCTX data (the array will be sorted
+       68      787           by the age of the blocks).
+       69      788        */
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:16   
+       70      789    1      N = 0;
+
+    789  1 000002   000002 450000 0                  STZ     N
+
+       71      790    1      AGELIM = FU_TIME - %CUTOFF;
+
+    790  1 000003   000000 235000 xsym               LDA     FU_TIME
+         1 000004   777777 135007                    SBLA    -1,DL
+         1 000005   000003 755000 0                  STA     AGELIM
+
+       72      791    1      FCTX$ = DS.FCTX$;
+
+    791  1 000006   000000 470400 xsym               LDP0    B$DS8
+         1 000007   000004 236100                    LDQ     4,,PR0
+         1 000010   000010 756000 0                  STQ     FCTX$
+
+       73      792    2      DO WHILE (FCTX$ ~= ADDR( NIL));
+
+    792  1 000011   000076 710000 1                  TRA     s:807
+
+       74      793    2         NS = NS + 1;
+
+    793  1 000012   000002 054000 0                  AOS     N
+
+       75      794    2         ARRAY( N) = 0;
+
+    794  1 000013   000001 470400 0                  LDP0    @ARRAY
+         1 000014   000002 720000 0                  LXL0    N
+         1 000015   000000 450110                    STZ     0,X0,PR0
+
+       76      795    2         IF FCTX.AGE > AGELIM THEN ARRAY( N) = FCTX.AGE - AGELIM;
+
+    795  1 000016   000010 471400 0                  LDP1    FCTX$
+         1 000017   000003 236000 0                  LDQ     AGELIM
+         1 000020   100013 116100                    CMPQ    11,,PR1
+         1 000021   000025 603000 1                  TRC     s:796
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:17   
+    795  1 000022   100013 236100                    LDQ     11,,PR1
+         1 000023   000003 136000 0                  SBLQ    AGELIM
+         1 000024   000000 756110                    STQ     0,X0,PR0
+
+       77      796    2         ARRAY( N) = ARRAY( N)*262144 + FCTX.PROC#; /* Fctx is type 0 */
+
+    796  1 000025   100012 236100                    LDQ     10,,PR1
+         1 000026   777777 376007                    ANQ     -1,DL
+         1 000027   000020 756000 0                  STQ     J+1
+         1 000030   000000 236110                    LDQ     0,X0,PR0
+         1 000031   000022 736000                    QLS     18
+         1 000032   000020 036000 0                  ADLQ    J+1
+         1 000033   000000 756110                    STQ     0,X0,PR0
+
+       78      797    2         IF FCTX.DCB# ~= 0 THEN ARRAYB.D( N) = 1;            /* W/dcb is type 1 */
+
+    797  1 000034   100012 221100                    LDX1    10,,PR1
+         1 000035   000040 600000 1                  TZE     s:798
+
+    797  1 000036   001000 236007                    LDQ     512,DL
+         1 000037   000000 256110                    ORSQ    0,X0,PR0
+
+       79      798    2         UCTX$ = FCTX.UCTX$;
+
+    798  1 000040   100001 236100                    LDQ     1,,PR1
+         1 000041   000007 756000 0                  STQ     UCTX$
+
+       80      799    3         DO WHILE (UCTX$ ~= ADDR( NIL));
+
+    799  1 000042   000071 710000 1                  TRA     s:805
+
+       81      800    3            NS = NS + 1;
+
+    800  1 000043   000002 054000 0                  AOS     N
+
+       82      801    3            ARRAY( N) = 0;
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:18   
+    801  1 000044   000001 470400 0                  LDP0    @ARRAY
+         1 000045   000002 720000 0                  LXL0    N
+         1 000046   000000 450110                    STZ     0,X0,PR0
+
+       83      802    3            IF UCTX.AGE > AGELIM THEN ARRAY( N) = UCTX.AGE - AGELIM;
+
+    802  1 000047   000007 471400 0                  LDP1    UCTX$
+         1 000050   000003 236000 0                  LDQ     AGELIM
+         1 000051   100014 116100                    CMPQ    12,,PR1
+         1 000052   000056 603000 1                  TRC     s:803
+
+    802  1 000053   100014 236100                    LDQ     12,,PR1
+         1 000054   000003 136000 0                  SBLQ    AGELIM
+         1 000055   000000 756110                    STQ     0,X0,PR0
+
+       84      803    3            ARRAY( N) = ARRAY( N)*262144 + FCTX.PROC# + 1024; /* Uctx is type 2 */
+
+    803  1 000056   000010 473400 0                  LDP3    FCTX$
+         1 000057   300012 236100                    LDQ     10,,PR3
+         1 000060   777777 376007                    ANQ     -1,DL
+         1 000061   000020 756000 0                  STQ     J+1
+         1 000062   000000 236110                    LDQ     0,X0,PR0
+         1 000063   000022 736000                    QLS     18
+         1 000064   000020 036000 0                  ADLQ    J+1
+         1 000065   002000 036007                    ADLQ    1024,DL
+         1 000066   000000 756110                    STQ     0,X0,PR0
+
+       85      804    3            UCTX$ = UCTX.FLNK$;
+
+    804  1 000067   100002 236100                    LDQ     2,,PR1
+         1 000070   000007 756000 0                  STQ     UCTX$
+
+       86      805    3            END;
+
+    805  1 000071   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000072   000043 601000 1                  TNZ     s:800
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:19   
+       87      806    2         FCTX$ = FCTX.LNK$;
+
+    806  1 000073   000010 471400 0                  LDP1    FCTX$
+         1 000074   100000 236100                    LDQ     0,,PR1
+         1 000075   000010 756000 0                  STQ     FCTX$
+
+       88      807    2         END;
+
+    807  1 000076   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000077   000012 601000 1                  TNZ     s:793
+
+       89      808
+       90      809    1      CALL HEAPSORT;       /* now sort 'em */
+
+    809  1 000100   000657 701000 1                  TSX1    HEAPSORT
+         1 000101   000000 011000                    NOP     0
+
+       91      810
+       92      811        %EJECT;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:20   
+       93      812        /* For each process, if its over its limit for FCTXs or UCTXs, figure out
+       94      813           what AGE cutoff to use to get the over-limit blocks out.
+       95      814        */
+       96      815    1      I = 0;
+
+    815  1 000102   000004 450000 0                  STZ     I
+
+       97      816    2      DO UNTIL DS.P.SYSID( I) = 0;
+
+       98      817    2         IF DS.P.FCNT( I) >= DS.DCBLIM OR DS.P.UCNT( I) >= DS.BUFLIM
+
+    817  1 000103   000000 470400 xsym               LDP0    B$DS8
+         1 000104   000004 235000 0                  LDA     I
+         1 000105   000004 735000                    ALS     4
+         1 000106   000050 236105                    LDQ     40,AL,PR0
+         1 000107   000013 116100                    CMPQ    11,,PR0
+         1 000110   000114 605000 1                  TPL     s:819
+         1 000111   000047 236105                    LDQ     39,AL,PR0
+         1 000112   000014 116100                    CMPQ    12,,PR0
+         1 000113   000200 604000 1                  TMI     s:832
+
+       99      818    3          THEN DO;
+
+      100      819    3            FCNT = DS.DCBLIM/2 - DS.P.FCNT( I);
+
+    819  1 000114   000013 236100                    LDQ     11,,PR0
+         1 000115   000002 506007                    DIV     2,DL
+         1 000116   000004 235000 0                  LDA     I
+         1 000117   000004 735000                    ALS     4
+         1 000120   000050 136105                    SBLQ    40,AL,PR0
+         1 000121   000010 756000 0                  STQ     FCTX$
+
+      101      820    3            UCNT = DS.BUFLIM/2 - DS.P.UCNT( I);
+
+    820  1 000122   000014 236100                    LDQ     12,,PR0
+         1 000123   000002 506007                    DIV     2,DL
+         1 000124   000004 235000 0                  LDA     I
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:21   
+         1 000125   000004 735000                    ALS     4
+         1 000126   000047 136105                    SBLQ    39,AL,PR0
+         1 000127   000007 756000 0                  STQ     UCTX$
+
+      102      821    4            DO J = 1 TO N;
+
+    821  1 000130   000001 235007                    LDA     1,DL
+         1 000131   000005 755000 0                  STA     J
+         1 000132   000160 710000 1                  TRA     s:828+1
+
+      103      822    4               IF ARRAYB.PROC#( J) = I
+
+    822  1 000133   000001 470400 0                  LDP0    @ARRAY
+         1 000134   000005 720000 0                  LXL0    J
+         1 000135   000000 236110                    LDQ     0,X0,PR0
+         1 000136   000777 376007                    ANQ     511,DL
+         1 000137   000004 116000 0                  CMPQ    I
+         1 000140   000153 601000 1                  TNZ     s:827
+
+      104      823    5                THEN DO;
+
+      105      824    5                  FCNT = FCNT + ARRAYB.D( J);
+
+    824  1 000141   000000 236110                    LDQ     0,X0,PR0
+         1 000142   000011 772000                    QRL     9
+         1 000143   000001 376007                    ANQ     1,DL
+         1 000144   000010 036000 0                  ADLQ    FCTX$
+         1 000145   000010 756000 0                  STQ     FCTX$
+
+      106      825    5                  UCNT = UCNT + ARRAYB.U( J);
+
+    825  1 000146   000000 236110                    LDQ     0,X0,PR0
+         1 000147   000012 772000                    QRL     10
+         1 000150   000001 376007                    ANQ     1,DL
+         1 000151   000007 036000 0                  ADLQ    UCTX$
+         1 000152   000007 756000 0                  STQ     UCTX$
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:22   
+      107      826    5                  END;
+
+      108      827    4               IF FCNT >= 0 AND UCNT >= 0 THEN EXIT;
+
+    827  1 000153   000010 235000 0                  LDA     FCTX$
+         1 000154   000157 604000 1                  TMI     s:828
+         1 000155   000007 236000 0                  LDQ     UCTX$
+         1 000156   000164 605000 1                  TPL     s:830
+
+      109      828    4               END;
+
+    828  1 000157   000005 054000 0                  AOS     J
+         1 000160   000002 236000 0                  LDQ     N
+         1 000161   000133 604000 1                  TMI     s:822
+         1 000162   000005 116000 0                  CMPQ    J
+         1 000163   000133 605000 1                  TPL     s:822
+
+      110      829
+      111      830    3            ARRAYH.HI( 0) = MAXIMUM( ARRAYH.HI( J), ARRAYH.HI( 0));
+
+    830  1 000164   000001 470400 0                  LDP0    @ARRAY
+         1 000165   000000 236100                    LDQ     0,,PR0
+         1 000166   000022 772000                    QRL     18
+         1 000167   000005 720000 0                  LXL0    J
+         1 000170   000020 756000 0                  STQ     J+1
+         1 000171   000000 236110                    LDQ     0,X0,PR0
+         1 000172   000022 772000                    QRL     18
+         1 000173   000020 116000 0                  CMPQ    J+1
+         1 000174   000176 603000 1                  TRC     s:830+10
+         1 000175   000020 236000 0                  LDQ     J+1
+         1 000176   000000 621006                    EAX1    0,QL
+         1 000177   000000 741100                    STX1    0,,PR0
+
+      112      831    3            END;
+
+      113      832    2         I = I + 1;
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:23   
+    832  1 000200   000004 054000 0                  AOS     I
+
+      114      833    2         END;  /* do until (DS.P.SYSID( I) = 0) */
+
+    833  1 000201   000004 235000 0                  LDA     I
+         1 000202   000004 735000                    ALS     4
+         1 000203   000000 470400 xsym               LDP0    B$DS8
+         1 000204   000043 220105                    LDX0    35,AL,PR0
+         1 000205   000103 601000 1                  TNZ     s:817
+
+      115      834
+      116      835        /* If we need to cut down overall, figure out the age cutoff for that.
+      117      836        */
+      118      837    1      N = DS.FCNT + DS.UCNT + DS.MCNT + DS.HCNT;
+
+    837  1 000206   000005 236100                    LDQ     5,,PR0
+         1 000207   000010 036100                    ADLQ    8,,PR0
+         1 000210   000011 036100                    ADLQ    9,,PR0
+         1 000211   000007 036100                    ADLQ    7,,PR0
+         1 000212   000002 756000 0                  STQ     N
+
+      119      838    2      IF N >= DS.CTXLIM THEN DO;
+
+    838  1 000213   000216 604000 1                  TMI     s:839
+         1 000214   000012 116100                    CMPQ    10,,PR0
+         1 000215   000240 604000 1                  TMI     s:845
+
+      120      839    2         N = N - DS.CTXLIM + DS.CTXLIM/4;
+
+    839  1 000216   000012 136100                    SBLQ    10,,PR0
+         1 000217   000020 756000 0                  STQ     J+1
+         1 000220   000012 236100                    LDQ     10,,PR0
+         1 000221   000004 506007                    DIV     4,DL
+         1 000222   000020 036000 0                  ADLQ    J+1
+         1 000223   000002 756000 0                  STQ     N
+
+      121      840    2         ARRAYH.HI( 0) = MAXIMUM( ARRAYH.HI( N), ARRAYH.HI( 0));
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:24   
+
+    840  1 000224   000001 471400 0                  LDP1    @ARRAY
+         1 000225   100000 236100                    LDQ     0,,PR1
+         1 000226   000022 772000                    QRL     18
+         1 000227   000002 720000 0                  LXL0    N
+         1 000230   000020 756000 0                  STQ     J+1
+         1 000231   100000 236110                    LDQ     0,X0,PR1
+         1 000232   000022 772000                    QRL     18
+         1 000233   000020 116000 0                  CMPQ    J+1
+         1 000234   000236 603000 1                  TRC     s:840+10
+         1 000235   000020 236000 0                  LDQ     J+1
+         1 000236   000000 621006                    EAX1    0,QL
+         1 000237   100000 741100                    STX1    0,,PR1
+
+      122      841    2         END;
+
+      123      842
+      124      843        /* Release all FCTXs and UCTXs that are too old
+      125      844        */
+      126      845    1      AGELIM = AGELIM + ARRAYH.HI( 0);
+
+    845  1 000240   000001 471400 0                  LDP1    @ARRAY
+         1 000241   100000 236100                    LDQ     0,,PR1
+         1 000242   000022 772000                    QRL     18
+         1 000243   000003 036000 0                  ADLQ    AGELIM
+         1 000244   000003 756000 0                  STQ     AGELIM
+
+      127      846    1      FCTX$ = ADDR( DS.FCTX$);
+
+    846  1 000245   000000 236000 xsym               LDQ     B$DS8
+         1 000246   000004 036003                    ADLQ    4,DU
+         1 000247   000010 756000 0                  STQ     FCTX$
+
+      128      847    2      DO WHILE FCTX.LNK$ ~= ADDR( NIL);
+
+    847  1 000250   000377 710000 1                  TRA     s:874
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:25   
+      129      848                                                 /* Release any UCTX blocks that need it */
+      130      849    2         UCTX$ = PINCRW( ADDR( FCTX.LNK$-> FCTX.UCTX$), -2);
+               849                  /* FLNK$ is the third word */
+
+    849  1 000251   000010 470400 0                  LDP0    FCTX$
+         1 000252   000000 471500                    LDP1    0,,PR0
+         1 000253   177777 633500                    EPPR3   -1,,PR1
+         1 000254   000007 453400 0                  STP3    UCTX$
+
+      131      850    3         DO WHILE UCTX.FLNK$ ~= ADDR( NIL);
+
+    850  1 000255   000340 710000 1                  TRA     s:864
+
+      132      851    3            IF UCTX.FLNK$-> UCTX.AGE > AGELIM THEN UCTX$ = UCTX.FLNK$;
+
+    851  1 000256   000007 470400 0                  LDP0    UCTX$
+         1 000257   000002 471500                    LDP1    2,,PR0
+         1 000260   000003 236000 0                  LDQ     AGELIM
+         1 000261   100014 116100                    CMPQ    12,,PR1
+         1 000262   000266 603000 1                  TRC     s:853
+
+    851  1 000263   000002 236100                    LDQ     2,,PR0
+         1 000264   000007 756000 0                  STQ     UCTX$
+         1 000265   000340 710000 1                  TRA     s:864
+
+      133      852    4            ELSE DO;  /* release the UCTX from the HLNK and FCTX.UCTX chains */
+
+      134      853    4               T$ = ADDR( UCTX.FLNK$-> UCTX.HCTX$-> HCTX.UCTX$);
+
+    853  1 000266   100001 473500                    LDP3    1,,PR1
+         1 000267   300001 634500                    EPPR4   1,,PR3
+         1 000270   000006 454400 0                  STP4    T$
+
+      135      854    5               DO WHILE T$-> UCTX.HLNK$ ~= UCTX.FLNK$;
+
+    854  1 000271   400000 236100                    LDQ     0,,PR4
+         1 000272   000002 116100                    CMPQ    2,,PR0
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:26   
+         1 000273   000304 600000 1                  TZE     s:857
+
+      136      855    5                  T$ = T$-> UCTX.HLNK$;
+
+    855  1 000274   000006 470400 0                  LDP0    T$
+         1 000275   000000 236100                    LDQ     0,,PR0
+         1 000276   000006 756000 0                  STQ     T$
+
+      137      856    5                  END;
+
+    856  1 000277   000006 470400 0                  LDP0    T$
+         1 000300   000007 471400 0                  LDP1    UCTX$
+         1 000301   000000 236100                    LDQ     0,,PR0
+         1 000302   100002 116100                    CMPQ    2,,PR1
+         1 000303   000274 601000 1                  TNZ     s:855
+
+      138      857    4               T$-> UCTX.HLNK$ = UCTX.FLNK$-> UCTX.HLNK$;
+
+    857  1 000304   000007 470400 0                  LDP0    UCTX$
+         1 000305   000002 471500                    LDP1    2,,PR0
+         1 000306   100000 236100                    LDQ     0,,PR1
+         1 000307   000006 473400 0                  LDP3    T$
+         1 000310   300000 756100                    STQ     0,,PR3
+
+      139      858    4               T$ = UCTX.FLNK$;
+
+    858  1 000311   000002 236100                    LDQ     2,,PR0
+         1 000312   000006 756000 0                  STQ     T$
+
+      140      859    4               UCTX.FLNK$ = UCTX.FLNK$-> UCTX.FLNK$;
+
+    859  1 000313   000002 471500                    LDP1    2,,PR0
+         1 000314   100002 236100                    LDQ     2,,PR1
+         1 000315   000002 756100                    STQ     2,,PR0
+
+      141      860    4               DS.UCNT = DS.UCNT - 1;
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:27   
+    860  1 000316   000000 471400 xsym               LDP1    B$DS8
+         1 000317   000001 336007                    LCQ     1,DL
+         1 000320   100010 056100                    ASQ     8,,PR1
+
+      142      861    4               T$-> UCTX.HLNK$ = DS.P.UPRG$( FCTX.LNK$-> FCTX.PROC#);
+
+    861  1 000321   000010 473400 0                  LDP3    FCTX$
+         1 000322   300000 474500                    LDP4    0,,PR3
+         1 000323   400012 236100                    LDQ     10,,PR4
+         1 000324   000004 736000                    QLS     4
+         1 000325   000000 376000 2                  ANQ     0
+         1 000326   100057 236106                    LDQ     47,QL,PR1
+         1 000327   000006 475400 0                  LDP5    T$
+         1 000330   500000 756100                    STQ     0,,PR5
+
+      143      862    4               DS.P.UPRG$( FCTX.LNK$-> FCTX.PROC#) = T$;
+
+    862  1 000331   300000 474500                    LDP4    0,,PR3
+         1 000332   400012 236100                    LDQ     10,,PR4
+         1 000333   000004 736000                    QLS     4
+         1 000334   000000 376000 2                  ANQ     0
+         1 000335   000000 620006                    EAX0    0,QL
+         1 000336   000006 236000 0                  LDQ     T$
+         1 000337   100057 756110                    STQ     47,X0,PR1
+
+      144      863    4               END;
+
+      145      864    3            END;
+
+    864  1 000340   000007 470400 0                  LDP0    UCTX$
+         1 000341   000002 236100                    LDQ     2,,PR0
+         1 000342   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000343   000256 601000 1                  TNZ     s:851
+
+      146      865
+      147      866    2         IF FCTX.LNK$-> FCTX.AGE > AGELIM THEN FCTX$ = FCTX.LNK$;
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:28   
+    866  1 000344   000010 471400 0                  LDP1    FCTX$
+         1 000345   100000 473500                    LDP3    0,,PR1
+         1 000346   000003 236000 0                  LDQ     AGELIM
+         1 000347   300013 116100                    CMPQ    11,,PR3
+         1 000350   000354 603000 1                  TRC     s:868
+
+    866  1 000351   100000 236100                    LDQ     0,,PR1
+         1 000352   000010 756000 0                  STQ     FCTX$
+         1 000353   000377 710000 1                  TRA     s:874
+
+      148      867    3         ELSE DO;  /* release the FCTX from the DS.FCTX chain */
+
+      149      868    3            T$ = FCTX.LNK$;
+
+    868  1 000354   100000 236100                    LDQ     0,,PR1
+         1 000355   000006 756000 0                  STQ     T$
+
+      150      869    3            FCTX.LNK$ = FCTX.LNK$-> FCTX.LNK$;
+
+    869  1 000356   300000 236100                    LDQ     0,,PR3
+         1 000357   100000 756100                    STQ     0,,PR1
+
+      151      870    3            DS.FCNT = DS.FCNT - 1;
+
+    870  1 000360   000000 473400 xsym               LDP3    B$DS8
+         1 000361   000001 336007                    LCQ     1,DL
+         1 000362   300005 056100                    ASQ     5,,PR3
+
+      152      871    3            T$-> FCTX.LNK$ = DS.P.FPRG$( T$->FCTX.PROC#);
+
+    871  1 000363   000006 474400 0                  LDP4    T$
+         1 000364   400012 236100                    LDQ     10,,PR4
+         1 000365   000004 736000                    QLS     4
+         1 000366   000000 376000 2                  ANQ     0
+         1 000367   300056 236106                    LDQ     46,QL,PR3
+         1 000370   400000 756100                    STQ     0,,PR4
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:29   
+      153      872    3            DS.P.FPRG$( T$->FCTX.PROC#) = T$;
+
+    872  1 000371   400012 236100                    LDQ     10,,PR4
+         1 000372   000004 736000                    QLS     4
+         1 000373   000000 376000 2                  ANQ     0
+         1 000374   000000 620006                    EAX0    0,QL
+         1 000375   000006 236000 0                  LDQ     T$
+         1 000376   300056 756110                    STQ     46,X0,PR3
+
+      154      873    3            END;
+
+      155      874    2         END;
+
+    874  1 000377   000010 470400 0                  LDP0    FCTX$
+         1 000400   000000 236100                    LDQ     0,,PR0
+         1 000401   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000402   000251 601000 1                  TNZ     s:849
+
+      156      875    1      IF FU_PROC# ~= 0 THEN RETURN;
+
+    875  1 000403   000000 235000 xsym               LDA     FU_PROC#
+         1 000404   000407 600000 1                  TZE     s:875+4
+
+    875  1 000405   000000 221200 0                  LDX1  ! 0
+         1 000406   000001 702211                    TSX2  ! 1,X1
+         1 000407   000412 710000 1                  TRA     s:879
+
+      157      876
+      158      877        %EJECT;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:30   
+      159      878    1   FUG$PURGEP: ENTRY;
+
+    878  1 000410   000000 700200 xent  FUG$PURGEP   TSX0  ! X66_STATIC_1
+         1 000411   000000 000001 0                  ZERO    0,1
+
+      160      879    1      UCTX$ = DS.P.UPRG$( FU_PROC#);
+
+    879  1 000412   000000 235000 xsym               LDA     FU_PROC#
+         1 000413   000004 735000                    ALS     4
+         1 000414   000000 470400 xsym               LDP0    B$DS8
+         1 000415   000057 236105                    LDQ     47,AL,PR0
+         1 000416   000007 756000 0                  STQ     UCTX$
+
+      161      880    2      IF UCTX$ ~= ADDR( NIL) THEN DO WHILE '1'B;
+
+    880  1 000417   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000420   000461 600000 1                  TZE     FPRG
+
+      162      881    3         IF UCTX.BUF$ ~= ADDR( NIL) THEN DO;
+
+    881  1 000421   000007 470400 0                  LDP0    UCTX$
+         1 000422   000017 236100                    LDQ     15,,PR0
+         1 000423   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000424   000441 600000 1                  TZE     s:885
+
+      163      882    3            CALL FUI$MEMFREE( UCTX.BUF$);
+
+    882  1 000425   000007 236000 0                  LDQ     UCTX$
+         1 000426   000017 036003                    ADLQ    15,DU
+         1 000427   000020 756000 0                  STQ     J+1
+         1 000430   000020 630400 0                  EPPR0   J+1
+         1 000431   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000432   000000 701000 xent               TSX1    FUI$MEMFREE
+         1 000433   000000 011000                    NOP     0
+
+      164      883    3            DS.P.UCNT( FU_PROC#) = DS.P.UCNT( FU_PROC#) - 1;
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:31   
+    883  1 000434   000000 235000 xsym               LDA     FU_PROC#
+         1 000435   000004 735000                    ALS     4
+         1 000436   000000 470400 xsym               LDP0    B$DS8
+         1 000437   000001 336007                    LCQ     1,DL
+         1 000440   000047 056105                    ASQ     39,AL,PR0
+
+      165      884    3            END;
+
+      166      885    3         IF UCTX.HLNK$ = ADDR( NIL) THEN DO;
+
+    885  1 000441   000007 470400 0                  LDP0    UCTX$
+         1 000442   000000 236100                    LDQ     0,,PR0
+         1 000443   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000444   000457 601000 1                  TNZ     s:891
+
+      167      886    3            UCTX.HLNK$ = FU_CTXHD$;
+
+    886  1 000445   000000 236000 xsym               LDQ     FU_CTXHD$
+         1 000446   000000 756100                    STQ     0,,PR0
+
+      168      887    3            FU_CTXHD$ = DS.P.UPRG$( FU_PROC#);
+
+    887  1 000447   000000 235000 xsym               LDA     FU_PROC#
+         1 000450   000004 735000                    ALS     4
+         1 000451   000000 471400 xsym               LDP1    B$DS8
+         1 000452   100057 236105                    LDQ     47,AL,PR1
+         1 000453   000000 756000 xsym               STQ     FU_CTXHD$
+
+      169      888    3            DS.P.UPRG$( FU_PROC#) = ADDR( NIL);
+
+    888  1 000454   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000455   100057 756105                    STQ     47,AL,PR1
+
+      170      889    3            GOTO FPRG;
+
+    889  1 000456   000461 710000 1                  TRA     FPRG
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:32   
+      171      890    3            END;
+      172      891    2         UCTX$ = UCTX.HLNK$;
+
+    891  1 000457   000007 756000 0                  STQ     UCTX$
+
+      173      892    2         END;
+
+    892  1 000460   000421 710000 1                  TRA     s:881
+
+    891  1 000461                       FPRG         null
+      174      893
+      175      894    1   FPRG: ;
+      176      895    1      FCTX$ = DS.P.FPRG$( FU_PROC#);
+
+    895  1 000461   000000 235000 xsym               LDA     FU_PROC#
+         1 000462   000004 735000                    ALS     4
+         1 000463   000000 470400 xsym               LDP0    B$DS8
+         1 000464   000056 236105                    LDQ     46,AL,PR0
+         1 000465   000010 756000 0                  STQ     FCTX$
+
+      177      896    2      IF FCTX$ ~= ADDR( NIL) THEN DO WHILE '1'B;
+
+    896  1 000466   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000467   000525 600000 1                  TZE     s:909
+
+      178      897    3         IF FCTX.DCB# ~= 0 THEN DO;
+
+    897  1 000470   000010 470400 0                  LDP0    FCTX$
+         1 000471   000012 220100                    LDX0    10,,PR0
+         1 000472   000504 600000 1                  TZE     s:901
+
+      179      898    3            CALL FUN$RELDCB( FCTX);
+
+    898  1 000473   000010 630400 0                  EPPR0   FCTX$
+         1 000474   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000475   000000 701000 xent               TSX1    FUN$RELDCB
+         1 000476   000000 011000                    NOP     0
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:33   
+
+      180      899    3            DS.P.FCNT( FU_PROC#) = DS.P.FCNT( FU_PROC#) - 1;
+
+    899  1 000477   000000 235000 xsym               LDA     FU_PROC#
+         1 000500   000004 735000                    ALS     4
+         1 000501   000000 470400 xsym               LDP0    B$DS8
+         1 000502   000001 336007                    LCQ     1,DL
+         1 000503   000050 056105                    ASQ     40,AL,PR0
+
+      181      900    3            END;
+
+      182      901    3         IF FCTX.LNK$ = ADDR( NIL) THEN DO;
+
+    901  1 000504   000010 470400 0                  LDP0    FCTX$
+         1 000505   000000 236100                    LDQ     0,,PR0
+         1 000506   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000507   000523 601000 1                  TNZ     s:907
+
+      183      902    3            FCTX.LNK$ = FU_CTXHD$;
+
+    902  1 000510   000000 236000 xsym               LDQ     FU_CTXHD$
+         1 000511   000000 756100                    STQ     0,,PR0
+
+      184      903    3            FU_CTXHD$ = DS.P.FPRG$( FU_PROC#);
+
+    903  1 000512   000000 235000 xsym               LDA     FU_PROC#
+         1 000513   000004 735000                    ALS     4
+         1 000514   000000 471400 xsym               LDP1    B$DS8
+         1 000515   100056 236105                    LDQ     46,AL,PR1
+         1 000516   000000 756000 xsym               STQ     FU_CTXHD$
+
+      185      904    3            DS.P.FPRG$( FU_PROC#) = ADDR( NIL);
+
+    904  1 000517   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000520   100056 756105                    STQ     46,AL,PR1
+
+      186      905    3            RETURN;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:34   
+
+    905  1 000521   000000 221200 0                  LDX1  ! 0
+         1 000522   000001 702211                    TSX2  ! 1,X1
+
+      187      906    3            END;
+      188      907    2         FCTX$ = FCTX.LNK$;
+
+    907  1 000523   000010 756000 0                  STQ     FCTX$
+
+      189      908    2         END;
+
+    908  1 000524   000470 710000 1                  TRA     s:897
+
+      190      909    1      RETURN;
+
+    909  1 000525   000000 221200 0                  LDX1  ! 0
+         1 000526   000001 702211                    TSX2  ! 1,X1
+
+      191      910
+      192      911        %EJECT;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:35   
+      193      912        /*F*  NAME: FUG$REMOVE_FCTX
+      194      913              Purpose:
+      195      914                    To remove the given FCTX block and associated UCTX blocks from
+      196      915                    the chains they are in.
+      197      916        */
+      198      917        /*D*  NAME: FUG$REMOVE_FCTX
+      199      918              Inputs:
+      200      919                    ARRAY - actually the FCTX block to remove.
+      201      920        */
+      202      921    1   FUG$REMOVE_FCTX: ENTRY( ARRAY);
+
+    921  1 000527   000000 700200 xent  FUG$REMOVE_* TSX0  ! X66_STATIC_1
+         1 000530   000000 000001 0                  ZERO    0,1
+
+      203      922
+      204      923    1      FCTX$ = ADDR( ARRAY);
+
+    923  1 000531   000001 236000 0                  LDQ     @ARRAY
+         1 000532   000010 756000 0                  STQ     FCTX$
+
+      205      924                                           /* Release any associated UCTX blocks   */
+      206      925    1      UCTX$ = FCTX.UCTX$;
+
+    925  1 000533   000010 470400 0                  LDP0    FCTX$
+         1 000534   000001 236100                    LDQ     1,,PR0
+         1 000535   000007 756000 0                  STQ     UCTX$
+
+      207      926    2      DO WHILE UCTX$ ~= ADDR( NIL);
+
+    926  1 000536   000612 710000 1                  TRA     s:940
+
+      208      927    2         T$ = ADDR( UCTX.HCTX$-> HCTX.UCTX$);
+
+    927  1 000537   000007 470400 0                  LDP0    UCTX$
+         1 000540   000001 471500                    LDP1    1,,PR0
+         1 000541   100001 633500                    EPPR3   1,,PR1
+         1 000542   000006 453400 0                  STP3    T$
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:36   
+
+      209      928    3         DO WHILE T$-> UCTX.HLNK$ ~= UCTX$;
+
+    928  1 000543   300000 236100                    LDQ     0,,PR3
+         1 000544   000007 116000 0                  CMPQ    UCTX$
+         1 000545   000555 600000 1                  TZE     s:931
+
+      210      929    3            T$ = T$-> UCTX.HLNK$;
+
+    929  1 000546   000006 470400 0                  LDP0    T$
+         1 000547   000000 236100                    LDQ     0,,PR0
+         1 000550   000006 756000 0                  STQ     T$
+
+      211      930    3            END;
+
+    930  1 000551   000006 470400 0                  LDP0    T$
+         1 000552   000000 236100                    LDQ     0,,PR0
+         1 000553   000007 116000 0                  CMPQ    UCTX$
+         1 000554   000546 601000 1                  TNZ     s:929
+
+      212      931    2         T$-> UCTX.HLNK$ = UCTX.HLNK$;
+
+    931  1 000555   000007 470400 0                  LDP0    UCTX$
+         1 000556   000000 236100                    LDQ     0,,PR0
+         1 000557   000006 471400 0                  LDP1    T$
+         1 000560   100000 756100                    STQ     0,,PR1
+
+      213      932    2         DS.UCNT = DS.UCNT - 1;
+
+    932  1 000561   000000 473400 xsym               LDP3    B$DS8
+         1 000562   000001 336007                    LCQ     1,DL
+         1 000563   300010 056100                    ASQ     8,,PR3
+
+      214      933    2         UCTX.HLNK$ = FU_CTXHD$;
+
+    933  1 000564   000000 236000 xsym               LDQ     FU_CTXHD$
+         1 000565   000000 756100                    STQ     0,,PR0
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:37   
+
+      215      934    2         FU_CTXHD$ = UCTX$;
+
+    934  1 000566   000007 236000 0                  LDQ     UCTX$
+         1 000567   000000 756000 xsym               STQ     FU_CTXHD$
+
+      216      935    3         IF UCTX.BUF$ ~= ADDR( NIL) THEN DO;
+
+    935  1 000570   000017 236100                    LDQ     15,,PR0
+         1 000571   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000572   000607 600000 1                  TZE     s:939
+
+      217      936    3            CALL FUI$MEMFREE( UCTX.BUF$);
+
+    936  1 000573   000007 236000 0                  LDQ     UCTX$
+         1 000574   000017 036003                    ADLQ    15,DU
+         1 000575   000020 756000 0                  STQ     J+1
+         1 000576   000020 630400 0                  EPPR0   J+1
+         1 000577   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000600   000000 701000 xent               TSX1    FUI$MEMFREE
+         1 000601   000000 011000                    NOP     0
+
+      218      937    3            DS.P.UCNT( FU_PROC#) = DS.P.UCNT( FU_PROC#) - 1;
+
+    937  1 000602   000000 235000 xsym               LDA     FU_PROC#
+         1 000603   000004 735000                    ALS     4
+         1 000604   000000 470400 xsym               LDP0    B$DS8
+         1 000605   000001 336007                    LCQ     1,DL
+         1 000606   000047 056105                    ASQ     39,AL,PR0
+
+      219      938    3            END;
+
+      220      939    2         UCTX$ = UCTX.FLNK$;
+
+    939  1 000607   000007 470400 0                  LDP0    UCTX$
+         1 000610   000002 236100                    LDQ     2,,PR0
+         1 000611   000007 756000 0                  STQ     UCTX$
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:38   
+
+      221      940    2         END;
+
+    940  1 000612   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000613   000537 601000 1                  TNZ     s:927
+
+      222      941
+      223      942                                             /* Look for the FCTX block and release  */
+      224      943    1      FCTX$ = ADDR( FU_FCTX$);
+
+    943  1 000614   000001 236000 2                  LDQ     1
+         1 000615   000010 756000 0                  STQ     FCTX$
+
+      225      944    2      DO WHILE FCTX.LNK$ ~= ADDR( ARRAY);
+
+    944  1 000616   000622 710000 1                  TRA     s:946
+
+      226      945    2         FCTX$ = FCTX.LNK$;
+
+    945  1 000617   000010 470400 0                  LDP0    FCTX$
+         1 000620   000000 236100                    LDQ     0,,PR0
+         1 000621   000010 756000 0                  STQ     FCTX$
+
+      227      946    2         END;
+
+    946  1 000622   000010 470400 0                  LDP0    FCTX$
+         1 000623   000000 236100                    LDQ     0,,PR0
+         1 000624   000001 116000 0                  CMPQ    @ARRAY
+         1 000625   000617 601000 1                  TNZ     s:945
+
+      228      947    1      T$ = FCTX.LNK$;
+
+    947  1 000626   000006 756000 0                  STQ     T$
+
+      229      948    1      FCTX.LNK$ = FCTX.LNK$-> FCTX.LNK$;
+
+    948  1 000627   000000 471500                    LDP1    0,,PR0
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:39   
+         1 000630   100000 236100                    LDQ     0,,PR1
+         1 000631   000000 756100                    STQ     0,,PR0
+
+      230      949    1      DS.FCNT = DS.FCNT - 1;
+
+    949  1 000632   000000 471400 xsym               LDP1    B$DS8
+         1 000633   000001 336007                    LCQ     1,DL
+         1 000634   100005 056100                    ASQ     5,,PR1
+
+      231      950    1      T$-> FCTX.LNK$ = FU_CTXHD$;
+
+    950  1 000635   000000 236000 xsym               LDQ     FU_CTXHD$
+         1 000636   000006 473400 0                  LDP3    T$
+         1 000637   300000 756100                    STQ     0,,PR3
+
+      232      951    1      FU_CTXHD$ = T$;
+
+    951  1 000640   000006 236000 0                  LDQ     T$
+         1 000641   000000 756000 xsym               STQ     FU_CTXHD$
+
+      233      952    2      IF T$->FCTX.DCB# ~= 0 THEN DO;
+
+    952  1 000642   300012 220100                    LDX0    10,,PR3
+         1 000643   000655 600000 1                  TZE     s:957
+
+      234      953    2         CALL FUN$RELDCB( T$->FCTX);
+
+    953  1 000644   000006 630400 0                  EPPR0   T$
+         1 000645   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000646   000000 701000 xent               TSX1    FUN$RELDCB
+         1 000647   000000 011000                    NOP     0
+
+      235      954    2         DS.P.FCNT( FU_PROC#) = DS.P.FCNT( FU_PROC#) - 1;
+
+    954  1 000650   000000 235000 xsym               LDA     FU_PROC#
+         1 000651   000004 735000                    ALS     4
+         1 000652   000000 470400 xsym               LDP0    B$DS8
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:40   
+         1 000653   000001 336007                    LCQ     1,DL
+         1 000654   000050 056105                    ASQ     40,AL,PR0
+
+      236      955    2         END;
+
+      237      956
+      238      957    1      RETURN;
+
+    957  1 000655   000000 221200 0                  LDX1  ! 0
+         1 000656   000001 702211                    TSX2  ! 1,X1
+
+      239      958        %EJECT;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:41   
+      240      959        /*I*  NAME:      HEAPSORT
+      241      960              Purpose:   to sort ARRAY.
+      242      961              Inputs:    ARRAY
+      243      962              Outputs:   ARRAY - sorted in ascending order
+      244      963              Algorithm: This is a HEAPSORT, taken from the book ALGORITHMS + DATA
+      245      964                         STRUCTURES = PROGRAMS by Nicolas Wirth.
+      246      965        */
+      247      966    1   HEAPSORT: PROC;
+
+    966  1 000657   000011 741200 0     HEAPSORT     STX1  ! FCTX$+1
+
+      248      967    2      DCL L SBIN;
+      249      968    2      DCL R SBIN;
+      250      969    2      DCL TEMP UBIN;
+      251      970
+      252      971    2      L = ( N / 2) + 1;
+
+    971  1 000660   000002 236000 0                  LDQ     N
+         1 000661   000001 772000                    QRL     1
+         1 000662   000001 036007                    ADLQ    1,DL
+         1 000663   000012 756000 0                  STQ     L
+
+      253      972    2      R = N;
+
+    972  1 000664   000002 235000 0                  LDA     N
+         1 000665   000013 755000 0                  STA     R
+
+      254      973    3      DO WHILE (L > 1);
+
+    973  1 000666   000001 116007                    CMPQ    1,DL
+         1 000667   000677 604400 1                  TMOZ    s:977
+
+      255      974    3         L = L - 1;
+
+    974  1 000670   000001 336007                    LCQ     1,DL
+         1 000671   000012 056000 0                  ASQ     L
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:42   
+      256      975    3         CALL SIFT;
+
+    975  1 000672   000722 701000 1                  TSX1    SIFT
+         1 000673   000000 011000                    NOP     0
+
+      257      976    3         END;
+
+    976  1 000674   000012 235000 0                  LDA     L
+         1 000675   000001 115007                    CMPA    1,DL
+         1 000676   000670 605400 1                  TPNZ    s:974
+
+      258      977    3      DO WHILE (R > 1);
+
+    977  1 000677   000013 235000 0                  LDA     R
+         1 000700   000001 115007                    CMPA    1,DL
+         1 000701   000721 604400 1                  TMOZ    s:983+3
+
+      259      978    3         TEMP = ARRAY( 1);
+
+    978  1 000702   000001 470400 0                  LDP0    @ARRAY
+         1 000703   000001 235100                    LDA     1,,PR0
+         1 000704   000014 755000 0                  STA     TEMP
+
+      260      979    3         ARRAY( 1) = ARRAY( R);
+
+    979  1 000705   000013 720000 0                  LXL0    R
+         1 000706   000000 235110                    LDA     0,X0,PR0
+         1 000707   000001 755100                    STA     1,,PR0
+
+      261      980    3         ARRAY( R) = TEMP;
+
+    980  1 000710   000014 236000 0                  LDQ     TEMP
+         1 000711   000000 756110                    STQ     0,X0,PR0
+
+      262      981    3         R = R - 1;
+
+    981  1 000712   000001 336007                    LCQ     1,DL
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:43   
+         1 000713   000013 056000 0                  ASQ     R
+
+      263      982    3         CALL SIFT;
+
+    982  1 000714   000722 701000 1                  TSX1    SIFT
+         1 000715   000000 011000                    NOP     0
+
+      264      983    3         END;
+
+    983  1 000716   000013 235000 0                  LDA     R
+         1 000717   000001 115007                    CMPA    1,DL
+         1 000720   000702 605400 1                  TPNZ    s:978
+         1 000721   000774 710000 1                  TRA     s:1001
+
+      265      984
+      266      985    2   SIFT: PROC;
+
+    985  1 000722   000015 741200 0     SIFT         STX1  ! TEMP+1
+
+      267      986    3      DCL I SBIN;
+      268      987    3      DCL J SBIN;
+      269      988
+      270      989    3      I = L;
+
+    989  1 000723   000012 235000 0                  LDA     L
+         1 000724   000016 755000 0                  STA     I
+
+      271      990    3      J = I * 2;
+
+    990  1 000725   000001 735000                    ALS     1
+         1 000726   000017 755000 0                  STA     J
+
+      272      991    3      TEMP = ARRAY(I);
+
+    991  1 000727   000001 470400 0                  LDP0    @ARRAY
+         1 000730   000016 720000 0                  LXL0    I
+         1 000731   000000 235110                    LDA     0,X0,PR0
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:44   
+         1 000732   000014 755000 0                  STA     TEMP
+
+      273      992    4      DO WHILE (J <= R);
+
+    992  1 000733   000017 236000 0                  LDQ     J
+         1 000734   000013 116000 0                  CMPQ    R
+         1 000735   000767 605400 1                  TPNZ    s:999
+
+      274      993    4         IF (J < R) AND ARRAY( J) < ARRAY( J+1) THEN J = J + 1;
+
+    993  1 000736   000017 236000 0                  LDQ     J
+         1 000737   000013 116000 0                  CMPQ    R
+         1 000740   000750 605000 1                  TPL     s:994
+         1 000741   000001 470400 0                  LDP0    @ARRAY
+         1 000742   000000 620006                    EAX0    0,QL
+         1 000743   000017 721000 0                  LXL1    J
+         1 000744   000000 236111                    LDQ     0,X1,PR0
+         1 000745   000001 116110                    CMPQ    1,X0,PR0
+         1 000746   000750 603000 1                  TRC     s:994
+
+    993  1 000747   000017 054000 0                  AOS     J
+
+      275      994    4         IF TEMP >= ARRAY( J) THEN EXIT;
+
+    994  1 000750   000001 470400 0                  LDP0    @ARRAY
+         1 000751   000017 720000 0                  LXL0    J
+         1 000752   000014 236000 0                  LDQ     TEMP
+         1 000753   000000 116110                    CMPQ    0,X0,PR0
+         1 000754   000767 603000 1                  TRC     s:999
+
+      276      995    4         ARRAY( I) = ARRAY( J);
+
+    995  1 000755   000016 721000 0                  LXL1    I
+         1 000756   000000 235110                    LDA     0,X0,PR0
+         1 000757   000000 755111                    STA     0,X1,PR0
+
+      277      996    4         I = J;
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:45   
+
+    996  1 000760   000017 235000 0                  LDA     J
+         1 000761   000016 755000 0                  STA     I
+
+      278      997    4         J = I * 2;
+
+    997  1 000762   000001 735000                    ALS     1
+         1 000763   000017 755000 0                  STA     J
+
+      279      998    4         END;
+
+    998  1 000764   000017 236000 0                  LDQ     J
+         1 000765   000013 116000 0                  CMPQ    R
+         1 000766   000736 604400 1                  TMOZ    s:993
+
+      280      999    3      ARRAY( I) = TEMP;
+
+    999  1 000767   000016 720000 0                  LXL0    I
+         1 000770   000014 235000 0                  LDA     TEMP
+         1 000771   000000 755110                    STA     0,X0,PR0
+
+      281     1000    3   END SIFT;
+
+   1000  1 000772   000015 221200 0                  LDX1  ! TEMP+1
+         1 000773   000001 702211                    TSX2  ! 1,X1
+
+      282     1001    2   END HEAPSORT;
+
+   1001  1 000774   000011 221200 0                  LDX1  ! FCTX$+1
+         1 000775   000001 702211                    TSX2  ! 1,X1
+      283     1002
+      284     1003    1   END FUG$GARBCOL;
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:46   
+--  Include file information  --
+
+   FU_NFS_M.:FUA2TOU  is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is never referenced.
+      No diagnostics issued in procedure FUG$GARBCOL.
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:47   
+
+ **** Variables and constants ****
+
+  ****  Section 000  Data  FUG$GARBCOL
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     1-0-0/w PTR         r     1 @ARRAY                     3-0-0/w UBIN        r     1 AGELIM
+    *0-0-0/w UBIN        r     1 ARRAY(0:0)                *0-0-0/w STRC        r     1 ARRAYB(0:0)
+    *0-0-0/w STRC        r     1 ARRAYH(0:0)               10-0-0/w SBIN        r     1 FCNT
+    10-0-0/w PTR         r     1 FCTX$                      4-0-0/w SBIN        r     1 I
+    16-0-0/w SBIN        r     1 I                          5-0-0/w SBIN        r     1 J
+    17-0-0/w SBIN        r     1 J                         12-0-0/w SBIN        r     1 L
+     2-0-0/w UBIN        r     1 N                          2-0-0/w SBIN        r     1 NS
+    13-0-0/w SBIN        r     1 R                          6-0-0/w PTR         r     1 T$
+    14-0-0/w UBIN        r     1 TEMP                       7-0-0/w SBIN        r     1 UCNT
+     7-0-0/w PTR         r     1 UCTX$
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$DS8                      0-0-0/w PTR         r     1 FU_CTXHD$
+     0-0-0/w PTR         r     1 FU_FCTX$                   0-0-0/w UBIN        r     1 FU_PROC#
+     0-0-0/w UBIN        r     1 FU_TIME
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(4716)  r     1 DS                         0-0-0/w STRC(1656)  r     1 FCTX
+     0-0-0/w ASTR(900)   r     1 HCTX                       0-0-0/w STRC(1296)  r     1 UCTX
+
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:48   
+
+   Procedure FUG$GARBCOL requires 510 words for executable code.
+   Procedure FUG$GARBCOL is declared NOAUTO and requires 18 words of local(STATIC) storage.
+
+    No errors detected in file FUG$GARBCOL.:FUA2TSI    .
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:49   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:50   
+          MINI XREF LISTING
+
+AGELIM
+        34**DCL       790<<ASSIGN    795>>IF        795>>ASSIGN    802>>IF        802>>ASSIGN    845<<ASSIGN
+       845>>ASSIGN    851>>IF        866>>IF
+ARRAY
+        25**DCL        23--PROC       26--REDEF      27--REDEF     794<<ASSIGN    795<<ASSIGN    796<<ASSIGN
+       796>>ASSIGN    801<<ASSIGN    802<<ASSIGN    803<<ASSIGN    803>>ASSIGN    921--ENTRY     923--ASSIGN
+       944--DOWHILE   978>>ASSIGN    979<<ASSIGN    979>>ASSIGN    980<<ASSIGN    991>>ASSIGN    993>>IF
+       993>>IF        994>>IF        995<<ASSIGN    995>>ASSIGN    999<<ASSIGN
+ARRAYB.D
+        30**DCL       797<<ASSIGN    824>>ASSIGN
+ARRAYB.PROC#
+        31**DCL       822>>IF
+ARRAYB.U
+        29**DCL       825>>ASSIGN
+ARRAYH.HI
+        26**DCL       830<<ASSIGN    830>>ASSIGN    830>>ASSIGN    840<<ASSIGN    840>>ASSIGN    840>>ASSIGN
+       845>>ASSIGN
+B$DS8
+       773**DCL       576--IMP-PTR   791>>ASSIGN    816>>DOUNTIL   817>>IF        817>>IF        817>>IF
+       817>>IF        819>>ASSIGN    819>>ASSIGN    820>>ASSIGN    820>>ASSIGN    837>>ASSIGN    837>>ASSIGN
+       837>>ASSIGN    837>>ASSIGN    838>>IF        839>>ASSIGN    839>>ASSIGN    846>>ASSIGN    860>>ASSIGN
+       860>>ASSIGN    861>>ASSIGN    862>>ASSIGN    870>>ASSIGN    870>>ASSIGN    871>>ASSIGN    872>>ASSIGN
+       879>>ASSIGN    883>>ASSIGN    883>>ASSIGN    887>>ASSIGN    888>>ASSIGN    895>>ASSIGN    899>>ASSIGN
+       899>>ASSIGN    903>>ASSIGN    904>>ASSIGN    932>>ASSIGN    932>>ASSIGN    937>>ASSIGN    937>>ASSIGN
+       949>>ASSIGN    949>>ASSIGN    954>>ASSIGN    954>>ASSIGN
+DS.BUFLIM
+       583**DCL       817>>IF        820>>ASSIGN
+DS.CTXLIM
+       582**DCL       838>>IF        839>>ASSIGN    839>>ASSIGN
+DS.DCBLIM
+       583**DCL       817>>IF        819>>ASSIGN
+DS.FCNT
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:51   
+       581**DCL       837>>ASSIGN    870<<ASSIGN    870>>ASSIGN    949<<ASSIGN    949>>ASSIGN
+DS.FCTX$
+       581**DCL       791>>ASSIGN    846--ASSIGN
+DS.HCNT
+       582**DCL       837>>ASSIGN
+DS.MCNT
+       582**DCL       837>>ASSIGN
+DS.P.FCNT
+       587**DCL       817>>IF        819>>ASSIGN    899<<ASSIGN    899>>ASSIGN    954<<ASSIGN    954>>ASSIGN
+DS.P.FPRG$
+       589**DCL       871>>ASSIGN    872<<ASSIGN    895>>ASSIGN    903>>ASSIGN    904<<ASSIGN
+DS.P.SYSID
+       585**DCL       816>>DOUNTIL
+DS.P.UCNT
+       587**DCL       817>>IF        820>>ASSIGN    883<<ASSIGN    883>>ASSIGN    937<<ASSIGN    937>>ASSIGN
+DS.P.UPRG$
+       589**DCL       861>>ASSIGN    862<<ASSIGN    879>>ASSIGN    887>>ASSIGN    888<<ASSIGN
+DS.UCNT
+       582**DCL       837>>ASSIGN    860<<ASSIGN    860>>ASSIGN    932<<ASSIGN    932>>ASSIGN
+FCNT
+        42**DCL       819<<ASSIGN    824<<ASSIGN    824>>ASSIGN    827>>IF
+FCTX
+       607**DCL       898<>CALL      953<>CALL
+FCTX.AGE
+       634**DCL       795>>IF        795>>ASSIGN    866>>IF
+FCTX.DCB#
+       634**DCL       797>>IF        897>>IF        952>>IF
+FCTX.FID.ASN
+       685**DCL       686--REDEF
+FCTX.FOFFSET
+       694**DCL       694--REDEF
+FCTX.LNK$
+       611**DCL       806>>ASSIGN    847>>DOWHILE   849>>ASSIGN    861>>ASSIGN    862>>ASSIGN    866>>IF
+       866>>ASSIGN    868>>ASSIGN    869<<ASSIGN    869>>ASSIGN    869>>ASSIGN    871<<ASSIGN    901>>IF
+       902<<ASSIGN    907>>ASSIGN    944>>DOWHILE   945>>ASSIGN    947>>ASSIGN    948<<ASSIGN    948>>ASSIGN
+       948>>ASSIGN    950<<ASSIGN
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:52   
+FCTX.PROC#
+       634**DCL       796>>ASSIGN    803>>ASSIGN    861>>ASSIGN    862>>ASSIGN    871>>ASSIGN    872>>ASSIGN
+FCTX.UCTX$
+       611**DCL       798>>ASSIGN    849--ASSIGN    925>>ASSIGN
+FCTX$
+        41**DCL        42--REDEF     607--IMP-PTR   791<<ASSIGN    792>>DOWHILE   795>>IF        795>>ASSIGN
+       796>>ASSIGN    797>>IF        798>>ASSIGN    803>>ASSIGN    806<<ASSIGN    806>>ASSIGN    846<<ASSIGN
+       847>>DOWHILE   849>>ASSIGN    861>>ASSIGN    862>>ASSIGN    866>>IF        866<<ASSIGN    866>>ASSIGN
+       868>>ASSIGN    869>>ASSIGN    869>>ASSIGN    895<<ASSIGN    896>>IF        897>>IF        898>>CALL
+       901>>IF        902>>ASSIGN    907<<ASSIGN    907>>ASSIGN    923<<ASSIGN    925>>ASSIGN    943<<ASSIGN
+       944>>DOWHILE   945<<ASSIGN    945>>ASSIGN    947>>ASSIGN    948>>ASSIGN    948>>ASSIGN
+FPRG
+       891**LABEL     889--GOTO
+FUI$MEMFREE
+       779**DCL-ENT   882--CALL      936--CALL
+FUN$RELDCB
+       780**DCL-ENT   898--CALL      953--CALL
+FU_CTXHD$
+       774**DCL       886>>ASSIGN    887<<ASSIGN    902>>ASSIGN    903<<ASSIGN    933>>ASSIGN    934<<ASSIGN
+       950>>ASSIGN    951<<ASSIGN
+FU_FCTX$
+       775**DCL       943--ASSIGN
+FU_PROC#
+       776**DCL       875>>IF        879>>ASSIGN    883>>ASSIGN    883>>ASSIGN    887>>ASSIGN    888>>ASSIGN
+       895>>ASSIGN    899>>ASSIGN    899>>ASSIGN    903>>ASSIGN    904>>ASSIGN    937>>ASSIGN    937>>ASSIGN
+       954>>ASSIGN    954>>ASSIGN
+FU_TIME
+       777**DCL       790>>ASSIGN
+HCTX.NAME.L
+       769**DCL       770--IMP-SIZ
+HCTX.UCTX$
+       767**DCL       853--ASSIGN    927--ASSIGN
+HEAPSORT
+       966**PROC      809--CALL
+I
+        36**DCL       815<<ASSIGN    816>>DOUNTIL   817>>IF        817>>IF        819>>ASSIGN    820>>ASSIGN
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:53   
+       822>>IF        832<<ASSIGN    832>>ASSIGN
+I IN PROCEDURE SIFT
+       986**DCL       989<<ASSIGN    990>>ASSIGN    991>>ASSIGN    995>>ASSIGN    996<<ASSIGN    997>>ASSIGN
+       999>>ASSIGN
+J
+        37**DCL       821<<DOINDEX   822>>IF        824>>ASSIGN    825>>ASSIGN    830>>ASSIGN
+J IN PROCEDURE SIFT
+       987**DCL       990<<ASSIGN    992>>DOWHILE   993>>IF        993>>IF        993>>IF        993<<ASSIGN
+       993>>ASSIGN    994>>IF        995>>ASSIGN    996>>ASSIGN    997<<ASSIGN
+L IN PROCEDURE HEAPSORT
+       967**DCL       971<<ASSIGN    973>>DOWHILE   974<<ASSIGN    974>>ASSIGN    989>>ASSIGN
+N
+        32**DCL        33--REDEF     789<<ASSIGN    794>>ASSIGN    795>>ASSIGN    796>>ASSIGN    796>>ASSIGN
+       797>>ASSIGN    801>>ASSIGN    802>>ASSIGN    803>>ASSIGN    803>>ASSIGN    821>>DOINDEX   837<<ASSIGN
+       838>>IF        839<<ASSIGN    839>>ASSIGN    840>>ASSIGN    971>>ASSIGN    972>>ASSIGN
+NS
+        33**DCL       793<<ASSIGN    793>>ASSIGN    800<<ASSIGN    800>>ASSIGN
+R IN PROCEDURE HEAPSORT
+       968**DCL       972<<ASSIGN    977>>DOWHILE   979>>ASSIGN    980>>ASSIGN    981<<ASSIGN    981>>ASSIGN
+       992>>DOWHILE   993>>IF
+SIFT IN PROCEDURE HEAPSORT
+       985**PROC      975--CALL      982--CALL
+T$
+        38**DCL       853<<ASSIGN    854>>DOWHILE   855<<ASSIGN    855>>ASSIGN    857>>ASSIGN    858<<ASSIGN
+       861>>ASSIGN    862>>ASSIGN    868<<ASSIGN    871>>ASSIGN    871>>ASSIGN    872>>ASSIGN    872>>ASSIGN
+       927<<ASSIGN    928>>DOWHILE   929<<ASSIGN    929>>ASSIGN    931>>ASSIGN    947<<ASSIGN    950>>ASSIGN
+       951>>ASSIGN    952>>IF        953>>CALL
+TEMP IN PROCEDURE HEAPSORT
+       969**DCL       978<<ASSIGN    980>>ASSIGN    991<<ASSIGN    994>>IF        999>>ASSIGN
+UCNT
+        40**DCL       820<<ASSIGN    825<<ASSIGN    825>>ASSIGN    827>>IF
+UCTX.AGE
+       741**DCL       802>>IF        802>>ASSIGN    851>>IF
+UCTX.BUF$
+       745**DCL       881>>IF        882<>CALL      935>>IF        936<>CALL
+UCTX.FFLG#
+PL6.E3A0      #001=FUG$GARBCOL File=FUG$GARBCOL.:FUA2TSI                         FRI 11/21/97 11:31 Page:54   
+       741**DCL       741--REDEF
+UCTX.FILEPOS
+       745**DCL       746--REDEF
+UCTX.FILEPOS.FOFFSET
+       745**DCL       746--REDEF
+UCTX.FLNK$
+       715**DCL       804>>ASSIGN    850>>DOWHILE   851>>IF        851>>ASSIGN    853>>ASSIGN    854>>DOWHILE
+       857>>ASSIGN    858>>ASSIGN    859<<ASSIGN    859>>ASSIGN    859>>ASSIGN    939>>ASSIGN
+UCTX.HCTX$
+       715**DCL       853>>ASSIGN    927>>ASSIGN
+UCTX.HLNK$
+       715**DCL       854>>DOWHILE   855>>ASSIGN    857<<ASSIGN    857>>ASSIGN    861<<ASSIGN    885>>IF
+       886<<ASSIGN    891>>ASSIGN    928>>DOWHILE   929>>ASSIGN    931<<ASSIGN    931>>ASSIGN    933<<ASSIGN
+UCTX$
+        39**DCL        40--REDEF     711--IMP-PTR   763--IMP-PTR   798<<ASSIGN    799>>DOWHILE   802>>IF
+       802>>ASSIGN    804<<ASSIGN    804>>ASSIGN    849<<ASSIGN    850>>DOWHILE   851>>IF        851<<ASSIGN
+       851>>ASSIGN    853>>ASSIGN    854>>DOWHILE   857>>ASSIGN    858>>ASSIGN    859>>ASSIGN    859>>ASSIGN
+       879<<ASSIGN    880>>IF        881>>IF        882>>CALL      885>>IF        886>>ASSIGN    891<<ASSIGN
+       891>>ASSIGN    925<<ASSIGN    926>>DOWHILE   927>>ASSIGN    928>>DOWHILE   931>>ASSIGN    933>>ASSIGN
+       934>>ASSIGN    935>>IF        936>>CALL      939<<ASSIGN    939>>ASSIGN

@@ -1,0 +1,818 @@
+
+
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: get.c,v 1.6 87/04/03 16:48:53 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /* S H A R E D   F I L E
+        7         7              *
+        8         8              * G E T . C
+        9         9              */
+       10        10
+       11        11             #include <stdio:h>
+       12        12             #include "types:h"
+       13        13             #include "def:h"
+       14        14             #include "debug:h"
+       15        15             #include "global:h"
+       16        16             #include "lset:h"
+       17        17             #include "cset:h"
+       18        18             #include "get:h"
+       19        19             #include "alloc:h"
+       20        20             #include "map:h"
+       21        21             #include "aux:h"
+       22        22             #include "em_spec:h"
+       23        23             #include "em_mnem:h"
+       24        24             #include "em_pseu:h"
+       25        25             #include "em_mes:h"
+       26        26
+       27        27             FILE *curinp;
+       28        28             block_id lastbid;  /* block identifying number */
+       29        29             lab_id  lastlabid; /* last label identifier */
+       30        30             struct bblock bblock_init = { 0, (line_p) 0,
+       31        31    1              (lset) 0,
+       32        32    1              (lset) 0,
+       33        33    1              (bblock_p) 0,
+       34        34    1              (lset) 0,
+       35        35    1              0,
+       36        36    1              (bext_p) 0,
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=2  
+       37        37    1              (bblock_p) 0,
+       38        38    1              0 };
+       39        39
+       40        40             proc_p save_proc;  /* for il opt save cur proc being processed. */
+       41        41             bblock_p save_block; /* for inline opt save blk curr in. */
+       42        42
+       43        43
+       44        44
+       45        45             /* creating new identifying numbers, i.e. numbers that did not
+       46        46              * appear in the input.
+       47        47              */
+       48        48
+       49        49             bblock_p freshblock()
+       50        50             {
+       51        51    1         bblock_p b;
+       52        52    1         b = newbblock();
+       53        53    1         *b = bblock_init ;  /* set the block to correct init values. */
+       54        54    1         b->b_id = ++lastbid;
+       55        55    1         return b;
+       56        56    1        }
+       57        57
+       58        58
+       59        59             lab_id freshlabel()
+       60        60             {
+       61        61    1         curproc->p_nrlabels++;
+       62        62    1         return ++lastlabid;
+       63        63    1        }
+       64        64
+       65        65
+       66        66             #define getmark()  getbyte()
+       67        67
+       68        68             short getshort() {
+       69        69    1         register int l_byte, h_byte;
+       70        70    1
+       71        71    1         l_byte = getbyte();
+       72        72    1         h_byte = getbyte();
+       73        73    1         if (h_byte>=256 ) h_byte -= 512 ;
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=3  
+       74        74    1         return l_byte | (h_byte*512) ;
+       75        75    1        }
+       76        76
+       77        77
+       78        78             offset getoff() {
+       79        79    1         register long l;
+       80        80    1         register int h_byte;
+       81        81    1
+       82        82    1         l = getbyte();
+       83        83    1         l |= ((unsigned) getbyte())*512 ;
+       84        84    1         l |= getbyte()*512L*512L ;
+       85        85    1         h_byte = getbyte() ;
+       86        86    1         if (h_byte>=256 ) h_byte -= 512 ;
+       87        87    1         return l | (h_byte*512L*512*512L) ;
+       88        88    1        }
+       89        89
+       90        90             STATIC int getint()
+       91        91             {
+       92        92    1         /* Read an integer from the input file. This routine is
+       93        93    1          * only used when reading a bitvector-set. We expect  an
+       94        94    1          * integer to be either a short or a long.
+       95        95    1          */
+       96        96    1
+       97        97    1         if (sizeof(int) == sizeof(short)) {
+       98        98    2            return getshort();
+       99        99    2         } else {
+      100       100    2            assert (sizeof(int) == sizeof(offset));
+      101       101    2            return getoff();
+      102       102    2         }
+      103       103    1        }
+      104       104
+      105       105             /* getptable */
+      106       106
+      107       107             loop_p getloop(id)
+      108       108              loop_id id;
+      109       109             {
+      110       110    1         /* Map a loop identifier onto a loop struct.
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=4  
+      111       111    1          * If no struct was alocated yet for this identifier then
+      112       112    1          * allocate one now and update the loop-map table.
+      113       113    1          */
+      114       114    1
+      115       115    1
+      116       116    1         assert (id > 0 && id <=lplength);
+      117       117    1         if (lpmap[id] == (loop_p) 0) {
+      118       118    2            lpmap[id] = newloop();
+      119       119    2            lpmap[id]->lp_id = id;
+      120       120    2         }
+      121       121    1         return (lpmap[id]);
+      122       122    1        }
+      123       123
+      124       124             bblock_p getblock(id)
+      125       125              block_id id;
+      126       126             {
+      127       127    1         /* Map a basic block identifier onto a block struct
+      128       128    1          * If no struct was alocated yet for this identifier then
+      129       129    1          * allocate one now and update the block-map table.
+      130       130    1          */
+      131       131    1
+      132       132    1
+      133       133    1         assert (id >= 0 && id <=blength);
+      134       134    1         if (id == 0) return (bblock_p) 0;
+      135       135    1         if (bmap[id] == (bblock_p) 0) {
+      136       136    2            bmap[id] = newbblock();
+      137       137    2          *bmap[id] = bblock_init ;
+      138       138    2            bmap[id]->b_id = id;
+      139       139    2         }
+      140       140    1         return (bmap[id]);
+      141       141    1        }
+      142       142
+      143       143
+      144       144             lset getlset(p)
+      145       145              char *((*p) ());
+      146       146             {
+      147       147    1         /* Read a 'long' set. Such a set is represented externally
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=5  
+      148       148    1          * as a sequence of identifying numbers terminated by a 0.
+      149       149    1          * The procedural parameter p maps such a number onto a
+      150       150    1          * pointer to a struct (bblock_p, loop_p etc.).
+      151       151    1          */
+      152       152    1
+      153       153    1         lset s;
+      154       154    1         int id;
+      155       155    1
+      156       156    1         s = Lempty_set();
+      157       157    1         while (id = getshort()) {
+      158       158    2            Ladd( (*p) (id), &s);
+      159       159    2         }
+      160       160    1         return s;
+      161       161    1        }
+      162       162
+      163       163
+      164       164             cset getcset()
+      165       165             {
+      166       166    1         /* Read a 'compact' set. Such a set is represented externally
+      167       167    1          * a row of bytes (its bitvector) preceded by its length.
+      168       168    1          */
+      169       169    1
+      170       170    1         cset s;
+      171       171    1         register short i;
+      172       172    1
+      173       173    1         s = Cempty_set(getshort());
+      174       174    1         for (i = 0; i <= DIVWL(s->v_size-1);i++) {
+      175       175    2            s->v_bits[i] = getint();
+      176       176    2         }
+      177       177    1         return s;
+      178       178    1        }
+      179       179
+      180       180
+      181       181             proc_p getptable(pname)
+      182       182              char *pname;
+      183       183             {
+      184       184    1         short i;
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=6  
+      185       185    1         proc_p head, p, *pp;
+      186       186    1         short all;
+      187       187    1
+      188       188    1         if ((curinp = fopen(pname,"rb")) == NULL) {
+      189       189    2            error("cannot open %s",pname);
+      190       190    2         }
+      191       191    1
+      192       192    1         plength = getshort();  /* table is preceded by its length */
+      193       193    1         assert(plength >= 0);
+      194       194    1         assert(plength < 1000);  /* See if its a reasonable number */
+      195       195    1         pmap = (proc_p *) newmap(plength);   /* allocate the pmap table */
+      196       196    1
+      197       197    1         all = getshort();
+      198       198    1         head = (proc_p) 0;
+      199       199    1         pp = &head;
+      200       200    1         for (i = 0; i < plength; i++) {
+      201       201    2            if (feof(curinp)) {
+      202       202    3               error("unexpected eof %s", pname);
+      203       203    3            }
+      204       204    2            p = newproc();
+      205       205    2            p->p_id = getshort();
+      206       206    2            assert(p->p_id > 0 && p->p_id <= plength);
+      207       207    2            pmap[p->p_id] = p;
+      208       208    2            p->p_flags1 = getbyte();
+      209       209    2            if (p->p_flags1 & PF_BODYSEEN) {
+      210       210    3               p->p_nrlabels = getshort();
+      211       211    3               p->p_localbytes = getoff();
+      212       212    3               p->p_nrformals = getoff();
+      213       213    3               if (all) {
+      214       214    4                  p->p_change = newchange();
+      215       215    4                  p->p_change->c_ext = getcset();
+      216       216    4                  p->p_change->c_flags = getshort();
+      217       217    4                  p->p_use = newuse();
+      218       218    4                  p->p_use->u_flags = getshort();
+      219       219    4                  p->p_calling = getcset();
+      220       220    4               }
+      221       221    3           else {
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=7  
+      222       222    4             p->p_change = (proc_p) 0 ; }
+"zbe$get:c.:ZBC3TSI", line 222: (warning) incompatible pointers in =
+      223       223    3            }
+      224       224    2            *pp = p;
+      225       225    2            pp = &(p->p_next);
+      226       226    2          p->p_next = (proc_p) 0 ;
+      227       227    2         }
+      228       228    1         fclose(curinp);
+      229       229    1         OUTTRACE("have read proc table of length %d",plength);
+      230       230    1         return head;   /* pointer to first structure of list */
+      231       231    1        }
+      232       232
+      233       233
+      234       234
+      235       235             /* getdtable */
+      236       236
+      237       237             dblock_p getdtable(dname)
+      238       238              char *dname;
+      239       239             {
+      240       240    1         /* Read the data block table. Every data block may
+      241       241    1          * have a list of objects and a list of values (arguments),
+      242       242    1          * each of which is also represented by a structure.
+      243       243    1          * So the input file contains a mixture of dblock,
+      244       244    1          * obj and arg records, each one having its own
+      245       245    1          * attributes. A mark indicates which one comes next.
+      246       246    1          * We assume that the syntactic structure of the input
+      247       247    1          * is correct.
+      248       248    1          */
+      249       249    1
+      250       250    1         dblock_p head, d, *dp;
+      251       251    1         obj_p    obj, *op;
+      252       252    1         arg_p    arg, *ap;
+      253       253    1         /* dp, op an ap tell how the next dblock/obj/arg
+      254       254    1          * has to be linked.
+      255       255    1          */
+      256       256    1         int n;
+      257       257    1
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=8  
+      258       258    1         head = (dblock_p) 0;
+      259       259    1         dp = &head;
+      260       260    1         if ((curinp = fopen(dname,"rb")) == NULL) {
+      261       261    2            error("cannot open %s", dname);
+      262       262    2         }
+      263       263    1         olength = getshort();
+      264       264    1         assert(olength >= 0);
+      265       265    1         assert(olength < 5000);  /* See if its a reasonable number */
+      266       266    1         /* total number of objects */
+      267       267    1         omap = (obj_p *) newmap(olength);  /* allocate omap table */
+      268       268    1
+      269       269    1         while (TRUE) {
+      270       270    2            n = getmark();
+      271       271    2            if (feof(curinp)) break;
+      272       272    2            switch(n) {
+      273       273    3               case MARK_DBLOCK:
+      274       274    3                  d = *dp = newdblock();
+      275       275    3                  op = &d->d_objlist;
+      276       276    3                  ap = &d->d_values;
+      277       277    3                  dp = &d->d_next;
+      278       278    3           d->d_next = NULL ;
+      279       279    3           d->d_objlist = NULL ;
+      280       280    3           d->d_values = NULL ;
+      281       281    3                  d->d_id = getshort();
+      282       282    3                  d->d_pseudo = getbyte();
+      283       283    3                  d->d_size = getoff();
+      284       284    3                  d->d_fragmnr = getshort();
+      285       285    3                  d->d_flags1 = getbyte();
+      286       286    3                  break;
+      287       287    3               case MARK_OBJ:
+      288       288    3                  obj = *op = newobject();
+      289       289    3                  op = &obj->o_next;
+      290       290    3                  obj->o_dblock = d;
+      291       291    3                  obj->o_id = getshort();
+      292       292    3                  assert(obj->o_id >0);
+      293       293    3                  assert(obj->o_id <= olength);
+      294       294    3                  omap[obj->o_id] = obj;
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=9  
+      295       295    3                  obj->o_size = getoff();
+      296       296    3                  obj->o_off = getoff();
+      297       297    3           obj->o_next = NULL ;
+      298       298    3                  break;
+      299       299    3               case MARK_ARG:
+      300       300    3                  arg = *ap = newarg(ARGOFF);
+      301       301    3                  ap = &arg->a_next;
+      302       302    3           arg->a_next = NULL ;
+      303       303    3                  arg->a_a.a_offset = getoff();
+      304       304    3                  break;
+      305       305    3               default:
+      306       306    3                  assert(FALSE);
+      307       307    3            }
+      308       308    2         }
+      309       309    1         OUTTRACE("have read data table, %d objects",olength);
+      310       310    1         return head;
+      311       311    1        }
+      312       312
+      313       313
+      314       314
+      315       315             /* getbblocks */
+      316       316
+      317       317             STATIC argstring(length,abp)
+      318       318              short  length;
+      319       319              register argb_p abp;
+      320       320             {
+      321       321    1
+      322       322    1          abp->ab_next = (argb_p) 0;
+      323       323    1         while (length--) {
+      324       324    2            if (abp->ab_index == NARGBYTES)
+      325       325    2           {
+      326       326    3               abp = abp->ab_next = newargb();
+      327       327    3            abp->ab_next = (argb_p) 0;  }
+      328       328    2            abp->ab_contents[abp->ab_index++] = getbyte();
+      329       329    2         }
+      330       330    1        }
+      331       331
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=10 
+      332       332
+      333       333
+      334       334             STATIC arg_p readargs()
+      335       335             {
+      336       336    1         /* Read a list of arguments and allocate structures
+      337       337    1          * for them. Return a pointer to the head of the list.
+      338       338    1          */
+      339       339    1
+      340       340    1         arg_p head, arg, *ap;
+      341       341    1         byte  t;
+      342       342    1         short length;
+      343       343    1
+      344       344    1         ap = &head;
+      345       345    1         for (;;) {
+      346       346    2            /* every argument list is terminated by an
+      347       347    2             * ARGCEND byte in Intermediate Code.
+      348       348    2             */
+      349       349    2            t = getbyte();
+      350       350    2            if (t == (byte) ARGCEND) {
+      351       351    3               return head;
+      352       352    3            }
+      353       353    2            arg = *ap = newarg(t);
+      354       354    2            ap = &arg->a_next;
+      355       355    2          arg->a_next = (arg_p) 0;
+      356       356    2            switch((short) t) {
+      357       357    3               case ARGOFF:
+      358       358    3                  arg->a_a.a_offset = getoff();
+      359       359    3                  break;
+      360       360    3               case ARGINSTRLAB:
+      361       361    3                  arg->a_a.a_instrlab = getshort();
+      362       362    3                  break;
+      363       363    3               case ARGOBJECT:
+      364       364    3                  arg->a_a.a_obj = omap[getshort()];
+      365       365    3                  /* Read an object identifier (o_id)
+      366       366    3                   * and use the omap table to obtain
+      367       367    3                   * a pointer to the rigth obj struct.
+      368       368    3                   */
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=11 
+      369       369    3                  break;
+      370       370    3               case ARGPROC:
+      371       371    3                  arg->a_a.a_proc = pmap[getshort()];
+      372       372    3                  /* Read a procedure identifier (p_id) */
+      373       373    3                  break;
+      374       374    3               case ARGSTRING:
+      375       375    3                  length = getshort();
+      376       376    3                  argstring(length, &arg->a_a.a_string);
+      377       377    3                  break;
+      378       378    3               case ARGICN:
+      379       379    3               case ARGUCN:
+      380       380    3               case ARGFCN:
+      381       381    3                  length = getshort();
+      382       382    3                  arg->a_a.a_con.ac_length = length;
+      383       383    3                  /* size of the constant */
+      384       384    3                  argstring(getshort(),
+      385       385    3                       &arg->a_a.a_con.ac_con);
+      386       386    3                  break;
+      387       387    3               default:
+      388       388    3                  assert(FALSE);
+      389       389    3            }
+      390       390    2         }
+      391       391    1        }
+      392       392
+      393       393
+      394       394             line_p read_line(p_out)
+      395       395              proc_p *p_out;
+      396       396             {
+      397       397    1         /* Read a line of EM code (i.e. one instruction)
+      398       398    1          * and its arguments (if any).
+      399       399    1          * In Intermediate Code, the first byte is the
+      400       400    1          * instruction code and the second byte denotes the kind
+      401       401    1          * of operand(s) that follow.
+      402       402    1          */
+      403       403    1
+      404       404    1         line_p lnp;
+      405       405    1         byte   instr;
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=12 
+      406       406    1
+      407       407    1         instr = getbyte();
+      408       408    1         if (feof(curinp)) return (line_p) 0;
+      409       409    1         lnp = newline(getbyte());
+      410       410    1         linecount++;
+      411       411    1         lnp->l_instr = instr;
+      412       412    1         lnp->l_next = (line_p) 0 ;
+      413       413    1         switch(TYPE(lnp)) {
+      414       414    2            /* read the operand(s) */
+      415       415    2            case OPSHORT:
+      416       416    2               SHORT(lnp) = getshort();
+      417       417    2               break;
+      418       418    2            case OPOFFSET:
+      419       419    2               OFFSET(lnp) = getoff();
+      420       420    2               break;
+      421       421    2            case OPINSTRLAB:
+      422       422    2               INSTRLAB(lnp) = getshort();
+      423       423    2               if ((instr & BMASK) == op_lab) {
+      424       424    3                  /* defining occurrence of an
+      425       425    3                   * instruction label.
+      426       426    3                   */
+      427       427    3                  lmap[INSTRLAB(lnp)] = lnp;
+      428       428    3               }
+      429       429    2               break;
+      430       430    2            case OPOBJECT:
+      431       431    2               OBJ(lnp) = omap[getshort()];
+      432       432    2               break;
+      433       433    2            case OPPROC:
+      434       434    2               PROC(lnp) = pmap[getshort()];
+      435       435    2               if ((instr & BMASK) == ps_pro) {
+      436       436    3                  /* enter new procedure: allocate a
+      437       437    3                   * label map and a label-block map table.
+      438       438    3                   */
+      439       439    3                  *p_out = PROC(lnp);
+      440       440    3                  llength = (*p_out)->p_nrlabels;
+      441       441    3                  lmap = (line_p *) newmap(llength);
+      442       442    3                  /* maps lab_id to line structure */
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=13 
+      443       443    3                  lbmap = (bblock_p *) newmap(llength);
+      444       444    3                  /* maps lab_id to bblock structure */
+      445       445    3                  lastlabid = llength;
+      446       446    3               }
+      447       447    2               break;
+      448       448    2            case OPLIST:
+      449       449    2               ARG(lnp) = readargs();
+      450       450    2               break;
+      451       451    2            default:
+      452       452    2               assert(TYPE(lnp) == OPNO);
+      453       453    2         }
+      454       454    1         return lnp;
+      455       455    1        }
+      456       456
+      457       457
+      458       458             STATIC message(lnp)
+      459       459              line_p lnp;
+      460       460             {
+      461       461    1         /* See if  lnp is some useful message.
+      462       462    1          * (e.g. a message telling that a certain local variable
+      463       463    1          * will never be referenced indirectly, so it may be put
+      464       464    1          * in a register. If so, add it to the mesregs set.)
+      465       465    1          */
+      466       466    1
+      467       467    1         assert(ARG(lnp)->a_type == ARGOFF);
+      468       468    1         switch((int) aoff(ARG(lnp),0)) {
+      469       469    2            case ms_reg:
+      470       470    2               if (ARG(lnp)->a_next != (arg_p) 0) {
+      471       471    3                  /* take only "mes 3" with further arguments */
+      472       472    3                  Ladd(lnp,&mesregs);
+      473       473    3               }
+      474       474    2               break;
+      475       475    2            case ms_err:
+      476       476    2               error("ms_err encountered");
+      477       477    2            case ms_opt:
+      478       478    2               error("ms_opt encountered");
+      479       479    2            case ms_emx:
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=14 
+      480       480    2               ws = aoff(ARG(lnp),1);
+      481       481    2               ps = aoff(ARG(lnp),2);
+      482       482    2               break;
+      483       483    2         }
+      484       484    1        }
+      485       485
+      486       486
+      487       487
+      488       488             line_p getlines(lf,n,p_out,collect_mes)
+      489       489              FILE *lf;
+      490       490              int n;
+      491       491              proc_p *p_out;
+      492       492              bool collect_mes;
+      493       493             {
+      494       494    1         /* Read n lines of EM text and doubly link them.
+      495       495    1          * Also process messages.
+      496       496    1          */
+      497       497    1
+      498       498    1         line_p head, *pp, l, lprev;
+      499       499    1
+      500       500    1         curinp = lf; /* EM input file */
+      501       501    1         pp = &head;
+      502       502    1         lprev = (line_p) 0;
+      503       503    1         while (n--) {
+      504       504    2            l = *pp = read_line(p_out);
+      505       505    2            PREV(l) = lprev;
+      506       506    2            pp = &l->l_next;
+      507       507    2            lprev = l;
+      508       508    2            if (collect_mes && INSTR(l) == ps_mes) {
+      509       509    3               message(l);
+      510       510    3            }
+      511       511    2         }
+      512       512    1         *pp = (line_p) 0;
+      513       513    1         return head;
+      514       514    1        }
+      515       515
+      516       516
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=15 
+      517       517
+      518       518             bool getunit(gf,lf,kind_out,g_out,l_out,p_out,collect_mes)
+      519       519              FILE   *gf,*lf;
+      520       520              short  *kind_out;
+      521       521              bblock_p *g_out;
+      522       522              line_p *l_out;
+      523       523              proc_p *p_out;
+      524       524              bool   collect_mes;
+      525       525             {
+      526       526    1         /* Read control flow graph (gf) and EM text (lf) of the next procedure.
+      527       527    1          * A pointer to the proctable entry of the read procedure is
+      528       528    1          * returned via p_out.
+      529       529    1          * This routine also constructs the bmap and lpmap tables.
+      530       530    1          * Note that we allocate structs for basic blocks and loops
+      531       531    1          * at their first reference rather than at when we read them.
+      532       532    1          */
+      533       533    1
+      534       534    1         int n,i;
+      535       535    1         bblock_p head, *pp, b;
+      536       536    1         loop_p lp;
+      537       537    1
+      538       538    1         curinp = gf;
+      539       539    1         blength = getshort(); /* # basic blocks in this procedure */
+      540       540    1         if (feof(curinp)) return FALSE;
+      541       541    1         if (blength == 0) {
+      542       542    2            /* data unit */
+      543       543    2            *kind_out = LDATA;
+      544       544    2            n = getshort();
+      545       545    2            *l_out = getlines(lf,n,p_out,collect_mes);
+      546       546    2            return TRUE;
+      547       547    2         }
+      548       548    1         *kind_out = LTEXT;
+      549       549    1         bmap = (bblock_p *) newmap(blength); /* maps block_id on bblock_p */
+      550       550    1         lplength = getshort(); /* # loops in this procedure */
+      551       551    1         lpmap = (loop_p *) newmap(lplength); /* maps loop_id on loop_p */
+      552       552    1
+      553       553    1         /* Read the basic blocks and the EM text */
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=16 
+      554       554    1         pp = &head; /* we use a pointer-to-a-pointer to link the structs */
+      555       555    1         for (i = 0; i < blength; i++) {
+      556       556    2            b = getblock(getshort());
+      557       557    2            n = getshort();  /* #instructions in the block */
+      558       558    2            b->b_succ = getlset(getblock);
+      559       559    2            b->b_pred = getlset(getblock);
+      560       560    2            b->b_idom = getblock(getshort());
+      561       561    2            b->b_loops = getlset(getloop);
+      562       562    2            b->b_flags = getshort();
+      563       563    2            b->b_start = getlines(lf,n,p_out,collect_mes);  /* read EM text */
+      564       564    2            *pp = b;
+      565       565    2            pp = &b->b_next;
+      566       566    2         b->b_next = (bblock_p *) 0 ;
+"zbe$get:c.:ZBC3TSI", line 566: (warning) incompatible pointers in =
+      567       567    2            curinp = gf;
+      568       568    2         }
+      569       569    1         lastbid = blength; /* last block_id */
+      570       570    1
+      571       571    1         /* read the information about loops */
+      572       572    1         curproc->p_loops = Lempty_set();
+      573       573    1         for (i = 0; i < lplength; i++) {
+      574       574    2            lp = getloop(getshort());
+      575       575    2            lp->lp_level = getshort(); /* nesting level */
+      576       576    2            lp->lp_entry = getblock(getshort()); /* entry block of the loop */
+      577       577    2            lp->lp_end = getblock(getshort()); /* tail of back edge of loop */
+      578       578    2            Ladd(lp,&curproc->p_loops);
+      579       579    2         }
+      580       580    1         *g_out = head;
+      581       581    1         return TRUE;
+      582       582    1        }
+      583       583
+      584       584             /*i*
+      585       585                   name: get_next_line
+      586       586                   purpose: This routine gets the next line table entry
+      587       587                   for the calling routine. It also checks if it is the start
+      588       588                   of a procedure. Substitute for 'read_line'.
+      589       589             */
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=17 
+      590       590             line_p get_next_line(p_out) proc_p *p_out; {
+      591       591    1        line_p lnp;
+      592       592    1
+      593       593    1         if (next_line_ptr == (line_p) 0) return (line_p) 0;
+      594       594    1
+      595       595    1         lnp = next_line_ptr;
+      596       596    1         next_line_ptr = lnp->l_next;
+      597       597    1         switch (TYPE(lnp)) {
+      598       598    2           case OPINSTRLAB:
+      599       599    2             if ((INSTR(lnp) & BMASK) == op_lab) {
+      600       600    3               lmap[INSTRLAB(lnp)] = lnp;
+      601       601    3             }
+      602       602    2             break;
+      603       603    2           case OPPROC:
+      604       604    2             if ((INSTR(lnp) & BMASK) == ps_pro) {
+      605       605    3        /*      enter new procedure: allocate a
+      606       606    3                label map and a label-block map table.  */
+      607       607    3
+      608       608    3               *p_out = PROC(lnp);
+      609       609    3               llength   = (*p_out)->p_nrlabels;
+      610       610    3               lmap = (line_p *) newmap(llength);
+      611       611    3        /*      maps lab_id to line structure */
+      612       612    3               lbmap   = (bblock_p *) newmap(llength);
+      613       613    3        /*      maps lab_id to bblock structure */
+      614       614    3               lastlabid = llength ;
+      615       615    3              }
+      616       616    2           }
+      617       617    1           return (lnp);
+      618       618    1         }  /* end of the function get_next_line..  */
+      619       619
+      620       620
+      621       621             /*i*
+      622       622                   name: put_curr_unit
+      623       623                   purpose: The routine replaces the 'putunit' routine.
+      624       624                   Just deletes work areas.
+      625       625             */
+      626       626             put_curr_unit(kind, p, l) short kind; proc_p p; line_p l; {
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=18 
+"zbe$get:c.:ZBC3TSI", line 626: (warning) identifier "kind" is not used
+"zbe$get:c.:ZBC3TSI", line 626: (warning) identifier "p" is not used
+"zbe$get:c.:ZBC3TSI", line 626: (warning) identifier "l" is not used
+      627       627    1
+      628       628    1         /* Release the memory for the lmap, lbmap, bmap, lpmap tables */
+      629       629    1         if (lmap != (line_p *) 0) oldmap(lmap,llength);
+      630       630    1         if (lbmap != (bblock_p *) 0) oldmap(lbmap,llength);
+      631       631    1         if (bmap != (bblock_p *) 0)  oldmap(bmap,blength);
+      632       632    1         if (lpmap != (loop_p *) 0) oldmap(lpmap,lplength);
+      633       633    1         lmap = (line_p) 0;
+"zbe$get:c.:ZBC3TSI", line 633: (warning) incompatible pointers in =
+      634       634    1         lbmap = (bblock_p) 0;
+"zbe$get:c.:ZBC3TSI", line 634: (warning) incompatible pointers in =
+      635       635    1         bmap = (bblock_p) 0;
+"zbe$get:c.:ZBC3TSI", line 635: (warning) incompatible pointers in =
+      636       636    1         lpmap = (loop_p) 0;
+"zbe$get:c.:ZBC3TSI", line 636: (warning) incompatible pointers in =
+      637       637    1         return;
+      638       638    1        }
+      639       639
+      640       640
+      641       641             /*i*
+      642       642                   name: get_curr_unit(kind_out, g_out, l_out, p_out, collect_mes)
+      643       643                   purpose: This routine replaces 'get_lines'. It gets lines
+      644       644                   associated with the current procedure.
+      645       645             */
+      646       646             get_curr_unit(kind_out, g_out, l_out, p_out, collect_mes)
+      647       647             short *kind_out;
+      648       648             bblock_p *g_out;
+      649       649             line_p *l_out;
+      650       650             proc_p *p_out;
+      651       651             bool collect_mes;   {
+      652       652    1
+      653       653    1        int no_instrs, no_bblocks, no_loops, i , n ,id;
+      654       654    1        bblock_p b, next_b;
+      655       655    1        lset next_loop;
+      656       656    1        loop_p loop_ptr;
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=19 
+      657       657    1
+      658       658    1          if (first_line_ptr == (proc_p) 0) return FALSE;
+"zbe$get:c.:ZBC3TSI", line 658: (warning) incompatible pointers in ==
+      659       659    1
+      660       660    1          *p_out = next_proc;
+      661       661    1          if((!next_proc->p_flags1 & PF_BODYSEEN) && next_proc != (proc_p) 0) {
+      662       662    2            next_proc = next_proc->p_next; }
+      663       663    1
+      664       664    1          no_instrs = (*p_out)->p_instrs_count;
+      665       665    1          no_bblocks = (*p_out)->p_bblock_count;
+      666       666    1          blength = no_bblocks;
+      667       667    1          no_loops = (*p_out)->p_loops_count;
+      668       668    1
+      669       669    1          if (no_bblocks == 0) {
+      670       670    2            *kind_out = LDATA;
+      671       671    2            *l_out = first_line_ptr ;
+      672       672    2            get_messages(no_instrs, first_line_ptr,collect_mes);
+      673       673    2            return TRUE;
+      674       674    2          }
+      675       675    1
+      676       676    1          *kind_out = LTEXT;
+      677       677    1
+      678       678    1          bmap = (bblock_p *) newmap (no_bblocks * sizeof(struct bblock));
+      679       679    1          lpmap = (loop_p *) newmap (no_loops * sizeof(struct loop));
+      680       680    1
+      681       681    1          llength   = (*p_out)->p_nrlabels;
+      682       682    1          lmap = (line_p *) newmap(llength);
+      683       683    1        /* maps lab_id to line structure */
+      684       684    1          lbmap   = (bblock_p *) newmap(llength);
+      685       685    1        /* maps lab_id to bblock structure */
+      686       686    1          lastlabid = llength ;
+      687       687    1
+      688       688    1          b = (*p_out)->p_start;
+      689       689    1          *g_out = (*p_out)->p_start;
+      690       690    1          for (next_loop = (*p_out)->p_loops; next_loop != (lset) 0; next_loop = next_
+                               loop->e_next) {
+      691       691    2            loop_ptr = (loop_p) next_loop->e_elem;
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=20 
+      692       692    2            id = loop_ptr->lp_id;
+      693       693    2            lpmap[id] = (loop_p) next_loop->e_elem; }
+      694       694    1          for (next_b=b ; next_b != (bblock_p) 0; next_b = next_b->b_next) {
+      695       695    2            bmap[next_b->b_id] = next_b; }
+      696       696    1
+      697       697    1          for (i=0; i<no_bblocks; i++) {
+      698       698    2            n = b->b_instrs_count;
+      699       699    2            get_messages (n , b->b_start, collect_mes);
+      700       700    2            b = b->b_next;
+      701       701    2            if (b == (bblock_p) 0) break;
+      702       702    2          }
+      703       703    1        }
+      704       704
+      705       705
+      706       706             /*I*
+      707       707                   NAME: get_messages
+      708       708                   PURPOSE: this routine walks the line tbl thread for the
+      709       709                   current procedure and finds the message lines (if any).
+      710       710             */
+      711       711             get_messages(n, l, mes) int n; line_p l; bool mes; {
+"zbe$get:c.:ZBC3TSI", line 711: (warning) identifier "n" is not used
+      712       712    1        line_p ll, next_l;
+      713       713    1
+      714       714    1         for (ll = l; ll != (line_p) 0; ll = next_l) {
+      715       715    2           next_l = ll->l_next;
+      716       716    2           if (mes && INSTR(ll) == ps_mes) {
+      717       717    3              message(ll); }
+      718       718    2         }
+      719       719    1         return;
+      720       720    1        }   /* end of the routine get_messages. */
+      721       721
+      722       722
+      723       723             /*i*
+      724       724                   name: get_next_il_line
+      725       725                   purpose: This routine gets the next line table entry
+      726       726                   for the calling routine. It also checks if it is the start
+      727       727                   of a procedure. Substitute for 'read_line'. Actually the
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=21 
+      728       728                   returned line is moved to new line tbl entry. Used in inline. */
+      729       729             line_p get_next_il_line(p_out) proc_p *p_out; {
+      730       730    1        line_p lnp;
+      731       731    1
+      732       732    1         if (next_line_ptr == (line_p) 0)  {
+      733       733    2           if (save_block->b_next == (bblock_p) 0) { return (line_p) 0; }
+      734       734    2           else {
+      735       735    3             save_block = save_block->b_next;
+      736       736    3             while (save_block->b_start == (line_p) 0) {
+      737       737    4                if (save_block->b_next == (bblock_p) 0) return((line_p) 0);
+      738       738    4                save_block = save_block->b_next;
+      739       739    4             }
+      740       740    3             next_line_ptr = save_block->b_start; }
+      741       741    2         }
+      742       742    1
+      743       743    1         lnp = next_line_ptr;
+      744       744    1         next_line_ptr = lnp->l_next;
+      745       745    1         switch (TYPE(lnp)) {
+      746       746    2           case OPINSTRLAB:
+      747       747    2             break;
+      748       748    2           case OPPROC:
+      749       749    2             if ((INSTR(lnp) & BMASK) == ps_pro) {
+      750       750    3        /*      enter new procedure: allocate
+      751       751    3                nothing. */
+      752       752    3
+      753       753    3               save_proc = PROC(lnp);
+      754       754    3               save_block = save_proc->p_start;
+      755       755    3               next_line_ptr = save_block->b_start;
+      756       756    3               next_line_ptr = next_line_ptr->l_next;
+      757       757    3               next_line_ptr = next_line_ptr->l_next; /* skip by the proc op */
+      758       758    3               *p_out = PROC(lnp);   }
+      759       759    2           }
+      760       760    1           return (lnp);
+      761       761    1         }  /* end of the function get_next_il_line..  */
+      762       762
+---  Include file information  ---
+
+CC.C03    File=zbe$get:c.:ZBC3TSI                                                   Fri Aug 22 1997  Page=22 
+   stdio:h.:LIBRARY. is referenced
+   zbe$types:h.:ZBC3TOU. is referenced
+   zbe$def:h.:ZBC3TOU. is referenced
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$cset:h.:ZBC3TOU. is referenced
+   zbe$get:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$map:h.:ZBC3TOU. is referenced
+   zbe$aux:h.:ZBC3TOU. is referenced
+   em_spec:h.:ZBC3TOU. is referenced
+   em_mnem:h.:ZBC3TOU. is referenced
+   em_pseu:h.:ZBC3TOU. is referenced
+   em_mes:h.:ZBC3TOU. is referenced
+
+11 warnings were detected in the file zbe$get:c.:ZBC3TSI

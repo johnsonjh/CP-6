@@ -1,0 +1,241 @@
+
+
+CC.C03    File=zbc$field:c.:ZBC3TSI                                                 Fri Aug 22 1997  Page=1  
+        1         1             /*
+        2         2              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        3         3              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        4         4              */
+        5         5             /* $Header: field.c,v 3.6 87/03/10 17:25:46 ceriel Exp $ */
+        6         6             /*  BITFIELD EXPRESSION EVALUATOR */
+        7         7
+        8         8             #include "nobitfield:h"
+        9         9
+       10        10             #ifndef NOBITFIELD
+       11        11             #include <em:h>
+       12        12             #include "debug:h"
+       13        13             #include "arith:h"
+       14        14             #include "type:h"
+       15        15             #include "idf:h"
+       16        16             #include "label:h"
+       17        17             #include "code:h"
+       18        18             #include "assert:h"
+       19        19             #include "expr:h"
+       20        20             #include "sizes:h"
+       21        21             #include "Lpars:h"
+       22        22             #include "field:h"
+       23        23
+       24        24             arith tmp_pointer_var(); /* eval.c   */
+       25        25             char *symbol2str();      /* symbol2str.c   */
+       26        26
+       27        27             /*  Eval_field() evaluates expressions involving bit fields.
+       28        28              The various instructions are not yet optimised in the expression
+       29        29              tree and are therefore dealt with in this function.
+       30        30              The actions taken at any operation are described clearly by the
+       31        31              code for this actions.
+       32        32              Notes
+       33        33              [1]   the bitfields are packed in target machine integers!
+       34        34              [2]   op is either an assignment operator or an increment/
+       35        35                 decrement operator
+       36        36              [3]   atype: the type in which the bitfield arithmetic is done;
+CC.C03    File=zbc$field:c.:ZBC3TSI                                                 Fri Aug 22 1997  Page=2  
+       37        37                 and in which bitfields are stored!
+       38        38             */
+       39        39             eval_field(expr, code)
+       40        40              struct expr *expr;
+       41        41              int code;
+       42        42             {
+       43        43    1         int op = expr->OP_OPER;
+       44        44    1         register struct expr *leftop = expr->OP_LEFT;
+       45        45    1         register struct expr *rightop = expr->OP_RIGHT;
+       46        46    1         register struct field *fd = leftop->ex_type->tp_field;
+       47        47    1         struct type *tp = leftop->ex_type->tp_up;
+       48        48    1         arith old_offset, tmpvar;
+       49        49    1         struct type *atype = tp->tp_unsigned == UNSIGNED ? uword_type : word_type;
+       50        50    1         arith asize = atype->tp_size;
+       51        51    1         register int uns = atype->tp_unsigned == UNSIGNED;
+       52        52    1         register int cvt = tp->tp_size != word_size;
+       53        53    1
+       54        54    1         /* First some assertions to be sure that the rest is legal */
+       55        55    1         ASSERT(asize == word_size);   /* make sure that C_loc() is legal */
+       56        56    1         ASSERT(leftop->ex_type->tp_fund == FIELD);
+       57        57    1         leftop->ex_type = tp;   /* this is cheating but it works... */
+       58        58    1         if (op == '=') {
+       59        59    2            /* F = E: f = ((E & mask)<<shift) | (~(mask<<shift) & f) */
+       60        60    2            ASSERT(tp == rightop->ex_type);
+       61        61    2            EVAL(rightop, RVAL, TRUE, NO_LABEL, NO_LABEL);
+       62        62    2            conversion(tp, atype);
+       63        63    2            C_loc(fd->fd_mask);
+       64        64    2            C_and(asize);
+       65        65    2            if (code == TRUE)
+       66        66    2               C_dup(asize);
+       67        67    2            C_loc((arith)fd->fd_shift);
+       68        68    2            if (uns)
+       69        69    2               C_slu(asize);
+       70        70    2            else
+       71        71    2               C_sli(asize);
+       72        72    2        #ifdef TM_L66
+       73        73    2            C_loc(~((fd->fd_mask << fd->fd_shift) | (~0 << (9 * asize))));
+CC.C03    File=zbc$field:c.:ZBC3TSI                                                 Fri Aug 22 1997  Page=3  
+       74        74    2        #else
+       75        75   *S*           C_loc(~((fd->fd_mask << fd->fd_shift) | (~0 << (8 * asize))));
+       76        76   *S*       #endif
+       77        77    2            if (leftop->ex_depth == 0) {  /* simple case */
+       78        78    3               load_val(leftop, RVAL);
+       79        79    3               if (cvt) conversion(tp, atype);
+       80        80    3               C_and(asize);
+       81        81    3               C_ior(asize);
+       82        82    3               if (cvt) conversion(atype, tp);
+       83        83    3               store_val(&(leftop->ex_object.ex_value), tp);
+       84        84    3            }
+       85        85    2            else  {        /* complex case   */
+       86        86    3               tmpvar = tmp_pointer_var(&old_offset);
+       87        87    3               EVAL(leftop, LVAL, TRUE, NO_LABEL, NO_LABEL);
+       88        88    3               C_dup(pointer_size);
+       89        89    3               C_lal(tmpvar);
+       90        90    3               C_sti(pointer_size);
+       91        91    3               C_loi(tp->tp_size);
+       92        92    3               if (cvt) conversion(tp, atype);
+       93        93    3               C_and(asize);
+       94        94    3               C_ior(asize);
+       95        95    3               C_lal(tmpvar);
+       96        96    3               C_loi(pointer_size);
+       97        97    3               if (cvt) conversion(atype, tp);
+       98        98    3               C_sti(tp->tp_size);
+       99        99    3               free_tmp_var(old_offset);
+      100       100    3            }
+      101       101    2         }
+      102       102    1         else {      /* treat ++F as F += 1 and --F as F -= 1  */
+      103       103    2            /* F op= e: f = (((((f>>shift)&mask) op e)&mask)<<shift)|
+      104       104    2                     (f&~(mask<<shift))
+      105       105    2            */
+      106       106    2            if (leftop->ex_depth == 0)  { /* simple case */
+      107       107    3               load_val(leftop, RVAL);
+      108       108    3               if (cvt) conversion(tp, atype);
+      109       109    3               }
+      110       110    2            else  {        /* complex case   */
+CC.C03    File=zbc$field:c.:ZBC3TSI                                                 Fri Aug 22 1997  Page=4  
+      111       111    3               tmpvar = tmp_pointer_var(&old_offset);
+      112       112    3               EVAL(leftop, LVAL, TRUE, NO_LABEL, NO_LABEL);
+      113       113    3               C_dup(pointer_size);
+      114       114    3               C_lal(tmpvar);
+      115       115    3               C_sti(pointer_size);
+      116       116    3               C_loi(tp->tp_size);
+      117       117    3               if (cvt) conversion(tp, atype);
+      118       118    3            }
+      119       119    2            if (uns) {
+      120       120    3               C_loc((arith)fd->fd_shift);
+      121       121    3               C_sru(asize);
+      122       122    3               C_loc(fd->fd_mask);
+      123       123    3               C_and(asize);
+      124       124    3            }
+      125       125    2            else {
+      126       126    3        #ifdef TM_L66
+      127       127    3               arith bits_in_type = asize * 9;
+      128       128    3        #else
+      129       129   *S*              arith bits_in_type = asize * 8;
+      130       130   *S*       #endif
+      131       131    3               C_loc(bits_in_type - (fd->fd_width + fd->fd_shift));
+      132       132    3               C_sli(asize);
+      133       133    3               C_loc(bits_in_type - fd->fd_width);
+      134       134    3               C_sri(asize);
+      135       135    3            }
+      136       136    2            if (code == TRUE && (op == POSTINCR || op == POSTDECR))
+      137       137    2               C_dup(asize);
+      138       138    2            conversion(atype, rightop->ex_type);
+      139       139    2            EVAL(rightop, RVAL, TRUE, NO_LABEL, NO_LABEL);
+      140       140    2            /* the 'op' operation: */
+      141       141    2            if (op == PLUSPLUS || op == POSTINCR)
+      142       142    2               assop(rightop->ex_type, PLUSAB);
+      143       143    2            else
+      144       144    2            if (op == MINMIN || op == POSTDECR)
+      145       145    2               assop(rightop->ex_type, MINAB);
+      146       146    2            else
+      147       147    2               assop(rightop->ex_type, op);
+CC.C03    File=zbc$field:c.:ZBC3TSI                                                 Fri Aug 22 1997  Page=5  
+      148       148    2            conversion(rightop->ex_type, atype);
+      149       149    2            C_loc(fd->fd_mask);
+      150       150    2            C_and(asize);
+      151       151    2            if (code == TRUE && op != POSTINCR && op != POSTDECR)
+      152       152    2               C_dup(asize);
+      153       153    2            C_loc((arith)fd->fd_shift);
+      154       154    2            if (uns)
+      155       155    2               C_slu(asize);
+      156       156    2            else
+      157       157    2               C_sli(asize);
+      158       158    2        #ifdef TM_L66
+      159       159    2            C_loc(~((fd->fd_mask << fd->fd_shift) | (~0 << (9 * asize))));
+      160       160    2        #else
+      161       161   *S*           C_loc(~((fd->fd_mask << fd->fd_shift) | (~0 << (8 * asize))));
+      162       162   *S*       #endif
+      163       163    2            if (leftop->ex_depth == 0) {
+      164       164    3               load_val(leftop, RVAL);
+      165       165    3               if (cvt) conversion(tp, atype);
+      166       166    3               C_and(asize);
+      167       167    3               C_ior(asize);
+      168       168    3               if (cvt) conversion(atype, tp);
+      169       169    3               store_val(&(leftop->ex_object.ex_value), tp);
+      170       170    3            }
+      171       171    2            else  {
+      172       172    3               C_lal(tmpvar);
+      173       173    3               C_loi(pointer_size);
+      174       174    3               C_loi(tp->tp_size);
+      175       175    3               if (cvt) conversion(tp, atype);
+      176       176    3               C_and(asize);
+      177       177    3               C_ior(asize);
+      178       178    3               C_lal(tmpvar);
+      179       179    3               C_loi(pointer_size);
+      180       180    3               if (cvt) conversion(atype, tp);
+      181       181    3               C_sti(tp->tp_size);
+      182       182    3               free_tmp_var(old_offset);
+      183       183    3            }
+      184       184    2         }
+CC.C03    File=zbc$field:c.:ZBC3TSI                                                 Fri Aug 22 1997  Page=6  
+      185       185    1         if (code == TRUE) {
+      186       186    2            /* Take care that the effective value stored in
+      187       187    2               the bit field (i.e. the value that is got on
+      188       188    2               retrieval) is on top of stack.
+      189       189    2            */
+      190       190    2            if (uns == 0) {   /* sign extension */
+      191       191    3        #ifdef TM_L66
+      192       192    3               register arith shift = asize * 9 - fd->fd_width;
+      193       193    3        #else
+      194       194   *S*              register arith shift = asize * 8 - fd->fd_width;
+      195       195   *S*       #endif
+      196       196    3
+      197       197    3               C_loc(shift);
+      198       198    3               C_sli(asize);
+      199       199    3               C_loc(shift);
+      200       200    3               C_sri(asize);
+      201       201    3            }
+      202       202    2            conversion(atype, expr->ex_type);
+      203       203    2         }
+      204       204    1        }
+      205       205             #endif NOBITFIELD
+      206       206
+---  Include file information  ---
+
+   zbc$nobitfield:h.:ZBC3TOU. is referenced
+   em:h.:ZBC3TOU. is referenced
+   em_arith:h.:ZBC3TOU. is referenced
+   em_label:h.:ZBC3TOU. is referenced
+   em_code:h.:ZBC3TOU. is referenced
+   zbc$debug:h.:ZBC3TOU. is referenced
+   zbc$arith:h.:ZBC3TOU. is referenced
+   zbc$spec_arith:h.:ZBC3TOU. is referenced
+   zbc$type:h.:ZBC3TOU. is referenced
+   zbc$nofloat:h.:ZBC3TOU. is referenced
+   zbc$idf:h.:ZBC3TOU. is referenced
+   zbc$nopp:h.:ZBC3TOU. is referenced
+   zbc$label:h.:ZBC3TOU. is referenced
+CC.C03    File=zbc$field:c.:ZBC3TSI                                                 Fri Aug 22 1997  Page=7  
+   zbc$code:h.:ZBC3TOU. is referenced
+   zbc$assert:h.:ZBC3TOU. is referenced
+   zbc$expr:h.:ZBC3TOU. is referenced
+   zbc$sizes:h.:ZBC3TOU. is referenced
+   zbc$nocross:h.:ZBC3TOU. is referenced
+   zbc$target_sizes:h.:ZBC3TOU. is referenced
+   zbc$Lpars:h.:ZBC3TOU. is referenced
+   zbc$field:h.:ZBC3TOU. is referenced
+
+No diagnostics were issued in the file zbc$field:c.:ZBC3TSI

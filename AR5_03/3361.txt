@@ -1,0 +1,397 @@
+
+
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: cj.c,v 1.5 87/03/10 10:48:21 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /* C R O S S   J U M P I N G
+        7         7              *
+        8         8              * CJ.H
+        9         9              *
+       10        10              */
+       11        11
+       12        12             #include <stdio:h>
+       13        13             #include "types:h"
+       14        14             #include "debug:h"
+       15        15             #include "global:h"
+       16        16             #include "files:h"
+       17        17             #include "get:h"
+       18        18             #include "put:h"
+       19        19             #include "lset:h"
+       20        20             #include "map:h"
+       21        21             #include "alloc:h"
+       22        22             #include "aux:h"
+       23        23             #include "def:h"
+       24        24             #include "stack_chg:h"
+       25        25             #include "go:h"
+       26        26             #include "em_mnem:h"
+       27        27             #include "em_spec:h"
+       28        28
+       29        29
+       30        30             /* Cross jumping performs optimzations like:
+       31        31              *
+       32        32              *   if cond then goto L1;         if cond then goto L1
+       33        33              *   S1;         ----->      S1;
+       34        34              *   S2;               goto L3;
+       35        35              *   goto L2;            L1:
+       36        36              *  L1:                S3;
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=2  
+       37        37              *   S3;              L3:
+       38        38              *   S2;               S2;
+       39        39              *  L2:
+       40        40              *
+       41        41              * CJ looks for two basic blocks b1 and b2 with the following properties:
+       42        42              *  - there exists a basic block S such that SUCC(b1) = SUCC(b2) = {S}
+       43        43              *    (so both have only 1 successor)
+       44        44              *  - the last N (N > 0) instructions of b1 and b2, not counting a possible
+       45        45              *    BRAnch instruction, are the same.
+       46        46              * As a result of the first condition, at least of the two blocks must end
+       47        47              * on an (unconditional) BRAnch instruction. If both end on a BRA, one block
+       48        48              * is chosen at random. Assume this block is b1. A new label L is put just
+       49        49              * before the N common instructions of block b2 (so this block is split
+       50        50              * into two). The BRA of b1 is changed into a BRA L. So dynamically the same
+       51        51              * instructions are executed in a slightly different order; yet the size of
+       52        52              * the code has become smaller.
+       53        53              */
+       54        54
+       55        55
+       56        56             STATIC int Scj;  /* number of optimizations found */
+       57        57
+       58        58
+       59        59
+       60        60             #define DLINK(l1,l2)  l1->l_next=l2; l2->l_prev=l1
+       61        61
+       62        62
+       63        63             STATIC bool same_instr(l1,l2)
+       64        64              line_p l1,l2;
+       65        65             {
+       66        66    1         /* See if l1 and l2 are the same instruction */
+       67        67    1
+       68        68    1         if (l1 == 0 || l2 == 0 || TYPE(l1) != TYPE(l2)) return FALSE;
+       69        69    1         if (INSTR(l1) != INSTR(l2)) return FALSE;
+       70        70    1         switch(TYPE(l1)) {
+       71        71    2            case OPSHORT: return SHORT(l1) == SHORT(l2);
+       72        72    2            case OPOFFSET: return OFFSET(l1) == OFFSET(l2);
+       73        73    2            case OPPROC: return PROC(l1) == PROC(l2);
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=3  
+       74        74    2            case OPOBJECT: return OBJ(l1) == OBJ(l2);
+       75        75    2            case OPINSTRLAB: return INSTRLAB(l1) == INSTRLAB(l2);
+       76        76    2            case OPNO: return TRUE;
+       77        77    2            default: return FALSE;
+       78        78    2         }
+       79        79    1        }
+       80        80
+       81        81
+       82        82
+       83        83             STATIC line_p last_mnem(b)
+       84        84              bblock_p b;
+       85        85             {
+       86        86    1         /* Determine the last line of a list */
+       87        87    1
+       88        88    1         register line_p l;
+       89        89    1
+       90        90    1         for (l = b->b_start; l->l_next != (line_p) 0; l = l->l_next);
+       91        91    1         while (l != (line_p) 0 && (INSTR(l) < sp_fmnem || INSTR(l) > sp_lmnem)) {
+       92        92    2            l = PREV(l);
+       93        93    2         }
+       94        94    1         return l;
+       95        95    1        }
+       96        96
+       97        97
+       98        98             STATIC bool is_desirable(text)
+       99        99              line_p text;
+      100       100             {
+      101       101    1         /* We avoid to generate a BRAnch in the middle of some expression,
+      102       102    1          * as the code generator will write the contents of the fakestack
+      103       103    1          * to the real stack if it encounters a BRA. We do not avoid to
+      104       104    1          * split the parameter-pushing code of a subroutine call into two,
+      105       105    1          * as the parameters are pushed on the real stack anyway.
+      106       106    1          * So e.g. "LOL a ; LOL b; ADI" will not be split, but
+      107       107    1          * "LOL a; LOL b; CAL f" may be split.
+      108       108    1          */
+      109       109    1
+      110       110    1         line_p l;
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=4  
+      111       111    1         bool ok;
+      112       112    1         int stack_diff,pop,push;
+      113       113    1
+      114       114    1         stack_diff = 0;
+      115       115    1         for (l = text; l != (line_p) 0; l = l->l_next) {
+      116       116    2            switch(INSTR(l)) {
+      117       117    3               case op_asp:
+      118       118    3               case op_bra:
+      119       119    3                  return TRUE;
+      120       120    3               case op_cal:
+      121       121    3               case op_lfr:
+      122       122    3                  return FALSE;
+      123       123    3            }
+      124       124    2            line_change(l,&ok,&pop,&push);
+      125       125    2            /* printf("instr %d, pop %d, push %d, ok %d\n",INSTR(l),pop,push,ok); */
+      126       126    2            if (!ok || (stack_diff -= pop) < 0) {
+      127       127    3               return FALSE;
+      128       128    3            } else {
+      129       129    3               stack_diff += push;
+      130       130    3            }
+      131       131    2         }
+      132       132    1         return TRUE;
+      133       133    1        }
+      134       134
+      135       135
+      136       136             STATIC cp_loops(b1,b2)
+      137       137              bblock_p b1,b2;
+      138       138             {
+      139       139    1         /* Copy the loopset of b2 to b1 */
+      140       140    1
+      141       141    1         Lindex i;
+      142       142    1         loop_p lp;
+      143       143    1         for (i = Lfirst(b2->b_loops); i != (Lindex) 0;
+      144       144    1              i = Lnext(i,b2->b_loops)) {
+      145       145    2            lp = (loop_p) Lelem(i);
+      146       146    2            Ladd(lp,&b1->b_loops);
+      147       147    2         }
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=5  
+      148       148    1        }
+      149       149
+      150       150
+      151       151             STATIC jump_cross(l1,l2,b1,b2)
+      152       152              line_p l1,l2;
+      153       153              bblock_p b1,b2;
+      154       154             {
+      155       155    1         /* A cross-jump from block b2 to block b1 is found; the code in
+      156       156    1          * block b2 from line l2 up to the BRAnch is removed; block b1 is
+      157       157    1          * split into two; the second part consists of a new label
+      158       158    1          * followed by the code from l1 till the end of the block.
+      159       159    1          */
+      160       160    1
+      161       161    1         line_p l;
+      162       162    1         bblock_p b;
+      163       163    1         bblock_p s;
+      164       164    1
+      165       165    1         /* First adjust the control flow graph */
+      166       166    1         b = freshblock();  /* create a new basic block */
+      167       167    1         b->b_succ = b1->b_succ;
+      168       168    1         /* SUCC(b1) = {b} */
+      169       169    1         b1->b_succ = Lempty_set(); Ladd(b,&b1->b_succ);
+      170       170    1         /* SUCC(b2) = {b} */
+      171       171    1         Ldeleteset(b2->b_succ); b2->b_succ = Lempty_set(); Ladd(b,&b2->b_succ);
+      172       172    1         /* PRED(b) = {b1,b2} */
+      173       173    1         b->b_pred = Lempty_set(); Ladd(b1,&b->b_pred); Ladd(b2,&b->b_pred);
+      174       174    1         /* PRED(SUCC(b)) := PRED(SUCC(b)) - {b1,b2} + {b} */
+      175       175    1         assert(Lnrelems(b->b_succ) == 1);
+      176       176    1         s = (bblock_p) Lelem(Lfirst(b->b_succ));
+      177       177    1         Lremove(b1,&s->b_pred); Lremove(b2,&s->b_pred); Ladd(b,&s->b_pred);
+      178       178    1         cp_loops(b,b1);
+      179       179    1         b->b_idom = common_dom(b1,b2);
+      180       180    1         b->b_flags = b1->b_flags;
+      181       181    1         b->b_next = b1->b_next;
+      182       182    1         b1->b_next = b;
+      183       183    1
+      184       184    1         /* Now adjust the EM text */
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=6  
+      185       185    1         l = PREV(l1);
+      186       186    1         if (l == (line_p) 0) {
+      187       187    2            b1->b_start = (line_p) 0;
+      188       188    2         } else {
+      189       189    2            l->l_next = (line_p) 0;
+      190       190    2         }
+      191       191    1         l = newline(OPINSTRLAB);
+      192       192    1         l->l_instr = op_lab;
+      193       193    1         INSTRLAB(l) = freshlabel();
+      194       194    1         DLINK(l,l1);
+      195       195    1         b->b_start = l;
+      196       196    1         for (l = l2; INSTR(l) != op_bra; l = l->l_next) {
+      197       197    2            assert (l != (line_p) 0);
+      198       198    2            rm_line(l,b2);
+      199       199    2         }
+      200       200    1         INSTRLAB(l) = INSTRLAB(b->b_start);
+      201       201    1        }
+      202       202
+      203       203
+      204       204             STATIC bool try_tail(b1,b2)
+      205       205              bblock_p b1,b2;
+      206       206             {
+      207       207    1         /* See if b1 and b2 end on the same sequence of instructions */
+      208       208    1
+      209       209    1         line_p l1,l2;
+      210       210    1         bblock_p b = (bblock_p) 0;
+      211       211    1         int cnt = 0;
+      212       212    1         /* printf("try block %d and %d\n",b1->b_id,b2->b_id); */
+      213       213    1
+      214       214    1         if (b1->b_start == (line_p) 0 || b2->b_start == (line_p) 0) return FALSE;
+      215       215    1         l1 = last_mnem(b1);
+      216       216    1         l2 = last_mnem(b2);
+      217       217    1         if (l1 == (line_p) 0 || l2 == (line_p) 0) return FALSE;
+      218       218    1         /* printf("consider:\n"); showinstr(l1); showinstr(l2); */
+      219       219    1         if (INSTR(l1) == op_bra) {
+      220       220    2            b = b1;
+      221       221    2            l1 = PREV(l1);
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=7  
+      222       222    2         }
+      223       223    1         if (INSTR(l2) == op_bra) {
+      224       224    2            b = b2;
+      225       225    2            l2 = PREV(l2);
+      226       226    2         }
+      227       227    1         assert(b != (bblock_p) 0);
+      228       228    1         while(same_instr(l1,l2)) {
+      229       229    2            cnt++;
+      230       230    2            l1 = PREV(l1);
+      231       231    2            l2 = PREV(l2);
+      232       232    2            /* printf("consider:\n"); showinstr(l1); showinstr(l2); */
+      233       233    2         }
+      234       234    1         if (cnt >= 1) {
+      235       235    2            l1 = (l1 == 0 ? b1->b_start : l1->l_next);
+      236       236    2            l2 = (l2 == 0 ? b2->b_start : l2->l_next);
+      237       237    2            if (is_desirable(l1)) {
+      238       238    3               if (b == b1) {
+      239       239    4                  jump_cross(l2,l1,b2,b1);
+      240       240    4                  Scj++;
+      241       241    4               } else {
+      242       242    4                  jump_cross(l1,l2,b1,b2);
+      243       243    4                  Scj++;
+      244       244    4               }
+      245       245    3               return TRUE;
+      246       246    3            }
+      247       247    2         }
+      248       248    1         return FALSE;
+      249       249    1        }
+      250       250
+      251       251
+      252       252
+      253       253             STATIC bool try_pred(b)
+      254       254              bblock_p b;
+      255       255             {
+      256       256    1         /* See if there is any pair (b1,b2), both in PRED(b) for
+      257       257    1          * which we can perform cross jumping.
+      258       258    1          */
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=8  
+      259       259    1
+      260       260    1         register bblock_p b1,b2;
+      261       261    1         register Lindex i,j;
+      262       262    1         lset s = b->b_pred;
+      263       263    1
+      264       264    1         for (i = Lfirst(s); i != (Lindex) 0; i = Lnext(i,s)) {
+      265       265    2            b1 = (bblock_p) Lelem(i);
+      266       266    2            if (Lnrelems(b1->b_succ) != 1) continue;
+      267       267    2            for (j = Lfirst(s); j != (Lindex) 0; j = Lnext(j,s)) {
+      268       268    3               b2 = (bblock_p) Lelem(j);
+      269       269    3               if (b1 != b2 && Lnrelems(b2->b_succ) == 1) {
+      270       270    4                  if (try_tail(b1,b2)) return TRUE;
+      271       271    4               }
+      272       272    3            }
+      273       273    2         }
+      274       274    1         return FALSE;
+      275       275    1        }
+      276       276
+      277       277
+      278       278
+      279       279             cj_optimize(p)
+      280       280              proc_p p;
+      281       281             {
+      282       282    1         /* Perform cross jumping for procedure p.
+      283       283    1          * In case cases a cross-jumping optimization which give
+      284       284    1          * new opportunities for further cross-jumping optimizations.
+      285       285    1          * Hence we repeat the whole process for the entire procedure,
+      286       286    1          * untill we find no further optimizations.
+      287       287    1          */
+      288       288    1
+      289       289    1         bblock_p b;
+      290       290    1         bool changes = TRUE;
+      291       291    1
+      292       292    1         while(changes) {
+      293       293    2            changes = FALSE;
+      294       294    2            b = p->p_start;
+      295       295    2            while (b != (bblock_p) 0) {
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=9  
+      296       296    3               if (try_pred(b)) {
+      297       297    4                  changes = TRUE;
+      298       298    4               } else {
+      299       299    4                  b = b->b_next;
+      300       300    4               }
+      301       301    3            }
+      302       302    2         }
+      303       303    1        }
+      304       304
+      305       305
+      306       306             cjmain(argc,argv)
+      307       307              int argc;
+      308       308              char *argv[];
+      309       309             {
+      310       310    1         go(argc,argv,no_action,cj_optimize,no_action,no_action);
+      311       311    1         report("cross jumps",Scj);
+      312       312    1           return ;
+      313       313    1        }
+      314       314
+      315       315
+      316       316
+      317       317             /******
+      318       318              * Debugging stuff
+      319       319              */
+      320       320
+      321       321             extern char em_mnem[]; /* The mnemonics of the EM instructions. */
+      322       322
+      323       323             STATIC showinstr(lnp) line_p lnp; {
+      324       324    1
+      325       325    1            /* Makes the instruction in `lnp' human readable. Only lines that
+      326       326    1             * can occur in expressions that are going to be eliminated are
+      327       327    1             * properly handled.
+      328       328    1             */
+      329       329    1            if (lnp == 0) return;
+      330       330    1            if (INSTR(lnp) < sp_fmnem || INSTR(lnp) > sp_lmnem) {
+      331       331    2         printf("\t*** ?\n");
+      332       332    2         return;
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=10 
+      333       333    2            }
+      334       334    1
+      335       335    1            printf("\t%s", &em_mnem[4 * (INSTR(lnp)-sp_fmnem)]);
+      336       336    1            switch (TYPE(lnp)) {
+      337       337    2         case OPNO:
+      338       338    2             break;
+      339       339    2         case OPSHORT:
+      340       340    2             printf(" %d", SHORT(lnp)); break;
+      341       341    2         case OPOBJECT:
+      342       342    2             printf(" %d", OBJ(lnp)->o_id); break;
+      343       343    2         case OPOFFSET:
+      344       344    2             printf(" %ld", OFFSET(lnp)); break;
+      345       345    2         default:
+      346       346    2             printf(" ?"); break;
+      347       347    2            }
+      348       348    1            printf("\n");
+      349       349    1        } /* showinstr */
+      350       350
+      351       351
+      352       352             STATIC print_list(list,b1,b2,p)
+      353       353              line_p list;
+      354       354              bblock_p b1,b2;
+      355       355              proc_p p;
+      356       356             {
+      357       357    1         line_p l;
+      358       358    1         printf("block %d and %d of proc %d:\n",b1->b_id,b2->b_id,p->p_id);
+      359       359    1         for (l = list; l != 0; l = l->l_next) {
+      360       360    2            showinstr(l);
+      361       361    2         }
+      362       362    1        }
+      363       363
+---  Include file information  ---
+
+   stdio:h.:LIBRARY. is referenced
+   zbe$types:h.:ZBC3TOU. is referenced
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+CC.C03    File=zbe$cj:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=11 
+   zbe$files:h.:ZBC3TOU. is referenced
+   zbe$get:h.:ZBC3TOU. is referenced
+   zbe$put:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$map:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$aux:h.:ZBC3TOU. is referenced
+   zbe$def:h.:ZBC3TOU. is referenced
+   zbe$stack_chg:h.:ZBC3TOU. is referenced
+   zbe$go:h.:ZBC3TOU. is referenced
+   em_mnem:h.:ZBC3TOU. is referenced
+   em_spec:h.:ZBC3TOU. is referenced
+
+No diagnostics were issued in the file zbe$cj:c.:ZBC3TSI

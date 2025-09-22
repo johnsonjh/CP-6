@@ -1,0 +1,264 @@
+/*M* PM -- Gather performance data. */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMR,PLM=5,IND=3,CTI=3,SDI=3,MCL=10,CSI=0,ECI=0 */
+%SET LISTSUB='1'B;
+/*P* NAME: PM
+     PURPOSE:  PM is a set of subroutines designed to be linked with
+               a users program and gather performance data as that
+               program runs.  The entry point PMSTART is called to
+               start gathering data, and PMEND is call to stop
+               gathering data.  The data is buffered up and written to
+               a disk file for later munging with PMDISP.
+*/
+                              /* Original PM code and concept by
+                                   Chuck McDevitt                 */
+                                        /* continued meddling by JLJ */
+PMSTART: PROC  NOAUTO;
+DCL PMX ENTRY ASYNC;                    /* Routine to handle timer runouts */
+DCL 1 PM_BUF (0:1999) STATIC SYMDEF,
+       2 OVERLAY# UBIN HALF UNAL,
+       2 IC UBIN HALF UNAL;
+DCL PM_INDEX SBIN WORD STATIC SYMDEF INIT(0);
+DCL PM_OVERLAID BIT(1) ALIGNED STATIC SYMDEF;
+DCL PM_ROOT_MAX SBIN WORD STATIC SYMDEF;
+DCL PM_MAX_ADDR SBIN WORD STATIC SYMDEF;
+DCL PM_INITED BIT(1) ALIGNED STATIC SYMDEF INIT('0'B);
+DCL PM_DPS90FLG STATIC SYMDEF BIT(1) ALIGNED INIT('0'B);
+DCL 1 BIRTH_INFO STATIC ALIGNED,
+       2 W1 UBIN WORD,
+       2 W2 UBIN WORD,
+       2 UTS UBIN WORD,
+       2 RU_TYPE UBIN WORD;
+DCL 1 RU_KEY STATIC CALIGNED,
+       2 * UBIN BYTE CALIGNED INIT(5),
+       2 * CHAR(5) CALIGNED INIT('BIRTH');
+%INCLUDE CP_6;
+%INCLUDE B_STRINGS_C;
+%INCLUDE B$JIT;
+%INCLUDE B$OBJECT_C;
+%INCLUDE B$ROSEG;
+DCL B$JIT$ PTR SYMREF;
+%B$TCB;
+%B$ALT;
+DCL B$TCB$ PTR SYMREF;
+DCL B$ROS$ PTR SYMREF;
+%B$RUHEADKEY;
+%B$HEAD (STCLASS="STATIC");
+%B$RUBIRTH (STCLASS=STATIC);
+%B$TREE_TABLE;
+DCL I SBIN WORD STATIC;
+DCL P1$ PTR STATIC;
+%FPT_STIMER (FPTN=TIMER,
+                    UENTRY=PMX,
+                    UNITS=20);
+%FPT_STIMER (FPTN=PMX_TIMER,  STCLASS="SYMREF");
+%FPT_TTIMER (FPTN=CAN,
+                    CANCEL=YES);
+%FPT_WRITE (FPTN=WRPM,
+                    BUF=PM_BUF,
+                    DCB=PM_DCB);
+DCL 1 XT STATIC ALIGNED,
+       2 EXEC SBIN WORD INIT(0),
+       2 SERV SBIN WORD INIT(0);
+%FPT_WRITE (FPTN=WR_TIME,
+                    BUF=TIMEBUF,
+                    DCB=PM_DCB);
+DCL 1 TIMEBUF STATIC ALIGNED,
+       2 * UBIN WORD INIT(0),
+       2 EXEC UBIN WORD INIT(0),
+       2 SERV UBIN WORD INIT(0);
+DCL PM_DCB DCB;
+DCL M$LM DCB;
+%FPT_CLOSE (FPTN=PM_CLOSE,
+                    DCB=PM_DCB,
+                    DISP=SAVE);
+%FPT_OPEN (FPTN=OP_PM,
+                    REASSIGN=YES,
+                    FUN=CREATE,
+                    EXIST=OLDFILE,
+                    DCB=PM_DCB,
+                    ASN=FILE,
+                    CTG=YES,
+                    TYPE='D ');
+%FPT_OPEN (FPTN=OP_PM2,
+                    NAME=PM_FID,
+                    ASN=FILE,
+                    SETDCB=YES,
+                    DCB=PM_DCB);
+%VLP_NAME (FPTN=PM_FID,
+               NAME='*PM_DATA',
+               LEN=31,STCLASS="STATIC SYMDEF");
+%FPT_READ (FPTN=READ_BIRTH,
+                    BUF=B$RUBIRTH,
+                    DCB=M$LM,
+                    KEY=RU_KEY,
+                    KEYS=YES);
+%FPT_READ (FPTN=READ_HEAD,
+                    BUF=B$HEAD,
+                    DCB=M$LM,
+                    KEY=B$RUHEADKEY,
+                    KEYS=YES);
+%FPT_WRITE (FPTN=WRITE_INIT,
+                    BUF=BIRTH_INFO,
+                    DCB=PM_DCB,
+                    WAIT=YES);
+%FPT_MONINFO (FPTN=GET_MONINFO,
+                    SITEINFO=VLR_SITEINFO);
+%VLR_SITEINFO;
+ 
+ 
+ 
+     CALL M$OPEN(OP_PM2);
+     CALL M$OPEN(OP_PM);
+     PM_INDEX = 0;
+ 
+     PM_OVERLAID = '0'B;
+ 
+     IF NOT PM_INITED
+     THEN
+     DO;
+        PM_INITED = '1'B;
+        CALL M$READ (READ_BIRTH)
+        WHENALTRETURN
+        DO;
+           CALL M$MERC;
+           END;
+        CALL M$READ (READ_HEAD)
+        WHENALTRETURN
+        DO;
+           CALL M$MERC;
+           END;
+        BIRTH_INFO.W1 = 0;         /* W1+W2 are so PMDISP knows that this is*/
+        BIRTH_INFO.W2 = BITBIN('400000000000'O); /* the birth info */
+        BIRTH_INFO.UTS = B$RUBIRTH.CREATE_UTS;
+        BIRTH_INFO.RU_TYPE = B$HEAD.FLAVOR;
+        CALL M$WRITE (WRITE_INIT);
+        CALL M$MONINFO (GET_MONINFO);
+        IF VLR_SITEINFO.CPU_TYPE# = %DPS90
+           OR
+           VLR_SITEINFO.CPU_TYPE# = %DPS90XA
+        THEN
+        DO;
+           PM_DPS90FLG = '1'B;
+           TIMER.V.UNITS# = 2;
+           PMX_TIMER.V.UNITS# = 2;
+           END;
+        END;                            /* SETUP STUFF */
+ 
+     IF B$ROS$->B$ROSEG.TREE$ ~= ADDR(NIL) THEN
+        IF B$ROS$->B$ROSEG.TREE$->B$TREE_HEADER.NODES > 1 THEN DO;
+           PM_OVERLAID = '1'B;
+           P1$ = PINCRW(B$ROS$->B$ROSEG.TREE$,SIZEW(B$TREE_HEADER));
+           PM_ROOT_MAX = P1$->B$TREE_NODE.PADDR + P1$->B$TREE_NODE.PSIZE;
+           PM_MAX_ADDR = PM_ROOT_MAX;
+           DO I = 1 TO B$ROS$->B$ROSEG.TREE$->B$TREE_HEADER.NODES - 1;
+              P1$ = PINCRW(P1$,SIZEW(B$TREE_NODE));
+              IF P1$->B$TREE_NODE.PADDR + P1$->B$TREE_NODE.PSIZE > PM_MAX_ADDR THEN
+                 PM_MAX_ADDR = P1$->B$TREE_NODE.PADDR+P1$->B$TREE_NODE.PSIZE;
+              END;
+           END;
+ 
+ 
+     XT.EXEC = B$JIT.TUEXT;
+     XT.SERV = B$JIT.TUSVT;
+ 
+     CALL M$STIMER(TIMER);
+     RETURN;
+ 
+ 
+ 
+PMEND: ENTRY;
+     CALL M$TTIMER(CAN)
+     WHENALTRETURN DO;END;
+     TIMEBUF.EXEC = B$JIT.TUEXT - XT.EXEC;
+     TIMEBUF.SERV = B$JIT.TUSVT - XT.SERV;
+ 
+     IF PM_INDEX >0 THEN
+     DO;
+        WRPM.BUF_.BOUND=(PM_INDEX*4)-1;
+        CALL M$WRITE(WRPM);
+        PM_INDEX = 0;
+        END;
+     CALL M$WRITE(WR_TIME);
+     CALL M$CLOSE(PM_CLOSE);
+END PMSTART;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+PMX: PROC ASYNC NOAUTO;
+%INCLUDE CP_6;
+%INCLUDE B$OBJECT_C;
+%INCLUDE B$ROSEG;
+DCL B$JIT$ PTR SYMREF;
+DCL B$ROS$ PTR SYMREF;
+DCL 1 PM_BUF (0:1999) ALIGNED SYMREF,
+       2 OVERLAY# UBIN HALF UNAL,
+       2 IC UBIN HALF UNAL;
+DCL PM_INDEX SBIN WORD SYMREF;
+DCL IC SBIN WORD STATIC;
+DCL I SBIN WORD STATIC;
+DCL P1$ PTR STATIC;
+DCL PM_OVERLAID BIT(1) ALIGNED SYMREF;
+DCL PM_ROOT_MAX SBIN WORD SYMREF;
+DCL PM_MAX_ADDR SBIN WORD SYMREF;
+DCL PM_DPS90FLG BIT(1) ALIGNED SYMREF;
+%B$TCB;
+%B$ALT;
+%B$EXCFR;
+DCL B$TCB$ PTR SYMREF;
+%B$TREE_TABLE;
+%FPT_STIMER (FPTN=PMX_TIMER, STCLASS="STATIC SYMDEF",
+                         UENTRY=PMX,
+                         UNITS=20);
+%FPT_WRITE (FPTN=WRPM,
+                    BUF=PM_BUF,
+                    DCB=PM_DCB);
+DCL PM_DCB DCB;
+ 
+ 
+ 
+     DO INHIBIT;
+        IC = B$TCB$->B$TCB.STK$->B$EXCFR.IC - 1;
+        IF B$TCB$->B$TCB.STK$->B$EXCFR.IRBIT.MIR THEN DO;
+           IC = IC + 1;
+           END;
+        PM_BUF.IC (PM_INDEX) = IC;
+ 
+        IF IC ~= 0 THEN DO;
+           PM_BUF.OVERLAY#(PM_INDEX) = 0;
+           IF PM_OVERLAID THEN
+              IF IC<PM_ROOT_MAX OR IC>PM_MAX_ADDR THEN PM_BUF.OVERLAY#(PM_INDEX) = 0;
+              ELSE DO;
+                 P1$ = PINCRW(B$ROS$->B$ROSEG.TREE$,SIZEW(B$TREE_HEADER));
+                 DO I = 1 TO B$ROS$->B$ROSEG.TREE$->B$TREE_HEADER.NODES - 1;
+                    P1$ = PINCRW(P1$,SIZEW(B$TREE_NODE));
+                    IF P1$->B$TREE_NODE.FLGS.NOW_IN THEN
+                       IF IC >= P1$->B$TREE_NODE.PADDR AND
+                          IC < P1$->B$TREE_NODE.PADDR + P1$->B$TREE_NODE.PSIZE THEN DO;
+                          PM_BUF.OVERLAY#(PM_INDEX) = I;
+                          GOTO READY;
+                          END;
+                    END;
+                 END;
+READY:     ;
+ 
+ 
+           IF PM_INDEX < 1999 THEN
+              PM_INDEX = PM_INDEX + 1;
+           ELSE DO;
+              CALL M$WRITE(WRPM);
+              PM_INDEX = 0;
+              END;
+           END;
+ 
+        CALL M$STIMER(PMX_TIMER);
+        RETURN;
+        END;
+END PMX;

@@ -1,0 +1,673 @@
+
+
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: sr_reduce.c,v 1.5 87/03/10 11:44:04 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /* S T R E N G T H   R E D U C T I O N
+        7         7              *
+        8         8              * S R _ R E D U C E . C
+        9         9              *
+       10        10              */
+       11        11
+       12        12
+       13        13             #include "types:h"
+       14        14             #include "sr:h"
+       15        15             #include "em_mnem:h"
+       16        16             #include "debug:h"
+       17        17             #include "alloc:h"
+       18        18             #include "global:h"
+       19        19             #include "aux:h"
+       20        20             #include "sr_aux:h"
+       21        21             #include "lset:h"
+       22        22             #include "sr_xform:h"
+       23        23             #include "sr_reduce:h"
+       24        24             #include "sr_expr:h"
+       25        25             #include "em_pseu:h"
+       26        26             #include "em_reg:h"
+       27        27             #include "em_mes:h"
+       28        28             #include "em_mnem:h"
+       29        29
+       30        30
+       31        31
+       32        32             STATIC lset avail;
+       33        33             /* If an expression such as "iv * const" or "A[iv]" is
+       34        34              * used more than once in a loop, we only use one temporary
+       35        35              * local for it and reuse this local each time.
+       36        36              * After the first occurrence, the expression is said to
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=2  
+       37        37              * be available.
+       38        38              */
+       39        39
+       40        40             STATIC int regtyp(code)
+       41        41              code_p code;
+       42        42             {
+       43        43    1         switch(code->co_instr) {
+       44        44    2            case op_mli:
+       45        45    2            case op_mlu:
+       46        46    2               return reg_any;
+       47        47    2            default:
+       48        48    2               return reg_pointer;
+       49        49    2         }
+       50        50    1         /* NOTREACHED */
+       51        51    1        }
+       52        52
+       53        53
+       54        54             STATIC gen_regmes(tmp,score,code,p)
+       55        55              offset tmp;
+       56        56              int score;
+       57        57              code_p code;
+       58        58              proc_p p;
+       59        59             {
+       60        60    1         /* generate a register message for the temporary variable and
+       61        61    1          * insert it at the start of the procedure.
+       62        62    1          */
+       63        63    1
+       64        64    1         line_p l,pro;
+       65        65    1
+       66        66    1         l = reg_mes(tmp,code->co_tmpsize,regtyp(code),score);
+       67        67    1         pro = p->p_start->b_start; /* every proc. begins with a PRO pseudo */
+       68        68    1         l->l_next = pro->l_next;
+       69        69    1         PREV(l->l_next) = l;
+       70        70    1         pro->l_next = l;
+       71        71    1         PREV(l) = pro;
+       72        72    1        }
+       73        73
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=3  
+       74        74
+       75        75             STATIC line_p newcode(code,tmp)
+       76        76              code_p code;
+       77        77              offset tmp;
+       78        78             {
+       79        79    1         /* Construct the EM code that will replace the reducible code,
+       80        80    1          * e.g.   iv * c   ->   tmp
+       81        81    1          *   a[iv]    ->   *tmp
+       82        82    1          */
+       83        83    1
+       84        84    1         line_p l;
+       85        85    1
+       86        86    1         switch(code->co_instr) {
+       87        87    2            case op_mli:
+       88        88    2            case op_mlu:
+       89        89    2               /* new code is just a LOL tmp */
+       90        90    2               l = int_line(tmp);
+       91        91    2               l->l_instr = op_lol;
+       92        92    2               break;
+       93        93    2            case op_aar:
+       94        94    2               /* New code is a LOAD tmp, where tmp is a
+       95        95    2                * pointer variable, so the actual EM code
+       96        96    2                * depends on the pointer size.
+       97        97    2                */
+       98        98    2               l = move_pointer(tmp,LOAD);
+       99        99    2               break;
+      100       100    2            case op_lar:
+      101       101    2               /* New code is a load-indirect */
+      102       102    2               l = int_line(tmp);
+      103       103    2               l->l_instr = op_lil;
+      104       104    2               break;
+      105       105    2            case op_sar:
+      106       106    2               /* New code is a store-indirect */
+      107       107    2               l = int_line(tmp);
+      108       108    2               l->l_instr = op_sil;
+      109       109    2               break;
+      110       110    2            default:
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=4  
+      111       111    2               assert(FALSE);
+      112       112    2         }
+      113       113    1         return l;
+      114       114    1        }
+      115       115
+      116       116
+      117       117
+      118       118             STATIC replcode(code,text)
+      119       119              code_p code;
+      120       120              line_p text;
+      121       121             {
+      122       122    1         /* Replace old code (extending from code->co_lfirst to
+      123       123    1          * code->co_llast) by new code (headed by 'text').
+      124       124    1          */
+      125       125    1
+      126       126    1         line_p l, l1, l2;
+      127       127    1
+      128       128    1         for (l = text; l->l_next != (line_p) 0; l = l->l_next);
+      129       129    1         /* 'l' now points to last instruction of text */
+      130       130    1         l1 = PREV(code->co_lfirst); /* instruction just before old code */
+      131       131    1         l2 = code->co_llast->l_next; /* instruction just behind old code */
+      132       132    1         if (l1 == (line_p) 0) {
+      133       133    2            code->co_block->b_start = text;
+      134       134    2            PREV(text) = (line_p) 0;
+      135       135    2         } else {
+      136       136    2            l1->l_next = text;
+      137       137    2            PREV(text) = l1;
+      138       138    2         }
+      139       139    1         if (l2 != (line_p) 0) {
+      140       140    2            PREV(l2) = l;
+      141       141    2         }
+      142       142    1         l->l_next = l2;
+      143       143    1         code->co_llast->l_next = (line_p) 0;
+      144       144    1         /* Note that the old code is still accessible via code->co_lfirst */
+      145       145    1        }
+      146       146
+      147       147
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=5  
+      148       148
+      149       149             STATIC init_code(code,tmp)
+      150       150              code_p code;
+      151       151              offset tmp;
+      152       152             {
+      153       153    1         /* Generate code to set up the temporary local.
+      154       154    1          * For multiplication, its initial value is const*iv_expr,
+      155       155    1          * for array operations it is &a[iv_expr] (where iv_expr is
+      156       156    1          * an expression that is a linear function of the induc. var.
+      157       157    1          * This code is inserted immediately before the loop entry.
+      158       158    1          * As the initializing code looks very much like the
+      159       159    1          * reduced code, we reuse that (old) code.
+      160       160    1          */
+      161       161    1
+      162       162    1         line_p l, *p;
+      163       163    1
+      164       164    1         l = code->co_llast; /* the mli, lar etc. instruction */
+      165       165    1         switch(INSTR(l)) {
+      166       166    2            case op_mli:
+      167       167    2            case op_mlu:
+      168       168    2               /* reduced code is: iv_expr * lc  (or lc * iv_expr)
+      169       169    2                * init_code is:    tmp = iv_expr * lc  (or lc*iv_expr)
+      170       170    2                * So we just insert a 'STL tmp'.
+      171       171    2                */
+      172       172    2               l->l_next = int_line(tmp);
+      173       173    2               l->l_next->l_instr = op_stl;
+      174       174    2               break;
+      175       175    2            case op_lar:
+      176       176    2            case op_sar:
+      177       177    2               /* reduced code is: ...= A[iv_expr] resp.
+      178       178    2                *        A[iv]_expr = ..
+      179       179    2                * init_code is: tmp = &A[iv_expr].
+      180       180    2                * So just change the lar or sar into a aar ...
+      181       181    2                */
+      182       182    2               l->l_instr = (byte) op_aar;
+      183       183    2               /* ... and fall through !! */
+      184       184    2            case op_aar:
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=6  
+      185       185    2               /* append code to store a pointer in temp. local */
+      186       186    2               l->l_next = move_pointer(tmp,STORE);
+      187       187    2               break;
+      188       188    2            default:
+      189       189    2               assert(FALSE); /* non-reducible instruction */
+      190       190    2         }
+      191       191    1         PREV(l->l_next) = l;
+      192       192    1         /* Now insert the code at the end of the header block */
+      193       193    1         p = &code->co_loop->LP_INSTR;
+      194       194    1         if (*p == (line_p) 0) {
+      195       195    2            /* LP_INSTR points to last instruction of header block,
+      196       196    2             * so if it is 0, the header block is empty yet.
+      197       197    2             */
+      198       198    2            code->co_loop->LP_HEADER->b_start =
+      199       199    2                code->co_lfirst;
+      200       200    2         } else {
+      201       201    2            (*p)->l_next = code->co_lfirst;
+      202       202    2            PREV(code->co_lfirst) = *p;
+      203       203    2         }
+      204       204    1         *p = l->l_next; /* new last instruction */
+      205       205    1        }
+      206       206
+      207       207
+      208       208
+      209       209             STATIC incr_code(code,tmp)
+      210       210              code_p  code;
+      211       211              offset  tmp;
+      212       212             {
+      213       213    1         /* Generate code to increment the temporary local variable.
+      214       214    1          * The variable is incremented by
+      215       215    1          *  1) multiply -->   step value of iv * loop constant
+      216       216    1          *  2) array    -->   step value of iv * element size
+      217       217    1          * This value can be determined statically.
+      218       218    1          * If the induction variable is used in a linear
+      219       219    1          * expression in which its sign is negative
+      220       220    1          * (such as in: "5-(6-(-iv))" ), this value is negated.
+      221       221    1          * The generated code looks like:
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=7  
+      222       222    1          *  LOL tmp ; LOC incr ; ADI ws ; STL tmp
+      223       223    1          * For pointer-increments we generate a "ADP c", rather than
+      224       224    1          * a "LOC c; ADS ws".
+      225       225    1          * This code is put just after the code that increments
+      226       226    1          * the induction variable.
+      227       227    1          */
+      228       228    1
+      229       229    1         line_p load_tmp, loc, add, store_tmp, l;
+      230       230    1
+      231       231    1         add = newline(OPSHORT);
+      232       232    1         add->l_next = (line_p) 0;
+      233       233    1         SHORT(add) = ws;  /* the add instruction, can be ADI,ADU or ADS */
+      234       234    1         switch(code->co_instr) {
+      235       235    2            case op_mli:
+      236       236    2            case op_mlu:
+      237       237    2               loc = int_line(
+      238       238    2                    code->co_sign *
+      239       239    2                    off_set(code->c_o.co_loadlc) *
+      240       240    2                    code->co_iv->iv_step);
+      241       241    2               loc->l_instr = op_loc;
+      242       242    2               add->l_instr = op_adi;
+      243       243    2               load_tmp = int_line(tmp);
+      244       244    2               load_tmp->l_instr = op_lol;
+      245       245    2               store_tmp = int_line(tmp);
+      246       246    2               store_tmp->l_instr = op_stl;
+      247       247    2               break;
+      248       248    2            case op_lar:
+      249       249    2            case op_sar:
+      250       250    2            case op_aar:
+      251       251    2               loc = (line_p) 0;
+      252       252    2               add = int_line(
+      253       253    2                       code->co_sign *
+      254       254    2                  code->co_iv->iv_step *
+      255       255    2                  elemsize(code->c_o.co_desc));
+      256       256    2               add->l_instr = op_adp;
+      257       257    2               load_tmp = move_pointer(tmp,LOAD);
+      258       258    2               store_tmp = move_pointer(tmp,STORE);
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=8  
+      259       259    2               break;
+      260       260    2            default:
+      261       261    2               assert(FALSE);
+      262       262    2         }
+      263       263    1         /* Now we've got pieces of code to load the temp. local,
+      264       264    1          * load the constant, add the two and store the result in
+      265       265    1          * the local. This code will be put just after the code that
+      266       266    1          * increments the induction variable.
+      267       267    1          */
+      268       268    1         if (loc != (line_p) 0) concatenate(load_tmp,loc);
+      269       269    1         concatenate(load_tmp,add);
+      270       270    1         concatenate(load_tmp,store_tmp);
+      271       271    1         /* Now load_tmp points to a list of EM instructions */
+      272       272    1         l = code->co_iv->iv_incr;
+      273       273    1         if (l->l_next != (line_p) 0) {
+      274       274    2            DLINK(store_tmp,l->l_next);
+      275       275    2         }
+      276       276    1         DLINK(l,load_tmp); /* doubly link them */
+      277       277    1        }
+      278       278
+      279       279
+      280       280             STATIC remcode(c)
+      281       281              code_p c;
+      282       282             {
+      283       283    1         line_p l, next;
+      284       284    1
+      285       285    1         for (l = c->co_lfirst; l != (line_p) 0; l = next) {
+      286       286    2            next = l->l_next;
+      287       287    2            oldline(l);
+      288       288    2         }
+      289       289    1         oldcinfo(c);
+      290       290    1        }
+      291       291
+      292       292
+      293       293             STATIC bool same_address(l1,l2,vars)
+      294       294              line_p l1,l2;
+      295       295              lset   vars;
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=9  
+      296       296             {
+      297       297    1         /* See if l1 and l2 load the same address */
+      298       298    1
+      299       299    1         if (INSTR(l1) != INSTR(l2)) return FALSE;
+      300       300    1         switch(INSTR(l1)) {
+      301       301    2            case op_lae:
+      302       302    2               return OBJ(l1) == OBJ(l2);
+      303       303    2            case op_lal:
+      304       304    2               return off_set(l1) == off_set(l2);
+      305       305    2            case op_lol:
+      306       306    2               return ps == ws &&
+      307       307    2                 off_set(l1) == off_set(l2) &&
+      308       308    2                 is_loopconst(l1,vars);
+      309       309    2            case op_ldl:
+      310       310    2               return ps == 2*ws &&
+      311       311    2                 off_set(l1) == off_set(l2) &&
+      312       312    2                 is_loopconst(l1,vars);
+      313       313    2            default:
+      314       314    2               return FALSE;
+      315       315    2         }
+      316       316    1        }
+      317       317
+      318       318
+      319       319             STATIC bool same_expr(lb1,le1,lb2,le2)
+      320       320              line_p lb1,le1,lb2,le2;
+      321       321             {
+      322       322    1         /* See if the code from lb1 to le1 is the same
+      323       323    1          * expression as the code from lb2 to le2.
+      324       324    1          */
+      325       325    1
+      326       326    1
+      327       327    1         register line_p l1,l2;
+      328       328    1
+      329       329    1         l1 = lb1;
+      330       330    1         l2 = lb2;
+      331       331    1         for (;;) {
+      332       332    2            if (INSTR(l1) != INSTR(l2)) return FALSE;
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=10 
+      333       333    2            switch(TYPE(l1)) {
+      334       334    3               case OPSHORT:
+      335       335    3                  if (TYPE(l2) != OPSHORT ||
+      336       336    3                      SHORT(l1) != SHORT(l2)) return FALSE;
+      337       337    3                  break;
+      338       338    3               case OPOFFSET:
+      339       339    3                  if (TYPE(l2) != OPOFFSET ||
+      340       340    3                      OFFSET(l1) != OFFSET(l2)) return FALSE;
+      341       341    3                  break;
+      342       342    3               case OPNO:
+      343       343    3                  break;
+      344       344    3               default:
+      345       345    3                  return FALSE;
+      346       346    3            }
+      347       347    2            if (l1 == le1 ) return l2 == le2;
+      348       348    2            if (l2 == le2) return FALSE;
+      349       349    2            l1 = l1->l_next;
+      350       350    2            l2 = l2->l_next;
+      351       351    2         }
+      352       352    1        }
+      353       353
+      354       354             STATIC bool same_code(c1,c2,vars)
+      355       355              code_p c1,c2;
+      356       356              lset   vars;
+      357       357             {
+      358       358    1         /* See if c1 and c2 compute the same expression. Two array
+      359       359    1          * references can be the same even if one is e.g a fetch
+      360       360    1          * and the other a store.
+      361       361    1          */
+      362       362    1
+      363       363    1         switch(c1->co_instr) {
+      364       364    2            case op_mli:
+      365       365    2               return c1->co_instr == c2->co_instr &&
+      366       366    2               off_set(c1->c_o.co_loadlc) ==
+      367       367    2               off_set(c2->c_o.co_loadlc) &&
+      368       368    2               same_expr(c1->co_ivexpr,c1->co_endexpr,
+      369       369    2                    c2->co_ivexpr,c2->co_endexpr);
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=11 
+      370       370    2            case op_aar:
+      371       371    2            case op_lar:
+      372       372    2            case op_sar:
+      373       373    2               return c2->co_instr != op_mli &&
+      374       374    2               c2->co_instr != op_mlu &&
+      375       375    2               same_expr(c1->co_ivexpr,c1->co_endexpr,
+      376       376    2                    c2->co_ivexpr,c2->co_endexpr) &&
+      377       377    2               same_address(c1->c_o.co_desc,c2->c_o.co_desc,vars) &&
+      378       378    2               same_address(c1->co_lfirst,c2->co_lfirst,vars);
+      379       379    2            default:
+      380       380    2               assert(FALSE);
+      381       381    2         }
+      382       382    1         /* NOTREACHED */
+      383       383    1        }
+      384       384
+      385       385
+      386       386             STATIC code_p available(c,vars)
+      387       387              code_p c;
+      388       388              lset   vars;
+      389       389             {
+      390       390    1         /* See if the code is already available.
+      391       391    1          * If so, return a pointer to the first occurrence
+      392       392    1          * of the code.
+      393       393    1          */
+      394       394    1
+      395       395    1         Lindex i;
+      396       396    1         code_p cp;
+      397       397    1
+      398       398    1         for (i = Lfirst(avail); i != (Lindex) 0; i = Lnext(i,avail)) {
+      399       399    2            cp = (code_p) Lelem(i);
+      400       400    2            if (same_code(c,cp,vars)) {
+      401       401    3               return cp;
+      402       402    3            }
+      403       403    2         }
+      404       404    1         return (code_p) 0;
+      405       405    1        }
+      406       406
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=12 
+      407       407
+      408       408
+      409       409             STATIC reduce(code,vars)
+      410       410              code_p code;
+      411       411              lset   vars;
+      412       412             {
+      413       413    1         /* Perform the actual transformations. The code on the left
+      414       414    1          * gets transformed into the code on the right. Note that
+      415       415    1          * each piece of code is assigned a name, that will be
+      416       416    1          * used to describe the whole process.
+      417       417    1          *
+      418       418    1          *             t = iv * 118;  (init_code)
+      419       419    1          * do    --->     do
+      420       420    1          *    .. iv * 118 ..       .. t ..  (new_code)
+      421       421    1          *    iv++;          iv++;
+      422       422    1          *                t += 118;   (incr_code)
+      423       423    1          * od          od
+      424       424    1          */
+      425       425    1
+      426       426    1         offset tmp;
+      427       427    1         code_p ac;
+      428       428    1
+      429       429    1         OUTTRACE("succeeded!!",0);
+      430       430    1         if ((ac = available(code,vars)) != (code_p) 0) {
+      431       431    2            /* The expression is already available, so we
+      432       432    2             * don't have to generate a new temporary local for it.
+      433       433    2             */
+      434       434    2            OUTTRACE("expression was already available",0);
+      435       435    2            replcode(code,newcode(code,ac->co_temp));
+      436       436    2            remcode(code);
+      437       437    2         } else {
+      438       438    2            make_header(code->co_loop);
+      439       439    2            /* make sure there's a header block */
+      440       440    2            tmp = tmplocal(curproc,(offset) code->co_tmpsize);
+      441       441    2            code->co_temp = tmp;
+      442       442    2            /* create a new local variable in the stack frame
+      443       443    2             * of current proc.
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=13 
+      444       444    2             */
+      445       445    2            gen_regmes(tmp,3,code,curproc); /* generate register message */
+      446       446    2            /* score is set to 3, as TMP is used at least 3 times */
+      447       447    2            replcode(code,newcode(code,tmp));
+      448       448    2            OUTTRACE("replaced old code by new code",0);
+      449       449    2            /* Construct the EM-code that will replace the reducible code
+      450       450    2             * and replace the old code by the new code.
+      451       451    2             */
+      452       452    2            init_code(code,tmp);
+      453       453    2            OUTTRACE("emitted initializing code",0);
+      454       454    2            /* Emit code to initialize the temporary local. This code is
+      455       455    2             * put in the loop header block.
+      456       456    2             */
+      457       457    2            incr_code(code,tmp); /* emit code to increment temp. local */
+      458       458    2            OUTTRACE("emitted increment code",0);
+      459       459    2            Ladd(code,&avail);
+      460       460    2         }
+      461       461    1        }
+      462       462
+      463       463
+      464       464
+      465       465             STATIC try_multiply(lp,ivs,vars,b,mul)
+      466       466              loop_p   lp;
+      467       467              lset   ivs,vars;
+      468       468              bblock_p b;
+      469       469              line_p   mul;
+      470       470             {
+      471       471    1         /* See if we can reduce the strength of the multiply
+      472       472    1          * instruction. If so, then set up the global common
+      473       473    1          * data structure 'c' (containing information about the
+      474       474    1          * code to be reduced) and call 'reduce'.
+      475       475    1          */
+      476       476    1
+      477       477    1         line_p l2,lbegin;
+      478       478    1         iv_p   iv;
+      479       479    1         code_p c;
+      480       480    1         int    sign;
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=14 
+      481       481    1
+      482       482    1         VL(mul);
+      483       483    1         OUTTRACE("trying multiply instruction on line %d",linecount);
+      484       484    1         if (ovfl_harmful && !IS_STRONG(b)) return;
+      485       485    1         /* If b is not a strong block, optimization may
+      486       486    1          * introduce an overflow error in the initializing code.
+      487       487    1          */
+      488       488    1
+      489       489    1         l2 = PREV(mul); /* Instruction before the multiply */
+      490       490    1         if ( (is_ivexpr(l2,ivs,vars,&lbegin,&iv,&sign)) &&
+      491       491    1            is_const(PREV(lbegin)) ) {
+      492       492    2               /* recognized expression "const * iv_expr" */
+      493       493    2               c = newcinfo();
+      494       494    2               c->c_o.co_loadlc = PREV(l2);
+      495       495    2               c->co_endexpr = l2;
+      496       496    2               c->co_lfirst = PREV(lbegin);
+      497       497    2         } else {
+      498       498    2            if (is_const(l2) &&
+      499       499    2               (is_ivexpr(PREV(l2),ivs,vars,&lbegin,&iv,&sign))) {
+      500       500    3                  /* recognized "iv * const " */
+      501       501    3                  c = newcinfo();
+      502       502    3                  c->c_o.co_loadlc = l2;
+      503       503    3                  c->co_endexpr = PREV(l2);
+      504       504    3                  c->co_lfirst = lbegin;
+      505       505    3            } else {
+      506       506    3               OUTTRACE("failed",0);
+      507       507    3               return;
+      508       508    3            }
+      509       509    2         }
+      510       510    1         /* common part for both patterns */
+      511       511    1         c->co_iv = iv;
+      512       512    1         c->co_loop = lp;
+      513       513    1         c->co_block = b;
+      514       514    1         c->co_llast = mul;
+      515       515    1         c->co_ivexpr = lbegin;
+      516       516    1         c->co_sign = sign;
+      517       517    1         c->co_tmpsize = ws; /* temp. local is a word */
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=15 
+      518       518    1         c->co_instr = INSTR(mul);
+      519       519    1         OUTVERBOSE("sr: multiply in proc %d loop %d",
+      520       519    1            curproc->p_id, lp->lp_id);
+      521       520    1         Ssr++;
+      522       521    1         reduce(c,vars);
+      523       522    1        }
+      524       523
+      525       524
+      526       525
+      527       526             STATIC try_array(lp,ivs,vars,b,arr)
+      528       527              loop_p   lp;
+      529       528              lset   ivs,vars;
+      530       529              bblock_p b;
+      531       530              line_p   arr;
+      532       531             {
+      533       532    1         /* See if we can reduce the strength of the array reference
+      534       533    1          * instruction 'arr'.
+      535       534    1          */
+      536       535    1
+      537       536    1         line_p l2,l3,lbegin;
+      538       537    1         iv_p   iv;
+      539       538    1         code_p c;
+      540       539    1         int    sign;
+      541       540    1
+      542       541    1         /* Try to recognize the pattern:
+      543       542    1          * LOAD ADDRES OF A
+      544       543    1          *      LOAD IV
+      545       544    1          *      LOAD ADDRESS OF DESCRIPTOR
+      546       545    1          */
+      547       546    1         VL(arr);
+      548       547    1         OUTTRACE("trying array instruction on line %d",linecount);
+      549       548    1         if (arrbound_harmful && !IS_STRONG(b)) return;
+      550       549    1         /* If b is not a strong block, optimization may
+      551       550    1          * introduce an array bound error in the initializing code.
+      552       551    1          */
+      553       552    1         l2 = PREV(arr);
+      554       553    1         if (is_caddress(l2,vars) &&
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=16 
+      555       554    1            (INSTR(arr) == op_aar || elemsize(l2) == ws) &&
+      556       555    1            (is_ivexpr(PREV(l2),ivs,vars,&lbegin,&iv,&sign)) ) {
+      557       556    2            l3 = PREV(lbegin);
+      558       557    2            if (is_caddress(l3,vars)) {
+      559       558    3               c = newcinfo();
+      560       559    3               c->co_iv = iv;
+      561       560    3               c->co_loop = lp;
+      562       561    3               c->co_block = b;
+      563       562    3               c->co_lfirst = l3;
+      564       563    3               c->co_llast = arr;
+      565       564    3               c->co_ivexpr = lbegin;
+      566       565    3               c->co_endexpr = PREV(l2);
+      567       566    3               c->co_sign = sign;
+      568       567    3               c->co_tmpsize = ps; /* temp. local is pointer */
+      569       568    3               c->co_instr = INSTR(arr);
+      570       569    3               c->c_o.co_desc = l2;
+      571       570    3               OUTVERBOSE("sr: array in proc %d loop %d",
+      572       570    3                  curproc->p_id,lp->lp_id);
+      573       571    3               Ssr++;
+      574       572    3               reduce(c,vars);
+      575       573    3            }
+      576       574    2         }
+      577       575    1        }
+      578       576
+      579       577
+      580       578
+      581       579             STATIC clean_avail()
+      582       580             {
+      583       581    1         Lindex i;
+      584       582    1
+      585       583    1         for (i = Lfirst(avail); i != (Lindex) 0; i = Lnext(i,avail)) {
+      586       584    2            oldcinfo(Lelem(i));
+      587       585    2         }
+      588       586    1         Ldeleteset(avail);
+      589       587    1        }
+      590       588
+      591       589
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=17 
+      592       590
+      593       591             strength_reduction(lp,ivs,vars)
+      594       592              loop_p lp;  /* description of the loop */
+      595       593              lset    ivs;   /* set of induction variables of the loop */
+      596       594              lset  vars; /* set of local variables changed in loop */
+      597       595             {
+      598       596    1         /* Find all expensive instructions (multiply, array) and see if
+      599       597    1          * they can be reduced. We branch to several instruction-specific
+      600       598    1          * routines (try_...) that check if reduction is possible,
+      601       599    1          * and that set up a common data structure (code_info).
+      602       600    1          * The actual transformations are done by 'reduce', that is
+      603       601    1          * essentially instruction-independend.
+      604       602    1          */
+      605       603    1
+      606       604    1         bblock_p b;
+      607       605    1         line_p   l, next;
+      608       606    1         Lindex   i;
+      609       607    1
+      610       608    1         avail = Lempty_set();
+      611       609    1         for (i = Lfirst(lp->LP_BLOCKS); i != (Lindex) 0;
+      612       610    1               i = Lnext(i,lp->LP_BLOCKS)) {
+      613       611    2            b = (bblock_p) Lelem(i);
+      614       612    2            for (l = b->b_start; l != (line_p) 0; l = next) {
+      615       613    3               next = l->l_next;
+      616       614    3               if (TYPE(l) == OPSHORT && SHORT(l) == ws) {
+      617       615    4                  switch(INSTR(l)) {
+      618       616    5                     case op_mlu:
+      619       617    5                     case op_mli:
+      620       618    5                        try_multiply(lp,ivs,vars,b,l);
+      621       619    5                        break;
+      622       620    5                     case op_lar:
+      623       621    5                     case op_sar:
+      624       622    5                     case op_aar:
+      625       623    5                        try_array(lp,ivs,vars,b,l);
+      626       624    5                        break;
+      627       625    5                  }
+      628       626    4               }
+CC.C03    File=zbe$sr_reduce:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=18 
+      629       627    3            }
+      630       628    2         }
+      631       629    1         clean_avail();
+      632       630    1        }
+      633       631
+---  Include file information  ---
+
+   zbe$types:h.:ZBC3TOU. is referenced
+   zbe$sr:h.:ZBC3TOU. is referenced
+   em_mnem:h.:ZBC3TOU. is referenced
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+   zbe$aux:h.:ZBC3TOU. is referenced
+   zbe$sr_aux:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$sr_xform:h.:ZBC3TOU. is referenced
+   zbe$sr_reduce:h.:ZBC3TOU. is referenced
+   zbe$sr_expr:h.:ZBC3TOU. is referenced
+   em_pseu:h.:ZBC3TOU. is referenced
+   em_reg:h.:ZBC3TOU. is referenced
+   em_mes:h.:ZBC3TOU. is referenced
+
+No diagnostics were issued in the file zbe$sr_reduce:c.:ZBC3TSI

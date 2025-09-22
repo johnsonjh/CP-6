@@ -1,0 +1,601 @@
+/*M* LOOK4  Given accounts, print table of filenames in them. */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* ICP,DMR,CLM=8,PLM=8,MOC */
+/*P*    NAME: LOOK4
+        PURPOSE:
+           LOOK4 reports on what files exist in specified accounts.
+        It is intended for use by programming development when
+        updates from several projects are to be merged into a
+        common base; give LOOK4 a list of the individual update
+        accounts, and it produces a report which can be used to
+        find possible update conflicts.
+           Optionally LOOK4 can be also given a Listfile as input.
+        The Listfile is in FUMBLE format.  When using Listfile input,
+        LOOK4 also produces an exception report of "bad" Listfile
+        records; i.e., not starting with "filename," or lacking a
+        module owner field.  In addition, if one of the specified
+        accounts is designated MASTER, LOOK4's exception report tells
+        of differences between the files named in the Listfile and
+        names of files in the MASTER account.
+        DESCRIPTION:
+           LOOK4 reads commands from M$SI.  Commands may be --
+        *     [DP#sn].account[,MASTER]
+                 specifies an account to scan.  Up to 30 allowed.
+        *     LIST=fid
+                 specifies a Listfile to be read.
+        *     RANGE=name1,name2
+                 says only scan/report on files whose names are
+                 within the range.
+        *     REPORT=EXCEPTIONS
+                 in conjunction with LIST, says only produce the
+                 exception report(s).
+           Output is to M$LO. It consists of echoed commands, error
+        messages, and reports.
+*/
+LOOK4:  PROC MAIN;
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%F$DCB;
+%INCLUDE XU_MACRO_C;
+/*****     DCBs     *****/
+DCL M$SI DCB;
+DCL M$LO DCB;
+/*****     Data for Command Reading and Parse     *****/
+DCL SIBUF CHAR(256) STATIC;
+DCL SILEN UBIN STATIC;
+DCL BASEDBUF CHAR(SILEN)BASED;
+%FPT_OPEN(FPTN=OPENLO,STCLASS=STATIC,DCB=M$LO);
+%FPT_READ (FPTN=READSI,STCLASS=STATIC,DCB=M$SI,BUF=SIBUF);
+%FPT_WRITE(FPTN=ECHOCC,STCLASS=STATIC,DCB=M$LO,BUF=SIBUF);
+DCL LOOK4CMD UBIN SYMREF;
+DCL X$PARSE ENTRY(1)ALTRET;
+%P_PCB (STCLASS=STATIC,T=SIBUF,R=LOOK4CMD);
+%PARSE$OUT (STCLASS=BASED);
+%PARSE$SYM (STCLASS=BASED);
+%FPT_GDP (FPTN=GETPG,STCLASS=STATIC,PAGES=1,RESULTS=GPPAGE);
+%VLP_VECTOR(FPTN=GPPAGE,STCLASS=STATIC);
+DCL 1 VBASED BASED,
+      2 WBOUND UBIN(18)UNAL,
+      2 * UBIN(18)UNAL,
+      2 P$ PTR;
+%FPT_FDP (FPTN=FREEPG,STCLASS=STATIC,PAGES=1);
+/*****     Data for Reporting Errors     *****/
+%FPT_ERRMSG (FPTN=ERRMSG,STCLASS=STATIC,BUF=SIBUF,OUTDCB1=M$LO);
+DCL B$TCB$ PTR SYMREF;
+%B$TCB (STCLASS="BASED(B$TCB$)");
+%B$ALT;
+%FPT_WRITE (FPTN=WRITELO,STCLASS=STATIC,DCB=M$LO);
+%MACRO CANNED(N=BLOTTO,T=' ');
+DCL 1 N CONSTANT,
+      2 * UBIN(9)UNAL INIT(LENGTHC(N.C)),
+      2 C CHAR(0)INIT(T);
+%MEND;
+%CANNED(N=ERR_FID,T="' Non-Disk File FIDs are illegal here.'");
+%CANNED(N=ERR_2M,T="' Too many accounts. Only 30 allowed.'");
+%CANNED(N=ERR_NON,T="' File name FIDs must have a file name!!'");
+%CANNED(N=ERR_NOA,T="' Account name FIDs must have an account specified!!'");
+%CANNED(N=ERR_2MASTER,T="' Only one MASTER account allowed.'");
+%CANNED(N=ERR_2LISTS,T="' Only one Listfile allowed.'");
+%CANNED(N=ERR_LFNOOWNER,T="'  **** The following listfile record has no owner:'");
+%CANNED(N=ERR_LFBADFILE,T="'  **** The following listfile record is bad:'");
+%CANNED(N=ERR_LFDUP,T="'  **** The following listfile record is a duplicate:'");
+DCL 1 ERR_NOMF STATIC,
+      2 * UBIN(9)UNAL INIT(LENGTHC(ERR_NOMF.C)),
+      2 C,
+        3 * CHAR(0)INIT(' The following file is not in '),
+        3 A CHAR(8)INIT(' '),
+        3 * CHAR(0)INIT(':  '),
+        3 F CHAR(31)INIT(' ');
+/*****     Help Messages     *****/
+DCL HELPMSG1 CHAR(0)STATIC INIT
+        ('  Show table of filenames in accounts. Commands are:');
+DCL HELPMSG2 CHAR(0)STATIC INIT
+        ('    [DP#sn/].acct[,M]  Specifies an account to look in.');
+DCL HELPMSG3 CHAR(0)STATIC INIT
+        ('    RANGE=filename,filename   Restricts search to range.');
+DCL HELPMSG4 CHAR(0)STATIC INIT
+        ('    LIST=fid    Reports from a Listfile, else in filename order.');
+DCL HELPMSG5 CHAR(0)STATIC INIT
+        ('               REPORT=EXCEPTIONS only prints listfile errors.');
+/*****     Temps     *****/
+DCL I SBIN STATIC;
+DCL J SBIN STATIC;
+DCL K SBIN STATIC;
+/*****     Data for doing FID and setting DCB     *****/
+%VLP_NAME(FPTN=FIDN,STCLASS=STATIC,
+                    NAME='1234567890123456789012345678901');
+%VLP_ACCT(FPTN=FIDA,STCLASS=STATIC,ACCT='12345678');
+%VLP_PASS(FPTN=FIDP,STCLASS=STATIC,PASS='12345678');
+%VLP_WSN (FPTN=FIDW,STCLASS=STATIC,WSN='12345678');
+%VLP_SN  (FPTN=FIDS,STCLASS=STATIC,N=1,SN='123456');
+%VLR_FID(FPTN=FIDRSLT,STCLASS=STATIC);
+%FPT_FID (FPTN=FIDFPT,STCLASS=STATIC,RESULTS=FIDRSLT,
+        NAME=FIDN,ACCT=FIDA,PASS=FIDP,WSN=FIDW,SN=FIDS,
+        RES=SETOPEN.V.RES#,ASN=SETOPEN.V.ASN#);
+%FPT_OPEN (FPTN=SETOPEN,STCLASS=STATIC,
+        NAME=FIDN,ACCT=FIDA,PASS=FIDP,WSN=FIDW,SN=FIDS,
+        SCRUB=YES,ASN=FILE,TEST=YES,NXTF=YES,FUN=IN);
+/*****     Data for setting up DCBs and filename ranges     *****/
+DCL DCB$ PTR STATIC INIT(ADDR(NIL));
+DCL DCBNO UBIN STATIC INIT(0);
+%FPT_GETDCB(FPTN=GETDCB,STCLASS=STATIC,DCBNUM=DCBNO);
+DCL NUMDCBS SBIN STATIC INIT(-1);
+DCL NUMDCB SBIN STATIC;
+DCL DCBBOT SBIN STATIC INIT(-1);
+DCL DCBTOP SBIN STATIC INIT(-1);
+DCL DCBN$(0:29) PTR STATIC;
+DCL DCBNOS(0:29) UBIN STATIC INIT(0*0);
+DCL REPORTYP UBIN STATIC INIT(2);
+DCL LISTDCBNO UBIN STATIC INIT(0);
+DCL 1 FIRSTNAME STATIC DALIGNED,
+      2 L UBIN(9)UNAL INIT(0),
+      2 C CHAR(31) INIT(' ');
+DCL 1 LASTNAME STATIC DALIGNED,
+      2 L UBIN(9)UNAL INIT(31),
+      2 C CHAR(31) INIT(BINASC(511));
+/*****     Other Data     *****/
+DCL 1 NAMEB BASED,
+      2 L UBIN(9)UNAL,
+      2 C CHAR(NAMEB.L);
+DCL YESSES UBIN STATIC INIT(0);
+DCL YESB(0:35)REDEF YESSES BIT(1);
+DCL LISTS UBIN STATIC INIT(0);
+DCL LISTB(0:35)REDEF LISTS BIT(1);
+DCL MASTERS(0:35)BIT(1)STATIC INIT('0'B*0);
+DCL EXISTS UBIN STATIC INIT(0);
+DCL EXISTB(0:35)REDEF EXISTS BIT(1);
+DCL FIRSTCHAR CHAR(1)STATIC INIT(BINASC(0));
+DCL NAME$ PTR STATIC;
+DCL PRTLINE CHAR(160)STATIC INIT(' ');
+DCL ACCTX(0:29)UBIN STATIC;
+DCL ACCTL(0:29)UBIN STATIC;
+DCL NAMEX UBIN STATIC INIT(0);
+%FPT_OPEN(FPTN=FIRSTEF,STCLASS=STATIC,NAME=FIRSTNAME,
+        TEST=YES,NXTF=YES,THISF=YES);
+%FPT_OPEN(FPTN=NXTEF,STCLASS=STATIC,TEST=YES,NXTF=YES);
+%FPT_WRITE(FPTN=PRINTIT,STCLASS=STATIC,DCB=M$LO,BUF=PRTLINE);
+%FPT_DEVICE(FPTN=LOPAGE,STCLASS=STATIC,DCB=M$LO,PAGE=YES);
+%FPT_DEVICE(FPTN=TITLO,STCLASS=STATIC,DCB=M$LO,PAGE=YES,HDR=TIT);
+%VLP_HDR(FPTN=TIT,STCLASS=STATIC,HEADERHEIGHT=2,LEN=160);
+DCL OWNERBUF STATIC CHAR(48);
+DCL 1 OTBUF STATIC,
+      2 L UBIN(9)UNAL INIT(79),
+      2 OWNER CHAR(48),
+      2 FN CHAR(31);
+%FPT_OPEN(FPTN=MAKELF,STCLASS=STATIC,SCRUB=YES,ASN=FILE,ACS=DIRECT,
+        FUN=CREATE,DISP=SCRATCH,ORG=KEYED);
+%FPT_READ(FPTN=READLIST,STCLASS=STATIC,BUF=SIBUF);
+%FPT_WRITE(FPTN=WRITELF,STCLASS=STATIC,KEY=FIDN,NEWKEY=YES,
+        ONEWKEY=NO,BUF=OWNERBUF);
+%FPT_WRITE(FPTN=WRWF,STCLASS=STATIC,KEY=OTBUF,BUF=YESSES);
+%FPT_REW(FPTN=REW,STCLASS=STATIC);
+%FPT_CLOSE(FPTN=CLSSAV,STCLASS=STATIC,DISP=SAVE);
+%FPT_READ(FPTN=READLF,STCLASS=STATIC,KEYS=NO,KEYR=YES,KEY=FIDN,
+        BUF=OWNERBUF);
+%FPT_READ(FPTN=READWF,STCLASS=STATIC,KEYS=NO,KEYR=YES,KEY=OTBUF,
+        BUF=YESSES);
+%VLP_HDR(FPTN=HDREXCEPT,STCLASS=STATIC,HEADERHEIGHT=2,
+        TITLE='       **  LISTFILE EXCEPTION REPORT  **');
+%EJECT;
+/*
+        Get space, read and echo control commands,
+        parse commands, and process commands.
+           RANGE command fills in FIRSTNAME and/or LASTNAME
+        with filename range to be examined.
+           REPORT command sets REPORTYP to appropriate value
+        for desired reports.
+           LISTFILE command makes a DCB for listfile, opens it,
+        and puts its number in LISTDCBNO (which is then nonzero).
+           ACCOUNT command makes a DCB and test-opens it to the
+        specified account.  NUMDCBS is set to (count of accounts
+        minus 1), DCBNOS(NUMDCBS) to the DCB's number, and
+        DCBN$(NUMDCBS) to point to the DCB's filename field.
+        If account was Master, MASTERS bit for it is set.
+*/
+        CALL M$OPEN(OPENLO); /* Force M$LO open. */
+        CALL M$GDP(GETPG)ALTRET(ERR$TCB$MERR);
+        P_PCB.WORK$=ADDR(GPPAGE)->VBASED.P$;
+        P_PCB.WKSZ=ADDR(GPPAGE)->VBASED.WBOUND+1;
+NEXTCC: ;
+        CALL M$READ(READSI)ALTRET(SIEOF);
+        SILEN=DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+        IF (NOT DCBADDR(DCBNUM(M$SI))->F$DCB.DDEV.IC#) OR
+          (NOT DCBADDR(DCBNUM(M$LO))->F$DCB.DDEV.IC#) THEN
+           IF SILEN>0 THEN DO;
+              ECHOCC.BUF_.BOUND=SILEN-1;
+              CALL M$WRITE(ECHOCC);
+              END;
+        P_PCB.NCHARS=SILEN;
+        CALL X$PARSE(P_PCB)ALTRET(ERR$PCB$NEXTCC);
+        DO CASE(P_PCB.OUT$->OUT$BLK.CODE);
+         CASE(2); /* FNCMD */
+           DO I=0 TO P_PCB.OUT$->OUT$BLK.NSUBLKS-1;
+              FIDFPT.TEXTFID_=VECTOR(
+                P_PCB.OUT$->OUT$BLK.SUBLK$(I)->OUT$SYM.TEXT);
+              CALL M$FID(FIDFPT)ALTRET(ERR$TCB$NEXTCC);
+              IF NOT FIDRSLT.NAME THEN
+                 CALL WRLO_CANNED(ERR_NON);
+              ELSE
+              DO CASE(P_PCB.OUT$->OUT$BLK.SUBLK$(I)->OUT$BLK.CODE);
+               CASE(1); /* FRSTNAME */
+                 FIRSTNAME=FIDN;
+               CASE(2); /* LASTNAME */
+                 LASTNAME=FIDN;
+               END;
+              END;
+         CASE(1); /*ACCTCMD */
+           FIDFPT.TEXTFID_=VECTOR(
+             P_PCB.OUT$->OUT$BLK.SUBLK$(0)->OUT$SYM.TEXT);
+           CALL M$FID(FIDFPT)ALTRET(ERR$TCB$NEXTCC);
+           IF SETOPEN.V.ASN#~=%FILE# THEN DO;
+              CALL WRLO_CANNED(ERR_FID);
+              GOTO NEXTCC;
+              END;
+           IF NOT FIDRSLT.ACCT THEN DO;
+              CALL WRLO_CANNED(ERR_NOA);
+              GOTO NEXTCC;
+              END;
+           IF DCB$=ADDR(NIL) THEN DO;
+              CALL M$GETDCB(GETDCB)ALTRET(ERR$TCB$MERR);
+              DCB$=DCBADDR(DCBNO);
+              END;
+           SETOPEN.V.DCB#=DCBNO;
+           SETOPEN.V.OPER.NXTF#=%YES#;
+           SETOPEN.V.OPER.TEST#=%YES#;
+           CALL M$OPEN(SETOPEN)ALTRET(ERR$TCBDCB$NEXTCC);
+           IF NUMDCBS>=29 THEN DO;
+              CALL WRLO_CANNED(ERR_2M);
+              GOTO NEXTCC;
+              END;
+           IF P_PCB.OUT$->OUT$BLK.NSUBLKS>1 THEN DO;
+              IF MASTERS THEN DO;
+                 CALL WRLO_CANNED(ERR_2MASTER);
+                 GOTO NEXTCC;
+                 END;
+              MASTERS(NUMDCBS+1)='1'B;
+              ERR_NOMF.C.A=FIDA.ACCT#;
+              END;
+           NUMDCBS=NUMDCBS+1;
+           DCBN$(NUMDCBS)=ADDR(DCB$->F$DCB.NAME#);
+           DCBNOS(NUMDCBS)=DCBNO;
+           DCB$=ADDR(NIL);
+         CASE(5); /*REPORTCMD*/
+           REPORTYP=P_PCB.OUT$->OUT$BLK.SUBLK$(0)->OUT$BLK.CODE;
+         CASE(4); /*LISTCMD*/
+           FIDFPT.TEXTFID_=VECTOR(
+             P_PCB.OUT$->OUT$BLK.SUBLK$(0)->OUT$SYM.TEXT);
+           CALL M$FID(FIDFPT)ALTRET(ERR$TCB$NEXTCC);
+           IF LISTDCBNO~=0 THEN DO;
+              CALL WRLO_CANNED(ERR_2LISTS);
+              GOTO NEXTCC;
+              END;
+           IF DCB$=ADDR(NIL) THEN DO;
+              CALL M$GETDCB(GETDCB)ALTRET(ERR$TCB$MERR);
+              DCB$=DCBADDR(DCBNO);
+              END;
+           SETOPEN.V.DCB#=DCBNO;
+           SETOPEN.V.OPER.NXTF#=%NO#;
+           SETOPEN.V.OPER.TEST#=%NO#;
+           CALL M$OPEN(SETOPEN)ALTRET(ERR$TCBDCB$NEXTCC);
+           LISTDCBNO=DCBNO;
+           DCB$=ADDR(NIL);
+         CASE(6); /*NULLCMD */
+           GOTO SIEOF;
+         CASE(3); /*HELPCMD*/
+           WRITELO.BUF_=VECTOR(HELPMSG1);
+           CALL WRLO_;
+           WRITELO.BUF_=VECTOR(HELPMSG2);
+           CALL WRLO_;
+           WRITELO.BUF_=VECTOR(HELPMSG3);
+           CALL WRLO_;
+           WRITELO.BUF_=VECTOR(HELPMSG4);
+           CALL WRLO_;
+           WRITELO.BUF_=VECTOR(HELPMSG5);
+           CALL WRLO_;
+         END;
+        GOTO NEXTCC;
+ERR$TCB$MERR:;
+        ERRMSG.CODE_=VECTOR(B$TCB.ALT$->B$ALT.ERR);
+        CALL M$ERRMSG(ERRMSG);
+        CALL CLSSAVE(DCBNUM(M$LO));
+        CALL M$ERR;
+ERR$PCB$NEXTCC:;
+        ERRMSG.CODE_=VECTOR(P_PCB.ERROR);
+        CALL M$ERRMSG(ERRMSG);
+        GOTO NEXTCC;
+ERR$TCB$NEXTCC:;
+        ERRMSG.CODE_=VECTOR(B$TCB.ALT$->B$ALT.ERR);
+        CALL M$ERRMSG(ERRMSG);
+        GOTO NEXTCC;
+ERR$TCBDCB$NEXTCC:;
+        ERRMSG.CODE_=VECTOR(B$TCB.ALT$->B$ALT.ERR);
+        ERRMSG.V.DCB#=B$TCB.ALT$->B$ALT.DCB#;
+        CALL M$ERRMSG(ERRMSG);
+        ERRMSG.V.DCB#=0;
+        GOTO NEXTCC;
+EXITHERE: ;
+        CALL CLSSAVE(DCBNUM(M$LO));
+        CALL M$EXIT;
+SIEOF:  ;
+        CALL M$FDP(FREEPG);
+/*      Now eliminate DCBs whose accounts have no files in range.*/
+        I=0;
+        J=0;
+        DO WHILE (I<=NUMDCBS);
+           FIRSTEF.V.DCB#=DCBNOS(I);
+           CALL M$OPEN(FIRSTEF)ALTRET(NOACCT);
+           IF DCBN$(I)->NAMEB.C<=ADDR(LASTNAME)->NAMEB.C THEN DO;
+              IF J<I THEN DO;
+                 DCBNOS(J)=DCBNOS(I);
+                 DCBN$(J)=DCBN$(I);
+                 MASTERS(J)=MASTERS(I);
+                 END;
+              EXISTB(J)='1'B;
+              J=J+1;
+              END;
+NOACCT:    I=I+1;
+           END;
+        NUMDCBS=J-1;
+        IF LISTDCBNO+NUMDCBS<0 THEN
+           GOTO EXITHERE;
+%EJECT;
+/*
+        If this is a LISTFILE run, read the list file and copy it
+        to a temp file sorted by file name.
+*/
+        IF LISTDCBNO=0 THEN GOTO NOLISTPROC;
+        CALL DOTITLE(HDREXCEPT);
+        IF DCB$=ADDR(NIL) THEN DO;
+           CALL M$GETDCB(GETDCB)ALTRET(ERR$TCB$MERR);
+           DCB$=DCBADDR(DCBNO);
+           END;
+        MAKELF.V.DCB#=DCBNO;
+        CALL M$OPEN(MAKELF);
+        READLIST.V.DCB#=LISTDCBNO;
+        WRITELF.V.DCB#=DCBNO;
+RDLISTLOOP:;
+        CALL M$READ(READLIST)ALTRET(RDLISTEOF);
+        SILEN=DCBADDR(LISTDCBNO)->F$DCB.ARS#;
+        CALL INDEX1(I,',',ADDR(SIBUF)->BASEDBUF)ALTRET(BADLFFILE);
+        FIDFPT.TEXTFID_=VECTOR(SUBSTR(SIBUF,0,I));
+        CALL M$FID(FIDFPT)ALTRET(BADLFFILE);
+        IF FIDRSLT.ACCT OR FIDRSLT.PASS OR FIDRSLT.WSN OR FIDRSLT.RES
+          OR NOT FIDRSLT.NAME THEN GOTO BADLFFILE;
+        CALL INDEX1(I,' ',ADDR(SIBUF)->BASEDBUF)ALTRET(BADLFOWNER);
+        IF SUBSTR(ADDR(SIBUF)->BASEDBUF,I)=' ' THEN GOTO BADLFOWNER;
+        DO WHILE (SUBSTR(SIBUF,I,1)=' ');
+           I=I+1;
+           END;
+        OWNERBUF=SUBSTR(ADDR(SIBUF)->BASEDBUF,I);
+BADOWRITE:;
+        CALL M$WRITE(WRITELF)ALTRET(BADLFDUP);
+        GOTO RDLISTLOOP;
+BADLFOWNER:;
+        CALL WRLO_CANNED(ERR_LFNOOWNER);
+        WRITELO.BUF_=VECTOR(ADDR(SIBUF)->BASEDBUF);
+        CALL WRLO_;
+        OWNERBUF='  ** NO OWNER **';
+        GOTO BADOWRITE;
+BADLFFILE:;
+        CALL WRLO_CANNED(ERR_LFBADFILE);
+        GOTO BADLF;
+BADLFDUP:;
+        CALL WRLO_CANNED(ERR_LFDUP);
+BADLF:  ;
+        WRITELO.BUF_=VECTOR(ADDR(SIBUF)->BASEDBUF);
+        CALL WRLO_;
+        GOTO RDLISTLOOP;
+RDLISTEOF:;
+        CALL CLSSAVE(LISTDCBNO);
+        IF NUMDCBS<0 THEN GOTO EXITHERE;
+        CALL REWIND(DCBNO);
+        MAKELF.V.DCB#=LISTDCBNO;
+        CALL M$OPEN(MAKELF);
+        READLF.V.DCB#=DCBNO;
+        NUMDCB=NUMDCBS+1;
+        DCBN$(NUMDCB)=ADDR(FIDN);
+        DCBNOS(NUMDCB)=1;
+        LISTS=0;
+        LISTB(NUMDCB)='1'B;
+        WRWF.V.DCB#=LISTDCBNO;
+        CALL M$READ(READLF)ALTRET(NOGOODLIST);
+        EXISTB(NUMDCB)='1'B;
+NOGOODLIST:;
+        DO WHILE (EXISTB);
+           YESSES=0;
+           DO I=0 TO NUMDCB;
+              IF EXISTB(I) THEN
+                 IF YESSES=0 THEN DO;
+                    YESB(I)='1'B;
+                    NAME$=DCBN$(I);
+                    END;
+                 ELSE IF DCBN$(I)->NAMEB.C<=NAME$->NAMEB.C THEN
+                       IF DCBN$(I)->NAMEB.C=NAME$->NAMEB.C THEN
+                          YESB(I)='1'B;
+                       ELSE DO;
+                          YESSES=0;
+                          YESB(I)='1'B;
+                          NAME$=DCBN$(I);
+                          END;
+              END;
+           OTBUF.FN=NAME$->NAMEB.C;
+           IF YESB&LISTB THEN DO;
+              OTBUF.OWNER=OWNERBUF;
+              IF MASTERS AND NOT(MASTERS&YESB) THEN DO;
+                 ERR_NOMF.C.F=OTBUF.FN;
+                 CALL WRLO_CANNED(ERR_NOMF);
+                 END;
+              IF REPORTYP=2 THEN
+                 CALL M$WRITE(WRWF);
+              END;
+           ELSE DO;
+              OTBUF.OWNER=' ** NOT IN LISTFILE **';
+              CALL M$WRITE(WRWF);
+              END;
+           DO I=0 TO NUMDCB;
+              IF YESB(I) THEN DO;
+                 IF I~=NUMDCB THEN DO;
+                    NXTEF.V.DCB#=DCBNOS(I);
+                    CALL M$OPEN(NXTEF)ALTRET(ACCTENDLF);
+                    END;
+                 ELSE DO;
+                    CALL M$READ(READLF)ALTRET(ACCTENDLF);
+                    END;
+                 IF DCBN$(I)->NAMEB.C>ADDR(LASTNAME)->NAMEB.C THEN
+ACCTENDLF:          EXISTB(I)='0'B;
+                 END;
+              END;
+           END;
+LFPRINTOUT:;
+        DCBTOP=-1;
+NEXTPARTLF:;
+        CALL ESTABDCBS ALTRET(EXITHERE);
+        EXISTB=EXISTB|LISTB;
+        CALL REWIND(LISTDCBNO);
+        READWF.V.DCB#=LISTDCBNO;
+        OWNERBUF=' ';
+NEXTLINELF2:;
+        CALL M$READ(READWF)ALTRET(NEXTPARTLF);
+        IF NOT(EXISTB & YESB) THEN GOTO NEXTLINELF2;
+        IF OTBUF.OWNER~=OWNERBUF THEN DO;
+           OWNERBUF=OTBUF.OWNER;
+           CALL INSERT(TIT.TITL.TITLE#,NAMEX,,OWNERBUF);
+           CALL DOTITLE(TIT);
+           END;
+        CALL INSERT(PRTLINE,NAMEX,31,OTBUF.FN);
+        DO I=DCBBOT TO DCBTOP;
+           IF YESB(I) THEN DO;
+              CALL INSERT(PRTLINE,ACCTX(I),ACCTL(I),
+                SUBSTR(TIT.TITL.TITLE#,ACCTX(I),ACCTL(I)));
+              END;
+           END;
+        CALL M$WRITE(PRINTIT);
+        PRTLINE=' ';
+        GOTO NEXTLINELF2;
+%EJECT;
+/*
+        Having read and interpreted the commands, we are ready
+        to start processing.
+        The first stage of processing gets us to the first valid
+        file in each account.
+        The account displacements and sizes are placed in ACCTX
+        and ACCTL so that account names can later be moved from
+        the title line to the print line for display.
+        M$LO is told that the title line is its title.
+*/
+NOLISTPROC:;
+        DCBTOP=-1;
+NEXTPART:;
+        CALL ESTABDCBS ALTRET(EXITHERE);
+        TIT.CTL.COUNT#=NAMEX+2;
+        CALL DOTITLE(TIT);
+/*
+        Now every DCB is aligned to the first file in its range.
+        Find the lowest file name.
+        Fill the print line with it and the accounts it lives in.
+        Do open NXTF on the DCBs for those accounts.
+        Print the line.
+        Repeat until all DCBs are out of range.
+        When first character of file name changes, go to new page.
+*/
+NEXTLINE:;
+        YESSES=0;
+        DO I=DCBBOT TO DCBTOP;
+           IF DCBNOS(I)~=0 THEN
+              IF YESSES=0 THEN DO;
+                 YESB(I)='1'B;
+                 NAME$=DCBN$(I);
+                 END;
+              ELSE IF DCBN$(I)->NAMEB.C<=NAME$->NAMEB.C THEN
+                    IF DCBN$(I)->NAMEB.C=NAME$->NAMEB.C THEN
+                       YESB(I)='1'B;
+                    ELSE DO;
+                       YESSES=0;
+                       YESB(I)='1'B;
+                       NAME$=DCBN$(I);
+                       END;
+           END;
+        IF YESSES=0 THEN GOTO NEXTPART;
+        IF SUBSTR(NAME$->NAMEB.C,0,1)~=FIRSTCHAR THEN DO;
+           FIRSTCHAR=SUBSTR(NAME$->NAMEB.C,0,1);
+           CALL M$DEVICE(LOPAGE);
+           END;
+        CALL INSERT(PRTLINE,NAMEX,31,NAME$->NAMEB.C);
+        DO I=DCBBOT TO DCBTOP;
+           IF YESB(I) THEN DO;
+              CALL INSERT(PRTLINE,ACCTX(I),ACCTL(I),
+                SUBSTR(TIT.TITL.TITLE#,ACCTX(I),ACCTL(I)));
+              NXTEF.V.DCB#=DCBNOS(I);
+              CALL M$OPEN(NXTEF)ALTRET(ACCTEND);
+              IF DCBN$(I)->NAMEB.C>ADDR(LASTNAME)->NAMEB.C THEN
+ACCTEND:         DCBNOS(I)=0;
+              END;
+           END;
+        CALL M$WRITE(PRINTIT);
+        PRTLINE=' ';
+        GOTO NEXTLINE;
+%EJECT;
+WRLO_CANNED: PROC(TEXT);
+DCL 1 TEXT,
+      2 L UBIN(9)UNAL,
+      2 C CHAR(TEXT.L);
+        WRITELO.BUF_.BUF$=ADDR(TEXT.C);
+        WRITELO.BUF_.BOUND=TEXT.L-1;
+WRLO_:  ENTRY;
+        CALL M$WRITE(WRITELO);
+        RETURN;
+END WRLO_CANNED;
+/**/
+CLSSAVE: PROC(DCBNO);
+DCL DCBNO UBIN WORD ALIGNED;
+        CLSSAV.V.DCB#=DCBNO;
+        CALL M$CLOSE(CLSSAV);
+        RETURN;
+REWIND: ENTRY(DCBNO);
+        REW.V.DCB#=DCBNO;
+        CALL M$REW(REW);
+        RETURN;
+END CLSSAVE;
+/**/
+DOTITLE: PROC(VLPHDR);
+%VLP_HDR(FPTN=VLPHDR,STCLASS=,LEN="VLPHDR.TITL.L#");
+        IF DCBADDR(DCBNUM(M$LO))->F$DCB.LINES#=0 THEN
+           CALL WRLO_CANNED(VLPHDR.TITL);
+        ELSE DO;
+           TITLO.HDR_=VECTOR(VLPHDR);
+           CALL M$DEVICE(TITLO);
+           END;
+        RETURN;
+END DOTITLE;
+/**/
+ESTABDCBS: PROC ALTRET;
+        IF DCBTOP>=NUMDCBS THEN ALTRETURN;
+        NAMEX=0;
+        EXISTS=0;
+        K=DCBADDR(DCBNUM(M$LO))->F$DCB.WIDTH#;
+        IF K=0 THEN K=160;
+        TIT.TITL.L#=K;
+        DCBBOT=DCBTOP+1;
+        DO DCBTOP=DCBBOT TO NUMDCBS;
+           CALL INDEX1(J,' ',
+             DCBADDR(DCBNOS(DCBTOP))->F$DCB.ACCT#);
+           IF K<(NAMEX+J+32) THEN
+              IF DCBTOP~=DCBBOT THEN DO;
+                 DCBTOP=DCBTOP-1;
+                 RETURN;
+                 END;
+           EXISTB(DCBTOP)='1'B;
+           ACCTL(DCBTOP)=J;
+           ACCTX(DCBTOP)=NAMEX;
+           CALL INSERT(TIT.TITL.TITLE#,NAMEX,J,
+             DCBADDR(DCBNOS(DCBTOP))->F$DCB.ACCT#);
+           NAMEX=NAMEX+J+1;
+           END;
+        DCBTOP=NUMDCBS;
+        RETURN;
+END ESTABDCBS;
+END LOOK4;

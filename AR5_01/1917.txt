@@ -1,0 +1,1039 @@
+VERSION E05
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:1    
+        1        1        /*M* QQA$FPCHNG - Process FPRG status change events */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* IND=2, DCI=4, CSU=2, ECU=4, DTI=2, CTI=4, AND */
+        8        8        /*P* NAME:        QQA$FPCHNG
+        9        9             PURPOSE:     To process FPRG status change events of CG_FPEXIT#,
+       10       10                          CG_FPABORT# and CG_FPLDTRC#
+       11       11        */
+       12       12        /*D* NAME:        QQA$FPCHNG
+       13       13             CALL:        CALL QQA$FPCHNG
+       14       14             INPUT:       Contents of the *AUEV status change event message
+       15       15             OUTPUT:      None
+       16       16             DESCRIPTION: QQA$FPCHNG handles processing of FPRG status change
+       17       17                          events of CG_FPLDTRC#, CG_FPEXIT# and CG_FPABORT#.
+       18       18
+       19       19                          CG_FPLDTRC# status changes simply cause us to place
+       20       20                          '(name)' into TP$STATION.FP if this is not a LOAD-BY-TYPE
+       21       21                          initiated M$LDTRC, otherwise we move TP$STATION.PEND_FP
+       22       22                          into TP$STATION.FP and clear PEND_FP.  At this point
+       23       23                          the buffer pointed to by QQ_GLOBAL.CMDBUF$ is set to
+       24       24                          be pointed at by TP$STATION.FPLDTRC$.  The buffer
+       25       25                          represents B$CGAURD (4 bytes) followed by VLP_FPRG.
+       26       26                          Note TP$STATION.FPLDTRC$ will point to the start of
+       27       27                          VLP_FPRG.  This info is used in QQA$FPABT and probably
+       28       28                          will be used in the SPY command.
+       29       29
+       30       30                          CG_FPEXIT# status changes may be one of several
+       31       31                          conditions:
+       32       32                             1) A command forms program exiting as the final
+       33       33                                step of a BEGIN or DEBUG command. In this case,
+       34       34                                TP$STATION.QT$FORM$ will be non-NIL. We will
+       35       35                                call QQA$SETFP with TP$STATION.QT$FORM$->QT$FORM
+       36       36                                to finish the BEGIN or DEBUG command and also
+       37       37                                place TP$STATION.PEND_FP into TP$STATION.FP.
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:2    
+       38       38                             2) A non- command forms program exiting. In this
+       39       39                                case, TP$STATION.FP~='*DFLT' and we respond
+       40       40                                by re-starting the command forms program.
+       41       41                             3) A command forms program exiting. In this case,
+       42       42                                TP$STATION.FP='*DFLT' and we respond by
+       43       43                                issuing an M$DEACTIVATE/DISCONNECT to remove
+       44       44                                the station.
+       45       45
+       46       46                          CG_FPABORT# status changes may be one of several
+       47       47                          conditions:
+       48       48                             1) A non- command forms program aborting. In this
+       49       49                                case, TP$STATION.FP~='*DFLT' and we respond by
+       50       50                                re-starting the command forms program.
+       51       51                             2) The command forms program aborting due to
+       52       52                                ctl-Y. We respond by re-starting the command
+       53       53                                forms program unless this program was also
+       54       54                                the default forms program (ie via BEGIN type
+       55       55                                BY DEFAULT) in which case the station is
+       56       56                                deactivated.
+       57       57                             3) The command forms program aborting due to
+       58       58                                something other than ctl-Y. We respond by
+       59       59                                issuing an M$DEACTIVATE/DISCONNECT to remove
+       60       60                                the station.
+       61       61        */
+       62       62
+       63       63        QQA$FPCHNG: PROC;
+       64       64        %INCLUDE Q_PAGE_C;
+       65       96        %SET LISTEXP = '1'B;
+       66       97        %PAGE(ARG="Includes");
+
+               114        /***************************************************************************
+               115         *                                                                         *
+               116         *                                  Includes                               *
+               117         *                                                                         *
+               118         ***************************************************************************/
+
+       67      122        %INCLUDE B_ERRORS_C;
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:3    
+       68     1249        %INCLUDE CP_6;
+       69     1330        %INCLUDE QQ_MACROS_C;
+       70     1755        %INCLUDE QQ_DATA_R;
+       71     2001        %INCLUDE QT_MACROS_C;
+       72     2159        %INCLUDE QQ_PERR_C;
+       73     2320        %INCLUDE Q_ERRCODE_C;
+       74     2343        %PAGE(ARG="Externally defined routines");
+
+              2360    1   /***************************************************************************
+              2361    1    *                                                                         *
+              2362    1    *                        Externally defined routines                      *
+              2363    1    *                                                                         *
+              2364    1    ***************************************************************************/
+
+       75     2368    1   DCL QQA$BYTYPE ENTRY(4) ALTRET;
+       76     2369    1   DCL QQA$SETFP ENTRY(2);
+       77     2370    1   DCL QQC$RLS_BLK ENTRY(2);
+       78     2371    1   DCL QQC$FINDSTA ENTRY(3);
+       79     2372    1   DCL QQC$GET_BLK ENTRY(3) ALTRET;
+       80     2373    1   DCL QQC$SCREECH ENTRY;
+       81     2374        %PAGE(ARG="Symrefs");
+
+              2391    1   /***************************************************************************
+              2392    1    *                                                                         *
+              2393    1    *                                  Symrefs                                *
+              2394    1    *                                                                         *
+              2395    1    ***************************************************************************/
+
+       82     2399    1   DCL B$TCB$ PTR SYMREF;
+       83     2400        %PAGE(ARG="DCBs");
+
+              2417    1   /***************************************************************************
+              2418    1    *                                                                         *
+              2419    1    *                                    DCBs                                 *
+              2420    1    *                                                                         *
+              2421    1    ***************************************************************************/
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:4    
+       84     2425    1   DCL M$CG DCB;
+       85     2426        %PAGE(ARG="Based");
+
+              2443    1   /***************************************************************************
+              2444    1    *                                                                         *
+              2445    1    *                                   Based                                 *
+              2446    1    *                                                                         *
+              2447    1    ***************************************************************************/
+
+       86     2451        %B$TCB;
+       87     2454        %B$ALT;
+       88     2462        %B$CGAURD(STCLASS="BASED(QQ_GLOBAL.CMDBUF$)");
+       89     2481        %TP$STATION;
+       90     2554        %QT$FORM(STCLASS=BASED);
+       91     2593    1   DCL 1 E$RR BASED ALIGNED,
+       92     2594    1         2 * BIT(19) UNAL,
+       93     2595    1         2 CODE UBIN(14) UNAL,
+       94     2596    1         2 * BIT(3) UNAL;
+       95     2597    1   DCL CHAR$STRING CHAR(CHAR_STRING_SIZE) BASED;
+       96     2598        %PAGE(ARG="Static");
+
+              2615    1   /***************************************************************************
+              2616    1    *                                                                         *
+              2617    1    *                                   Static                                *
+              2618    1    *                                                                         *
+              2619    1    ***************************************************************************/
+
+       97     2623    1   DCL STATION CHAR(8) STATIC;
+       98     2624        %PAGE(ARG="Auto");
+
+              2641    1   /***************************************************************************
+              2642    1    *                                                                         *
+              2643    1    *                                    Auto                                 *
+              2644    1    *                                                                         *
+              2645    1    ***************************************************************************/
+
+       99     2649        %QT$FORM(FPTN=QT_FORM,STCLASS=AUTO);
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:5    
+      100     2688    1   DCL FOUND_FLAG BIT(1) ALIGNED;
+      101     2689    1   DCL ERR UBIN;
+      102     2690    1   DCL CHAR_STRING_SIZE UBIN WORD;
+      103     2691        %PAGE(ARG="Error codes",PAGE=YES);
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:6    
+              2708    1   /***************************************************************************
+              2709    1    *                                                                         *
+              2710    1    *                                Error codes                              *
+              2711    1    *                                                                         *
+              2712    1    ***************************************************************************/
+
+      104     2716        %ERRCODE(NAME=CODE_NO_POOLMEM,CODE#=%E$NO_POOLMEM,FCG#=%FCG_QQ,MID#=%MID_A);
+      105     2723        %PAGE(ARG="EQUs");
+
+              2740    1   /***************************************************************************
+              2741    1    *                                                                         *
+              2742    1    *                                    EQUs                                 *
+              2743    1    *                                                                         *
+              2744    1    ***************************************************************************/
+
+      106     2748        %EQU_CG;
+      107     2796        %PAGE(ARG="FPTs");
+
+              2813    1   /***************************************************************************
+              2814    1    *                                                                         *
+              2815    1    *                                    FPTs                                 *
+              2816    1    *                                                                         *
+              2817    1    ***************************************************************************/
+
+      108     2821        %FPT_ACTIVATE(FPTN=FPT_DEACTIVATE,STCLASS=CONSTANT,
+      109     2822                      DCB=M$CG,STATION=STATION,DISCONNECT=YES);
+      110     2845        %PAGE(ARG="VLPs");
+
+              2862    1   /***************************************************************************
+              2863    1    *                                                                         *
+              2864    1    *                                    VLPs                                 *
+              2865    1    *                                                                         *
+              2866    1    ***************************************************************************/
+
+      111     2870        %VLP_FPRG;
+      112     2891        %PAGE(ARG="QQA$FPCHNG");
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:7    
+              2908    1   /***************************************************************************
+              2909    1    *                                                                         *
+              2910    1    *                                 QQA$FPCHNG                              *
+              2911    1    *                                                                         *
+              2912    1    ***************************************************************************/
+
+      113     2916    1           STATION=B$CGAURD.STATION;
+      114     2917    1           CALL QQC$FINDSTA(B$CGAURD.STATION,S$,FOUND_FLAG);
+      115     2918                /*
+      116     2919                   Check if FOUND on stationlist, if not,
+      117     2920                   he was probably subject to STATIONMAX exceeded.
+      118     2921                */
+      119     2922    2           IF ~ FOUND_FLAG THEN DO;
+      120     2923    2               CALL M$DEACTIVATE(FPT_DEACTIVATE);
+      121     2924    2               RETURN;
+      122     2925    2             END;
+      123     2926
+      124     2927    2           DO CASE(B$CGAURD.EVENT);
+      125     2928    2             CASE(26/* CG_FPLDTRC# */);
+      126     2929    2               IF TP$STATION.PEND_FP=' '
+      127     2930    2               THEN TP$STATION.FP='(name)';
+      128     2931    3               ELSE DO;
+      129     2932    3                   TP$STATION.FP=TP$STATION.PEND_FP;
+      130     2933    3                   TP$STATION.PEND_FP=' ';
+      131     2934    3                 END;
+      132     2935    2               IF TP$STATION.FPLDTRC$ = ADDR(NIL) THEN
+      133     2936    2                 CALL QQC$GET_BLK(QQ_GLOBAL.POOL$,SIZEW(VLP_FPRG),TP$STATION.FPLDTRC$)
+      134     2937    2                     ALTRET(NO_MEM);
+      135     2938    2               CHAR_STRING_SIZE = SIZEC(VLP_FPRG);
+      136     2939    2               TP$STATION.FPLDTRC$ -> CHAR$STRING = PINCRW(QQ_GLOBAL.CMDBUF$,
+      137     2940    2                   SIZEW(B$CGAURD)) -> CHAR$STRING;
+      138     2941    2             CASE(24/* CG_FPEXIT# */);
+      139     2942    3               IF TP$STATION.FPLDTRC$~=ADDR(NIL) THEN DO;
+      140     2943    3                   CALL QQC$RLS_BLK(QQ_GLOBAL.POOL$, TP$STATION.FPLDTRC$);
+      141     2944    3                   TP$STATION.FPLDTRC$=ADDR(NIL);
+      142     2945    3                 END;
+      143     2946    3               IF TP$STATION.FLAGS.IS_QT$FORM THEN DO;
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:8    
+      144     2947    3                   CALL QQA$SETFP(S$,TP$STATION.QT$FORM$->QT$FORM);
+      145     2948    3                   TP$STATION.FLAGS.IS_QT$FORM = '0'B;
+      146     2949    3                 END;
+      147     2950    3               ELSE IF TP$STATION.FP~='*DFLT' THEN DO;
+      148     2951                          /*  When Default forms program exits or if it
+      149     2952                              should abort, the TP station is logged off the
+      150     2953                              system.
+      151     2954                          */
+      152     2955    4   STCFP:            IF TP$STATION.DFLT_FP = TP$STATION.FP THEN DO;
+      153     2956    4                         IF B$CGAURD.EVENT = 24 THEN
+      154     2957    4                           TP$STATION.FLAGS.DISCONNECT = '1'B;
+      155     2958    4                         GOTO DACT;
+      156     2959    4                       END;
+      157     2960    3                     CALL QQA$BYTYPE(S$,QT_FORM,'*DFLT   ',ERR) ALTRET(DACT);
+      158     2961    3                     CALL QQA$SETFP(S$,QT_FORM);
+      159     2962    3                   END;
+      160     2963    2                 ELSE
+      161     2964    3   DACT:           CALL M$DEACTIVATE(FPT_DEACTIVATE) WHENALTRETURN DO;
+      162     2965    3                     END;
+      163     2966
+      164     2967    2             CASE(25/* CG_FPABORT# */);
+      165     2968    2               IF TP$STATION.FP~='*DFLT' THEN GOTO STCFP;
+      166     2969    2               ELSE IF ADDR(B$CGAURD.INFO)->E$RR.CODE=1059
+      167     2970    2                     OR ADDR(B$CGAURD.INFO)->E$RR.CODE=1056
+      168     2971    2                 THEN GOTO STCFP;
+      169     2972    2                 ELSE GOTO DACT;
+      170     2973    2           END;                            /* CASE                               */
+      171     2974    1           RETURN;
+      172     2975    1   NO_MEM:
+      173     2976    1           QQ_GLOBAL.ERR = CODE_NO_POOLMEM;
+      174     2977    1           CALL QQC$SCREECH;
+      175     2978    1   END QQA$FPCHNG;
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:9    
+--  Include file information  --
+
+   Q_ERRCODE_C.:E05TOU  is referenced.
+   QQ_PERR_C.:E05TOU  is referenced.
+   QT_MACROS_C.:E05TOU  is referenced.
+   QQ_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   QQ_MACROS_C.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   Q_PAGE_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure QQA$FPCHNG.
+
+   Procedure QQA$FPCHNG requires 167 words for executable code.
+   Procedure QQA$FPCHNG requires 34 words of local(AUTO) storage.
+
+    No errors detected in file QQA$FPCHNG.:E05TSI    .
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:10   
+
+ Object Unit name= QQA$FPCHNG                                 File name= QQA$FPCHNG.:E05TOU
+ UTS= JUL 30 '97 05:23:02.16 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   DCB   even  none     0      0  M$UC
+    1   DCB   even  none     0      0  M$CG
+    2   Data  even  none    20     24  QQA$FPCHNG
+    3  RoData even  UTS     22     26  QQA$FPCHNG
+    4   Proc  even  none   167    247  QQA$FPCHNG
+    5  RoData even  none     5      5  QQA$FPCHNG
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     4      0   yes            yes      Std        0  QQA$FPCHNG
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       3 QQC$FINDSTA
+         yes           Std       0 QQC$SCREECH
+         yes           Std       2 QQC$RLS_BLK
+         yes           Std       2 QQA$SETFP
+ yes     yes           Std       3 QQC$GET_BLK
+ yes     yes           Std       4 QQA$BYTYPE
+                       nStd      0 X66_AUTO_0
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:11   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     M$UC                                  QQ_GLOBAL                             M$CG
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID                                 NULLSID
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:12   
+
+
+        1        1        /*M* QQA$FPCHNG - Process FPRG status change events */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* IND=2, DCI=4, CSU=2, ECU=4, DTI=2, CTI=4, AND */
+        8        8        /*P* NAME:        QQA$FPCHNG
+        9        9             PURPOSE:     To process FPRG status change events of CG_FPEXIT#,
+       10       10                          CG_FPABORT# and CG_FPLDTRC#
+       11       11        */
+       12       12        /*D* NAME:        QQA$FPCHNG
+       13       13             CALL:        CALL QQA$FPCHNG
+       14       14             INPUT:       Contents of the *AUEV status change event message
+       15       15             OUTPUT:      None
+       16       16             DESCRIPTION: QQA$FPCHNG handles processing of FPRG status change
+       17       17                          events of CG_FPLDTRC#, CG_FPEXIT# and CG_FPABORT#.
+       18       18
+       19       19                          CG_FPLDTRC# status changes simply cause us to place
+       20       20                          '(name)' into TP$STATION.FP if this is not a LOAD-BY-TYPE
+       21       21                          initiated M$LDTRC, otherwise we move TP$STATION.PEND_FP
+       22       22                          into TP$STATION.FP and clear PEND_FP.  At this point
+       23       23                          the buffer pointed to by QQ_GLOBAL.CMDBUF$ is set to
+       24       24                          be pointed at by TP$STATION.FPLDTRC$.  The buffer
+       25       25                          represents B$CGAURD (4 bytes) followed by VLP_FPRG.
+       26       26                          Note TP$STATION.FPLDTRC$ will point to the start of
+       27       27                          VLP_FPRG.  This info is used in QQA$FPABT and probably
+       28       28                          will be used in the SPY command.
+       29       29
+       30       30                          CG_FPEXIT# status changes may be one of several
+       31       31                          conditions:
+       32       32                             1) A command forms program exiting as the final
+       33       33                                step of a BEGIN or DEBUG command. In this case,
+       34       34                                TP$STATION.QT$FORM$ will be non-NIL. We will
+       35       35                                call QQA$SETFP with TP$STATION.QT$FORM$->QT$FORM
+       36       36                                to finish the BEGIN or DEBUG command and also
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:13   
+       37       37                                place TP$STATION.PEND_FP into TP$STATION.FP.
+       38       38                             2) A non- command forms program exiting. In this
+       39       39                                case, TP$STATION.FP~='*DFLT' and we respond
+       40       40                                by re-starting the command forms program.
+       41       41                             3) A command forms program exiting. In this case,
+       42       42                                TP$STATION.FP='*DFLT' and we respond by
+       43       43                                issuing an M$DEACTIVATE/DISCONNECT to remove
+       44       44                                the station.
+       45       45
+       46       46                          CG_FPABORT# status changes may be one of several
+       47       47                          conditions:
+       48       48                             1) A non- command forms program aborting. In this
+       49       49                                case, TP$STATION.FP~='*DFLT' and we respond by
+       50       50                                re-starting the command forms program.
+       51       51                             2) The command forms program aborting due to
+       52       52                                ctl-Y. We respond by re-starting the command
+       53       53                                forms program unless this program was also
+       54       54                                the default forms program (ie via BEGIN type
+       55       55                                BY DEFAULT) in which case the station is
+       56       56                                deactivated.
+       57       57                             3) The command forms program aborting due to
+       58       58                                something other than ctl-Y. We respond by
+       59       59                                issuing an M$DEACTIVATE/DISCONNECT to remove
+       60       60                                the station.
+       61       61        */
+       62       62
+       63       63        QQA$FPCHNG: PROC;
+
+     63  4 000000   000000 700200 xent  QQA$FPCHNG   TSX0  ! X66_AUTO_0
+         4 000001   000042 000000                    ZERO    34,0
+
+       64       64        %INCLUDE Q_PAGE_C;
+       65       96        %SET LISTEXP = '1'B;
+       66       97        %PAGE(ARG="Includes");
+
+               114        /***************************************************************************
+               115         *                                                                         *
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:14   
+               116         *                                  Includes                               *
+               117         *                                                                         *
+               118         ***************************************************************************/
+
+       67      122        %INCLUDE B_ERRORS_C;
+       68     1249        %INCLUDE CP_6;
+       69     1330        %INCLUDE QQ_MACROS_C;
+       70     1755        %INCLUDE QQ_DATA_R;
+       71     2001        %INCLUDE QT_MACROS_C;
+       72     2159        %INCLUDE QQ_PERR_C;
+       73     2320        %INCLUDE Q_ERRCODE_C;
+       74     2343        %PAGE(ARG="Externally defined routines");
+
+              2360    1   /***************************************************************************
+              2361    1    *                                                                         *
+              2362    1    *                        Externally defined routines                      *
+              2363    1    *                                                                         *
+              2364    1    ***************************************************************************/
+
+       75     2368    1   DCL QQA$BYTYPE ENTRY(4) ALTRET;
+       76     2369    1   DCL QQA$SETFP ENTRY(2);
+       77     2370    1   DCL QQC$RLS_BLK ENTRY(2);
+       78     2371    1   DCL QQC$FINDSTA ENTRY(3);
+       79     2372    1   DCL QQC$GET_BLK ENTRY(3) ALTRET;
+       80     2373    1   DCL QQC$SCREECH ENTRY;
+       81     2374        %PAGE(ARG="Symrefs");
+
+              2391    1   /***************************************************************************
+              2392    1    *                                                                         *
+              2393    1    *                                  Symrefs                                *
+              2394    1    *                                                                         *
+              2395    1    ***************************************************************************/
+
+       82     2399    1   DCL B$TCB$ PTR SYMREF;
+       83     2400        %PAGE(ARG="DCBs");
+
+              2417    1   /***************************************************************************
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:15   
+              2418    1    *                                                                         *
+              2419    1    *                                    DCBs                                 *
+              2420    1    *                                                                         *
+              2421    1    ***************************************************************************/
+
+       84     2425    1   DCL M$CG DCB;
+       85     2426        %PAGE(ARG="Based");
+
+              2443    1   /***************************************************************************
+              2444    1    *                                                                         *
+              2445    1    *                                   Based                                 *
+              2446    1    *                                                                         *
+              2447    1    ***************************************************************************/
+
+       86     2451        %B$TCB;
+       87     2454        %B$ALT;
+       88     2462        %B$CGAURD(STCLASS="BASED(QQ_GLOBAL.CMDBUF$)");
+       89     2481        %TP$STATION;
+       90     2554        %QT$FORM(STCLASS=BASED);
+       91     2593    1   DCL 1 E$RR BASED ALIGNED,
+       92     2594    1         2 * BIT(19) UNAL,
+       93     2595    1         2 CODE UBIN(14) UNAL,
+       94     2596    1         2 * BIT(3) UNAL;
+       95     2597    1   DCL CHAR$STRING CHAR(CHAR_STRING_SIZE) BASED;
+       96     2598        %PAGE(ARG="Static");
+
+              2615    1   /***************************************************************************
+              2616    1    *                                                                         *
+              2617    1    *                                   Static                                *
+              2618    1    *                                                                         *
+              2619    1    ***************************************************************************/
+
+       97     2623    1   DCL STATION CHAR(8) STATIC;
+       98     2624        %PAGE(ARG="Auto");
+
+              2641    1   /***************************************************************************
+              2642    1    *                                                                         *
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:16   
+              2643    1    *                                    Auto                                 *
+              2644    1    *                                                                         *
+              2645    1    ***************************************************************************/
+
+       99     2649        %QT$FORM(FPTN=QT_FORM,STCLASS=AUTO);
+      100     2688    1   DCL FOUND_FLAG BIT(1) ALIGNED;
+      101     2689    1   DCL ERR UBIN;
+      102     2690    1   DCL CHAR_STRING_SIZE UBIN WORD;
+      103     2691        %PAGE(ARG="Error codes",PAGE=YES);
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:17   
+              2708    1   /***************************************************************************
+              2709    1    *                                                                         *
+              2710    1    *                                Error codes                              *
+              2711    1    *                                                                         *
+              2712    1    ***************************************************************************/
+
+      104     2716        %ERRCODE(NAME=CODE_NO_POOLMEM,CODE#=%E$NO_POOLMEM,FCG#=%FCG_QQ,MID#=%MID_A);
+      105     2723        %PAGE(ARG="EQUs");
+
+              2740    1   /***************************************************************************
+              2741    1    *                                                                         *
+              2742    1    *                                    EQUs                                 *
+              2743    1    *                                                                         *
+              2744    1    ***************************************************************************/
+
+      106     2748        %EQU_CG;
+      107     2796        %PAGE(ARG="FPTs");
+
+              2813    1   /***************************************************************************
+              2814    1    *                                                                         *
+              2815    1    *                                    FPTs                                 *
+              2816    1    *                                                                         *
+              2817    1    ***************************************************************************/
+
+      108     2821        %FPT_ACTIVATE(FPTN=FPT_DEACTIVATE,STCLASS=CONSTANT,
+      109     2822                      DCB=M$CG,STATION=STATION,DISCONNECT=YES);
+      110     2845        %PAGE(ARG="VLPs");
+
+              2862    1   /***************************************************************************
+              2863    1    *                                                                         *
+              2864    1    *                                    VLPs                                 *
+              2865    1    *                                                                         *
+              2866    1    ***************************************************************************/
+
+      111     2870        %VLP_FPRG;
+      112     2891        %PAGE(ARG="QQA$FPCHNG");
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:18   
+              2908    1   /***************************************************************************
+              2909    1    *                                                                         *
+              2910    1    *                                 QQA$FPCHNG                              *
+              2911    1    *                                                                         *
+              2912    1    ***************************************************************************/
+
+      113     2916    1           STATION=B$CGAURD.STATION;
+
+   2916  4 000002   000052 470400 xsym               LDP0    QQ_GLOBAL+42
+         4 000003   040000 100500                    MLR     fill='040'O
+         4 000004   000001 000010                    ADSC9   1,,PR0                   cn=0,n=8
+         4 000005   000000 000010 2                  ADSC9   STATION                  cn=0,n=8
+
+      114     2917    1           CALL QQC$FINDSTA(B$CGAURD.STATION,S$,FOUND_FLAG);
+
+   2917  4 000006   200033 631500                    EPPR1   FOUND_FLAG,,AUTO
+         4 000007   200040 451500                    STP1    CHAR_STRING_SIZE+3,,AUTO
+         4 000010   200003 633500                    EPPR3   S$,,AUTO
+         4 000011   200037 453500                    STP3    CHAR_STRING_SIZE+2,,AUTO
+         4 000012   000052 236000 xsym               LDQ     QQ_GLOBAL+42
+         4 000013   000001 036003                    ADLQ    1,DU
+         4 000014   200036 756100                    STQ     CHAR_STRING_SIZE+1,,AUTO
+         4 000015   200036 630500                    EPPR0   CHAR_STRING_SIZE+1,,AUTO
+         4 000016   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         4 000017   000000 701000 xent               TSX1    QQC$FINDSTA
+         4 000020   000000 011000                    NOP     0
+
+      115     2918                /*
+      116     2919                   Check if FOUND on stationlist, if not,
+      117     2920                   he was probably subject to STATIONMAX exceeded.
+      118     2921                */
+      119     2922    2           IF ~ FOUND_FLAG THEN DO;
+
+   2922  4 000021   200033 236100                    LDQ     FOUND_FLAG,,AUTO
+         4 000022   400000 376003                    ANQ     -131072,DU
+         4 000023   400000 676003                    ERQ     -131072,DU
+         4 000024   000031 600000 4                  TZE     s:2927
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:19   
+
+      120     2923    2               CALL M$DEACTIVATE(FPT_DEACTIVATE);
+
+   2923  4 000025   000002 630400 3                  EPPR0   FPT_DEACTIVATE
+         4 000026   100001 713400                    CLIMB   32769
+         4 000027   401400 401760                    pmme    nvectors=4
+
+      121     2924    2               RETURN;
+
+   2924  4 000030   000000 702200 xent               TSX2  ! X66_ARET
+
+      122     2925    2             END;
+      123     2926
+      124     2927    2           DO CASE(B$CGAURD.EVENT);
+
+   2927  4 000031   000052 470400 xsym               LDP0    QQ_GLOBAL+42
+         4 000032   000000 235100                    LDA     0,,PR0
+         4 000033   000030 135007                    SBLA    24,DL
+         4 000034   000003 115007                    CMPA    3,DL
+         4 000035   000037 602005 4                  TNC     s:2927+6,AL
+         4 000036   000240 710000 4                  TRA     s:2974
+         4 000037   000113 710000 4                  TRA     s:2942
+         4 000040   000224 710000 4                  TRA     s:2968
+         4 000041   000042 710000 4                  TRA     s:2929
+
+      125     2928    2             CASE(26/* CG_FPLDTRC# */);
+
+      126     2929    2               IF TP$STATION.PEND_FP=' '
+
+   2929  4 000042   200003 471500                    LDP1    S$,,AUTO
+         4 000043   040000 106500                    CMPC    fill='040'O
+         4 000044   100006 000010                    ADSC9   6,,PR1                   cn=0,n=8
+         4 000045   000035 000001 xsym               ADSC9   B_VECTNIL+29             cn=0,n=1
+         4 000046   000053 601000 4                  TNZ     s:2932
+
+      127     2930    2               THEN TP$STATION.FP='(name)';
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:20   
+   2930  4 000047   040100 100400                    MLR     fill='040'O
+         4 000050   000022 000006 3                  ADSC9   FPT_DEACTIVATE+16        cn=0,n=6
+         4 000051   100002 000010                    ADSC9   2,,PR1                   cn=0,n=8
+         4 000052   000063 710000 4                  TRA     s:2935
+
+      128     2931    3               ELSE DO;
+
+      129     2932    3                   TP$STATION.FP=TP$STATION.PEND_FP;
+
+   2932  4 000053   040100 100500                    MLR     fill='040'O
+         4 000054   100006 000010                    ADSC9   6,,PR1                   cn=0,n=8
+         4 000055   100002 000010                    ADSC9   2,,PR1                   cn=0,n=8
+
+      130     2933    3                   TP$STATION.PEND_FP=' ';
+
+   2933  4 000056   200003 470500                    LDP0    S$,,AUTO
+         4 000057   000035 235000 xsym               LDA     B_VECTNIL+29
+         4 000060   000035 236000 xsym               LDQ     B_VECTNIL+29
+         4 000061   000006 755100                    STA     6,,PR0
+         4 000062   000007 756100                    STQ     7,,PR0
+
+      131     2934    3                 END;
+
+      132     2935    2               IF TP$STATION.FPLDTRC$ = ADDR(NIL) THEN
+
+   2935  4 000063   200003 470500                    LDP0    S$,,AUTO
+         4 000064   000017 236100                    LDQ     15,,PR0
+         4 000065   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         4 000066   000100 601000 4                  TNZ     s:2938
+
+      133     2936    2                 CALL QQC$GET_BLK(QQ_GLOBAL.POOL$,SIZEW(VLP_FPRG),TP$STATION.FPLDTRC$)
+
+   2936  4 000067   200003 236100                    LDQ     S$,,AUTO
+         4 000070   000017 036003                    ADLQ    15,DU
+         4 000071   200040 756100                    STQ     CHAR_STRING_SIZE+3,,AUTO
+         4 000072   000002 237000 5                  LDAQ    2
+         4 000073   200036 757100                    STAQ    CHAR_STRING_SIZE+1,,AUTO
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:21   
+         4 000074   200036 630500                    EPPR0   CHAR_STRING_SIZE+1,,AUTO
+         4 000075   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         4 000076   000000 701000 xent               TSX1    QQC$GET_BLK
+         4 000077   000241 702000 4                  TSX2    NO_MEM
+
+      134     2937    2                     ALTRET(NO_MEM);
+      135     2938    2               CHAR_STRING_SIZE = SIZEC(VLP_FPRG);
+
+   2938  4 000100   000110 235007                    LDA     72,DL
+         4 000101   200035 755100                    STA     CHAR_STRING_SIZE,,AUTO
+
+      136     2939    2               TP$STATION.FPLDTRC$ -> CHAR$STRING = PINCRW(QQ_GLOBAL.CMDBUF$,
+
+   2939  4 000102   200003 470500                    LDP0    S$,,AUTO
+         4 000103   000017 471500                    LDP1    15,,PR0
+         4 000104   000052 473400 xsym               LDP3    QQ_GLOBAL+42
+         4 000105   000000 620005                    EAX0    0,AL
+         4 000106   200035 721100                    LXL1    CHAR_STRING_SIZE,,AUTO
+         4 000107   040140 100540                    MLR     fill='040'O
+         4 000110   300004 000010                    ADSC9   4,,PR3                   cn=0,n=*X0
+         4 000111   100000 000011                    ADSC9   0,,PR1                   cn=0,n=*X1
+         4 000112   000240 710000 4                  TRA     s:2974
+
+      137     2940    2                   SIZEW(B$CGAURD)) -> CHAR$STRING;
+      138     2941    2             CASE(24/* CG_FPEXIT# */);
+
+      139     2942    3               IF TP$STATION.FPLDTRC$~=ADDR(NIL) THEN DO;
+
+   2942  4 000113   200003 471500                    LDP1    S$,,AUTO
+         4 000114   100017 236100                    LDQ     15,,PR1
+         4 000115   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         4 000116   000132 600000 4                  TZE     s:2946
+
+      140     2943    3                   CALL QQC$RLS_BLK(QQ_GLOBAL.POOL$, TP$STATION.FPLDTRC$);
+
+   2943  4 000117   200003 236100                    LDQ     S$,,AUTO
+         4 000120   000017 036003                    ADLQ    15,DU
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:22   
+         4 000121   000002 235000 5                  LDA     2
+         4 000122   200036 757100                    STAQ    CHAR_STRING_SIZE+1,,AUTO
+         4 000123   200036 630500                    EPPR0   CHAR_STRING_SIZE+1,,AUTO
+         4 000124   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         4 000125   000000 701000 xent               TSX1    QQC$RLS_BLK
+         4 000126   000000 011000                    NOP     0
+
+      141     2944    3                   TP$STATION.FPLDTRC$=ADDR(NIL);
+
+   2944  4 000127   000001 236000 xsym               LDQ     B_VECTNIL+1
+         4 000130   200003 470500                    LDP0    S$,,AUTO
+         4 000131   000017 756100                    STQ     15,,PR0
+
+      142     2945    3                 END;
+
+      143     2946    3               IF TP$STATION.FLAGS.IS_QT$FORM THEN DO;
+
+   2946  4 000132   200003 470500                    LDP0    S$,,AUTO
+         4 000133   000022 430100                    FSZN    18,,PR0
+         4 000134   000151 605000 4                  TPL     s:2950
+
+      144     2947    3                   CALL QQA$SETFP(S$,TP$STATION.QT$FORM$->QT$FORM);
+
+   2947  4 000135   000015 471500                    LDP1    13,,PR0
+         4 000136   200037 451500                    STP1    CHAR_STRING_SIZE+2,,AUTO
+         4 000137   200003 633500                    EPPR3   S$,,AUTO
+         4 000140   200036 453500                    STP3    CHAR_STRING_SIZE+1,,AUTO
+         4 000141   200036 630500                    EPPR0   CHAR_STRING_SIZE+1,,AUTO
+         4 000142   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         4 000143   000000 701000 xent               TSX1    QQA$SETFP
+         4 000144   000000 011000                    NOP     0
+
+      145     2948    3                   TP$STATION.FLAGS.IS_QT$FORM = '0'B;
+
+   2948  4 000145   200003 470500                    LDP0    S$,,AUTO
+         4 000146   000001 236000 5                  LDQ     1
+         4 000147   000022 356100                    ANSQ    18,,PR0
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:23   
+
+      146     2949    3                 END;
+
+   2949  4 000150   000240 710000 4                  TRA     s:2974
+
+      147     2950    3               ELSE IF TP$STATION.FP~='*DFLT' THEN DO;
+
+   2950  4 000151   040000 106500                    CMPC    fill='040'O
+         4 000152   000002 000010                    ADSC9   2,,PR0                   cn=0,n=8
+         4 000153   000024 000005 3                  ADSC9   FPT_DEACTIVATE+18        cn=0,n=5
+         4 000154   000216 600000 4                  TZE     DACT
+
+      148     2951                          /*  When Default forms program exits or if it
+      149     2952                              should abort, the TP station is logged off the
+      150     2953                              system.
+      151     2954                          */
+      152     2955    4   STCFP:            IF TP$STATION.DFLT_FP = TP$STATION.FP THEN DO;
+
+   2955  4 000155   200003 470500       STCFP        LDP0    S$,,AUTO
+         4 000156   040100 106500                    CMPC    fill='040'O
+         4 000157   000004 000010                    ADSC9   4,,PR0                   cn=0,n=8
+         4 000160   000002 000010                    ADSC9   2,,PR0                   cn=0,n=8
+         4 000161   000171 601000 4                  TNZ     s:2960
+
+      153     2956    4                         IF B$CGAURD.EVENT = 24 THEN
+
+   2956  4 000162   000052 471400 xsym               LDP1    QQ_GLOBAL+42
+         4 000163   100000 235100                    LDA     0,,PR1
+         4 000164   000030 115007                    CMPA    24,DL
+         4 000165   000170 601000 4                  TNZ     s:2958
+
+      154     2957    4                           TP$STATION.FLAGS.DISCONNECT = '1'B;
+
+   2957  4 000166   020000 236003                    LDQ     8192,DU
+         4 000167   000022 256100                    ORSQ    18,,PR0
+
+      155     2958    4                         GOTO DACT;
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:24   
+
+   2958  4 000170   000216 710000 4                  TRA     DACT
+
+      156     2959    4                       END;
+      157     2960    3                     CALL QQA$BYTYPE(S$,QT_FORM,'*DFLT   ',ERR) ALTRET(DACT);
+
+   2960  4 000171   200034 631500                    EPPR1   ERR,,AUTO
+         4 000172   200041 451500                    STP1    CHAR_STRING_SIZE+4,,AUTO
+         4 000173   000004 236000 5                  LDQ     4
+         4 000174   200040 756100                    STQ     CHAR_STRING_SIZE+3,,AUTO
+         4 000175   200004 633500                    EPPR3   QT_FORM,,AUTO
+         4 000176   200037 453500                    STP3    CHAR_STRING_SIZE+2,,AUTO
+         4 000177   200003 634500                    EPPR4   S$,,AUTO
+         4 000200   200036 454500                    STP4    CHAR_STRING_SIZE+1,,AUTO
+         4 000201   200036 630500                    EPPR0   CHAR_STRING_SIZE+1,,AUTO
+         4 000202   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         4 000203   000000 701000 xent               TSX1    QQA$BYTYPE
+         4 000204   000216 702000 4                  TSX2    DACT
+
+      158     2961    3                     CALL QQA$SETFP(S$,QT_FORM);
+
+   2961  4 000205   200004 630500                    EPPR0   QT_FORM,,AUTO
+         4 000206   200037 450500                    STP0    CHAR_STRING_SIZE+2,,AUTO
+         4 000207   200003 631500                    EPPR1   S$,,AUTO
+         4 000210   200036 451500                    STP1    CHAR_STRING_SIZE+1,,AUTO
+         4 000211   200036 630500                    EPPR0   CHAR_STRING_SIZE+1,,AUTO
+         4 000212   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         4 000213   000000 701000 xent               TSX1    QQA$SETFP
+         4 000214   000000 011000                    NOP     0
+
+      159     2962    3                   END;
+
+   2962  4 000215   000240 710000 4                  TRA     s:2974
+
+      160     2963    2                 ELSE
+      161     2964    3   DACT:           CALL M$DEACTIVATE(FPT_DEACTIVATE) WHENALTRETURN DO;
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:25   
+   2964  4 000216   000002 630400 3     DACT         EPPR0   FPT_DEACTIVATE
+         4 000217   500001 713400                    CLIMB   alt,+32769
+         4 000220   401400 401760                    pmme    nvectors=4
+         4 000221   000223 702000 4                  TSX2    s:2965
+         4 000222   000223 710000 4                  TRA     s:2965
+
+      162     2965    3                     END;
+
+   2965  4 000223   000240 710000 4                  TRA     s:2974
+
+      163     2966
+      164     2967    2             CASE(25/* CG_FPABORT# */);
+
+      165     2968    2               IF TP$STATION.FP~='*DFLT' THEN GOTO STCFP;
+
+   2968  4 000224   200003 471500                    LDP1    S$,,AUTO
+         4 000225   040000 106500                    CMPC    fill='040'O
+         4 000226   100002 000010                    ADSC9   2,,PR1                   cn=0,n=8
+         4 000227   000024 000005 3                  ADSC9   FPT_DEACTIVATE+18        cn=0,n=5
+         4 000230   000155 601000 4                  TNZ     STCFP
+
+      166     2969    2               ELSE IF ADDR(B$CGAURD.INFO)->E$RR.CODE=1059
+
+   2969  4 000231   000003 236100                    LDQ     3,,PR0
+         4 000232   377770 376007                    ANQ     131064,DL
+         4 000233   020430 116007                    CMPQ    8472,DL
+         4 000234   000155 600000 4                  TZE     STCFP
+         4 000235   020400 116007                    CMPQ    8448,DL
+         4 000236   000155 600000 4                  TZE     STCFP
+
+      167     2970    2                     OR ADDR(B$CGAURD.INFO)->E$RR.CODE=1056
+      168     2971    2                 THEN GOTO STCFP;
+      169     2972    2                 ELSE GOTO DACT;
+
+   2972  4 000237   000216 710000 4                  TRA     DACT
+
+      170     2973    2           END;                            /* CASE                               */
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:26   
+
+      171     2974    1           RETURN;
+
+   2974  4 000240   000000 702200 xent               TSX2  ! X66_ARET
+
+      172     2975    1   NO_MEM:
+      173     2976    1           QQ_GLOBAL.ERR = CODE_NO_POOLMEM;
+
+   2976  4 000241   000000 236000 3     NO_MEM       LDQ     CODE_NO_POOLMEM
+         4 000242   000000 756000 xsym               STQ     QQ_GLOBAL
+
+      174     2977    1           CALL QQC$SCREECH;
+
+   2977  4 000243   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         4 000244   000000 701000 xent               TSX1    QQC$SCREECH
+         4 000245   000000 011000                    NOP     0
+
+      175     2978    1   END QQA$FPCHNG;
+
+   2978  4 000246   000000 702200 xent               TSX2  ! X66_ARET
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:27   
+--  Include file information  --
+
+   Q_ERRCODE_C.:E05TOU  is referenced.
+   QQ_PERR_C.:E05TOU  is referenced.
+   QT_MACROS_C.:E05TOU  is referenced.
+   QQ_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   QQ_MACROS_C.:E05TOU  is referenced.
+   CP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   Q_PAGE_C.:E05TOU  is referenced.
+   B$JIT_C.:E05TOU  was found in the system file and is never referenced.
+   CP_6_C.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure QQA$FPCHNG.
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:28   
+
+ **** Variables and constants ****
+
+  ****  Section 002  Data  QQA$FPCHNG
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/c CHAR(8)     r     1 STATION                    2-0-0/d STRC(612)   r     1 VLP_FPRG
+
+  ****  Section 003 RoData QQA$FPCHNG
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/b STRC        r     1 CODE_NO_POOLMEM            2-0-0/d STRC(576)   r     1 FPT_DEACTIVATE
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    35-0-0/w UBIN        r     1 CHAR_STRING_SIZE          34-0-0/w UBIN        r     1 ERR
+    33-0-0/w BIT         r     1 FOUND_FLAG                 4-0-0/w STRC(828)   r     1 QT_FORM
+     3-0-0/w PTR         r     1 S$
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(9090)  r     1 QQ_GLOBAL
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:29   
+     0-0-0/w STRC(144)   r     1 B$CGAURD                   0-0-0/c ACHR        r     1 CHAR$STRING
+     0-0-0/w STRC        r     1 E$RR                       0-0-0N  NULL        r     1 M$CG
+     0-0-0/w STRC(828)   r     1 QT$FORM                    0-0-0/w STRC(909)   r     1 TP$STATION
+
+
+   Procedure QQA$FPCHNG requires 167 words for executable code.
+   Procedure QQA$FPCHNG requires 34 words of local(AUTO) storage.
+
+    No errors detected in file QQA$FPCHNG.:E05TSI    .
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:30   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:31   
+          MINI XREF LISTING
+
+B$ALT.CODE
+      2456**DCL      2456--REDEF    2457--REDEF    2457--REDEF
+B$ALT.ERR.ERR#
+      2458**DCL      2458--REDEF
+B$ALT.EVID
+      2457**DCL      2457--REDEF    2457--REDEF
+B$CGAURD
+      2474**DCL      2939--ASSIGN
+B$CGAURD.EVENT
+      2478**DCL      2927>>DOCASE   2956>>IF
+B$CGAURD.INFO
+      2479**DCL      2969--IF       2969--IF
+B$CGAURD.STATION
+      2478**DCL      2478--REDEF    2916>>ASSIGN   2917<>CALL
+CHAR$STRING
+      2597**DCL      2939<<ASSIGN   2939>>ASSIGN
+CHAR_STRING_SIZE
+      2690**DCL      2597--IMP-SIZ  2938<<ASSIGN   2939>>ASSIGN   2939>>ASSIGN
+CODE_NO_POOLMEM
+      2717**DCL      2976>>ASSIGN
+DACT
+      2964**LABEL    2958--GOTO     2960--CALLALT  2972--GOTO
+E$RR.CODE
+      2595**DCL      2969>>IF       2969>>IF
+ERR
+      2689**DCL      2960<>CALL
+FOUND_FLAG
+      2688**DCL      2917<>CALL     2922>>IF
+FPT_DEACTIVATE
+      2833**DCL      2923<>CALL     2964<>CALL
+FPT_DEACTIVATE.V
+      2834**DCL      2833--DCLINIT
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:32   
+FPT_DEACTIVATE.V.DVBYTE.REREAD#
+      2836**DCL      2836--REDEF
+M$DEACTIVATE
+      1278**DCL-ENT  2923--CALL     2964--CALL
+NO_MEM
+      2976**LABEL    2936--CALLALT
+QQA$BYTYPE
+      2368**DCL-ENT  2960--CALL
+QQA$SETFP
+      2369**DCL-ENT  2947--CALL     2961--CALL
+QQC$FINDSTA
+      2371**DCL-ENT  2917--CALL
+QQC$GET_BLK
+      2372**DCL-ENT  2936--CALL
+QQC$RLS_BLK
+      2370**DCL-ENT  2943--CALL
+QQC$SCREECH
+      2373**DCL-ENT  2977--CALL
+QQ_GLOBAL.CMDBUF$
+      1772**DCL      2474--IMP-PTR  2916>>ASSIGN   2917>>CALL     2927>>DOCASE   2939>>ASSIGN   2956>>IF
+      2969>>IF       2969>>IF
+QQ_GLOBAL.DS1$_BITS
+      1775**DCL      1775--REDEF
+QQ_GLOBAL.DS2$_BITS
+      1775**DCL      1776--REDEF
+QQ_GLOBAL.DS3$_BITS
+      1776**DCL      1776--REDEF
+QQ_GLOBAL.DS4$_BITS
+      1776**DCL      1777--REDEF
+QQ_GLOBAL.ERR
+      1765**DCL      2976<<ASSIGN
+QQ_GLOBAL.POOL$
+      1776**DCL      2936<>CALL     2943<>CALL
+QT$FORM
+      2565**DCL      2947<>CALL
+QT_FORM
+PL6.E3A0      #001=QQA$FPCHNG File=QQA$FPCHNG.:E05TSI                            WED 07/30/97 05:23 Page:33   
+      2660**DCL      2960<>CALL     2961<>CALL
+S$
+      2493**DCL      2495--IMP-PTR  2917<>CALL     2929>>IF       2930>>ASSIGN   2932>>ASSIGN   2932>>ASSIGN
+      2933>>ASSIGN   2935>>IF       2936>>CALL     2939>>ASSIGN   2942>>IF       2943>>CALL     2944>>ASSIGN
+      2946>>IF       2947<>CALL     2947>>CALL     2948>>ASSIGN   2950>>IF       2955>>IF       2955>>IF
+      2957>>ASSIGN   2960<>CALL     2961<>CALL     2968>>IF
+STATION
+      2623**DCL      2833--DCLINIT  2916<<ASSIGN
+STCFP
+      2955**LABEL    2968--GOTO     2971--GOTO
+TP$STATION.DFLT_FP
+      2500**DCL      2955>>IF
+TP$STATION.FLAGS.DISCONNECT
+      2531**DCL      2957<<ASSIGN
+TP$STATION.FLAGS.IS_QT$FORM
+      2539**DCL      2946>>IF       2948<<ASSIGN
+TP$STATION.FP
+      2498**DCL      2930<<ASSIGN   2932<<ASSIGN   2950>>IF       2955>>IF       2968>>IF
+TP$STATION.FPLDTRC$
+      2515**DCL      2935>>IF       2936<>CALL     2939>>ASSIGN   2942>>IF       2943<>CALL     2944<<ASSIGN
+TP$STATION.PEND_FP
+      2502**DCL      2929>>IF       2932>>ASSIGN   2933<<ASSIGN
+TP$STATION.QT$FORM$
+      2511**DCL      2947>>CALL
+VLP_FPRG
+      2881**DCL      2936--CALL     2938--ASSIGN

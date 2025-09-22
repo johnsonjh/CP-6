@@ -1,0 +1,1039 @@
+/*M* GOFER - Finds character string expressions in files     */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+/*X* PLM=4,STI=2,IND=2,CTI=4,DCI=5,PRB=YES,ECI=3,CSI=3,THI=2,DTI=2,
+     DIN=2,ENI=2,CLM=0,CCC,SQB,MCI,NTB,MOC,CCI=3,MCR=NO,NLB,MCL=0,EDMC  */
+/*X* DDA */
+ 
+GOFER: PROC MAIN;
+ 
+  DCL M$LO DCB;
+  DCL M$GOFER DCB;
+  DCL M$DO DCB;
+ 
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B_ERRORS_C;
+%INCLUDE B_MICROPS_C;
+  %INCLUDE B$TABLES_C;
+  %INCLUDE B$JIT;
+  DCL B$JIT$ PTR SYMREF;
+ 
+%EQU GRANULE_SIZE=1024;
+%EQU GRANULE_SIZE_BYTES=GRANULE_SIZE*4;
+%EQU MAX_GRANS=32;          /* maximum number of granules to cache */
+ 
+%B$TCB;
+DCL B$TCB$ PTR SYMREF;
+%B$ALT;
+%F$DCB (DCBN = GOFER$DCB, STCLASS = "BASED (M$GOFER$)");
+  %B$SR_NON_ZERO;
+DCL GFR$APPEND ENTRY(1) CONV(0);
+DCL GFR$APPEND_COMP ENTRY(1) CONV(0);
+DCL GFR$MATCH ENTRY ALTRET;
+DCL APPEND_VFC BIT(72) DALIGNED SYMREF;
+DCL APPEND_NO_VFC BIT(72) DALIGNED SYMREF;
+ 
+DCL EDIT_MOPS(0:7) BIT(9) CALIGNED CONSTANT INIT
+                   (%MVZB4,%MVC1,%SES10,%INSB7,%MVC3,%INSM1,%INSP4,%INSM1);
+DCL SEQ_MOPS(0:5)  BIT(9) CALIGNED CONSTANT INIT
+                   (%INSM1,%MVZB7,%MVC1,%INSM1,%INSP4,%INSM1);
+DCL TEMP_CHAR8 CHAR(8);
+ 
+%VLP_SN(N=1);
+%VLP_NAME(LEN=31);
+%VLP_ACCT;
+%VLP_PASS;
+%VLP_WSN;
+%FPT_FID   (FPTN =                 GET_FID);
+%FPT_OPEN  (FPTN =                 OPEN_INPUT,
+            SHARE = IN,
+            THISF = YES,
+            NXTF = YES,
+            FUN = IN,
+            ACS = SEQUEN,
+            DCB=M$GOFER);
+%FPT_READ  (FPTN =                 READ_INPUT,
+            DCB = M$GOFER,
+            STRPVFC = YES,
+            KEYR = YES,
+            KEY = INPUT_KEY,
+            BUF = READ_BUF.BUF);
+%FPT_WRITE (FPTN =                 WRITE_INPUT,
+            DCB = M$LO,
+            BUF = READ_BUF);
+%FPT_WRITE (FPTN =                 WRITE_FID,
+            DCB = M$LO,
+            BUF = CHECK_FID);
+%FPT_CLOSE (FPTN =                 CLOSE_OUTPUT,
+            DISP = SAVE,
+            DCB = M$LO);
+%FPT_CLOSE (FPTN =                 CLOSE_INPUT,
+            DCB = M$GOFER);
+%FPT_ERRMSG (FPTN =                MONITOR_ERR,
+             BUF = READ_BUF.BUF,
+             CODE = ERROR#,
+             DCB = M$GOFER,
+             OUTDCB1 = M$DO);
+%FPT_GDP    (FPTN =                GET_PAGES,
+             PAGES = %MAX_GRANS,
+             RESULTS = GRAN_VECTOR);
+ 
+%FPT_EXIT;
+/** "STATIC" info used by the I/O routines, and GOFER **/
+ 
+DCL GRANULE# SBIN STATIC;
+DCL GRANX# SBIN;
+DCL LGRANX# SBIN;
+DCL LCRECX# SBIN;
+DCL CRECX# SBIN;
+DCL CRECNO# SBIN;
+DCL EOF# BIT(1);
+DCL ORG# UBIN;
+DCL 1 RSIZE# STATIC SYMDEF DALIGNED,  /* number of characters READ */
+      2 LEN SBIN ALIGNED,
+      2 *   SBIN ALIGNED;
+DCL LDS# SBIN;                        /* number of E$LDs on READs */
+DCL NGRANS# SBIN;                     /* number of granules in file */
+DCL KEYX# SBIN;                       /* index of currect key gran */
+DCL KEYRECX# (0:280) SBIN;            /* unpacked index to keys    */
+DCL NUMKEYS# SBIN;                    /* number of keys in KEYRECX */
+DCL QUICK_ACS# SBIN;                  /* file access mode if quick */
+DCL APPENDV EPTR;   /* append routine for compressed or uncomp data */
+DCL APPEND ENTRY(1) CONV(0) BASED;
+DCL GRAN_VECTOR VECTOR STATIC;        /* frames all granules to read */
+%VLP_ERRCODE(FPTN= ERROR#, STCLASS="STATIC SYMDEF");
+ 
+DCL CBUF$ (0:%(MAX_GRANS-1)) PTR;     /* pointer to each file gran */
+DCL GRANNUM (0:%(MAX_GRANS-1)) SBIN;
+DCL GRAN_AGE (0:%(MAX_GRANS-1)) SBIN;
+DCL GRANULE_ (0:%(GRANULE_SIZE-1)) SBIN BASED;
+%EQU MAX_GRAN_AGE=BITBIN('377777777777'O);
+ 
+  DCL HEAD$ PTR STATIC SYMDEF; /* points to boolean string definition */
+  DCL TEMP# SBIN STATIC SYMDEF;
+  DCL IDXSTRL# SBIN STATIC SYMDEF INIT (0);
+  DCL NBASE$ PTR;
+  DCL PASS_NODE   BIT(36) CONSTANT INIT ('000000400001'O);
+  DCL FAIL_NODE   BIT(36) CONSTANT INIT ('000000400000'O);
+  DCL I SBIN;
+  DCL SRCH_FID$ PTR;
+ 
+  DCL 1 READ_BUF STATIC SYMDEF,
+        2 KEY CHAR(12) CALIGNED INIT ('********* - '),
+        2 BUF CHAR(256) CALIGNED,
+        2 BUFC (0:255) REDEF BUF UBIN(9) UNAL;
+  DCL JUNK SBIN STATIC;
+  DCL FILE_COUNT SBIN STATIC INIT (0);
+  DCL FILE_MATCH UBIN STATIC INIT (0);
+  DCL FILE_NAME_PRINTED BIT (1);
+  DCL M$GOFER$ PTR;
+  DCL NUM_LENGTH SBIN;
+  DCL ALL_TYPES BIT(1) ALIGNED;
+  DCL IDX SBIN;
+ 
+  DCL 1 INPUT_KEY STATIC ALIGNED,     /* THE KEY READ FROM THE FILE */
+        2 COUNT UBIN BYTE CALIGNED,
+        2 KEY UBIN (27) UNAL;
+ 
+  DCL FILENAME CHAR (32) ALIGNED;   /* a copy of the input filename */
+  DCL FILELEN SBIN;            /* length of FILENAME including '?'s */
+  DCL NUMPARTS SBIN;               /* number of "parts" in FILENAME */
+  DCL FILE_IDX (0:16) SBIN;         /* index to "parts" in FILENAME */
+  DCL FILE_LEN (0:16) SBIN;        /* length of "parts" in FILENAME */
+  DCL FILE_WILD BIT(1) ALIGNED;    /* set if FILENAME contains '?'s */
+  DCL MORE_FILES BIT(1) ALIGNED;   /* set if more files to process */
+ 
+  DCL CHECK_FID CHAR(32) STATIC;   /* name of the last file openned */
+  DCL CHECK_LEN SBIN;                        /* length of CHECK_FID */
+  DCL SRCH_FID CHAR(32) BASED(SRCH_FID$);
+%EJECT;
+  CALL READ_IN_COMMAND_LINE;
+  IF B$JIT.PRIV.ACTIVE.FMBLK
+    THEN QUICK_ACS# = %BLOCK#;
+    ELSE QUICK_ACS# = %UBLOCK#;
+  M$GOFER$ = DCBADDR (DCBNUM (M$GOFER));
+  CALL M$GDP (GET_PAGES);
+  CBUF$(0) = VBASE (GRAN_VECTOR);
+  DO I = 1 TO %MAX_GRANS-1;
+     CBUF$(I) = PINCRW (CBUF$(I-1), %GRANULE_SIZE);
+  END;
+ 
+  DO UNTIL (NOT MORE_FILES); /* only loop once if the file isn't wild */
+    CALL GFR$OPEN ALTRET (EXITT);
+    FILE_COUNT = FILE_COUNT + 1;
+    FILE_NAME_PRINTED = '0'B;
+    DO WHILE ('1'B);
+      CALL GFR$READ ALTRET( GET_NEXT_FID );
+/**/
+      CALL GFR$MATCH
+      WHENRETURN DO;        /* a match was made */
+        IF (NOT FILE_NAME_PRINTED)
+          THEN DO;
+            IF (FILE_WILD) THEN CALL M$WRITE (WRITE_FID);
+            FILE_MATCH = FILE_MATCH + 1;
+            FILE_NAME_PRINTED = '1'B;
+          END;
+ 
+        IF (GOFER$DCB.ORG# = %KEYED#) AND (INPUT_KEY.COUNT = 3)
+          THEN DO;
+            CALL BINCHAR (TEMP_CHAR8, INPUT_KEY.KEY);
+            CALL EDITCHAR (READ_BUF.KEY, 0, 12, EDIT_MOPS, TEMP_CHAR8);
+          END;
+          ELSE DO;
+            CALL BINCHAR (TEMP_CHAR8, CRECNO#);
+            CALL EDITCHAR (READ_BUF.KEY, 0, 12, SEQ_MOPS, TEMP_CHAR8);
+          END;
+        WRITE_INPUT.BUF_.BOUND = NUM_LENGTH + RSIZE#.LEN;
+        CALL M$WRITE (WRITE_INPUT);
+      END;  /* whenreturn */
+    END; /* DO WHILE ('1'B); - READ THROUGH FILE LOOP */
+GET_NEXT_FID:;
+    CALL GFR$CLOSE;
+  END; /* DO UNTIL (NOT FILEWILD); - GO THROUGH FIDS LOOP */
+ 
+EXITT:;
+  CALL M$CLOSE (CLOSE_OUTPUT);
+  IF FILE_COUNT = 0
+   THEN DO;
+     CALL GFR$OUT ('could not find %c%/', SRCH_FID);
+     FPT_EXIT.V.STEPCC# = 4;
+     END;
+   ELSE DO;
+     DO SELECT (FILE_MATCH);
+      SELECT (0);
+        IF FILE_WILD
+         THEN CALL GFR$OUT ('no matches out of %s file(s) read%/', FILE_COUNT);
+         ELSE CALL GFR$OUT ('no match%/');
+        FPT_EXIT.V.STEPCC# = 2;
+      SELECT (1);
+        IF FILE_WILD
+         THEN CALL GFR$OUT ('1 match out of %s file(s) read%/', FILE_COUNT);
+         ELSE CALL GFR$OUT ('1 match%/');
+      SELECT (ELSE);
+        CALL GFR$OUT ('%s matches out of %s file(s) read%/', FILE_MATCH, FILE_COUNT);
+      END; /* select FILE_MATCH */
+     END;
+  CALL M$EXIT (FPT_EXIT);
+%EJECT;
+/*** MATCH_FID_NAME - match the name in M$GOFER to the user's    */
+/***                   wild-carded fid.  ALTRET if no match.     */
+ 
+MATCH_FID_NAME: PROC ALTRET;
+   DCL IDX SBIN;
+   DCL I SBIN;
+ 
+   CHECK_LEN = GOFER$DCB.NAME#.L;
+   CHECK_FID = SUBSTR (GOFER$DCB.NAME#.C, 0, CHECK_LEN);
+   OPEN_INPUT.NAME_ = VECTOR(NIL);
+ 
+   IDX = FILE_LEN(0);              /* part of file before first '?' */
+   IF IDX > 0
+      AND SUBSTR(CHECK_FID,0,IDX) ~= SUBSTR(FILENAME,0,IDX)
+     THEN DO;
+       IF SUBSTR(CHECK_FID,0,IDX) > SUBSTR(FILENAME,0,IDX)
+         THEN
+           MORE_FILES = %NO#;   /* we're past the wildcard boundary */
+       GOTO NOMATCH;
+     END;
+   IF NOT FILE_WILD
+     THEN DO;
+       IF IDX ~= FILELEN THEN GOTO NOMATCH;
+     END;
+     ELSE IF (NUMPARTS > 0) THEN DO;         /* more stuff to check */
+       DO I = 1 TO NUMPARTS-1;     /* go through parts between '?'s */
+         CALL INDEX (IDX, SUBSTR(FILENAME,FILE_IDX(I),FILE_LEN(I)),
+                          SUBSTR(CHECK_FID,0,CHECK_LEN), IDX) ALTRET (NOMATCH);
+       END;
+       IF FILE_LEN(NUMPARTS) > 0   /* a part after last '?' */
+          AND (IDX+FILE_LEN(NUMPARTS) > CHECK_LEN
+               OR SUBSTR (FILENAME,FILE_IDX(NUMPARTS),FILE_LEN(NUMPARTS)) ~=
+                  SUBSTR (CHECK_FID, CHECK_LEN-FILE_LEN(NUMPARTS), FILE_LEN(NUMPARTS)))
+         THEN
+           GOTO NOMATCH;
+     END;
+   RETURN;
+ 
+NOMATCH:
+   ALTRETURN;
+ 
+END MATCH_FID_NAME;
+%EJECT;
+/*** READ_IN_COMMAND_LINE - get the command line from B$JIT, and */
+/***                        initialize the processor with all    */
+/***                        the correct stuff.                   */
+ 
+READ_IN_COMMAND_LINE: PROC;
+  %INCLUDE XU_MACRO_C;
+  DCL BLK$ PTR;
+  %PARSE$OUT (NAME=OUT$BLK, STCLASS="BASED (BLK$)");
+  %PARSE$SYM (NAME=OUT$TEXT, STCLASS=BASED);
+  %FPT_OPEN (FPTN=OPEN_OUTPUT, FUN=CREATE, DCB=M$LO);
+  DCL XUG$INIT ENTRY(2) ALTRET;
+  DCL XUG$GETCMD ENTRY(1) ALTRET;
+  %XUG_INIT (GOODCMD=YES);
+  %XUG_GETCMD (NODES=GOFER_CMD);
+  DCL GOFER_CMD UBIN SYMREF;
+ 
+  DCL I SBIN;
+  DCL STRL SBIN;
+  DCL NEXT SBIN;
+ 
+  NUM_LENGTH = 11;
+  ALL_TYPES = %NO#;
+ 
+  CALL XUG$INIT (XUG_GETCMD, XUG_INIT) ALTRET (QUITT);
+  XUG_GETCMD.TEXT_ = VECTOR (SUBSTR (B$JIT.CCBUF, 0, B$JIT.CCARS));
+ 
+  CALL XUG$GETCMD (XUG_GETCMD) ALTRET (QUITT);
+  DO I = XUG_GETCMD.OUT$ -> OUT$BLK.NSUBLKS-1 DOWNTO 0;
+    BLK$ = XUG_GETCMD.OUT$ -> OUT$BLK.SUBLK$(I);
+    DO CASE (OUT$BLK.CODE);
+/**/
+      CASE (1,2,3);  /* NAME AND MODE OF OUTPUT FILE */
+        GET_FID.NAME_ = VECTOR (VLP_NAME);
+        GET_FID.ACCT_ = VECTOR (VLP_ACCT);
+        GET_FID.PASS_ = VECTOR (VLP_PASS);
+        GET_FID.SN_   = VECTOR (VLP_SN);
+        GET_FID.WSN_  = VECTOR (VLP_WSN);
+        GET_FID.ASN_  = VECTOR (OPEN_OUTPUT.V.ASN#);
+        GET_FID.V.CHECK.CCHARS# = %YES#;
+        GET_FID.TEXTFID_ = VECTOR (BLK$->OUT$BLK.SUBLK$(0)->OUT$TEXT.TEXT);
+        CALL M$FID (GET_FID);
+        OPEN_OUTPUT.V.EXIST# = OUT$BLK.CODE;
+        OPEN_OUTPUT.NAME_ = GET_FID.NAME_;
+        IF GET_FID.ACCT_ ~= VECTOR (NIL)
+          THEN OPEN_OUTPUT.ACCT_ = GET_FID.ACCT_;
+          ELSE OPEN_OUTPUT.ACCT_ = VECTOR (B$JIT.FACCN);
+        OPEN_OUTPUT.PASS_ = GET_FID.PASS_;
+        OPEN_OUTPUT.SN_   = GET_FID.SN_;
+        OPEN_OUTPUT.WSN_  = GET_FID.WSN_;
+        CALL M$OPEN (OPEN_OUTPUT);
+/**/
+      CASE (4);   /* NAME OF THIS PROCESSOR - IGNORE IT */
+/**/
+      CASE (5);    /* EXPRESSION TO LOOK FOR */
+        NBASE$ = XUG_GETCMD.OUT$;
+        CALL PARSE_EXPR (HEAD$, OUT$BLK.SUBLK$(0));
+/**/
+      CASE (6);   /* FILE LIST TO LOOK THROUGH */
+        GET_FID.NAME_ = VECTOR (VLP_NAME);
+        GET_FID.ACCT_ = VECTOR (VLP_ACCT);
+        GET_FID.PASS_ = VECTOR (VLP_PASS);
+        GET_FID.SN_   = VECTOR (VLP_SN);
+        GET_FID.WSN_  = VECTOR (VLP_WSN);
+        GET_FID.ASN_  = VECTOR (OPEN_INPUT.V.ASN#);
+        GET_FID.V.CHECK.CCHARS# = %NO#;
+        SRCH_FID$ = ADDR( BLK$->OUT$TEXT.COUNT );
+        GET_FID.TEXTFID_ = VECTOR (BLK$->OUT$TEXT.TEXT);
+        CALL M$FID (GET_FID);
+        FILELEN = VLP_NAME.L#;
+        FILENAME = SUBSTR (VLP_NAME.NAME#, 0, FILELEN);
+        FILE_WILD = (FILELEN = 0);
+        FILE_IDX(0) = 0;
+        DO NUMPARTS = 0 TO 16;          /* get out all of the parts */
+          CALL INDEX (FILE_LEN(NUMPARTS), '?', SUBSTR(FILENAME, FILE_IDX(NUMPARTS), FILELEN-FILE_IDX(NUMPARTS))) ALTRET (FOUNDALL);
+          FILE_IDX(NUMPARTS+1) = FILE_IDX(NUMPARTS)+FILE_LEN(NUMPARTS)+1;
+          FILE_WILD = %YES#;
+        END;
+FOUNDALL:;
+        MORE_FILES = FILE_WILD;
+        VLP_NAME.L# = FILE_LEN(0);
+        OPEN_INPUT.NAME_ = GET_FID.NAME_;
+        IF GET_FID.ACCT_ ~= VECTOR (NIL)
+          THEN OPEN_INPUT.ACCT_ = GET_FID.ACCT_;
+          ELSE OPEN_INPUT.ACCT_ = VECTOR (B$JIT.FACCN);
+        OPEN_INPUT.PASS_ = GET_FID.PASS_;
+        OPEN_INPUT.SN_   = GET_FID.SN_;
+        OPEN_INPUT.WSN_  = GET_FID.WSN_;
+/**/
+      CASE (7);   /* NLINE option - don't output line numbers */
+        NUM_LENGTH = -1;
+        WRITE_INPUT.BUF_.BUF$ = ADDR (READ_BUF.BUF);
+/**/
+      CASE (8);   /* ALL option - use all file types */
+        ALL_TYPES = %YES#;
+/**/
+      CASE (ELSE);  /* UNKNOWN OPTION */
+        CALL GFR$OUT ('unknown code in parse tree !%/');
+/**/
+    END;  /* DO CASE */
+  END; /* DO I = */
+ 
+  RETURN;
+ 
+QUITT:
+  FPT_EXIT.V.STEPCC# = 7;
+  CALL M$EXIT (FPT_EXIT);
+END READ_IN_COMMAND_LINE;
+%EJECT;
+/*** PARSE_EXPR - parse the boolean string expression from the   */
+/***              command line so that we can use it correctly.  */
+/***              X$PARSE did most of the work, we just have to  */
+/***              set up the correct pass/fail nodes.  The       */
+/***              resultant usage works exactly like short       */
+/***              circuit evaluation to determine a match.       */
+ 
+PARSE_EXPR: PROC (RESULT$, NODE$);
+ 
+  DCL RESULT$ PTR;     /* OUTPUT - resultant short circuit string */
+  DCL NODE$ PTR PARAM;
+  DCL N$ PTR;
+  DCL NN$ PTR;
+  DCL PREV$ PTR;
+  DCL 1 N$BLK BASED (N$),      /* a variation on a %PARSE$OUT block */
+        2 NEXT    UBIN HALF UNAL,        /* next node to process */
+        2 NSUBLKS UBIN(14) UNAL,         /* copy from %PARSE$OUT */
+        2 CODE    UBIN(4) UNAL,          /* copy from %PARSE$OUT */
+        2 FAIL$   PTR,                   /* node to process on fail */
+        2 PASS$   PTR,                   /* node to process on pass */
+        2 SUBLK$  (0:0) PTR;             /* from %PARSE$OUT */
+  DCL 1 N$BLKK BASED (N$),     /* a variation of N$BLK */
+        2 COUNT   UBIN HALF UNAL,        /* length of TEXT */
+        2 NSUBLKS UBIN(14) UNAL,
+        2 CODE#   UBIN(3) UNAL,          /* type of node */
+        2 AND_    UBIN(1) UNAL,          /* continuation info */
+        2 NEXT$   (0:1) PTR,             /* (0)=FAIL, (1)=PASS */
+        2 TEXT    CHAR(N$BLKK.COUNT);    /* text string to match */
+  %PARSE$SYM (NAME=N$SYM, STCLASS="BASED (N$)");
+  %PARSE$OUT (NAME=N$OUT, STCLASS="BASED (N$)");
+ 
+  DCL I SBIN;
+  DCL PASS$ PTR;
+  DCL FAIL$ PTR;
+ 
+  N$ = NODE$;
+  N$BLK.CODE = N$OUT.CODE;
+  N$BLK.NSUBLKS = N$OUT.NSUBLKS;
+  N$BLK.NEXT = BITBIN('777777'O);
+  N$BLK.PASS$ = ADDR(PASS_NODE);
+  N$BLK.FAIL$ = ADDR(FAIL_NODE);
+/**/
+  DO UNTIL (N$ = NODE$);
+    DO CASE (N$BLKK.CODE#);
+/**/
+      CASE (0,1);    /* OR/AND EXPRESSION */
+        PREV$ = N$;
+        DO I = 0 TO N$BLK.NSUBLKS-1;
+          NN$ = N$BLK.SUBLK$(I);
+          NN$->N$BLK.CODE    = NN$->N$OUT.CODE + N$BLKK.CODE#;
+          NN$->N$BLK.NSUBLKS = NN$->N$OUT.NSUBLKS;
+          NN$->N$BLK.NEXT    = POFFW (PREV$, NBASE$);
+          NN$->N$BLK.PASS$   = N$BLK.PASS$;
+          NN$->N$BLK.FAIL$   = N$BLK.FAIL$;
+          PREV$ = NN$;
+        END; /* DO I */
+        N$BLKK.CODE# = 4;          /* done */
+/**/
+      CASE (2,3);    /* STRING, ~STRING */
+        PASS$ = N$BLK.PASS$;
+        DO I = N$BLK.NSUBLKS-1 DOWNTO 0;
+          NN$ = N$BLK.SUBLK$(I)->N$BLK.SUBLK$(0);
+          NN$->N$BLK.CODE    = N$BLK.SUBLK$(I)->N$OUT.CODE;
+          NN$->N$BLKK.COUNT  = NN$->N$SYM.COUNT;
+          NN$->N$BLKK.TEXT   = NN$->N$SYM.TEXT;
+          NN$->N$BLKK.NSUBLKS = 0;
+          NN$->N$BLKK.NEXT$(3-N$BLKK.CODE#) = PASS$;
+          NN$->N$BLKK.NEXT$(N$BLKK.CODE#-2) = N$BLK.FAIL$;
+          PASS$ = NN$;
+        END;
+        NN$ = N$BLK.SUBLK$(0)->N$BLK.SUBLK$(0);
+        NN$->N$BLK.CODE = NN$->N$BLK.CODE + 4;
+        PREV$ = PINCRW (NBASE$, N$BLK.NEXT);
+        PREV$->N$BLKK.NEXT$ (N$BLKK.AND_) = NN$;
+/**/
+      CASE (4);    /* OR/AND DONE EXPRESSION */
+        PREV$ = PINCRW (NBASE$, N$BLK.NEXT);
+        PREV$->N$BLKK.NEXT$ (N$BLKK.AND_) = N$BLK.PASS$;
+    END;  /* CASE */
+    N$ = PREV$;
+  END;  /* do until */
+  RESULT$ = N$BLK.FAIL$;
+  RETURN;
+ 
+END PARSE_EXPR;
+%EJECT;
+GFR$FSF: PROC ALTRET;
+/*F*  NAME: GFR$FSF
+      PURPOSE: Contains subroutines and entry points for fast file
+         access routines.
+ ***/
+ 
+ /***
+  *** INCLUDE files:
+  ***/
+ 
+%INCLUDE FM$GRAN;
+%INCLUDE FM$FIT;
+%INCLUDE F$CP6V_C;
+ 
+ /***
+  *** Locals:
+  ***/
+ 
+DCL BBUF$ PTR AUTO;                     /* To (de)blocking buffer   */
+DCL CRECX$ PTR AUTO;                    /* To current control word  */
+DCL N SBIN STATIC;                      /* "Number of" ...          */
+DCL BKEY_ BIT(36) BASED ALIGNED;
+DCL MISEG$ PTR AUTO;
+DCL PAST_MISEG$ PTR AUTO;               /* To word past last MISEG  */
+ 
+DCL GDA# UBIN WORD ALIGNED AUTO;
+DCL 1 GDA REDEF GDA#,
+      2 * UBIN HALF UNAL,
+      2 GRAN UBIN HALF UNAL;
+ 
+ /***
+  *** BASED:
+  ***/
+ 
+%FM$GRAN;
+%FM$CON(BASED="BASED(CRECX$)");
+%FM$KEYENT;
+%FM$MISEG (BASED="BASED(MISEG$)");
+%FM$FIT;
+%CODE03 (BASED="BASED (BBUF$)");
+DCL BASED_WORD SBIN BASED;
+DCL NCHARS CHAR(N) BASED CALIGNED;
+ 
+ /***
+  *** STATIC STRUCTURES:
+  ***/
+ 
+%FPT_READ( FPTN=READ_GRANULE,
+   KEY=GRANULE#,
+   DCB=M$GOFER,
+   WAIT=YES,
+   FULL=YES,
+   KEYS=YES );
+ 
+%VLP_ERRCODE( FPTN=E_EOF,
+   STCLASS=CONSTANT,
+   FCG='0706'O,
+   MID='22'O,
+   MON='1'B,
+   SEV=0,
+   ERR#=%E$EOF);
+ 
+%VLP_ERRCODE( FPTN=E_LD,
+   STCLASS="CONSTANT SYMDEF",
+   FCG='0706'O,
+   MID='22'O,
+   MON='1'B,
+   SEV=0,
+   ERR#=%E$LD);
+ 
+%VLP_ERRCODE( FPTN=E_DI,
+   STCLASS=CONSTANT,
+   FCG='0706'O,
+   MID='22'O,
+   MON='1'B,
+   SEV=0,
+   ERR#=%E$DI);
+%EJECT;
+/********************************************************************/
+GFR$OPEN: ENTRY ALTRET;
+/*F*  NAME: GFR$OPEN
+      PURPOSE: Determines if file is a candidate for fast file access
+         and opens file either or fast access or standard.
+ ***/
+ 
+/********************/
+ 
+   ORG# = 0;
+   ERROR# = '0'B;
+   EOF# = %NO#;
+   CRECNO# = 0;
+   LDS# = 0;
+ 
+ /***
+  *** Perform TEST open to determine initial suitability for
+  *** optimized reads, and see if the name matches the required name.
+  ***/
+ 
+   OPEN_INPUT.V.OPER.TEST# = %YES#;
+   OPEN_INPUT.FPARAM_ = GRAN_VECTOR;
+   OPEN_INPUT.V.ACS# = %SEQUEN#;
+OPEN_NEXT:
+   CALL M$OPEN( OPEN_INPUT ) ALTRET( TEST_OPEN_ERROR );
+   CALL MATCH_FID_NAME
+      WHENALTRETURN DO;
+         OPEN_INPUT.V.OPER.THISF# = %NO#;
+         IF NOT MORE_FILES THEN ALTRETURN;
+         GOTO OPEN_NEXT;
+         END;
+   DO N = 1 TO CBUF$(0)->FM$FIT.CODES.CODE(0);
+      IF CBUF$(0)->FM$FIT.CODES.CODE(N)=03 THEN EXIT;
+   END;
+   BBUF$ = PINCRW(CBUF$(0), CBUF$(0)->FM$FIT.CODES.ITEMX(N));
+   IF NOT ALL_TYPES  /* don't want ALL types, skip Rx,Wx,Ox types */
+     THEN
+        CALL INDEX (N, SUBSTR(CODE03.TYPE, 0, 1), 'RWO')
+          WHENRETURN DO;
+             GOTO OPEN_NEXT;
+          END;
+   IF GOFER$DCB.ASN# = %FILE#
+      AND (CODE03.ORG = %KEYED# OR CODE03.ORG = %CONSEC# OR CODE03.ORG = %UR#)
+      AND NOT CODE03.DESC.BAD
+     THEN                    /* try to set up for optimized reads */
+        OPEN_INPUT.V.ACS# = QUICK_ACS#;
+ 
+ /***
+  *** Perform real open and see if monitor will allow fast file access.
+  ***/
+ 
+   OPEN_INPUT.V.OPER.TEST# = %NO#;
+   OPEN_INPUT.V.OPER.THISF# = %YES#;
+   OPEN_INPUT.FPARAM_ = VECTOR(NIL);
+   CALL M$OPEN( OPEN_INPUT ) ALTRET( RTN_OPEN_ERROR );
+   OPEN_INPUT.V.OPER.THISF# = %NO#;
+   IF GOFER$DCB.ACS# = QUICK_ACS#      /* a successful "fast" open */
+   THEN DO;
+      NGRANS# = CODE03.UGRANS;
+      ORG# = CODE03.ORG;   /* set ORG# to %KEYED#, %CONSEC# or %UR# */
+ 
+ /***
+  *** Initialize for first read or write.
+  ***/
+ 
+      IF CODE03.COMP
+      THEN APPENDV = ENTADDR( GFR$APPEND_COMP );
+      ELSE APPENDV = ENTADDR( GFR$APPEND );
+      GRANX# = 0;
+      LGRANX# = MINIMUM (%MAX_GRANS-1, NGRANS#-1);
+      GRANULE# = 0;
+      READ_GRANULE.BUF_.BUF$ = CBUF$(0);
+      READ_GRANULE.BUF_.BOUND = (LGRANX#+1) * %GRANULE_SIZE_BYTES - 1;
+      CALL M$READ (READ_GRANULE) ALTRET (RTN_OPEN_ERROR);
+      DO SELECT (ORG#);
+         SELECT (%CONSEC#, %UR#); /* consecutive file, fill up CBUF */
+            CRECX# = %GRANULE_SIZE;
+            LCRECX# = CBUF$(0)->FM$GRAN.NAVX + CBUF$(0)->FM$GRAN.AVAIL;
+         SELECT (%KEYED#);   /* keyed file, fill up CBUF iff whole file */
+            CRECX# = 0;
+            LCRECX# = 0;
+            DO GRANULE# = 0 TO LGRANX#;
+               GRANNUM( GRANULE# ) = GRANULE#;
+               GRAN_AGE( GRANULE# ) = %MAX_GRANS - GRANULE#;
+               END;
+            CALL GFR_UNPACK_KEY_GRAN;
+         END;  /* do select */
+      END;
+   RETURN;
+ 
+ /***
+  *** Error handling.
+  ***/
+ 
+TEST_OPEN_ERROR: ;                     /* Error on TEST open */
+   OPEN_INPUT.V.OPER.THISF# = %NO#;
+   IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE = %E$FDEOF  /* end of dir */
+      THEN
+         ALTRETURN;
+   CALL MATCH_FID_NAME
+   WHENRETURN DO;    /* this file should be searched - report error */
+RTN_OPEN_ERROR: ;                       /* Error on open            */
+      ERROR# = B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+      IF GOFER$DCB.FCD#
+      THEN
+         CALL M$CLOSE( CLOSE_INPUT ) WHENALTRETURN DO; END;
+      IF (FILE_WILD) THEN CALL M$WRITE (WRITE_FID);
+      CALL M$ERRMSG( MONITOR_ERR );
+      DO SELECT( ERROR#.ERR# );
+         SELECT( %E$FILEBUSY, %E$NOACCESS ); /* ok - just skip file */
+         SELECT( ELSE );             /* not OK - skip rest of files */
+            ALTRETURN;
+         END;  /* do select */
+      END;
+   GOTO OPEN_NEXT;
+ 
+%EJECT;
+/********************************************************************/
+GFR$CLOSE: ENTRY ALTRET;
+/*F*  NAME: GFR$CLOSE
+      PURPOSE: Close DCB.
+ ***/
+ 
+/********************/
+ 
+   IF GOFER$DCB.FCD#
+   THEN
+      CALL M$CLOSE( CLOSE_INPUT ) WHENALTRETURN DO; END;
+ 
+   RETURN;
+ 
+/********************************************************************/
+%EJECT;
+/********************************************************************/
+GFR$READ: ENTRY ALTRET;
+/*F*  NAME: GFR$READ
+      PURPOSE: If not a fast file, divert course to ordinary service
+         call.  Otherwise, initialize and get next record depending
+         on ORG.
+ ***/
+ 
+/********************/
+ 
+   ERROR# = '0'B;
+ 
+   IF EOF# THEN GOTO RETURN_EOF;
+ 
+   DO CASE( ORG# );
+    CASE( %CONSEC#, %UR# );
+      CALL GFR_CONSEC_READ;
+    CASE( %KEYED# );
+      CALL GFR_KEYED_READ;
+    CASE(ELSE);               /* It is not an optimized read */
+      CRECNO# = CRECNO# + 1;
+      CALL M$READ( READ_INPUT )
+      WHENALTRETURN DO;
+         ERROR# = B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+         END;
+      RSIZE#.LEN = GOFER$DCB.ARS#;
+    END;  /* do case */
+ 
+   DO SELECT (ERROR#.ERR#);
+      SELECT( %E$LD );            /* read_buf is too short - o well */
+         LDS# = LDS# + 1;
+         RETURN;
+      SELECT( %E$BADVECT1,        /* key_buffer too short - o well */
+              0           );      /* no error */
+         RETURN;
+      SELECT( %E$EOF );           /* end of file - no severe errors */
+      SELECT( ELSE );             /* ?? - report error, say EOF */
+         IF NOT FILE_NAME_PRINTED AND FILE_WILD THEN CALL M$WRITE (WRITE_FID);
+         FILE_NAME_PRINTED = '1'B;
+         CALL GFR$OUT ('problem reading %c - closing file%/', GOFER$DCB.NAME#);
+         CALL M$ERRMSG( MONITOR_ERR );
+   END; /* do select */
+ 
+RETURN_EOF: ;
+   IF (LDS# > 0)
+   THEN DO;
+      IF NOT FILE_NAME_PRINTED AND FILE_WILD THEN CALL M$WRITE (WRITE_FID);
+      CALL GFR$OUT ('lost data on %s record(s)%/', LDS#);
+      END;
+   ALTRETURN;                /* return EOF knowledge */
+ 
+%EJECT;
+/********************************************************************/
+GFR_KEYED_READ: PROC ALTRET;
+/*F*  NAME: GFR_KEYED_READ
+      PURPOSE: FF reads the next record from an ORG=KEYED
+ ***/
+ 
+/********************/
+ 
+   DO UNTIL( NOT CRECX$->FM$KEYENT.D );
+      CRECX# = CRECX# + 1; /* Index next key   */
+      DO WHILE(CRECX# > NUMKEYS#);
+         GDA# = CBUF$(KEYX#)->FM$GRAN.FLINK;
+         GRANULE# = GDA.GRAN;
+         IF GRANULE# = 0 THEN GOTO RPT_EOF;  /* End of file     */
+         GRAN_AGE( KEYX# ) = 0;         /* don't need this granule */
+         CALL GFR_GET_GRAN ALTRET( JUSTALT );
+         CALL GFR_UNPACK_KEY_GRAN;
+         CRECX# = 1;        /* First key of gran        */
+         END;
+      CRECX$ = PINCRW( CBUF$(KEYX#), KEYRECX#( CRECX# ));
+      END /* until not CRECX$->FM$KEYENT.D */;
+ 
+   INPUT_KEY = CRECX$->BKEY_;                        /* Return Key */
+   MISEG$ = PINCRW( CRECX$, SIZEW(CRECX$->FM$KEYENT)); /* Point to first MISEG entry */
+   IF FM$MISEG.CTL & '001'B              /* see if builtin VFC */
+   THEN RSIZE# = APPEND_VFC;
+   ELSE RSIZE# = APPEND_NO_VFC;
+ 
+ /***
+  *** Return record segment by segment.
+  ***/
+ 
+   CRECNO# = CRECNO# + 1;
+READ_DATA:
+   DO WHILE( %YES# );
+ /***
+  *** Determine where end of MISEG in current granule is.
+  ***/
+      PAST_MISEG$ = PINCRW( CBUF$(KEYX#), KEYRECX#( CRECX#+1 ));
+ 
+      DO WHILE( MISEG$ < PAST_MISEG$ );
+         GDA# = FM$MISEG.GDA;
+         GRANULE# = GDA.GRAN;         /* Data gran address        */
+         CALL GFR_GET_GRAN ALTRET( JUSTALT );
+         N = FM$MISEG.GACTB;         /* Number of bytes in segment */
+         CRECX$ = PINCRW( BBUF$, FM$MISEG.GX );    /* Data pointer */
+         CALL APPEND( CRECX$->NCHARS ) THRU APPENDV;
+         MISEG$ = PINCRW( MISEG$, LENGTHW(FM$MISEG) );
+         END;
+      IF CRECX# < NUMKEYS#
+         THEN EXIT READ_DATA;       /* Another segment can't exist */
+      GDA# = CBUF$(KEYX#)->FM$GRAN.FLINK;
+      GRANULE# = GDA.GRAN;
+      IF GRANULE# = 0
+         THEN EXIT READ_DATA;       /* Another segment can't exist */
+      GRAN_AGE( KEYX# ) = 0;            /* don't need this granule */
+      CALL GFR_GET_GRAN ALTRET( JUSTALT );
+      CALL GFR_UNPACK_KEY_GRAN;
+      CRECX# = 0;     /* Before first key of gran */
+      MISEG$ = PINCRW( CBUF$(KEYX#), KEYRECX#( KEYX# ));
+      END;
+ 
+   RETURN;
+ 
+RPT_EOF: ;
+   ERROR# = E_EOF;
+   EOF# = %YES#;
+JUSTALT: ;
+   ALTRETURN;
+%EJECT;
+ 
+/******************************/
+GFR_GET_GRAN: PROC ALTRET;
+/*F*  NAME: GFR_GET_GRAN
+      PURPOSE: Get "GRANULE#" of file.
+ ***/
+ 
+DCL GRANX SBIN;                         /* gran index               */
+ 
+/********************/
+ 
+   DO GRANX# = 0 TO LGRANX#;
+      IF GRANNUM(GRANX#) = GRANULE# THEN GOTO RET_GRAN;
+      END;
+ 
+   GRANX# = LGRANX#;   /* Must get rid of one of current granules. */
+   DO GRANX = LGRANX# DOWNTO 0;
+      IF GRAN_AGE( GRANX ) < GRAN_AGE( GRANX# )
+      THEN                          /* Current gran is older    */
+         GRANX# = GRANX;
+      END;
+ 
+   GRANNUM(GRANX#) = GRANULE#;
+   READ_GRANULE.BUF_ = VECTOR (CBUF$(GRANX#)->GRANULE_);
+   CALL M$READ( READ_GRANULE ) ALTRET( RPT_ERROR );
+RET_GRAN:
+   BBUF$ = CBUF$( GRANX# );
+   GRAN_AGE( GRANX# ) = CRECNO#; /* Buffer's age           */
+   RETURN;
+ 
+RPT_ERROR: ;
+   ERROR# = B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+   ALTRETURN;
+ 
+END GFR_GET_GRAN;
+ 
+END GFR_KEYED_READ;
+%EJECT;
+/*************************/
+GFR_UNPACK_KEY_GRAN: PROC ALTRET;
+/*F*  NAME: GFR_UNPACK_KEY_GRAN
+      PURPOSE: Unpack a key granule for easier, quicker access.
+***/
+ 
+DCL KEYTBL$ PTR;
+%FM$KEYTBL (BASED="BASED (KEYTBL$)");
+DCL KEYNUM SBIN;
+DCL KEY512 SBIN;
+ 
+/********************/
+ 
+   KEYX# = GRANX#;
+   KEYTBL$ = PINCRW( CBUF$(KEYX#), CBUF$(KEYX#)->FM$GRAN.FCEX );
+   NUMKEYS# = CBUF$(KEYX#)->FM$GRAN.KEYCNT;
+   KEY512 = FM$KEYTBL(0);    /* any key > this : add 512 to it */
+   KEYRECX#(0) = CBUF$(KEYX#)->FM$GRAN.FCEX+SIZEW(FM$KEYTBL);
+   DO KEYNUM = 1 TO NUMKEYS#;
+      KEYRECX#( KEYNUM ) = FM$KEYTBL( KEYNUM );
+      IF KEYNUM >= KEY512 THEN KEYRECX#( KEYNUM ) = KEYRECX#( KEYNUM )+512;
+      END;
+   KEYRECX#( KEYNUM ) = CBUF$(KEYX#)->FM$GRAN.NAVX;
+ 
+   GRAN_AGE( KEYX# ) = %MAX_GRAN_AGE;   /* don't allow caching out */
+   RETURN;
+ 
+END GFR_UNPACK_KEY_GRAN;
+ 
+/********************************************************************/
+%EJECT;
+/********************************************************************/
+GFR_CONSEC_READ: PROC ALTRET;
+/*F*  NAME: GFR_CONSEC_READ
+      PURPOSE: FF reads the next record from an ORG=CONSEC or UR file.
+ ***/
+ 
+/********************/
+ 
+ /***
+  *** Position to the beginning of the next record.
+  ***/
+ 
+   BBUF$ = CBUF$( GRANX# );
+   DO UNTIL( FM$CON.FAK ~= 0 );    /* Find beginning of next record */
+      CALL GFR_CONSEC_SEG ALTRET( EOF_EXPECTED );
+      END;   /* do until FM$CON.FAK ~= 0 */
+   CRECNO# = CRECNO# + 1;
+ 
+ /***
+  *** We are now positioned to the control word of first segment of
+  *** the next record.
+  ***/
+ 
+   IF FM$CON.CTL & '001'B              /* look for builtin VFC     */
+   THEN RSIZE# = APPEND_VFC;
+   ELSE RSIZE# = APPEND_NO_VFC;
+ 
+ /***
+  *** Keep appending record segments while a next segment exists and
+  *** the beginning of the next record is not encountered.
+  ***/
+ 
+APPEND_CONSEC_SEG:
+   N = FM$CON.GACTB;                    /* Get # bytes in segment   */
+ 
+   CALL APPEND( PINCRW(BBUF$,FM$CON.GX)->NCHARS ) THRU APPENDV;
+ 
+   IF ( FM$CON.C ~= 0 )        /* continuation of segment */
+   THEN
+      CALL GFR_CONSEC_SEG
+      WHENRETURN DO;
+         IF FM$CON.FAK ~= 0
+         THEN                     /* Hit beginning of next record  */
+            CRECX# = CRECX# + 1;  /* Remember position        */
+         ELSE                     /* a continuation segment - */
+            GOTO APPEND_CONSEC_SEG;  /* append it */
+         END;
+      WHENALTRETURN DO;
+         IF ERROR#.ERR# = %E$EOF THEN
+            ERROR#='0'B; /* Give him what we have so far. */
+         END;
+ 
+   RETURN;
+ 
+JUSTALT: ;
+EOF_EXPECTED: ;
+   ALTRETURN;
+ 
+END GFR_CONSEC_READ;
+/********************************************************************/
+%EJECT;
+/********************************************************************/
+GFR_CONSEC_SEG: PROC ALTRET;
+/*F*  NAME: GFR_CONSEC_SEG
+      PURPOSE: Position to the next segment of a CONSEC or UR file.
+ ***/
+ 
+/********************/
+ 
+   CRECX# = CRECX# - 1; /* Next control word      */
+ 
+   DO WHILE (CRECX# < LCRECX#);
+      CALL GFR_GET_NEXT_GRAN ALTRET( JUSTALT );
+      CRECX# = %(GRANULE_SIZE-1); /* Index of first record control word */
+      LCRECX# = BBUF$->FM$GRAN.NAVX + BBUF$->FM$GRAN.AVAIL;
+      END;
+ 
+   CRECX$ = PINCRW( BBUF$, CRECX# );
+   RETURN;
+ 
+JUSTALT: ;
+   ALTRETURN;
+ 
+END GFR_CONSEC_SEG;
+/********************************************************************/
+%EJECT;
+/********************************************************************/
+GFR_GET_NEXT_GRAN: PROC ALTRET;
+/*F*  NAME: GFR_GET_NEXT_GRAN
+      PURPOSE: Get next granule of input file.
+ ***/
+ 
+/********************/
+ 
+ /***
+  *** Check if CONSEC file eof.
+  ***/
+ 
+   IF NOT BBUF$->FM$GRAN.ENDLVL
+   THEN DO;                       /* That *was* the last granule   */
+      ERROR# = E_EOF;
+      EOF# = %YES#;
+      ALTRETURN;
+      END;
+ 
+ /***
+  *** Get the next granule.
+  ***/
+ 
+   GRANX# = GRANX# + 1;
+   GRANULE# = GRANULE# + 1;
+   IF GRANX# = %MAX_GRANS
+   THEN DO;         /* at end of buffer, wrap around and refill it */
+      READ_GRANULE.BUF_.BUF$ = CBUF$(0);
+      READ_GRANULE.BUF_.BOUND = MINIMUM(NGRANS#-GRANULE#, %MAX_GRANS) * %GRANULE_SIZE_BYTES - 1;
+      CALL M$READ (READ_GRANULE) ALTRET (RTN_ERR);
+      GRANX# = 0;
+      END;
+ 
+   BBUF$ = CBUF$( GRANX# );
+   IF BBUF$->BASED_WORD ~= -1 THEN
+      RETURN;
+   ERROR# = E_DI;
+   GOTO JUSTALT;
+ 
+RTN_ERR:
+   ERROR# = B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+JUSTALT:;
+   ALTRETURN;
+ 
+END GFR_GET_NEXT_GRAN;
+/********************************************************************/
+END GFR$FSF;
+%EJECT;
+GFR$OUT:PROC (CSTR, ARG1, ARG2);
+ 
+DCL CSTR CHAR(512);
+DCL ARG1 SBIN;
+DCL ARG2 SBIN;
+ 
+DCL ARG$ PTR;
+DCL SARG SBIN BASED (ARG$);
+DCL 1 CARG BASED (ARG$), 2 LEN UBIN(9) CALIGNED, 2 STR CHAR(CARG.LEN);
+ 
+DCL I SBIN;
+DCL IDX SBIN;
+%FPT_WRITE (DCB=M$DO);
+DCL BUFF CHAR(80);
+DCL BUFI SBIN;
+DCL TEMP12 CHAR(12);
+DCL X SBIN;
+ 
+  BUFI = 0;
+  I = 0;
+  ARG$ = ADDR(ARG1);
+  DO WHILE ('1'B);
+    CALL INDEX (IDX, '%', SUBSTR (CSTR, I));
+    SUBSTR(BUFF, BUFI, IDX) = SUBSTR (CSTR, I, IDX);
+    BUFI = BUFI + IDX;
+    I = I + IDX + 2;
+    DO SELECT (SUBSTR(CSTR, I-1, 1));
+     SELECT ('S','s');
+       CALL BINCHAR (TEMP12, SARG);
+       CALL SEARCH (IDX, X, B$SR_NON_ZERO, SUBSTR (TEMP12, 0, 11));
+       SUBSTR (BUFF, BUFI, 12-IDX) = SUBSTR (TEMP12, IDX);
+       BUFI = BUFI + 12 - IDX;
+     SELECT ('C','c');
+       SUBSTR(BUFF, BUFI, CARG.LEN) = CARG.STR;
+       BUFI = BUFI + CARG.LEN;
+     SELECT ('/');
+       FPT_WRITE.BUF_ = VECTOR (SUBSTR (BUFF, 0, BUFI));
+       CALL M$WRITE (FPT_WRITE);
+       RETURN;
+    END;
+    ARG$ = ADDR(ARG2);
+  END;  /* do while */
+END GFR$OUT;
+END GOFER;

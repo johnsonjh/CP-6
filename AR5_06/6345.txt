@@ -1,0 +1,1741 @@
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* PLM=5, THI=0, CSI=0 */
+X28DRIVER: PROC MAIN;
+ 
+%INCLUDE KX_EQUS_E;
+%INCLUDE KXX_MACROS_M;
+ 
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B$JIT;
+%INCLUDE X28_C61;
+%INCLUDE XU_MACRO_C;
+%INCLUDE B_ERRORS_C;
+%INCLUDE XU_PERR_C;
+%INCLUDE XU_SUBS_C;
+%INCLUDE XUH_MACRO_C;
+DCL M$VC DCB;
+DCL M$LO DCB;
+DCL M$DO DCB;
+DCL M$SI DCB;
+DCL M$TR DCB;
+DCL B$JIT$ PTR SYMREF;
+DCL B$TCB$ PTR SYMREF;
+%F$DCB;
+%B$TCB ( STCLASS = "BASED (B$TCB$)" );
+%B$EXCFR;
+%B$ALT;
+%FPT_EOM ( UTYPE = MIL10, DCB = M$SI, STCLASS = "STATIC SYMDEF" );
+/*
+   Keep track of terminal idle period length.
+*/
+DCL IDLE_LENGTH UBIN STATIC SYMDEF INIT(0);
+/*
+   After 3 (or n?) seconds without input, go to single char read.
+*/
+DCL IDLE_MAX UBIN STATIC SYMDEF INIT(300);
+DCL X3(0:%KX_X3PRMX_HI#) UBIN BYTE STATIC SYMDEF CALIGNED INIT(
+    1,0,2,20,0,0,21,0,0,0,14,1,0*0);
+%VC$DAT ( FPTN = PACKET, FUNCTION = DAT_RQS, STCLASS = "STATIC SYMDEF", LAST = "," );
+      2 DAT(0:127) UBIN BYTE CALIGNED;
+DCL P_INDEX UBIN BYTE STATIC SYMDEF INIT(0);
+DCL TERM_READBUF (0:255) UBIN BYTE STATIC SYMDEF CALIGNED;
+DCL FORWARD_CHAR (0:255) BIT(1) STATIC SYMDEF UNAL INIT('0'B*13,'1'B,'0'B*0);
+DCL FORWARD_REDEF (0:31) REDEF FORWARD_CHAR UBIN(8) UNAL;
+%VLP_EOMTABLE ( STCLASS = "STATIC SYMDEF" );
+%VLP_EOMTABLE ( FPTN = VLP_EOMTABLE_STD, VALUES = STD, STCLASS = "STATIC SYMDEF" );
+%FPT_READ ( FPTN = TERM_READ, DCB = M$SI, BUF = TERM_READBUF, TRANS = YES,
+    STCLASS = "STATIC SYMDEF" );
+%FPT_TRMPRG ( FPTN = CANCEL_TERM_READ, DCB = M$SI, ABORTREAD = YES,
+    STCLASS = CONSTANT SYMDEF );
+%FPT_TRMPRG ( FPTN = CANCEL_VC_READ, DCB = M$VC, ABORTREAD = YES,
+    STCLASS = CONSTANT SYMDEF );
+%FPT_WRITE ( FPTN = WRITE_PACKET, DCB = M$VC, BUF = PACKET, TRANS = YES,
+    STCLASS = "STATIC SYMDEF" );
+DCL MODE UBIN STATIC SYMDEF INIT (%X28_MODE_COMMAND#);
+%VLP_ERRCODE ( FPTN=ERR_CODE, STCLASS="STATIC SYMDEF" );
+%VC$DAT ( FPTN = DAT_RQS, FUNCTION = DAT_RQS, STCLASS = "STATIC SYMDEF" );
+%FPT_WRITE ( FPTN=WRITE_BREAK, DCB=M$VC, BUF=BRK_RQS, TRANS=YES,
+    STCLASS = "STATIC SYMDEF" );
+DCL WAITING_RESUME BIT (1) STATIC SYMDEF INIT('0'B);
+DCL FLOW_STOP BIT(1) STATIC SYMDEF INIT('0'B);
+DCL VCINP_PND BIT(1) STATIC SYMDEF INIT('0'B);
+DCL TIMER_ON BIT(1) STATIC SYMDEF INIT('0'B);
+%FPT_EXIT ( FPTN=FPT_EXIT_ERROR, STEPCC = ERROR, STCLASS = "STATIC SYMDEF" );
+%FPT_CLOSE ( FPTN=CLOSE_VC, DCB=M$VC, STCLASS="STATIC SYMDEF" );
+%FPT_WRITE ( FPTN=WRITE_TERM, DCB=M$LO, TRANS=YES, BP=YES,
+    STCLASS="STATIC SYMDEF" );
+DCL TRACING BIT(1) STATIC SYMDEF INIT('0'B);
+/* */
+%PARSE$OUT ( NAME = X28$BLK,STCLASS="BASED");
+%PARSE$SYM ( NAME = X28$SYM,STCLASS="BASED");
+%P$PCB(NAME=P_PCB,STCLASS="BASED");
+%P$NODE(STCLASS=BASED);
+%P$LIT(STCLASS=BASED);
+%XUR_INIT(SYNTAX=YES,COMMANDS=YES,ECHO=ALWAYS_ECHO,GOODCMD=YES);
+%XUH_PARAM;
+ 
+%FPT_EVENT ( UENTRY = READ$COMPLETE );
+DCL READ$COMPLETE ENTRY ASYNC;
+%VLP_SN ( FPTN = DF_RNAME );
+%VLP_SN ( FPTN = RNAME );
+%FPT_OPEN ( FPTN = OPEN_CL, DVFC = '@', RES = 'CL', DCB = M$VC, SN = RNAME,
+   SCRUB=YES, ATTR = %ATTR_CL_X28#, STCLASS = "STATIC SYMDEF" );
+%FPT_OPEN ( FPTN = OPEN_LO, ORG = TERMINAL, DCB = M$LO );
+%FPT_OPEN ( FPTN = OPEN_SI, ORG = TERMINAL, DCB = M$SI );
+%FPT_WRITE ( FPTN=WRITE_CAL_RQS, DCB=M$VC, BUF=CAL_RQS, TRANS=YES );
+%FPT_WRITE ( FPTN=WRITE_CLR_RQS, DCB=M$VC, BUF=CLR_RQS, TRANS=YES );
+%FPT_WRITE ( FPTN=WRITE_RST_RQS, DCB=M$VC, BUF=RST_RQS, TRANS=YES );
+%FPT_WRITE ( FPTN=WRITE_SETX3, DCB=M$VC, BUF=SET_X3, TRANS=YES );
+ 
+%VC$CAL ( FPTN = CAL_RQS, PROTOCOL = X28, RPRX3 = YES, FUNCTION = CAL_RQS,
+        STCLASS = STATIC, LAST = "," );
+     2 USRDAT(0:127) UBIN BYTE CALIGNED;
+%VC$CAL ( FPTN = SET_X3, FUNCTION = SETX3, STCLASS = STATIC );
+%VC$CLR ( FPTN = CLR_RQS, FUNCTION = CLR_RQS, STCLASS = STATIC );
+%VC$RST ( FPTN = RST_RQS, FUNCTION = RST_RQS, STCLASS = STATIC );
+%VC$DAT ( FPTN = BRK_RQS, FUNCTION = BRK_RQS, STCLASS = STATIC );
+ 
+%FPT_READ ( FPTN=READ_VC, DCB=M$VC, BUF=READ_BUF, TRANS=YES,
+   WAIT = NO, EVENT = 1, STCLASS = "STATIC SYMDEF" );
+DCL READ_BUF CHAR(4096) STATIC SYMDEF;
+DCL READ_BUF_ARRAY(0:4095) REDEF READ_BUF UBIN BYTE CALIGNED;
+ 
+%FPT_WRITE ( FPTN=WRITE_GREETING, VFC=YES, DCB=M$LO, BUF=GREET_MESS, STCLASS=STATIC );
+DCL 1 GREET_MESS STATIC,
+      2 * CHAR(0) INIT('AGreetings, using '),
+      2 ADRFID CHAR(40) INIT('no :X28ADR file.');
+%FPT_WRITE ( FPTN=WRITE_BOTTOM_PAGE, VFC=YES, DCB=M$LO, BUF=BOTTOM_PAGE, STCLASS=STATIC );
+DCL BOTTOM_PAGE CHAR(0) CONSTANT INIT('P');
+/*
+   A bunch of error messages to the x.28 user
+*/
+DCL CNCERR_MESS CHAR(0) CONSTANT INIT('circuit is active, use RSM to resume');
+DCL TOOLONG_MESS CHAR(0) CONSTANT INIT('more than 14 digits');
+DCL CNC_MESS CHAR(0) CONSTANT INIT('circuit connected');
+DCL RST_MESS CHAR(0) CONSTANT INIT('circuit reset');
+DCL CLR_MESS CHAR(0) CONSTANT INIT('circuit cleared');
+DCL NOSESS_MESS CHAR(0) CONSTANT INIT('no active session');
+DCL USRDAT_MESS CHAR(0) CONSTANT INIT('illegal call user data length');
+DCL BAD_PRMX CHAR(0) CONSTANT INIT('bad x.3 parameter index');
+DCL BAD_PRMV CHAR(0) CONSTANT INIT('bad parameter value');
+DCL CANTSET CHAR(0) CONSTANT INIT('this parameter cannot be altered');
+DCL UNIMP CHAR(0) CONSTANT INIT('parameter not supported currently');
+DCL DONESET CHAR(0) CONSTANT INIT('done');
+DCL READONLY_MESS CHAR(0) CONSTANT INIT('file opened for reading only');
+DCL NONEXIST_MESS CHAR(0) CONSTANT
+   INIT('file does not exist; using :X28ADR from previous account.');
+DCL 1 PAR_DISPLAY STATIC,
+      2 PRM (0:23),
+        3 NAME CHAR(18) CALIGNED INIT(
+ ' 1 PAD recall   = ', ' 9 CR pads      = ', '17 Dellin char  = ',
+ ' 2 PAD echo     = ', '10 Width        = ', '18 Dsplin char  = ',
+ ' 3 Datfwd chars = ', '11 Speed        = ', '19 Parm 19      = ',
+ ' 4 Idle timer   = ', '12 Trm flwctr   = ', '20 Parm 20      = ',
+ ' 5 PAD flwctr   = ', '13 LF insertion = ', '21 Parm 21      = ',
+ ' 6 Snd signals  = ', '14 LF pads      = ', '22 Parm 22      = ',
+ ' 7 Break action = ', '15 Local edit   = ', ' ',
+ ' 8 Outpt discrd = ', '16 Delchr char  = ', ' '),
+        3 VALUE CHAR(3) CALIGNED INIT(' '*0),
+        3 SPACE CHAR(3) CALIGNED INIT(' '*0);
+DCL NOT_DEFINED_MESS CHAR(0) CONSTANT INIT('this address is not defined.');
+DCL DEFINED_MESS CHAR(0) CONSTANT INIT('this address is already defined.');
+DCL 1 NETADR_DATA STATIC,
+      2 NAME CHAR(8) CALIGNED INIT('  '),
+      2 * CHAR(1) CALIGNED INIT(' '),
+      2 BCD CHAR(14) CALIGNED INIT('              '),
+      2 * CHAR(1) CALIGNED INIT(' '),
+      2 DESC CHAR(54) CALIGNED;
+DCL 1 NETADR_DATA_C CONSTANT,
+      2 NAME CHAR(8) CALIGNED INIT('  '),
+      2 * CHAR(1) CALIGNED INIT(' '),
+      2 BCD CHAR(14) CALIGNED INIT('              '),
+      2 * CHAR(1) CALIGNED INIT(' '),
+      2 DESC CHAR(54) CALIGNED
+        INIT('                                                      ');
+ 
+%FPT_WRITE ( FPTN=WRITE_ERR, DCB=M$LO, STCLASS="STATIC SYMDEF" );
+%FPT_WRITE ( FPTN=WRITE_PAR, DCB=M$LO, BUF=PAR_DISPLAY, STCLASS=STATIC );
+%FPT_PROMPT ( FPTN=SET_X28_PROMPT, PROMPT=X28_PROMPT, STCLASS="CONSTANT SYMDEF");
+DCL X28_PROMPT CHAR(0) STATIC SYMDEF INIT('X28>');
+DCL COMMAND UBIN(36) SYMREF;            /* ROOT PARSE NODE                    */
+ 
+%INCLUDE XUR_ENTRY;
+DCL X$HELP ENTRY(1) ALTRET;
+ 
+DCL P_PCB$ PTR;
+DCL NODE$ PTR;                          /* ptr to lower level nodes           */
+DCL ROOT$ PTR;                          /* PTR TO ROOT NODE IN TREE           */
+%VLP_ERRCODE ( FPTN = ROOT_ERR_CODE, STCLASS="REDEF ROOT$");/* ERROR CODE FROM XUR$GETCMD */
+%FPT_TRMCTL (STCLASS=CONSTANT, FPTN=GTRMCTL, TRMCTL=OTRMCTL, DCB=M$SI);
+%VLP_TRMCTL (FPTN=OTRMCTL);
+%FPT_TRMCTL (STCLASS=CONSTANT, FPTN=SETFNCCTL, TRMCTL = FNCTRMCTL);
+%VLP_TRMCTL (STCLASS=CONSTANT, FPTN=FNCTRMCTL, TRNUSRINPFNC=YES);
+%FPT_TRMCTL (STCLASS=CONSTANT, FPTN=SETACTONTRN, TRMCTL = FNCTRMCTL2);
+%VLP_TRMCTL (STCLASS=CONSTANT, FPTN=FNCTRMCTL2, ACTONTRN=YES);
+ 
+DCL DCB# UBIN;
+DCL I UBIN;
+DCL J UBIN;
+DCL STATE UBIN STATIC SYMDEF INIT(%X28_STATE_INT#);
+DCL ADDR_TEXT$ PTR;
+DCL ADDR_TEXT(0:999) UBIN BYTE CALIGNED BASED ( ADDR_TEXT$ );
+ 
+%FPT_INT ( FPTN = FPT_BREAK_CONTROL, UENTRY = BREAK$CONTROL );
+DCL BREAK$CONTROL ENTRY ASYNC;
+DCL READ$COMPLETE_PROC ENTRY;
+ 
+DCL ONE_TIME_COMMAND BIT(1);            /* handle command line invokation too */
+%FPT_WAIT ( FPTN=FOR_EVER, UNITS=82800 ); /* well, 23 hrs actually            */
+%FPT_WAIT ( FPTN=ONE_SEC, UNITS=1 );
+DCL B$STR CHAR(TEMP) BASED CALIGNED;
+DCL B$ARRAY(0:127) CHAR(1) BASED CALIGNED;
+DCL TEMP UBIN;
+/*
+   The following is for manipulating the :X28ADR file
+*/
+ 
+DCL UPDATE_MODE BIT(1) STATIC INIT('1'B);
+%M$DCB    (DCBN=M$NETADR,
+           NAME=':X28ADR',
+           ORG=KEYED,
+           ASN=FILE,
+           FUN=UPDATE,
+           EXIST=OLDFILE,
+           CTG=YES,
+           SHARE=ALL,
+           ACS=DIRECT,
+           ACCT=' ');
+%FPT_OPEN (FPTN=OPEN_NETADR,
+           DCB=M$NETADR,
+           ACSVEH=X28_ACSVEH);
+%FPT_CLOSE (FPTN=CLOSE_NETADR, DCB=M$NETADR);
+%VLP_ATTR (FPTN=X28_ACSVEH);
+%VLP_ACSVEH (READ=YES,UPD=YES,WNEW=YES,DELR=YES,VEHICLE='X28?.',LAST=",");
+%VLP_ACSVEH (READ=YES,UPD=YES,WNEW=YES,DELR=YES,VEHICLE='X28.X',LAST=";");
+%VLP_ACCT (FPTN=NETADR_ACCT, ACCT=':SYS');
+%VLP_ACCT (FPTN=VLP_ACCT_C,ACCT='        ',STCLASS=CONSTANT);
+%VLP_NAME (FPTN=NETADR_NAME,NAME=':X28ADR');
+%FPT_READ(FPTN=READ_NETADR,
+          DCB=M$NETADR,
+          KEY=NETADR_KEY,
+          KEYS=YES,
+          KEYR=YES,
+          BUF=NETADR_DATA.BCD,
+          STCLASS=STATIC);
+ 
+%FPT_WRITE(FPTN=WRITE_NETADR,
+          DCB=M$NETADR,
+          KEY=NETADR_KEY,
+          BUF=NETADR_DATA.BCD,
+          STCLASS=STATIC);
+ 
+%FPT_PRECORD(FPTN=PRECORD_NETADR,
+           KEYS=YES,
+           KEYR=YES,
+           KEY=NETADR_KEY,
+           DCB=M$NETADR,
+           STCLASS=STATIC);
+ 
+%FPT_DELREC(FPTN=DELREC_NETADR,
+           KEY=NETADR_KEY,
+           DCB=M$NETADR,
+           STCLASS=STATIC);
+ 
+%FPT_DELREC(FPTN=DELREC_NETADR_ALL,
+           KEY=NETADR_KEY_LOW,
+           LKEY=NETADR_KEY_HI,
+           DCB=M$NETADR,
+           STCLASS=STATIC);
+ 
+DCL 1 NETADR_KEY_C CONSTANT ALIGNED,
+      2 LEN UBIN BYTE UNAL INIT(8),
+      2 NETADRNAME CHAR(8) CALIGNED INIT('  ');
+ 
+DCL 1 NETADR_KEY ALIGNED STATIC,
+      2 LEN UBIN BYTE UNAL,
+      2 NETADRNAME CHAR(8) CALIGNED;
+ 
+DCL 1 NETADR_KEY@ ALIGNED AUTO,
+      2 LEN UBIN BYTE UNAL,
+      2 NETADRNAME CHAR(8) CALIGNED;
+ 
+DCL 1 NETADR_KEY_LOW CONSTANT ALIGNED,
+      2 LEN UBIN BYTE UNAL INIT(2),
+      2 NETADRNAME CHAR(2) CALIGNED INIT(' ');
+ 
+DCL 1 NETADR_KEY_HI CONSTANT ALIGNED,
+      2 LEN UBIN BYTE UNAL INIT(2),
+      2 NETADRNAME CHAR(2) CALIGNED INIT('~~');
+ 
+DCL 1 DF_NETADR CONSTANT,
+      2 LEN UBIN BYTE UNAL INIT(7),
+      2 NAME CHAR(7) INIT('DEFAULT');
+ 
+%FPT_PROMPT ( FPTN=NULL_PROMPT, PROMPT=A_NULL, VFC=YES, STCLASS="CONSTANT SYMDEF");
+DCL A_NULL CHAR(1) CALIGNED CONSTANT SYMDEF INIT('@');
+%FPT_DEVICE ( FPTN=SET_LO_DVFC, DCB=M$LO, DVFC='@', STCLASS="CONSTANT SYMDEF" );
+%FPT_DEVICE ( FPTN=RESET_LO_DVFC, DCB=M$LO, STCLASS="CONSTANT SYMDEF", DVFC='A' );
+/*
+   In CP-6 local edit mode, CR and EM are IMP'd to 'buffer read'.
+*/
+DCL ADD_CR_EM(0:32) BIT(9) UNAL CONSTANT SYMDEF
+    INIT ( '031'O,'004'O,'000'O*2,'016'O,'000'O*2,'015'O,
+    '033'O,'002'O,'777'O,'151'O,'043'O,'001'O,'015'O,
+    '111'O,'001'O*2,'015'O,'004'O,'000'O*2,'012'O,'000'O*2,'031'O,'033'O,
+    '002'O,'777'O,'111'O,'001'O*2,'031'O );
+DCL DEL_CR_EM(0:8) BIT(9) UNAL CONSTANT SYMDEF
+    INIT ( '031'O,'012'O,'002'O,'015'O,'004'O,'012'O,'002'O,'031'O,'004'O );
+%FPT_WRITE ( FPTN=WRITE_ADDCREM, DCB=M$UC, VFC=YES, BUF=ADD_CR_EM, TRANS=YES,
+             WAIT=YES, STCLASS="STATIC SYMDEF" );
+%FPT_WRITE ( FPTN=WRITE_DELCREM, DCB=M$UC, VFC=YES, BUF=DEL_CR_EM, TRANS=YES,
+             WAIT=YES, STCLASS="STATIC SYMDEF" );
+ 
+%FPT_GLINEATTR ( LINEATTR=VLP_LINEATTR );
+%VLP_LINEATTR;
+DCL CP6_2_X3(0:15) UBIN BYTE CALIGNED CONSTANT INIT(
+  10,5,0,1,6,8,2,4,3,3,7,7,12,13,14,15);
+ 
+     MODE = %X28_MODE_COMMAND#;
+     P_PCB$ = ADDR(NIL);
+     CALL XUR$INIT(XUR_INIT,P_PCB$);
+ 
+     CALL M$EVENT ( FPT_EVENT ) ALTRET (DIE);
+     CALL M$INT ( FPT_BREAK_CONTROL ) ALTRET (DIE);
+     DCB# = DCBNUM(M$SI);
+     CALL M$OPEN(OPEN_SI) ALTRET (DIE);
+ 
+     IF DCBADDR(DCBNUM(M$SI))->F$DCB.DDEV.IC# THEN CALL M$GTRMCTL (GTRMCTL);
+     CALL M$OPEN ( OPEN_LO ) ALTRET ( DIE );
+ 
+     IF OTRMCTL.TRNUSRINPFNC#~='01'B THEN DO;
+        CALL M$STRMCTL (SETFNCCTL);
+        OTRMCTL.TRNUSRINPFNC# = '1'B;
+        END;
+     CALL M$STRMCTL ( SETACTONTRN );
+/*
+   Open this guy's :NETADR file.
+*/
+     CALL M$OPEN ( OPEN_NETADR ) WHENALTRETURN DO;
+        OPEN_NETADR.ACCT_ = VECTOR(NETADR_ACCT);
+        CALL M$OPEN ( OPEN_NETADR ) WHENALTRETURN DO;
+           NETADR_ACCT.ACCT# = ':SYSTAC';
+           CALL M$OPEN ( OPEN_NETADR ) WHENALTRETURN DO;
+              CALL M$WRITE ( WRITE_GREETING ) ALTRET ( DIE );
+              GOTO DIE;
+              END;
+           END;
+        END;
+     READ_NETADR.BUF_.BOUND = SIZEC(NETADR_DATA.BCD) + SIZEC(NETADR_DATA.DESC);
+     CALL GET_NETADR ( DF_NETADR ) WHENRETURN DO;
+        DF_RNAME = RNAME;
+        END;
+     CALL CONCAT ( GREET_MESS.ADRFID,
+       SUBSTR(DCBADDR(DCBNUM(M$NETADR))->F$DCB.NAME#.C,0,
+       DCBADDR(DCBNUM(M$NETADR))->F$DCB.NAME#.L),
+       '.', DCBADDR(DCBNUM(M$NETADR))->F$DCB.ACCT#);
+     CALL M$WRITE ( WRITE_GREETING ) ALTRET ( DIE );
+     UPDATE_MODE = '1'B;
+/* Find out the line speed */
+     CALL M$GLINEATTR ( FPT_GLINEATTR );
+     X3(%KX_X3PRMX_LINSPD#) = CP6_2_X3(VLP_LINEATTR.LINESPEED#);
+ 
+/* Look for one time command */
+     IF SUBSTR(B$JIT$->B$JIT.CCBUF,B$JIT$->B$JIT.CCDISP,1) = '('
+     THEN
+     DO;
+        ONE_TIME_COMMAND='1'B;
+        I=B$JIT$->B$JIT.CCDISP+1;       /* INDEX OF COMMAND IN CCBUF          */
+        CALL INDEX1R(J,')',B$JIT$->B$JIT.CCBUF,B$JIT$->B$JIT.CCARS);
+        IF J < I
+        THEN
+           J=B$JIT$->B$JIT.CCARS - I;   /* SIZE OF COMMAND                    */
+        ELSE
+           J = J - I;
+        CALL XUR$GETCMD(COMMAND,ROOT$,VECTOR(X28_PROMPT),
+          SUBSTR(B$JIT$->B$JIT.CCBUF,I,J),J) ALTRET(DIE);
+        GOTO L_CODE;
+        END;
+     ELSE
+        ONE_TIME_COMMAND='0'B;
+ 
+     DO WHILE (NOT ONE_TIME_COMMAND OR STATE ~= %X28_STATE_INT#);
+        IF MODE = %X28_MODE_DATA#
+        THEN
+           CALL Y$READ_TERMINAL ALTRET ( DIE );
+        ELSE
+        DO;                             /* we're in x.28 command mode         */
+           CALL XUR$GETCMD(COMMAND,ROOT$,VECTOR(X28_PROMPT)) ALTRET ( DIE );
+/*
+  SEPERATE OUT THE INDIVIDUAL CASES, BASED ON THE ROOT NODE
+                                                                              */
+L_CODE:
+           DO CASE(ROOT$->X28$BLK.CODE);
+           CASE(%X28_CON);
+              CALL PROCESS_CON WHENALTRETURN
+              DO;
+DIE:             CALL XUR$ERRMSG ( B$TCB.ALT$->B$ALT.ERR,
+                   B$TCB.ALT$->B$ALT.DCB# );
+                 END;
+           CASE(%X28_CLR);
+              CALL PROCESS_CLR ALTRET ( DIE );
+           CASE(%X28_END,%X28_QUIT);
+              CALL M$WRITE ( WRITE_BOTTOM_PAGE );
+              CALL XUR$CLOSE_DCBS;
+              CALL M$EXIT;
+           CASE(%X28_RST);
+              CALL PROCESS_RST ALTRET ( DIE );
+           CASE(%X28_RSM);
+              CALL PROCESS_RSM ALTRET ( DIE );
+           CASE(%X28_PAR);
+              CALL PROCESS_PAR ALTRET ( DIE );
+           CASE(%X28_SET);
+              CALL PROCESS_SET ALTRET ( DIE );
+           CASE(%X28_DIS);
+              CALL PROCESS_DIS ALTRET ( DIE );
+           CASE(%X28_DEF);
+              IF NOT UPDATE_MODE
+              THEN
+              DO;
+                 WRITE_ERR.BUF_ = VECTOR ( READONLY_MESS);
+                 CALL M$WRITE ( WRITE_ERR ) ALTRET ( DIE );
+                 END;
+              ELSE
+                 CALL PROCESS_DEF ALTRET ( DIE );
+           CASE(%X28_DEL);
+              IF NOT UPDATE_MODE
+              THEN
+              DO;
+                 WRITE_ERR.BUF_ = VECTOR ( READONLY_MESS);
+                 CALL M$WRITE ( WRITE_ERR ) ALTRET ( DIE );
+                 END;
+              ELSE
+                 CALL PROCESS_DEL ALTRET ( DIE );
+           CASE(%X28_USE);
+              CALL PROCESS_USE ALTRET ( DIE );
+           CASE(%X28_RN);
+              CALL PROCESS_RN ALTRET ( DIE );
+           CASE(%X28_TR);
+              CALL PROCESS_TR ALTRET ( DIE );
+            END;                        /* CASE                               */
+           END;                         /* if mode                            */
+        END;                            /* while '1'b                         */
+     CALL M$WRITE ( WRITE_BOTTOM_PAGE );
+     CALL XUR$CLOSE_DCBS;
+     CALL M$EXIT;        /* we'll get here if a one time command is entered   */
+ 
+PROCESS_CON: PROC ALTRET;
+ 
+DCL TEMP2 SBIN;
+DCL TEMP3 SBIN;
+DCL HEXCHAR CHAR(0) CONSTANT INIT('0123456789ABCDEFabcdef');
+ 
+ 
+     CAL_RQS.CLGADRLNG = 0;
+     IF ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.NDTYPE = %DEC#
+     THEN
+     DO;                           /* a decimal address string was entered    */
+        CAL_RQS.CLDADRLNG = ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.COUNT;
+        IF CAL_RQS.CLDADRLNG > 14
+        THEN
+        DO;
+           WRITE_ERR.BUF_ = VECTOR(TOOLONG_MESS);
+L_WR_ERR:  CALL M$WRITE ( WRITE_ERR ) WHENALTRETURN
+           DO;
+L_ALT:        ALTRETURN;
+              END;
+           RETURN;
+           END;
+        ADDR_TEXT$ = ADDR ( ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.TEXT );
+        END;
+     ELSE
+     DO;                      /* an alphabetic address string was entered     */
+        CALL GET_NETADR ( ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.COUNT )
+          ALTRET ( L_WR_ERR );
+        CALL INDEX ( I, ' ', NETADR_DATA.BCD );
+        CAL_RQS.CLDADRLNG = I;
+        ADDR_TEXT$ = ADDR(NETADR_DATA.BCD);
+        END;
+     DO I = 0 TO CAL_RQS.CLDADRLNG - 2 BY 2;
+        CAL_RQS.CLDADRPAIR(I/2) = (ADDR_TEXT(I)-48)*16 + ADDR_TEXT(I+1)-48;
+        END;
+     IF I ~= CAL_RQS.CLDADRLNG
+     THEN
+        CAL_RQS.CLDADRPAIR((CAL_RQS.CLDADRLNG-1)/2) = (ADDR_TEXT(I)-48)*16;
+     CAL_RQS.USRDATLNG = 0;
+     CAL_RQS.X3 = X3;
+/*
+   Any options specified?
+*/
+     CAL_RQS.USRDATLNG = 0;
+     CAL_RQS.FSTSLC = %KX_FSTSLC_NON#;
+     DO I = 1 TO ROOT$->X28$BLK.NSUBLKS-1;
+        NODE$ = ROOT$->X28$BLK.SUBLK$(I)->X28$BLK.SUBLK$(0);
+        DO CASE ( NODE$->X28$SYM.CODE );
+        CASE ( %X28_REVERSE );
+           IF NODE$->X28$BLK.SUBLK$(0)->X28$SYM.CODE = %X28_YES
+           THEN
+              CAL_RQS.RVS = '1'B;
+           ELSE
+              CAL_RQS.RVS = '0'B;
+        CASE ( %X28_FAST );
+           CAL_RQS.FSTSLC = NODE$->X28$BLK.SUBLK$(0)->X28$SYM.CODE;
+        CASE ( %X28_DATA );
+           TEMP = NODE$->X28$BLK.SUBLK$(0)->X28$SYM.COUNT;
+           CAL_RQS.USRDATLNG = (TEMP+1)/2;
+           DO J = 0 TO TEMP-1 BY 2;
+              CALL INDEX (TEMP2, ADDR(NODE$->X28$BLK.SUBLK$(0)
+                ->X28$SYM.TEXT)->B$ARRAY(J), HEXCHAR);
+              IF (TEMP2>15) THEN TEMP2 = TEMP2-6;
+              TEMP2 = TEMP2*16;
+              IF ( J < TEMP-1 )
+              THEN
+                 CALL INDEX (TEMP3, ADDR(NODE$->X28$BLK.SUBLK$(0)
+                   ->X28$SYM.TEXT)->B$ARRAY(J+1), HEXCHAR);
+              IF (TEMP3>15) THEN TEMP3 = TEMP3-6;
+              TEMP2 = TEMP2 + TEMP3;
+              CAL_RQS.USRDAT(J/2) = TEMP2;
+              END;
+        CASE ( %X28_RN );
+           RNAME.SN#(0) = ' ';
+           IF NODE$->X28$BLK.NSUBLKS>0
+           THEN
+              RNAME.SN#(0) = NODE$->X28$BLK.SUBLK$(0)->X28$SYM.TEXT;
+         END;
+        END;
+     IF ( CAL_RQS.FSTSLC ~= 0 AND (CAL_RQS.USRDATLNG = 0
+       OR CAL_RQS.USRDATLNG > 128) ) OR
+       ( CAL_RQS.FSTSLC = 0 AND CAL_RQS.USRDATLNG > 64 )
+     THEN
+     DO;
+        WRITE_ERR.BUF_ = VECTOR ( USRDAT_MESS );
+        GOTO L_WR_ERR;
+        END;
+     IF STATE ~= %X28_STATE_INT#
+     THEN
+     DO;
+        WRITE_ERR.BUF_ = VECTOR(CNCERR_MESS);
+        CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+        RETURN;
+        END;
+/*
+  Lets try to make a call
+*/
+     CALL M$CLOSE ( CLOSE_VC );
+     CALL M$OPEN ( OPEN_CL ) WHENALTRETURN
+     DO;
+        ERR_CODE = B$TCB.ALT$->B$ALT.ERR;
+        CALL XUR$ERRMSG ( ERR_CODE );
+        RETURN;
+        END;
+     WRITE_CAL_RQS.BUF_.BOUND = LENGTHC ( SET_X3 ) + CAL_RQS.USRDATLNG - 1;
+     CALL M$WRITE ( WRITE_CAL_RQS ) ALTRET ( L_ALT );
+/*
+   start no wait read to vc
+*/
+     STATE = %X28_STATE_WCC#;
+     MODE = %X28_MODE_DATA#;
+     CALL M$READ ( READ_VC ) ALTRET ( L_ALT );
+/*
+   If we are in CP-6 local edit mode, we need to null out the prompt,
+   and IMP CR and EM.
+*/
+     IF NOT TERM_READ.V.DVBYTE.TRANS#
+     THEN
+     DO;
+        CALL M$PROMPT ( NULL_PROMPT ) ALTRET ( L_ALT );
+        CALL M$WRITE ( WRITE_ADDCREM ) ALTRET ( L_ALT );
+        END;
+     CALL M$DEVICE ( SET_LO_DVFC ) ALTRET ( L_ALT );
+     RETURN;
+ 
+END PROCESS_CON;
+ 
+PROCESS_CLR: PROC ALTRET;
+ 
+     IF STATE = %X28_STATE_INT#
+     THEN
+     DO;
+        WRITE_ERR.BUF_ = VECTOR(NOSESS_MESS);
+        CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+        RETURN;
+        END;
+     IF STATE ~= %X28_STATE_WCC#
+     THEN
+        CALL M$WRITE ( WRITE_CLR_RQS ) ALTRET ( L_ALT );
+     CALL M$CLOSE ( CLOSE_VC ) ALTRET ( L_ALT );
+     P_INDEX = 0;
+     WAITING_RESUME = '0'B;
+     STATE = %X28_STATE_INT#;
+     MODE = %X28_MODE_COMMAND#;
+     WRITE_ERR.BUF_ = VECTOR(CLR_MESS);
+     CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+     RETURN;
+L_ALT:
+     ALTRETURN;
+ 
+END PROCESS_CLR;
+ 
+PROCESS_RST: PROC ALTRET;
+ 
+     IF STATE ~= %X28_STATE_DAT#
+     THEN
+     DO;
+        WRITE_ERR.BUF_ = VECTOR(NOSESS_MESS);
+        CALL M$WRITE ( WRITE_ERR ) WHENALTRETURN
+        DO;
+L_ALT:     ALTRETURN;
+           END;
+        RETURN;
+        END;
+     CALL M$WRITE ( WRITE_RST_RQS ) ALTRET ( L_ALT );
+     WRITE_ERR.BUF_ = VECTOR(RST_MESS);
+     CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+END PROCESS_RST;
+ 
+PROCESS_RSM: PROC ALTRET;
+ 
+     IF STATE = %X28_STATE_INT#
+     THEN
+     DO;
+        WRITE_ERR.BUF_ = VECTOR(NOSESS_MESS);
+        CALL M$WRITE ( WRITE_ERR ) WHENALTRETURN
+        DO;
+L_ALT:     ALTRETURN;
+           END;
+        END;
+     ELSE
+     DO;
+        MODE = %X28_MODE_DATA#;
+        CALL Y$FORWARD;
+        IF WAITING_RESUME
+        THEN
+        DO;
+           CALL READ$COMPLETE_PROC;
+           END;
+        FPT_EOM.EOMTABLE_ = VECTOR ( VLP_EOMTABLE );
+        CALL M$EOM ( FPT_EOM ) ALTRET ( L_ALT );
+        FPT_EOM.EOMTABLE_ = VECTOR(NIL);
+        IF NOT TERM_READ.V.DVBYTE.TRANS#
+        THEN
+        DO;
+           CALL M$PROMPT ( NULL_PROMPT ) ALTRET ( L_ALT );
+           CALL M$WRITE ( WRITE_ADDCREM ) ALTRET ( L_ALT );
+           END;
+        CALL M$DEVICE ( SET_LO_DVFC ) ALTRET ( L_ALT );
+        END;
+     RETURN;
+ 
+END PROCESS_RSM;
+ 
+PROCESS_PAR: PROC ALTRET;
+ 
+DCL I UBIN;
+ 
+     IF ROOT$->X28$BLK.NSUBLKS = 0
+     THEN
+     DO;
+        WRITE_PAR.BUF_.BOUND = 3*SIZEC ( PAR_DISPLAY.PRM(0) ) - 4;
+        DO I = 0 TO %KX_X3PRMX_HI#;
+           J = 3*MOD(I,8) + I/8;
+           CALL BINCHAR ( PAR_DISPLAY.PRM.VALUE(J), X3(I) );
+           IF SUBSTR(PAR_DISPLAY.PRM.VALUE(J),0,1) = '0'
+           THEN
+           DO;
+              SUBSTR(PAR_DISPLAY.PRM.VALUE(J),0,1) = ' ';
+              IF SUBSTR(PAR_DISPLAY.PRM.VALUE(J),1,1) = '0'
+              THEN
+                 SUBSTR(PAR_DISPLAY.PRM.VALUE(J),1,1) = ' ';
+              END;
+           IF I>15 THEN DO;
+              WRITE_PAR.BUF_.BUF$ = ADDR(PAR_DISPLAY.PRM(J-2));
+              CALL M$WRITE ( WRITE_PAR ) ALTRET ( L_ALT );
+              END;
+           END;
+        WRITE_PAR.BUF_.BOUND = 2*SIZEC ( PAR_DISPLAY.PRM(0) ) - 4;
+        WRITE_PAR.BUF_.BUF$ = ADDR(PAR_DISPLAY.PRM(18));
+        CALL M$WRITE ( WRITE_PAR ) ALTRET ( L_ALT );
+        WRITE_PAR.BUF_.BUF$ = ADDR(PAR_DISPLAY.PRM(21));
+        CALL M$WRITE ( WRITE_PAR ) ALTRET ( L_ALT );
+        END;
+     ELSE
+     DO;
+        CALL CHARBIN ( I, ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.TEXT );
+        I = I - 1;
+        IF I > %KX_X3PRMX_HI#
+        THEN
+        DO;
+           WRITE_ERR.BUF_ = VECTOR(BAD_PRMX);
+           CALL M$WRITE ( WRITE_ERR ) WHENALTRETURN
+           DO;
+L_ALT:        ALTRETURN;
+              END;
+           RETURN;
+           END;
+        J = 3*MOD(I,8) + I/8;
+        CALL BINCHAR ( PAR_DISPLAY.PRM.VALUE(J), X3(I) );
+        IF SUBSTR(PAR_DISPLAY.PRM.VALUE(J),0,1) = '0'
+        THEN
+        DO;
+           SUBSTR(PAR_DISPLAY.PRM.VALUE(J),0,1) = ' ';
+           IF SUBSTR(PAR_DISPLAY.PRM.VALUE(J),1,1) = '0'
+           THEN
+              SUBSTR(PAR_DISPLAY.PRM.VALUE(J),1,1) = ' ';
+           END;
+        WRITE_PAR.BUF_ = VECTOR(PAR_DISPLAY.PRM(J));
+        CALL M$WRITE ( WRITE_PAR ) ALTRET ( L_ALT );
+        END;
+     RETURN;
+ 
+END PROCESS_PAR;
+ 
+PROCESS_SET: PROC ALTRET;
+ 
+DCL PRMX UBIN;
+DCL PRMV UBIN;
+DCL LO UBIN;
+DCL HI SBIN;
+DCL I UBIN;
+DCL B$BITS(0:0) BIT(1) BASED;
+ 
+     CALL CHARBIN ( PRMX, ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.TEXT );
+     PRMX = PRMX - 1;
+     IF PRMX > %KX_X3PRMX_HI#
+     THEN
+     DO;
+        WRITE_ERR.BUF_ = VECTOR(BAD_PRMX);
+L_WR_ERR: CALL M$WRITE ( WRITE_ERR ) WHENALTRETURN
+        DO;
+L_ALT:     ALTRETURN;
+           END;
+        RETURN;
+        END;
+     CALL CHARBIN ( PRMV, ROOT$->X28$BLK.SUBLK$(1)->X28$SYM.TEXT );
+     IF PRMV > 255
+     THEN
+     DO;
+L_ERR_PRMV: WRITE_ERR.BUF_ = VECTOR(BAD_PRMV);
+        GOTO L_WR_ERR;
+        END;
+CASE_PRMX:
+     DO CASE ( PRMX );
+     CASE ( %KX_X3PRMX_PADECH# );
+        IF PRMV>1 THEN GOTO L_ERR_PRMV;
+     CASE ( %KX_X3PRMX_LINSPD# );
+        WRITE_ERR.BUF_ = VECTOR(CANTSET);
+        GOTO L_WR_ERR;
+     CASE ( %KX_X3PRMX_PADRCL# );
+        IF ( PRMV > 1 AND PRMV < 32 ) OR ( PRMV > 126 ) THEN GOTO L_ERR_PRMV;
+        IF ( PRMV = X3(%KX_X3PRMX_PADRCL#) ) THEN EXIT;
+        X3(%KX_X3PRMX_PADRCL#) = PRMV;
+        GOTO SET_PADRCL;
+     CASE ( %KX_X3PRMX_FLWCTRPAD#, %KX_X3PRMX_DSCOTP# );
+        IF ( PRMV > 1 ) THEN GOTO L_ERR_PRMV;
+     CASE ( %KX_X3PRMX_DATFRWSGN# );
+        LO = 0;
+        HI = -1;
+        DO CASE ( PRMV );
+        CASE ( 0 );
+           FORWARD_CHAR = '0'B;
+        CASE ( 1 );
+           FORWARD_CHAR = '0'B;
+/*         LO = 48;                  */ /* Taken care of by Y$READ_TERMINAL   */
+/*         HI = 122;                 */ /* all alphanumeric                   */
+        CASE ( 2 );
+           FORWARD_CHAR = '0'B;
+           FORWARD_CHAR(13) = '1'B;     /* cr                                 */
+        CASE ( 4 );
+           FORWARD_CHAR = '0'B;
+           FORWARD_CHAR(27) = '1'B;     /* esc                                */
+           LO = 5;
+           HI = 7;                      /* esc,bel,enq,ack                    */
+        CASE ( 6 );                     /* 2 + 4                              */
+           FORWARD_CHAR = '0'B;
+           FORWARD_CHAR(13) = '1'B;     /* cr                                 */
+           FORWARD_CHAR(27) = '1'B;     /* esc                                */
+           LO = 5;
+           HI = 7;
+        CASE ( 8 );
+           FORWARD_CHAR = '0'B;
+           FORWARD_CHAR(127) = '1'B;    /* del                                */
+           FORWARD_CHAR(24) = '1'B;     /* can                                */
+           FORWARD_CHAR(18) = '1'B;     /* dc2                                */
+        CASE ( 16 );
+           FORWARD_CHAR = '0'B;
+           FORWARD_CHAR(3) = '1'B;      /* etx                                */
+           FORWARD_CHAR(4) = '1'B;      /* eot                                */
+        CASE ( 18 );                    /* 2 + 16                             */
+           FORWARD_CHAR = '0'B;
+           FORWARD_CHAR(13) = '1'B;     /* cr                                 */
+           FORWARD_CHAR(3) = '1'B;      /* etx                                */
+           FORWARD_CHAR(4) = '1'B;      /* eot                                */
+        CASE ( 32 );
+           FORWARD_CHAR = '0'B;
+           LO = 9;
+           HI = 12;                     /* ht,lf,vt,ff                        */
+        CASE ( 64 );
+           FORWARD_CHAR = '0'B;
+           FORWARD_CHAR(1) = '1'B;      /* soh                                */
+           FORWARD_CHAR(21)= '1'B;      /* nak                                */
+        CASE ( 126 );                   /* 2+4+8+16+32+64 ?                   */
+           FORWARD_CHAR = '0'B;
+           HI = 31;
+        CASE ( 127 );                   /* everything                         */
+/*         HI = 127;                 */ /* Taken care of by Y$READ_TERMINAL   */
+        CASE ( ELSE );
+           GOTO L_ERR_PRMV;
+         END;                           /* do case prmv                       */
+        DO I = LO TO HI;
+           FORWARD_CHAR(I) = '1'B;
+           END;
+        TIMER_ON = '0'B;                /* Recompute the timeout              */
+SET_PADRCL: ;
+        I = X3(%KX_X3PRMX_PADRCL#);
+        IF I = 1 THEN I = 16;
+        IF I ~= 0 THEN FORWARD_CHAR(I) = '1'B;
+/*
+   The other half of the table follows from symmetry.
+*/
+        DO I = 16 TO 31;
+           FORWARD_REDEF(I) = FORWARD_REDEF(I-16);
+           END;
+/*
+   Put it in the EOM table
+*/
+        DO I = 0 TO 31;
+           VLP_EOMTABLE.TABLE#.VALUES#(I) = FORWARD_REDEF(I);
+           END;
+     CASE ( %KX_X3PRMX_IDLTMRDLY# );
+     CASE ( %KX_X3PRMX_ACTBRK# );
+        IF PRMV ~= 0 AND PRMV ~= 1 AND PRMV ~= 4 AND PRMV ~= 8 AND
+          PRMV ~= 16 AND PRMV ~= 21
+        THEN
+           GOTO L_ERR_PRMV;
+     CASE ( %KX_X3PRMX_LFAFTCR# );
+        IF PRMV > 7 THEN GOTO L_ERR_PRMV;
+        IF MOD(PRMV,4) ~= 0 THEN GOTO L_UNIMP;
+     CASE ( %KX_X3PRMX_EDT# );
+        IF PRMV = X3(%KX_X3PRMX_EDT#)
+        THEN
+           EXIT CASE_PRMX;              /* nothing to change                  */
+        DO CASE ( PRMV );
+        CASE ( ELSE );
+           GOTO L_ERR_PRMV;
+        CASE ( 1 );
+           GOTO L_UNIMP;                /* sorry to put it first              */
+        CASE ( 2 );
+/*
+   In CP-6 local edit mode, echo and activation are done by VDH. IMPs are
+   available too.
+*/
+           X3(%KX_X3PRMX_PADECH#) = 1;
+           X3(%KX_X3PRMX_DATFRWSGN#) = 2; /* CR-only is the closest           */
+           VLP_EOMTABLE = VLP_EOMTABLE_STD;
+/* activate on cntl-Y as well */
+           ADDR ( VLP_EOMTABLE ) -> B$BITS ( 25*9/8+1 ) = '1'B;
+           ADDR ( VLP_EOMTABLE ) -> B$BITS ( 25*9/8+145 ) = '1'B;
+           X3(%KX_X3PRMX_IDLTMRDLY#) = 0; /* no idle timeout                  */
+           TERM_READ.V.DVBYTE.TRANS# = '0'B;
+           WRITE_TERM.V.DVBYTE.TRANS# = '0'B;
+        CASE ( 0 );
+/* turning off local edit */
+           TERM_READ.V.DVBYTE.TRANS# = '1'B; /* back to trans read            */
+           WRITE_TERM.V.DVBYTE.TRANS# = '1'B;
+           X3(%KX_X3PRMX_PADECH#) = 0;  /* back to remote echo                */
+           X3(%KX_X3PRMX_IDLTMRDLY#) = 20; /* back to default                 */
+           VLP_EOMTABLE = '0'B;
+           ADDR ( VLP_EOMTABLE ) -> B$BITS ( 13*9/8+1 ) = '1'B;
+           ADDR ( VLP_EOMTABLE ) -> B$BITS ( 13*9/8+145 ) = '1'B;
+         END;                           /* do case ( prmv )                   */
+/* activate on pad recall character as well */
+        DO CASE ( X3(%KX_X3PRMX_PADRCL#) );
+        CASE ( 0 );
+        CASE ( 1 );
+           ADDR ( VLP_EOMTABLE ) -> B$BITS ( 16*9/8 + 1 ) = '1'B;
+           ADDR ( VLP_EOMTABLE ) -> B$BITS ( 144*9/8 + 1 ) = '1'B;
+        CASE ( ELSE );
+           ADDR ( VLP_EOMTABLE ) -> B$BITS ( X3(%KX_X3PRMX_PADRCL#)*9/8+1 ) = '1'B;
+           ADDR ( VLP_EOMTABLE ) -> B$BITS ( X3(%KX_X3PRMX_PADRCL#)*9/8+145 ) = '1'B;
+         END;
+        DO I = 0 TO 31;
+           FORWARD_REDEF(I) = VLP_EOMTABLE.TABLE#.VALUES#(I);
+           END;
+     CASE ( ELSE );
+L_UNIMP: WRITE_ERR.BUF_ = VECTOR(UNIMP);
+        GOTO L_WR_ERR;
+      END;                              /* do case prmx                       */
+     X3(PRMX) = PRMV;
+     WRITE_ERR.BUF_ = VECTOR(DONESET);
+     CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+     SET_X3.X3 = X3;
+     IF STATE ~= %X28_STATE_INT#
+     THEN
+        CALL M$WRITE ( WRITE_SETX3 ) ALTRET ( L_ALT );
+     RETURN;
+ 
+END PROCESS_SET;
+ 
+PROCESS_DIS: PROC ALTRET;
+ 
+DCL ENDOFILE BIT(1);
+ 
+     NETADR_KEY = NETADR_KEY_C;
+     WRITE_ERR.BUF_ = VECTOR ( NETADR_DATA );
+     IF ROOT$->X28$BLK.NSUBLKS ~= 0
+     THEN
+     DO;
+        CALL GET_NETADR ( ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.COUNT )
+        WHENALTRETURN
+        DO;
+           CALL M$WRITE ( WRITE_ERR ) WHENALTRETURN
+           DO;
+L_ALT:        ALTRETURN;
+              END;
+           RETURN;
+           END;
+        NETADR_DATA.NAME = NETADR_KEY.NETADRNAME;
+        WRITE_ERR.BUF_.BOUND = DCBADDR(DCBNUM(M$NETADR))->F$DCB.ARS# + 8;
+        CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+        END;
+     ELSE
+     DO;
+        PRECORD_NETADR.V.N# = 0;
+        CALL M$PRECORD ( PRECORD_NETADR ) WHENALTRETURN
+        DO;
+                                        /* expected*/
+           END;
+ 
+        ENDOFILE = '0'B;
+        PRECORD_NETADR.V.N# = 1;
+        DO WHILE NOT(ENDOFILE);
+           NETADR_DATA = NETADR_DATA_C;
+           CALL M$READ ( READ_NETADR ) WHENALTRETURN
+           DO;
+              RETURN;
+              END;
+           NETADR_DATA.NAME = SUBSTR ( NETADR_KEY.NETADRNAME,0,NETADR_KEY.LEN );
+           WRITE_ERR.BUF_.BOUND = DCBADDR(DCBNUM(M$NETADR))->F$DCB.ARS# + 8;
+           CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+ 
+           CALL M$PRECORD ( PRECORD_NETADR ) WHENALTRETURN
+           DO;
+              ENDOFILE = '1'B;
+              END;
+           END;                         /* do while not eof                   */
+        END;                            /* if nsublk ~= 0                     */
+ 
+END PROCESS_DIS;
+ 
+PROCESS_DEF: PROC ALTRET;
+ 
+DCL ADR_LEN UBIN;
+DCL DESC_LEN UBIN;
+ 
+     NETADR_DATA = NETADR_DATA_C;
+     NETADR_KEY.LEN = ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.COUNT;
+     NETADR_KEY.NETADRNAME = ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.TEXT;
+     NETADR_KEY@ = NETADR_KEY;
+     CALL M$READ ( READ_NETADR ) WHENRETURN
+     DO;                                /* address is all ready defined*/
+        WRITE_ERR.BUF_ = VECTOR ( DEFINED_MESS);
+L_WR_ERR: CALL M$WRITE ( WRITE_ERR ) WHENALTRETURN
+        DO;
+L_ALT:     ALTRETURN;
+           END;
+        RETURN;
+        END;
+     ADR_LEN = ROOT$->X28$BLK.SUBLK$(1)->X28$SYM.COUNT;
+     IF ADR_LEN > 14
+     THEN
+     DO;
+        WRITE_ERR.BUF_ = VECTOR ( TOOLONG_MESS );
+        GOTO L_WR_ERR;
+        END;
+     TEMP = ADR_LEN;
+     ADDR( NETADR_DATA.BCD ) -> B$STR = ADDR ( ROOT$->X28$BLK.SUBLK$(1)->
+       X28$SYM.TEXT ) -> B$STR;
+     DESC_LEN = ROOT$->X28$BLK.SUBLK$(2)->X28$SYM.COUNT;
+     TEMP = MINIMUM ( 54, DESC_LEN );
+     ADDR(NETADR_DATA.DESC)->B$STR = ADDR(ROOT$->X28$BLK.SUBLK$(2)->
+       X28$SYM.TEXT)->B$STR;
+     NETADR_KEY = NETADR_KEY@;
+     WRITE_NETADR.BUF_.BOUND = 14 + TEMP;
+     CALL M$WRITE ( WRITE_NETADR ) ALTRET ( L_ALT );
+ 
+END PROCESS_DEF;
+ 
+PROCESS_DEL: PROC ALTRET;
+ 
+     IF ROOT$->X28$BLK.NSUBLKS = 1
+     THEN
+     DO;                                /* delete the specified record        */
+        NETADR_KEY.LEN = ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.COUNT;
+        NETADR_KEY.NETADRNAME = ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.TEXT;
+        CALL M$DELREC( DELREC_NETADR ) WHENALTRETURN
+        DO;
+           WRITE_ERR.BUF_ = VECTOR ( NOT_DEFINED_MESS );
+           CALL M$WRITE ( WRITE_ERR ) WHENALTRETURN
+           DO;
+L_ALT:        ALTRETURN;
+              END;
+           END;
+        END;
+     ELSE
+     DO;                                /* deleting all records               */
+        CALL M$DELREC ( DELREC_NETADR_ALL ) ALTRET ( L_ALT );
+        END;
+ 
+END PROCESS_DEL;
+ 
+PROCESS_USE: PROC ALTRET;
+DCL SAVE_ACCT CHAR(8);
+ 
+     NETADR_ACCT = VLP_ACCT_C;
+     SAVE_ACCT = DCBADDR(DCBNUM(M$NETADR))->F$DCB.ACCT#;
+     IF DCBADDR(DCBNUM(M$NETADR))->F$DCB.FCD#
+     THEN
+        CALL M$CLOSE ( CLOSE_NETADR ) ALTRET ( L_ALT );
+     OPEN_NETADR.ACCT_ = VECTOR(NETADR_ACCT);
+     IF ROOT$->X28$BLK.NSUBLKS ~= 0
+     THEN
+        NETADR_ACCT.ACCT# = ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.TEXT;
+RETRY_OPEN:
+     OPEN_NETADR.V.FUN# = %CREATE#;
+     CALL M$OPEN ( OPEN_NETADR ) WHENRETURN
+     DO;
+        UPDATE_MODE = '1'B;
+        END;
+     WHENALTRETURN
+     DO;
+        IF OPEN_NETADR.ACCT_ = VECTOR(NIL)
+        THEN
+L_ALT:     ALTRETURN;
+        ELSE
+        DO;
+           OPEN_NETADR.V.FUN# = %IN#;
+           CALL M$OPEN ( OPEN_NETADR ) WHENRETURN
+           DO;
+              WRITE_ERR.BUF_ = VECTOR ( READONLY_MESS );
+              CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+              UPDATE_MODE = '0'B;
+              END;
+           WHENALTRETURN
+           DO;
+              WRITE_ERR.BUF_ = VECTOR ( NONEXIST_MESS );
+              CALL M$WRITE ( WRITE_ERR ) ALTRET ( L_ALT );
+              NETADR_ACCT.ACCT# = SAVE_ACCT;
+              GOTO RETRY_OPEN;
+              END;
+           END;
+        END;
+     CALL GET_NETADR ( DF_NETADR ) WHENRETURN DO;
+        DF_RNAME = RNAME;
+        END;
+     RETURN;
+ 
+END PROCESS_USE;
+%EJECT;
+GET_NETADR: PROC ( KEY ) ALTRET;
+ 
+DCL 1 KEY ALIGNED,
+      2 C UBIN BYTE CALIGNED,
+      2 T CHAR(KEY.C);
+ 
+     NETADR_DATA = NETADR_DATA_C;
+     NETADR_KEY = KEY;
+     RNAME = DF_RNAME;
+     CALL M$READ ( READ_NETADR ) WHENALTRETURN DO;
+        IF KEY.C < NETADR_KEY.LEN
+          AND KEY.T = SUBSTR( NETADR_KEY.NETADRNAME,0,KEY.C) THEN DO;
+           PRECORD_NETADR.V.N# = 1;
+           CALL M$PRECORD ( PRECORD_NETADR ) ALTRET ( DO_ABBREV );
+           IF KEY.T ~= SUBSTR( NETADR_KEY.NETADRNAME,0,KEY.C) THEN DO;
+DO_ABBREV:    NETADR_KEY = KEY;
+              CALL M$READ ( READ_NETADR ) WHENALTRETURN DO; END;
+              READ_NETADR.V.KEYS# = '0'B;
+              CALL M$READ ( READ_NETADR ) WHENALTRETURN DO; END;
+              READ_NETADR.V.KEYS# = '1'B;
+              GOTO GOT_REC;
+              END;
+           END;
+        WRITE_ERR.BUF_ = VECTOR ( NOT_DEFINED_MESS );
+        ALTRETURN;
+        END;
+GOT_REC: ;
+     IF SUBSTR ( NETADR_DATA.DESC, 0, 1) = '@' THEN DO;
+        CALL INDEX ( I, ' ', NETADR_DATA.DESC );
+        RNAME.SN#(0) = SUBSTR ( NETADR_DATA.DESC, 1, I+1 );
+        END;
+     RETURN;
+END GET_NETADR;
+%EJECT;
+PROCESS_RN: PROC ALTRET;
+ 
+     IF ROOT$->X28$BLK.NSUBLKS = 0
+     THEN
+        DF_RNAME.SN#(0) = ' ';
+     ELSE
+     DO;
+        DF_RNAME.SN#(0) = ROOT$->X28$BLK.SUBLK$(0)->X28$SYM.TEXT;
+        END;
+     RETURN;
+ 
+END PROCESS_RN;
+ 
+PROCESS_TR: PROC ALTRET;
+ 
+%FPT_OPEN ( FPTN=OPEN_TRACE_FILE, NAME=TRACE_NAME, ACCT=TRACE_ACCT,
+            PASS=TRACE_PASS, SN=TRACE_SN, WSN=TRACE_WSN,
+            DCB=M$TR, SCRUB=YES, SHARE=ALL, FUN=CREATE, CTG=YES );
+%FPT_FID  ( FPTN=TRACE_FID,       NAME=TRACE_NAME, ACCT=TRACE_ACCT,
+            PASS=TRACE_PASS, SN=TRACE_SN, WSN=TRACE_WSN,
+            ASN=OPEN_TRACE_FILE.V.ASN#, RES=OPEN_TRACE_FILE.V.RES# );
+%VLP_ACCT ( FPTN=TRACE_ACCT );
+%VLP_NAME ( FPTN=TRACE_NAME );
+%VLP_PASS ( FPTN=TRACE_PASS );
+%VLP_SN ( FPTN=TRACE_SN );
+%VLP_WSN ( FPTN=TRACE_WSN );
+%FPT_CLOSE ( FPTN=CLOSE_TRACE_FILE, DCB=M$TR );
+ 
+     IF TRACING
+     THEN
+        CALL M$CLOSE ( CLOSE_TRACE_FILE ) WHENALTRETURN
+        DO;
+L_ALT:     ALTRETURN;
+           END;
+     TRACING = '0'B;
+     IF ROOT$->X28$BLK.NSUBLKS > 0
+     THEN
+     DO;
+        TRACE_FID.TEXTFID_ = VECTOR(ROOT$->X28$BLK.SUBLK$(1)->X28$SYM.TEXT);
+        CALL M$FID ( TRACE_FID ) ALTRET ( L_ALT );
+        DO CASE ( ROOT$->X28$BLK.SUBLK$(0)->X28$BLK.SUBLK$(0)->X28$BLK.CODE);
+        CASE ( %X28_ON, %X28_TO );
+           OPEN_TRACE_FILE.V.EXIST# = %ERROR#;
+        CASE ( %X28_OVER );
+           OPEN_TRACE_FILE.V.EXIST# = %NEWFILE#;
+        CASE ( %X28_INTO );
+           OPEN_TRACE_FILE.V.EXIST# = %OLDFILE#;
+         END;                           /* do case (...code )                 */
+        CALL M$OPEN ( OPEN_TRACE_FILE ) WHENRETURN
+        DO;
+           TRACING = '1'B;
+           END;
+        WHENALTRETURN
+        DO;
+           ERR_CODE = B$TCB.ALT$->B$ALT.ERR;
+           CALL XUR$ERRMSG ( ERR_CODE );
+           END;
+        END;
+     RETURN;
+ 
+END PROCESS_TR;
+ 
+Y$READ_TERMINAL: PROC ALTRET;
+ 
+DCL ONE_BYTE UBIN BYTE CALIGNED;
+DCL ONE_CHAR REDEF ONE_BYTE CHAR(1) CALIGNED;
+DCL MASK_BYTE UBIN BYTE;                /* byte with parity bit stripped off  */
+DCL TERM_READBUF_X UBIN;
+DCL BYTES_READ UBIN;                    /* number of bytes read this time     */
+DCL TENMILSECS SBIN;
+DCL EOM_ACTIVATED BIT(1);     /* read completed because of EOM activation     */
+%FPT_WRITE ( FPTN=WRITE_CRLF, DCB=M$LO, TRANS=YES, BUF=CR_LF );
+%FPT_WRITE ( FPTN=WRITE_CR, DCB=M$LO, TRANS=YES, BUF=CR_BUF);
+DCL CR_LF UBIN (18) STATIC SYMDEF CALIGNED INIT(BITBIN('015012'O));
+DCL CR_BUF UBIN BYTE STATIC SYMDEF CALIGNED INIT(BITBIN('015'O));
+%FPT_WRITE ( FPTN=WRITE_BOP, DCB=M$LO, VFC=YES, BUF=BOP );
+DCL BOP UBIN BYTE STATIC SYMDEF CALIGNED INIT(80/* char P */);
+ 
+     IF IDLE_LENGTH >= IDLE_MAX OR X3(%KX_X3PRMX_EDT#) ~= 0
+     THEN
+     DO;
+        IDLE_LENGTH = 0;
+        FPT_EOM.V.TIMEOUT# = 0;
+        CALL M$EOM ( FPT_EOM ) ALTRET ( L_ALT );
+        TIMER_ON = '0'B;
+        END;
+     ELSE
+        IF NOT TIMER_ON AND ( X3(%KX_X3PRMX_IDLTMRDLY#) > 0
+          OR MOD ( X3(%KX_X3PRMX_DATFRWSGN#), 2 ) ~= 0 )
+        THEN
+        DO;
+           IF MOD ( X3(%KX_X3PRMX_DATFRWSGN#), 2 ) ~= 0
+           THEN
+              TENMILSECS = 1;
+           ELSE
+              TENMILSECS = X3(%KX_X3PRMX_IDLTMRDLY#) * 5;
+           IF TENMILSECS <= 255
+           THEN
+           DO;
+              FPT_EOM.V.UTYPE# = %MIL10#;
+              FPT_EOM.V.TIMEOUT# = TENMILSECS;
+              END;
+           ELSE
+           DO;
+              FPT_EOM.V.UTYPE# = %SEC#;
+              FPT_EOM.V.TIMEOUT# = TENMILSECS / 100;
+              END;
+           CALL M$EOM ( FPT_EOM ) ALTRET ( L_ALT );
+           TIMER_ON = '1'B;
+           END;
+     IF X3(%KX_X3PRMX_EDT#) = 0
+     THEN
+        TERM_READ.V.WAIT# = %NO#;
+     ELSE
+        TERM_READ.V.WAIT# = %YES#;
+     TERM_READ.V.DVBYTE.REREAD# = '0'B;
+L_REREAD:
+     CALL M$READ ( TERM_READ ) WHENALTRETURN DO; END;
+     DO WHILE ( DCBADDR(DCBNUM(M$SI))->F$DCB.FCN.CNT(0) ~= 0 );
+        CALL M$WAIT ( ONE_SEC );
+        END;
+     IF MODE = %X28_MODE_COMMAND# THEN GOTO L_COMMAND;
+     IF NOT DCBADDR(DCBNUM(M$SI))->F$DCB.TYC
+     THEN
+     DO;
+        IF DCBADDR(DCBNUM(M$SI))->F$DCB.EOMCHAR# = %EOM_EOR#
+        THEN
+           EOM_ACTIVATED = '0'B;
+        ELSE
+           EOM_ACTIVATED = '1'B;
+        END;
+     ELSE
+     DO;
+ 
+/* If in local edit and interrupted, just reread. */
+ 
+        IF NOT TERM_READ.V.DVBYTE.TRANS# AND
+          DCBADDR(DCBNUM(M$SI))->F$DCB.TYC.OPER#
+        THEN
+        DO;
+           TERM_READ.V.SINPUTSIZE# = DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+           IF TERM_READ.V.SINPUTSIZE# > 0
+           THEN
+           DO;
+/* turn on reread only if sinputsize > 0 */
+              TERM_READ.V.DVBYTE.REREAD# = '1'B;
+              TERM_READ.V.REREADPOS# = DCBADDR(DCBNUM(M$SI))->F$DCB.ACTPOS;
+              END;
+           GOTO L_REREAD;
+           END;
+ 
+/* Did we get here because of interruption by vc read? */
+ 
+        IF NOT TIMER_ON AND NOT DCBADDR(DCBNUM(M$SI))->F$DCB.TYC.OPER#
+        THEN
+        DO;
+L_ALT:     ALTRETURN;
+           END;
+        IF DCBADDR(DCBNUM(M$SI))->F$DCB.ARS# = 0
+        THEN
+        DO;                        /* nothing read, forward whatever we have  */
+           IF FPT_EOM.V.UTYPE# = %MIL10#
+           THEN
+              IDLE_LENGTH = IDLE_LENGTH + FPT_EOM.V.TIMEOUT#;
+           ELSE
+              IDLE_LENGTH = IDLE_LENGTH + FPT_EOM.V.TIMEOUT#*100;
+           CALL Y$FORWARD;
+           RETURN;
+           END;
+        EOM_ACTIVATED = '0'B;
+        END;
+     IDLE_LENGTH = 0;
+     TERM_READBUF_X = 0;
+     BYTES_READ = DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+     WRITE_TERM.BUF_.BUF$ = ADDR(ONE_BYTE);
+     WRITE_TERM.BUF_.BOUND = 0;
+     DO WHILE ( TERM_READBUF_X < BYTES_READ );
+        ONE_BYTE = TERM_READBUF( TERM_READBUF_X );
+ACT_ENTRY:
+        MASK_BYTE = MOD ( ONE_BYTE, 128 );
+        IF ( MASK_BYTE = 16/* DLE */ AND X3(%KX_X3PRMX_PADRCL#) = 1 ) OR
+          ( MASK_BYTE = X3(%KX_X3PRMX_PADRCL#) AND MASK_BYTE > 1 )
+        THEN
+        DO;
+           MODE = %X28_MODE_COMMAND#;
+           CALL M$TRMPRG ( CANCEL_VC_READ );
+           DO WHILE ( DCBADDR(DCBNUM(M$VC))->F$DCB.FCN.CNT(0) ~= 0 );
+              CALL M$WAIT ( ONE_SEC );
+              END;
+/* any typeahead after switching mode is lost */
+L_COMMAND:
+           CALL M$WRITE ( WRITE_CR ) ALTRET ( L_ALT );
+           CALL M$WRITE ( WRITE_BOP ) ALTRET ( L_ALT );
+           CALL Y$FORWARD;
+           FPT_EOM.EOMTABLE_ = VECTOR ( VLP_EOMTABLE_STD );
+           FPT_EOM.V.TIMEOUT# = 0;
+           CALL M$EOM ( FPT_EOM ) ALTRET ( L_ALT );
+           FPT_EOM.EOMTABLE_ = VECTOR(NIL);
+           TIMER_ON = '0'B;
+           CALL M$PROMPT ( SET_X28_PROMPT ) ALTRET ( L_ALT );
+           CALL M$DEVICE ( RESET_LO_DVFC ) ALTRET ( L_ALT );
+           CALL M$WRITE ( WRITE_DELCREM ) ALTRET ( L_ALT );
+           RETURN;
+           END;
+        IF X3(%KX_X3PRMX_FLWCTRPAD#) = 1
+          AND (MASK_BYTE = %DC3 OR MASK_BYTE = %DC1)
+        THEN
+        DO;
+           IF MASK_BYTE = %DC3
+           THEN
+           DO;
+              FLOW_STOP = '1'B;
+              END;
+           ELSE
+              IF FLOW_STOP
+              THEN
+              DO;
+                 FLOW_STOP = '0'B;
+                 IF VCINP_PND
+                 THEN
+                    CALL READ$COMPLETE_PROC;
+                 END;
+           END;
+        PACKET.DAT(P_INDEX) = ONE_BYTE;
+        P_INDEX = P_INDEX + 1;
+        IF FORWARD_CHAR(MASK_BYTE) OR P_INDEX >= 127
+        THEN
+           CALL Y$FORWARD ALTRET ( L_ALT );
+        TERM_READBUF_X = TERM_READBUF_X + 1;
+        IF X3(%KX_X3PRMX_PADECH#) = 1 AND X3(%KX_X3PRMX_EDT#) = 0
+          OR MASK_BYTE = 13 AND X3(%KX_X3PRMX_EDT#) ~= 0
+        THEN
+           IF MASK_BYTE = 13 AND X3(%KX_X3PRMX_LFAFTCR#) > 3 /* ascii cr      */
+           THEN
+              CALL M$WRITE ( WRITE_CRLF ) ALTRET ( L_ALT );
+           ELSE
+              CALL M$WRITE ( WRITE_TERM ) ALTRET (L_ALT);
+        END;                            /* do while                           */
+     IF EOM_ACTIVATED              /* take care of the activation character   */
+     THEN
+     DO;
+        ONE_CHAR = DCBADDR(DCBNUM(M$SI))->F$DCB.EOMCHAR#;
+        EOM_ACTIVATED = '0'B;
+        GOTO ACT_ENTRY;
+        END;
+     CALL Y$FORWARD;
+     RETURN;
+ 
+END Y$READ_TERMINAL;
+ 
+Y$FORWARD: PROC ALTRET;
+ 
+     IF P_INDEX = 0
+     THEN
+L_ALT:  ALTRETURN;
+     IF STATE = %X28_STATE_WCC# THEN RETURN;
+     WRITE_PACKET.BUF_.BOUND = P_INDEX - 1 + LENGTHC(DAT_RQS);
+     CALL M$WRITE ( WRITE_PACKET ) ALTRET ( L_ALT );
+     P_INDEX = 0;
+     RETURN;
+ 
+END Y$FORWARD;
+ 
+END X28DRIVER;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+ 
+ 
+BREAK$CONTROL: PROC ASYNC;
+ 
+%INCLUDE KX_EQUS_E;
+%INCLUDE KXX_MACROS_M;
+ 
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B$JIT;
+%INCLUDE X28_C61;
+%INCLUDE XU_MACRO_C;
+%INCLUDE B_ERRORS_C;
+%INCLUDE XU_PERR_C;
+%INCLUDE XU_SUBS_C;
+%INCLUDE XUH_MACRO_C;
+%INCLUDE XUR_ENTRY;
+DCL M$VC DCB;
+DCL M$LO DCB;
+DCL M$DO DCB;
+DCL M$SI DCB;
+DCL B$JIT$ PTR SYMREF;
+DCL B$TCB$ PTR SYMREF;
+%F$DCB;
+%B$TCB ( STCLASS = "BASED (B$TCB$)" );
+%B$EXCFR;
+%B$ALT;
+%FPT_EXIT ( FPTN=FPT_EXIT_ERROR, STCLASS=SYMREF );
+%FPT_TRMPRG ( STCLASS=CONSTANT, RESETBREAK=YES );
+DCL X3(0:%KX_X3PRMX_HI#) UBIN BYTE SYMREF CALIGNED;
+%VC$DAT ( FPTN = PACKET, STCLASS = SYMREF, LAST = "," );
+      2 DAT(0:127) UBIN BYTE CALIGNED;
+DCL P_INDEX UBIN BYTE SYMREF;
+DCL FORWARD_CHAR (0:255) BIT(1) SYMREF UNAL;
+%FPT_WRITE ( FPTN = WRITE_PACKET, STCLASS = SYMREF );
+DCL MODE UBIN SYMREF;
+DCL STATE UBIN SYMREF;
+DCL FLOW_STOP BIT(1) SYMREF;
+DCL VCINP_PND BIT(1) SYMREF;
+%VLP_ERRCODE ( FPTN=ERR_CODE, STCLASS=SYMREF );
+%VC$DAT ( FPTN = DAT_RQS, STCLASS = SYMREF );
+%FPT_WRITE ( FPTN=WRITE_BREAK, STCLASS = SYMREF );
+%FPT_WRITE ( FPTN=WRITE_ERR, STCLASS = SYMREF);
+ 
+DCL ONE_BLANK CHAR(0) CONSTANT INIT(' ');
+ 
+DCL READ$COMPLETE_PROC ENTRY;
+ 
+     CALL M$TRMPRG (FPT_TRMPRG);
+     IF MODE = %X28_MODE_DATA# AND STATE = %X28_STATE_DAT#
+     THEN
+     DO;
+        CALL M$WRITE ( WRITE_BREAK ) WHENALTRETURN
+        DO;
+DIE:       ERR_CODE = B$TCB.ALT$->B$ALT.ERR;
+           CALL XUR$ERRMSG ( ERR_CODE );
+           CALL XUR$CLOSE_DCBS;
+           CALL M$EXIT ( FPT_EXIT_ERROR );
+           END;
+        FLOW_STOP = '0'B;
+        IF VCINP_PND
+        THEN
+           CALL READ$COMPLETE_PROC;
+        END;
+     ELSE
+     DO;
+        WRITE_ERR.BUF_ = VECTOR ( ONE_BLANK );
+        CALL M$WRITE ( WRITE_ERR ) ALTRET ( DIE );
+        END;
+     RETURN;
+ 
+END BREAK$CONTROL;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+READ$COMPLETE: PROC ASYNC;
+ 
+%INCLUDE X28_C61;
+%INCLUDE CP_6;
+%B$TCB ( STCLASS = "BASED (B$TCB$)" );
+%B$NWIO;
+DCL B$TCB$ PTR SYMREF READONLY;
+DCL READ$COMPLETE_PROC ENTRY;
+ 
+     IF B$TCB.STK$->B$NWIO.EVID ~= 0    /* Y$READ_TERMINAL handles EVID=0.    */
+     THEN
+        CALL READ$COMPLETE_PROC;
+     RETURN;
+ 
+END READ$COMPLETE;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+READ$COMPLETE_PROC: PROC;
+ 
+%INCLUDE KX_EQUS_E;
+%INCLUDE KXX_MACROS_M;
+ 
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B$JIT;
+%INCLUDE X28_C61;
+%INCLUDE XU_MACRO_C;
+%INCLUDE XU_PERR_C;
+%INCLUDE XU_SUBS_C;
+%INCLUDE XUH_MACRO_C;
+%INCLUDE B_ERRORS_C;
+%INCLUDE XUR_ENTRY;
+DCL M$VC DCB;
+DCL M$LO DCB;
+DCL M$DO DCB;
+DCL M$SI DCB;
+DCL M$TR DCB;
+DCL B$JIT$ PTR SYMREF;
+DCL B$TCB$ PTR SYMREF;
+%F$DCB;
+%B$TCB ( STCLASS = "BASED (B$TCB$)" );
+%B$EXCFR;
+%B$ALT;
+%B$NWIO;
+DCL X3(0:%KX_X3PRMX_HI#) UBIN BYTE SYMREF CALIGNED;
+%VC$DAT ( FPTN = PACKET, STCLASS = SYMREF, LAST = "," );
+      2 DAT(0:127) UBIN BYTE CALIGNED;
+DCL WAITING_RESUME BIT(1) SYMREF;
+DCL VCINP_PND BIT(1) SYMREF;
+DCL P_INDEX UBIN BYTE SYMREF;
+DCL FORWARD_CHAR (0:255) BIT(1) SYMREF UNAL;
+DCL FORWARD_REDEF (0:31) REDEF FORWARD_CHAR UBIN(8) UNAL;
+DCL FLOW_STOP BIT(1) SYMREF;
+%FPT_TRMPRG ( FPTN=CANCEL_TERM_READ, STCLASS=SYMREF);
+%FPT_PROMPT ( FPTN=SET_X28_PROMPT, STCLASS="SYMREF");
+%FPT_DEVICE ( FPTN=RESET_LO_DVFC, STCLASS=SYMREF );
+DCL X28_PROMPT CHAR(4) SYMREF;
+DCL DEL_CR_EM(0:8) BIT(9) UNAL SYMREF;
+%FPT_WRITE ( FPTN=WRITE_DELCREM, STCLASS=SYMREF );
+%VLP_EOMTABLE ( STCLASS = SYMREF );
+%VLP_EOMTABLE ( FPTN = VLP_EOMTABLE_STD, STCLASS = SYMREF );
+%FPT_WRITE ( FPTN = WRITE_PACKET, STCLASS = SYMREF );
+DCL MODE UBIN SYMREF;
+DCL STATE UBIN SYMREF;
+%VLP_ERRCODE ( FPTN=ERR_CODE, STCLASS=STATIC);
+%VC$DAT ( FPTN = DAT_RQS, STCLASS = SYMREF );
+%FPT_WRITE ( FPTN=WRITE_BREAK, STCLASS = SYMREF );
+DCL READ_BUF CHAR(4096) SYMREF;
+DCL READ_BUF_ARRAY(0:4095) REDEF READ_BUF UBIN BYTE CALIGNED;
+%FPT_WRITE ( FPTN=WRITE_TERM, STCLASS="SYMREF" );
+%FPT_READ ( FPTN=TERM_READ, STCLASS="SYMREF" );
+%FPT_READ ( FPTN=READ_VC, STCLASS=SYMREF );
+%FPT_EOM ( STCLASS = SYMREF );
+%FPT_CLOSE ( FPTN=CLOSE_VC, STCLASS=SYMREF );
+%FPT_OPEN ( FPTN=OPEN_CL, STCLASS=SYMREF );
+DCL TIMER_ON BIT(1) SYMREF;
+DCL IDLE_LENGTH UBIN SYMREF;
+DCL IDLE_MAX UBIN SYMREF;
+DCL TRACING BIT(1) SYMREF;
+ 
+%FPT_WRITE ( FPTN=WRITE_ERR_RST,STCLASS=CONSTANT,DCB=M$LO,BUF=RST_MESS,VFC=YES);
+DCL RST_MESS CHAR(0) STATIC INIT('Acircuit reset; cause 000, diag 000');
+%FPT_WRITE ( FPTN=WRITE_ERR_CLR,STCLASS=CONSTANT,DCB=M$LO,BUF=CLR_MESS,VFC=YES);
+DCL CLR_MESS CHAR(0) STATIC INIT('Acircuit cleared; cause 000, diag 000');
+%FPT_WRITE ( FPTN=WRITE_ERR_CNC,STCLASS=CONSTANT,DCB=M$LO,BUF=CNC_MESS,VFC=YES);
+DCL CNC_MESS CHAR(0) CONSTANT INIT('Acircuit connected');
+%FPT_WRITE ( FPTN=WRITE_RCL_CHN,STCLASS=CONSTANT,DCB=M$LO,BUF=RCL_MESS,VFC=YES);
+DCL RCL_MESS CHAR(0) STATIC INIT('APAD recall changed to XXX');
+%FPT_WRITE ( FPTN=WRITE_ERR_XIT,STCLASS=CONSTANT,DCB=M$LO,BUF=XIT_MESS,VFC=YES);
+DCL XIT_MESS CHAR(0) STATIC
+   INIT('Areceived unexpected message (type=00) from circuit; continuing');
+%FPT_WRITE ( FPTN=WRITE_CRLF,STCLASS=CONSTANT,DCB=M$LO,BUF=CRLF_MESS,TRANS=YES);
+DCL CRLF_MESS CHAR(0) CONSTANT INIT(%CONCAT(BINASC(13),BINASC(10)));
+%FPT_EXIT ( FPTN=FPT_EXIT_ERROR, STCLASS=SYMREF );
+%FPT_WRITE ( FPTN=WRITE_TRACE, DCB=M$TR, TRANS=YES, BUF=READ_BUF );
+ 
+%VC$CAL ( FPTN=IND$X3, STCLASS=BASED );
+%VC$CLR ( FPTN=VC$CLR, STCLASS=BASED );
+%VC$RST ( FPTN=VC$RST, STCLASS=BASED );
+ 
+DCL HI SBIN;
+DCL LO UBIN;
+DCL I UBIN;
+ 
+DCL DEEP UBIN STATIC INIT(0);
+DCL NEED2READ UBIN STATIC INIT(0);
+ 
+     IF NOT WAITING_RESUME AND NOT VCINP_PND
+     THEN
+     DO;
+        ERR_CODE = B$TCB.STK$->B$NWIO.IOERRCODE;
+        IF MODE = %X28_MODE_COMMAND#
+        THEN
+           WAITING_RESUME = '1'B;       /* we'll do this later                */
+        ELSE
+           IF FLOW_STOP
+           THEN
+              VCINP_PND = '1'B;         /* flow stopped and input pending     */
+           ELSE
+              EXIT;
+        RETURN;
+        END;
+     DEEP = DEEP + 1;
+     NEED2READ = 1;
+     IF ERR_CODE.ERR# ~= 0
+     THEN
+        GOTO DIE2;
+     IF TRACING
+     THEN
+     DO;
+        WRITE_TRACE.BUF_.BOUND = DCBADDR(DCBNUM(M$VC))->F$DCB.ARS# - 1;
+        CALL M$WRITE ( WRITE_TRACE ) ALTRET ( DIE );
+        END;
+     DO CASE ( READ_BUF_ARRAY(0) );
+     CASE ( %KX_VCFNC_DAT_IND# );
+        IF STATE ~= %X28_STATE_DAT#
+        THEN
+           GOTO L_REREAD;
+        WRITE_TERM.BUF_.BUF$ = PINCRC ( READ_VC.BUF_.BUF$, LENGTHC(DAT_RQS) );
+        IF DCBADDR(DCBNUM(M$VC))->F$DCB.ARS# <= LENGTHC(DAT_RQS) THEN EXIT;
+        WRITE_TERM.BUF_.BOUND = DCBADDR(DCBNUM(M$VC))->F$DCB.ARS# - 1 - LENGTHC(DAT_RQS);
+        CALL M$WRITE ( WRITE_TERM ) ALTRET ( DIE );
+     CASE ( %KX_VCFNC_RST_IND# );
+        CALL BINCHAR ( SUBSTR(RST_MESS,22,3), ADDR(READ_BUF)->VC$RST.CAUSE );
+        CALL BINCHAR ( SUBSTR(RST_MESS,32,3), ADDR(READ_BUF)->VC$RST.DIAG );
+        CALL M$WRITE ( WRITE_CRLF) ALTRET ( DIE );
+        CALL M$WRITE ( WRITE_ERR_RST) ALTRET ( DIE );
+     CASE ( %KX_VCFNC_CAL_CNF# );
+        IF STATE ~= %X28_STATE_WCC#
+        THEN
+           GOTO L_XIT;
+        P_INDEX = 0;
+        STATE = %X28_STATE_DAT#;
+        CALL M$WRITE ( WRITE_ERR_CNC ) ALTRET ( DIE );
+        FPT_EOM.EOMTABLE_ = VECTOR ( VLP_EOMTABLE );
+        CALL M$EOM ( FPT_EOM ) ALTRET ( DIE );
+        FPT_EOM.EOMTABLE_ = VECTOR(NIL);
+     CASE ( %KX_VCFNC_CLR_IND# );
+        CALL M$CLOSE ( CLOSE_VC ) ALTRET ( DIE );
+        CALL BINCHAR ( SUBSTR(CLR_MESS,24,3), ADDR(READ_BUF)->VC$CLR.CAUSE );
+        CALL BINCHAR ( SUBSTR(CLR_MESS,34,3), ADDR(READ_BUF)->VC$CLR.DIAG );
+        CALL M$WRITE ( WRITE_CRLF) ALTRET ( DIE );
+        CALL M$WRITE ( WRITE_ERR_CLR ) ALTRET ( DIE );
+L_DISC:
+        P_INDEX = 0;
+        STATE = %X28_STATE_INT#;
+        MODE = %X28_MODE_COMMAND#;
+        CALL M$TRMPRG (CANCEL_TERM_READ);
+        TERM_READ.V.DVBYTE.TRANS# = '1'B; /* dont echo prompt, for wait read  */
+        FPT_EOM.V.TIMEOUT# = 1;         /* and make it timeout quickly        */
+        CALL M$EOM (FPT_EOM);
+        TIMER_ON = '0'B;
+L_TRTN:
+        IF WAITING_RESUME               /* we were called from process_rsm    */
+        THEN
+           WAITING_RESUME = '0'B;
+        ELSE
+           IF VCINP_PND                 /* we were called processing an dc3   */
+           THEN
+              VCINP_PND = '0'B;
+        CALL M$PROMPT ( SET_X28_PROMPT ) ALTRET ( DIE );
+        CALL M$DEVICE ( RESET_LO_DVFC ) ALTRET ( DIE );
+        CALL M$WRITE ( WRITE_DELCREM ) ALTRET ( DIE );
+        DEEP = 0;
+        NEED2READ = 0;
+        RETURN;
+     CASE ( %KX_VCFNC_INDX3# );
+/*
+   Any change in forwarding character or pad recall ?
+*/
+        IF X3(%KX_X3PRMX_DATFRWSGN#) ~=
+          ADDR(READ_BUF)->IND$X3.X3(%KX_X3PRMX_DATFRWSGN#)
+          OR X3(%KX_X3PRMX_PADRCL#) ~=
+          ADDR(READ_BUF)->IND$X3.X3(%KX_X3PRMX_PADRCL#)
+        THEN
+        DO;
+           LO = 0;
+           HI = -1;
+           DO CASE ( ADDR(READ_BUF)->IND$X3.X3(%KX_X3PRMX_DATFRWSGN#) );
+           CASE ( 0 );
+              FORWARD_CHAR = '0'B;
+           CASE ( 1 );                  /* all alphanumeric                   */
+              FORWARD_CHAR = '0'B;
+/*            LO = 48;
+              HI = 122;                    taken care of by Y$READ_TERMINAL   */
+           CASE ( 2 );
+              FORWARD_CHAR = '0'B;
+              FORWARD_CHAR(13) = '1'B;  /* cr                                 */
+           CASE ( 4 );
+              FORWARD_CHAR = '0'B;
+              FORWARD_CHAR(27) = '1'B;  /* esc                                */
+              LO = 5;
+              HI = 7;                   /* esc,bel,enq,ack                    */
+           CASE ( 6 );                  /* 2 + 4                              */
+              FORWARD_CHAR = '0'B;
+              FORWARD_CHAR(13) = '1'B;  /* cr                                 */
+              FORWARD_CHAR(27) = '1'B;  /* esc                                */
+              LO = 5;
+              HI = 7;
+           CASE ( 8 );
+              FORWARD_CHAR = '0'B;
+              FORWARD_CHAR(127) = '1'B; /* del                                */
+              FORWARD_CHAR(24) = '1'B;  /* can                                */
+              FORWARD_CHAR(18) = '1'B;  /* dc2                                */
+           CASE ( 16 );
+              FORWARD_CHAR = '0'B;
+              FORWARD_CHAR(3) = '1'B;   /* etx                                */
+              FORWARD_CHAR(4) = '1'B;   /* eot                                */
+           CASE ( 18 );                 /* 2 + 16                             */
+              FORWARD_CHAR = '0'B;
+              FORWARD_CHAR(13) = '1'B;  /* cr                                 */
+              FORWARD_CHAR(3) = '1'B;   /* etx                                */
+              FORWARD_CHAR(4) = '1'B;   /* eot                                */
+           CASE ( 32 );
+              FORWARD_CHAR = '0'B;
+              LO = 9;
+              HI = 12;                  /* ht,lf,vt,ff                        */
+           CASE ( 64 );
+              FORWARD_CHAR = '0'B;
+              FORWARD_CHAR(1) = '1'B;   /* soh                                */
+              FORWARD_CHAR(21)= '1'B;   /* nak                                */
+           CASE ( 126 );                /* 2+4+8+16+32+64 ?                   */
+              FORWARD_CHAR = '0'B;
+              HI = 31;
+           CASE ( 127 );                /* everything                         */
+/*            HI = 127;                    also done by Y$READ_TERMINAL       */
+           CASE ( ELSE );
+                                        /* ignore it                          */
+            END;                        /* do case                            */
+           DO I = LO TO HI;
+              FORWARD_CHAR(I) = '1'B;
+              END;
+ 
+           IF ADDR(READ_BUF)->IND$X3.X3(%KX_X3PRMX_PADRCL#) = 0 THEN
+              ADDR(READ_BUF)->IND$X3.X3(%KX_X3PRMX_PADRCL#) =
+                X3(%KX_X3PRMX_PADRCL#); /* other end cant turn it off         */
+           I = ADDR(READ_BUF)->IND$X3.X3(%KX_X3PRMX_PADRCL#);
+           IF I ~= X3(%KX_X3PRMX_PADRCL#) THEN DO;
+              CALL INSERT(RCL_MESS,SIZEC(RCL_MESS)-3,3,'''',BINASC(I),'''');
+              IF I = 1 THEN CALL INSERT(RCL_MESS,SIZEC(RCL_MESS)-3,3,'DLE');
+              CALL M$WRITE ( WRITE_CRLF ) ALTRET (DIE );
+              CALL M$WRITE ( WRITE_RCL_CHN ) ALTRET (DIE );
+              END;
+           IF I = 1 THEN I = 16;
+           IF I ~= 0 THEN FORWARD_CHAR(I) = '1'B;
+ 
+           DO I = 0 TO 15;
+              FORWARD_REDEF(I+16) = FORWARD_REDEF(I);
+              VLP_EOMTABLE.TABLE#.VALUES#(I) = FORWARD_REDEF(I);
+              VLP_EOMTABLE.TABLE#.VALUES#(I+16) = FORWARD_REDEF(I);
+              END;
+           FPT_EOM.EOMTABLE_ = VECTOR ( VLP_EOMTABLE );
+           CALL M$EOM ( FPT_EOM ) ALTRET ( DIE );
+           FPT_EOM.EOMTABLE_ = VECTOR(NIL);
+           END;                         /* if datfrwsgn changed               */
+        TIMER_ON = '0'B;                /* Recompute the timeout              */
+        X3 = ADDR(READ_BUF)->IND$X3.X3;
+     CASE ( %KX_VCFNC_RST_CNF#, %KX_VCFNC_INT_CNF# ); /* nothing to do        */
+     CASE ( ELSE );
+L_XIT:  CALL BINCHAR ( SUBSTR(XIT_MESS,36,2), READ_BUF_ARRAY(0) );
+        CALL M$WRITE ( WRITE_CRLF) ALTRET ( DIE );
+        CALL M$WRITE ( WRITE_ERR_XIT ) ALTRET ( DIE );
+      END;                              /* do case                            */
+L_REREAD:
+     IF DEEP = 1
+     THEN
+     DO WHILE ( NEED2READ ~= 0 );
+        NEED2READ = 0;
+        CALL M$READ ( READ_VC ) ALTRET ( DIE );
+        END;
+     DEEP = DEEP - 1;
+     WAITING_RESUME = '0'B;
+     VCINP_PND = '0'B;
+     RETURN;
+ 
+DIE:
+     ERR_CODE = B$TCB.ALT$->B$ALT.ERR;
+DIE2:
+     IF ERR_CODE.ERR# = %E$OPER AND WAITING_RESUME
+     THEN
+        GOTO L_REREAD;                  /* Just read again if we canceled     */
+ 
+     CALL XUR$ERRMSG ( ERR_CODE );
+     IF ERR_CODE.ERR# = %E$LDSC
+     THEN
+        GOTO L_DISC;
+     CALL XUR$CLOSE_DCBS;
+     CALL M$EXIT ( FPT_EXIT_ERROR );
+ 
+END READ$COMPLETE_PROC;
+ 

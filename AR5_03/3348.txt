@@ -1,0 +1,361 @@
+
+
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: bo.c,v 1.6 87/03/10 10:41:35 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /* B R A N C H   O P T I M I Z A T I O N
+        7         7              *
+        8         8              * B O . C
+        9         9              */
+       10        10
+       11        11
+       12        12             #include <stdio:h>
+       13        13             #include "types:h"
+       14        14             #include "debug:h"
+       15        15             #include "global:h"
+       16        16             #include "files:h"
+       17        17             #include "get:h"
+       18        18             #include "put:h"
+       19        19             #include "lset:h"
+       20        20             #include "map:h"
+       21        21             #include "alloc:h"
+       22        22             #include "aux:h"
+       23        23             #include "def:h"
+       24        24             #include "go:h"
+       25        25             #include "em_mnem:h"
+       26        26             #include "em_pseu:h"
+       27        27             #include "em_spec:h"
+       28        28
+       29        29             #define LP_BLOCKS  lp_extend->lpx_ra.lpx_blocks
+       30        30
+       31        31             #define newbolpx() (lpext_p)   newstruct(lpext_ra)
+       32        32             #define oldbolpx(x)   oldstruct(lpext_ra,x)
+       33        33
+       34        34             STATIC int Sbo;  /* #optimizations found */
+       35        35
+       36        36             #define DLINK(l1,l2)  l1->l_next=l2; l2->l_prev=l1
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=2  
+       37        37
+       38        38             /* This module performs some very simple branch optimizations.
+       39        39              *
+       40        40              * I) Look for pairs of basic blocks (B1,B2), such that
+       41        41              *        SUCC(b1) = {B2} and
+       42        42              *        PRED(B2) = {B1}.
+       43        43              *    In this case B1 and B2 can be combined into one block.
+       44        44              *    This optimization is mainly succesful:
+       45        45              *     1) for switch statements in C, as the C compiler generates a branch
+       46        46              *        over the entire switch.
+       47        47              *     2) for return statements, if the only way to return from a procedure
+       48        48              *        is via a return statement somewhere in the middle of the procedure.
+       49        49              * II) Optimize while statements. Transformations like:
+       50        50              *         1:            jmp 2
+       51        51              *     tst cond    1:
+       52        52              *     beq 2f             S
+       53        53              *     S        2:
+       54        54              *     jmp 1           tst cond
+       55        55              *      2:                bneq 1
+       56        56              *  are done by this optimization.
+       57        57              */
+       58        58
+       59        59
+       60        60
+       61        61             STATIC line_p last_code(lines,skip_pseu)
+       62        62              line_p lines;
+       63        63              bool skip_pseu;
+       64        64             {
+       65        65    1         /* Determine the last line of a list */
+       66        66    1
+       67        67    1         register line_p l;
+       68        68    1
+       69        69    1         for (l = lines; l->l_next != (line_p) 0; l = l->l_next);
+       70        70    1         if (skip_pseu) {
+       71        71    2            while (INSTR(l) < sp_fmnem || INSTR(l) > sp_lmnem) l = PREV(l);
+       72        72    2         }
+       73        73    1         return l;
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=3  
+       74        74    1        }
+       75        75
+       76        76             STATIC short cc_tab[12] =
+       77        77              {op_blt,op_zlt,op_ble,op_zle,op_beq,op_zeq,
+       78        78    1          op_zne,op_bne,op_zgt,op_bgt,op_zge,op_bge};
+       79        79
+       80        80
+       81        81             STATIC short rev_cond(cond)
+       82        82               short cond;
+       83        83             {
+       84        84    1          register i;
+       85        85    1
+       86        86    1          for (i = 0; i < 12; i++) {
+       87        87    2            if (cond == cc_tab[i]) return cc_tab[11-i];
+       88        88    2         }
+       89        89    1         return op_nop;
+       90        90    1        }
+       91        91
+       92        92             STATIC bool is_bcc(l)
+       93        93              line_p l;
+       94        94             {
+       95        95    1         return rev_cond(INSTR(l)) != op_nop;
+       96        96    1        }
+       97        97
+       98        98
+       99        99             STATIC bo_optloop(p,b,x,bra,bcc)
+      100       100              proc_p p;
+      101       101              bblock_p b,x;
+      102       102              line_p bra,bcc;
+      103       103             {
+      104       104    1         bblock_p prevb,n;
+      105       105    1         line_p l;
+      106       106    1
+      107       107    1         if (b->b_start == bra) {
+      108       108    2            b->b_start = (line_p) 0;
+      109       109    2         } else {
+      110       110    2            PREV(bra)->l_next = (line_p) 0;
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=4  
+      111       111    2         }
+      112       112    1         PREV(bra) = (line_p) 0;
+      113       113    1         bcc->l_instr = rev_cond(INSTR(bcc));
+      114       114    1         n = x->b_next;
+      115       115    1         l = n->b_start;
+      116       116    1         if (l == (line_p) 0 || INSTR(l) != op_lab) {
+      117       117    2            l = newline(OPINSTRLAB);
+      118       118    2            l->l_instr = op_lab;
+      119       119    2            INSTRLAB(l) = freshlabel();
+      120       120    2            if (n->b_start != (line_p) 0) {
+      121       121    3               DLINK(l,n->b_start);
+      122       122    3            }
+      123       123    2            n->b_start = l;
+      124       124    2         }
+      125       125    1         INSTRLAB(bcc) = INSTRLAB(l);
+      126       126    1         for (prevb = p->p_start; prevb != (bblock_p) 0 && prevb->b_next != x;
+      127       127    1            prevb = prevb->b_next);
+      128       128    1         if (prevb == (bblock_p) 0) {
+      129       129    2            p->p_start = x->b_next;
+      130       130    2         } else {
+      131       131    2            prevb->b_next = x->b_next;
+      132       132    2            l = last_instr(prevb);
+      133       133    2            if (l == (line_p) 0) {
+      134       134    3               prevb->b_start = bra;
+      135       135    3            } else {
+      136       136    3               if (INSTR(l) == op_bra &&
+      137       137    3                   INSTRLAB(l) == INSTRLAB(bra)) {
+      138       138    4                  oldline(bra);
+      139       139    4               } else {
+      140       140    4                  appnd_line(bra,l);
+      141       141    4               }
+      142       142    3            }
+      143       143    2         }
+      144       144    1         x->b_next = b->b_next;
+      145       145    1         b->b_next = x;
+      146       146    1        }
+      147       147
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=5  
+      148       148
+      149       149
+      150       150             STATIC bo_tryloop(p,loop)
+      151       151              proc_p p;
+      152       152              lset loop;
+      153       153             {
+      154       154    1         Lindex i,j;
+      155       155    1         bblock_p b,x;
+      156       156    1         line_p bra,bcc;
+      157       157    1
+      158       158    1         for (i = Lfirst(loop); i != (Lindex) 0; i = Lnext(i,loop)) {
+      159       159    2            b = (bblock_p) Lelem(i);
+      160       160    2            if (b->b_next != (bblock_p) 0 && !Lis_elem(b->b_next,loop)) {
+      161       161    3               j = Lfirst(b->b_succ);
+      162       162    3               if (j != (Lindex) 0 &&
+      163       163    3                   (bra = last_instr(b)) != (line_p) 0 &&
+      164       164    3                   INSTR(bra) == op_bra) {
+      165       165    4                  x = (bblock_p) Lelem(j); /* single successor */
+      166       166    4                  if (Lis_elem(b->b_next,x->b_succ) &&
+      167       167    4                      is_bcc((bcc = last_instr(x)))) {
+      168       168    5        OUTVERBOSE("branch optimization proc %d block %d\n", curproc->p_id,x->b_id);
+      169       169    5                     Sbo++;
+      170       170    5                     bo_optloop(p,b,x,bra,bcc);
+      171       171    5                     return;
+      172       172    5                  }
+      173       173    4               }
+      174       174    3            }
+      175       175    2         }
+      176       176    1        }
+      177       177
+      178       178
+      179       179
+      180       180             STATIC bo_loops(p)
+      181       181              proc_p p;
+      182       182             {
+      183       183    1         Lindex i;
+      184       184    1         loop_p lp;
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=6  
+      185       185    1
+      186       186    1         for (i = Lfirst(p->p_loops); i != (Lindex) 0; i = Lnext(i,p->p_loops)) {
+      187       187    2            lp = (loop_p) (Lelem(i));
+      188       188    2            bo_tryloop(p,lp->LP_BLOCKS);
+      189       189    2         }
+      190       190    1        }
+      191       191
+      192       192             STATIC mv_code(b1,b2)
+      193       193              bblock_p b1,b2;
+      194       194             {
+      195       195    1         line_p l,x;
+      196       196    1
+      197       197    1         l = last_code(b2->b_start,TRUE);
+      198       198    1         assert(INSTR(l) == op_bra);
+      199       199    1         DLINK(l,b1->b_start);
+      200       200    1         x = l->l_next;
+      201       201    1         rm_line(l,b2);
+      202       202    1         if (INSTR(x) == op_lab) {
+      203       203    2            rm_line(x,b2);
+      204       204    2         }
+      205       205    1        }
+      206       206
+      207       207             bo_switch(b)
+      208       208              bblock_p b;
+      209       209             {
+      210       210    1         bblock_p s,x;
+      211       211    1         Lindex i;
+      212       212    1         line_p l,bra;
+      213       213    1
+      214       214    1         if (Lnrelems(b->b_succ) == 1) {
+      215       215    2            s = (bblock_p) Lelem(Lfirst(b->b_succ));
+      216       216    2            if (b->b_start != (line_p) 0 &&
+      217       217    2                s->b_start != (line_p) 0 &&
+      218       218    2                Lnrelems(s->b_pred) == 1 &&
+      219       219    2                (bra = last_code(b->b_start,TRUE)) != (line_p) 0 &&
+      220       220    2                INSTR(bra) == op_bra &&
+      221       221    2                (s->b_next == (bblock_p) 0 ||
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=7  
+      222       222    2                 !Lis_elem(s->b_next,s->b_succ))) {
+      223       223    3               l = last_code(s->b_start,FALSE);
+      224       224    3               if (INSTR(l) == ps_end) {
+      225       225    4                  if (PREV(l) == (line_p) 0) return;
+      226       226    4                  PREV(l)->l_next = (line_p) 0;
+      227       227    4                  PREV(l) = (line_p) 0;
+      228       228    4               } else {
+      229       229    4                  l = (line_p) 0;
+      230       230    4               }
+      231       231    3        OUTVERBOSE("branch optimization in proc %d, block %d",curproc->p_id,b->b_id);
+      232       232    3               Sbo++;
+      233       233    3               Ldeleteset(b->b_succ);
+      234       234    3               b->b_succ = s->b_succ;
+      235       235    3               Ldeleteset(s->b_pred);
+      236       236    3               s->b_succ = Lempty_set();
+      237       237    3               s->b_pred = Lempty_set();
+      238       238    3               for (i = Lfirst(b->b_succ); i != (Lindex) 0;
+      239       239    3                        i = Lnext(i,b->b_succ)) {
+      240       240    4                  x = (bblock_p) Lelem(i);
+      241       241    4                  Lremove(s,&x->b_pred);
+      242       242    4                  Ladd(b,&x->b_pred);
+      243       243    4                  if (x->b_idom == s) {
+      244       244    5                     x->b_idom = b;
+      245       245    5                  }
+      246       246    4               }
+      247       247    3               mv_code(s,b);
+      248       248    3               s->b_start = l;
+      249       249    3            }
+      250       250    2         }
+      251       251    1        }
+      252       252
+      253       253             STATIC bo_extproc(p)
+      254       254              proc_p p;
+      255       255             {
+      256       256    1         /* Allocate the extended data structures for procedure p */
+      257       257    1
+      258       258    1         register loop_p lp;
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=8  
+      259       259    1         register Lindex pi;
+      260       260    1
+      261       261    1         for (pi = Lfirst(p->p_loops); pi != (Lindex) 0;
+      262       262    1            pi = Lnext(pi,p->p_loops)) {
+      263       263    2            lp = (loop_p) Lelem(pi);
+      264       264    2            lp->lp_extend = newbolpx();
+      265       265    2          lp->LP_BLOCKS = (lset) 0;
+      266       266    2         }
+      267       267    1        }
+      268       268
+      269       269
+      270       270             STATIC loop_blocks(p)
+      271       271              proc_p p;
+      272       272             {
+      273       273    1         /* Compute the LP_BLOCKS sets for all loops of p */
+      274       274    1
+      275       275    1         register bblock_p b;
+      276       276    1         register Lindex i;
+      277       277    1
+      278       278    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      279       279    2            for (i = Lfirst(b->b_loops); i != (Lindex) 0;
+      280       280    2               i = Lnext(i,b->b_loops)) {
+      281       281    3               Ladd(b,&(((loop_p) Lelem(i))->LP_BLOCKS));
+      282       282    3            }
+      283       283    2         }
+      284       284    1        }
+      285       285
+      286       286             STATIC bo_cleanproc(p)
+      287       287              proc_p p;
+      288       288             {
+      289       289    1         /* Allocate the extended data structures for procedure p */
+      290       290    1
+      291       291    1         register loop_p lp;
+      292       292    1         register Lindex pi;
+      293       293    1         register bblock_p b;
+"zbe$bo:c.:ZBC3TSI", line 293: (warning) identifier "b" is not used
+      294       294    1
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=9  
+      295       295    1         for (pi = Lfirst(p->p_loops); pi != (Lindex) 0;
+      296       296    1            pi = Lnext(pi,p->p_loops)) {
+      297       297    2            lp = (loop_p) Lelem(pi);
+      298       298    2            oldbolpx(lp->lp_extend);
+      299       299    2          lp->lp_extend = (lpext_p) 0;
+      300       300    2         }
+      301       301    1        }
+      302       302
+      303       303             bo_optimize(p)
+      304       304              proc_p p;
+      305       305             {
+      306       306    1         bblock_p b;
+      307       307    1
+      308       308    1         bo_extproc(p);
+      309       309    1         loop_blocks(p);
+      310       310    1         bo_loops(p);
+      311       311    1         for (b = p->p_start; b != 0; b = b->b_next) {
+      312       312    2            bo_switch(b);
+      313       313    2         }
+      314       314    1         bo_cleanproc(p);
+      315       315    1        }
+      316       316
+      317       317
+      318       318
+      319       319             bomain(argc,argv)
+      320       320              int argc;
+      321       321              char *argv[];
+      322       322             {
+      323       323    1         go(argc,argv,no_action,bo_optimize,no_action,no_action);
+      324       324    1         report("branch optimizations", Sbo);
+      325       325    1           return ;
+      326       326    1        }
+      327       327
+---  Include file information  ---
+
+   stdio:h.:LIBRARY. is referenced
+   zbe$types:h.:ZBC3TOU. is referenced
+CC.C03    File=zbe$bo:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=10 
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+   zbe$files:h.:ZBC3TOU. is referenced
+   zbe$get:h.:ZBC3TOU. is referenced
+   zbe$put:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$map:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$aux:h.:ZBC3TOU. is referenced
+   zbe$def:h.:ZBC3TOU. is referenced
+   zbe$go:h.:ZBC3TOU. is referenced
+   em_mnem:h.:ZBC3TOU. is referenced
+   em_pseu:h.:ZBC3TOU. is referenced
+   em_spec:h.:ZBC3TOU. is referenced
+
+1 warning was detected in the file zbe$bo:c.:ZBC3TSI

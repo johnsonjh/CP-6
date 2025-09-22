@@ -1,0 +1,1543 @@
+VERSION E05
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:1    
+        1        1        /*M*  EXECUTION SCHEDULER                                             */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*  AND,DTI=3  */
+        8        8                                                /**/
+        9        9        SSX$XSCHD: PROC;
+       10       10                                                /**/
+       11       11    1   DCL   J UBIN;                           /* STATE INDEX                        */
+       12       12    1   DCL   K UBIN;                           /* TEMP USER NUMBER                   */
+       13       13    1   DCL KS REDEF K SBIN;
+       14       14    1   DCL   EVFLG SBIN;                       /* TEMP EVENT FLAG                    */
+       15       15        %EQU  PRIODEC = 1;                      /* PRIORITY DECREMENT STEP            */
+       16       16    1   DCL   RTIME UBIN;                       /* TEMP RESPONSE TIME                 */
+       17       17    1   DCL DCB# UBIN;
+       18       18        /*                                                                    */
+       19       19    1   DCL   KQ_BASEDELAY UBIN SYMREF;
+       20       20    1   DCL   S_PNO SBIN SYMREF;
+       21       21    1   DCL   S_CUN UBIN SYMREF;
+       22       22    1   DCL    S_UXTSCHD UBIN SYMREF;
+       23       23    1   DCL    S_USTSCHD UBIN SYMREF;
+       24       24    1   DCL   B$JIT$ PTR SYMREF READONLY;
+       25       25    1   DCL  B$ROSEG$ PTR SYMREF READONLY;
+       26       26        /*                                                                    */
+       27       27    1   DCL   HFC$ASSOCCLR ENTRY(3);            /* CLEAR PAGE TABLE ASSOC. MEMORY     */
+       28       28    1   DCL   KCC$BASE ENTRY;                   /* DO DELAYED COMGROUP STUFF          */
+       29       29    1   DCL   SSC$IDLE ENTRY;                   /* ACCOUNT FOR IDLE TIME              */
+       30       30    1   DCL   SSC$IOW ENTRY;                    /* ACCOUNT FOR I/O WAIT               */
+       31       31    1   DCL   SSC$MONTIMRWU ENTRY;              /* DO PERIODIC SERVICES               */
+       32       32    1   DCL   SSC$QTIMR ENTRY(1);               /* SET TIMER REGISTER                 */
+       33       33    1   DCL   SSC$RESIOW ENTRY;                 /* ACCOUNT FOR RESOURCE & I/O WAIT    */
+       34       34    1   DCL   SSC$RESW ENTRY;                   /* ACCOUNT FOR RESOURCE WAIT          */
+       35       35    1   DCL   SSC$SASYNC ENTRY;                 /* ACCOUNT FOR MONITOR EXECUTION      */
+       36       36    1   DCL   SSC$SERV ENTRY;                   /* ACCOUNT FOR USER SERVICE           */
+       37       37    1   DCL   SSR$CHS ENTRY(1);                 /* CHANGE STATE TO CURRENT USER       */
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:2    
+       38       38    1   DCL   SSR$CHSE ENTRY(1);                /* CHANGE STATE TO COMPUTE            */
+       39       39    1   DCL   SSR$SKIP ENTRY(1);                /* PUT USER AT END OF HIS QUEUE       */
+       40       40    1   DCL   SSS$CACHE ENTRY;                  /* USE CACHE ISR DSCR                 */
+       41       41    1   DCL   SSS$CACHEBP ENTRY;                /* BYPASS CACHE ON ISR ACCESS         */
+       42       42    1   DCL   SSS$CCAC ENTRY;                   /* CLEAR CACHE AND PG TBL AM          */
+       43       43    1   DCL   SSS$EOMTIME ENTRY(1);             /* CURRENT TIME                       */
+       44       44    1   DCL   SSS$IDLE ENTRY;                   /* WAIT ON DIS INSTRUCTION            */
+       45       45    1   DCL   SSS$STOP ENTRY;                   /* STOP EXECUTING, WAIT FOR START     */
+       46       46    1   DCL   SSS$MIXED ENTRY ALTRET;      /* TEST FOR REQUIRED CPU TYPE IN MIXED MP  */
+       47       47    1   DCL   SSS$WARP ENTRY ALTRET;            /* FINISH UP ANY WARPING              */
+       48       48        %INCLUDE F$DCB;
+       49       97        %INCLUDE MM_DATA_R;                     /* Needed to reference MM$VCB         */
+       50      617        %INCLUDE SS_SCHED_C;
+       51      850        %INCLUDE S_WSPTD_R;
+       52      866        %INCLUDE SS_SCHED_R;
+       53      909        %INCLUDE B$USER;
+       54     1125        %B$USERREFS;
+       55     1129        %INCLUDE PM_BUCKET_C;
+       56     1214        %INCLUDE P_PMDAT_R;
+       57     1522        %INCLUDE HF_LOCK_C;
+       58     1536        %INCLUDE HF_DATA_R;
+       59     1579        /*                                                                    */
+       60     1580        %DUMMY_BUCKET (NAME=P_RT,STCLASS=SYMREF);
+       61     1586        %INCLUDE B$JIT_C;
+       62     1900        %B$JIT0;
+       63     1989        %U$JIT1X;
+       64     1992        %M$JIT2;
+       65     2002        %F$JIT3X;
+       66     2005        %S$JIT4;
+       67     2011        %J$JIT5X;
+       68     2014        %A$JIT6X;
+       69     2017        /*                                                                    */
+       70     2018        %SUB    IDLQUAN=100000;
+       71     2019        %EJECT;
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:3    
+       72     2020    2           DO UNTIL ('0'B);           /* Keep doing it until we get it right     */
+       73     2021    2              IF KQ_BASEDELAY ~= 0 THEN
+       74     2022    2                 IF S_PNO = 0 THEN
+       75     2023    2                    CALL KCC$BASE;
+       76     2024                   %LOCK (G# = S_SCHDGATE);
+       77     2027    2              IF NOT HW_SMART_CACHE
+       78     2028    2              THEN CALL SSS$CCAC;
+       79     2029                   /* Clears cache for static scheduler tables;
+       80     2030                      also clears cache and PTWAM for (possible) new user */
+       81     2031
+       82     2032    2              J = S_PCU (S_PNO);
+       83     2033    2              S_PCU (S_PNO) = 0;
+       84     2034    2              IF J ~= 0
+       85     2035    2              THEN
+       86     2036    2                 CALL SSR$CHSE (J);
+       87     2037
+       88     2038    2              IF S_STOP (S_PNO) ~= 0
+       89     2039    3              THEN DO;
+       90     2040                         %UNLOCK (G# = S_SCHDGATE);
+       91     2043    3                    CALL SSS$STOP;
+       92     2044    3                 END;
+       93     2045
+       94     2046    2              EVFLG = S_EVF;
+       95     2047                                           /* So we know when to try again, from idle */
+       96     2048
+       97     2049    3              DO J = 1 TO %SS_SCU - 1;
+       98     2050                                                /* Run the executable queues...       */
+       99     2051    3                 K = S_HQ (J);
+      100     2052    4                 DO WHILE (K ~= 0);
+      101     2053    4                    S$CU$ = ADDR (B$USRT$ -> B$USER (K));
+      102     2054    4                    IF ((NOT S$CU$ -> B$U.FLG & %U_MSTR)
+      103     2055    4                      AND (S$CU$ -> B$U.CPU = 0
+      104     2056    4                      OR S$CU$ -> B$U.CPU - 1 = S_PNO))
+      105     2057                            /* If master is not required and this is not a user
+      106     2058                               requiring a specific CPU or this is the required
+      107     2059                               CPU then we got a live one */
+      108     2060    4                      OR (S$CU$ -> B$U.FLG & %U_MSTR AND S_PNO = 0)
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:4    
+      109     2061                                 /* also cool if master req'd and this is the master  */
+      110     2062
+      111     2063    5                    THEN DO;               /* we have a user to run              */
+      112     2064    5                          S_WSPTD.BLKNO(%USERWSQ)=S$CU$->B$U.PT;
+      113     2065    5                          IF S$CU$->B$U.FLG.BIGPT THEN
+      114     2066    5                             S_WSPTD.NBLKS(%USERWSQ)= 32;
+      115     2067    5                          ELSE
+      116     2068    5                             S_WSPTD.NBLKS(%USERWSQ)= 16;
+      117     2069    5                          S_PCU(S_PNO)=K;
+      118     2070    5                          S_CUN=K;
+      119     2071
+      120     2072    5                          CALL HFC$ASSOCCLR (%USERWSQ,0,16384); /*MAX DENSE PT*/
+      121     2073
+      122     2074    5                          IF H_MIXED_MP ~= 0
+      123     2075    5                          THEN CALL SSS$MIXED ALTRET(NEXT_USER);
+      124     2076                                                /* MIXED_MP flag is set               */
+      125     2077                                 /* Check to see if sepcific CPU type is required     */
+      126     2078    5                          ELSE IF S_PORTNR(7) ~= 0 AND S_PORTNR(7) = S_PNO
+      127     2079    5                               AND S$CU$->B$U.CPU = 0
+      128     2080    6                             THEN DO;
+      129     2081        /*
+      130     2082                                  We are running on the partitioned CPU.  Since
+      131     2083                                  user did not request to be run on this CPU,
+      132     2084                                  look for another user to run on this CPU.
+      133     2085        */
+      134     2086    6                                   S_PCU(S_PNO) = 0;
+      135     2087    6                                   GOTO NEXT_USER;
+      136     2088    6                                END;
+      137     2089
+      138     2090    5                          IF S$CU$->B$U.FLG.NOQUAN
+      139     2091    5                            AND S$CU$->B$U.PRIO = S$CU$->B$U.PRIOB THEN
+      140     2092    6                             DO;
+      141     2093                                   /* He already got a free quantum,
+      142     2094                                      pass him up this time */
+      143     2095    6                                CALL SSR$SKIP(K);
+      144     2096    6                                S$CU$->B$U.FLG.NOQUAN = '0'B;
+      145     2097    6                                S_PCU(S_PNO) = 0;
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:5    
+      146     2098    6                                GOTO NEXT_USER;
+      147     2099    6                             END;
+      148     2100
+      149     2101    5                          S_HIR=S_HIR-1;   /* One less executable user waiting   */
+      150     2102    5                          CALL SSR$CHS(K); /* Make him the current user          */
+      151     2103
+      152     2104    5                          IF S_NSCPUA = 0
+      153     2105    6                          THEN DO INHIBIT;
+      154     2106    6                                S$CU$ -> B$U.ASYNCH = S$CU$ -> B$U.ASYNCH&~%U_RESET;
+      155     2107    6                             END;
+      156     2108    6                          ELSE DO;
+      157     2109                                     %LOCK (G# = S_ASFGATE);
+      158     2112    6                                S$CU$ -> B$U.ASYNCH = S$CU$ -> B$U.ASYNCH&~%U_RESET;
+      159     2113                                     %UNLOCK (G# = S_ASFGATE);
+      160     2116    6                             END;
+      161     2117
+      162     2118    5                          IF S$CU$->B$U.PRIO = S$CU$->B$U.PRIOB + S_PINC(3)
+      163     2119                                           /* Mark him, so we pass him up next time   */
+      164     2120    5                          THEN S$CU$->B$U.FLG.NOQUAN = '1'B;
+      165     2121
+      166     2122    5                          S_CUP=S$CU$->B$U.PRIO;
+      167     2123    5                          IF S_CUP > S$CU$ -> B$U.PRIOB
+      168     2124    6                          THEN DO;
+      169     2125    6                                S_CUP = S_CUP - %PRIODEC;
+      170     2126    6                                S$CU$ -> B$U.PRIO = S_CUP;
+      171     2127    6                             END;
+      172     2128
+      173     2129                               %UNLOCK (G# = S_SCHDGATE);
+      174     2132        /* If the virtual segments are defined move in the appropiate wsptd */
+      175     2133    6                          DO J = 0 TO 2;
+      176     2134    6                             S_WSPTD (%VS1WSQ + J) = '0'B;
+      177     2135
+      178     2136    6                             DCB# = B$JIT.VIRTUAL.DCB#(J);
+      179     2137    6                             IF DCB# ~= 0
+      180     2138    7                             THEN DO;
+      181     2139    7                                   S_WSPTD(%VS1WSQ + J) = DCBADDR(DCB#)->F$DCB.SETSTA$
+              2139                                            ->MM$VCB.WSPTD;
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:6    
+      182     2140    7                                   CALL HFC$ASSOCCLR (%VS1WSQ+J,0,1024*4096);
+              2140                                            /*MAX frag WS*/
+      183     2141    7                                END;
+      184     2142
+      185     2143    6                          END;
+      186     2144    5                          S_UXTSCHD=B$JIT.XTIME;
+      187     2145    5                          S_USTSCHD=B$JIT.STIME;
+      188     2146    5                          B$JIT.SCHTIME=B$JIT.XTIME+B$JIT.STIME+B$JIT.CTIME;
+      189     2147    5                          P_SCHD#(S_PNO)=P_SCHD#(S_PNO)+1;
+      190     2148
+      191     2149    5                          IF S$CU$->B$U.FLG.INTUSR THEN
+      192     2150    6                             DO;
+      193     2151    6                                S$CU$->B$U.FLG.INTUSR='0'B;
+      194     2152    6                                IF B$JIT.MODE = %M_INT# THEN
+      195     2153    7                                   DO;
+      196     2154                                           %LOCK (G# = P_GATE);
+      197     2157    7                                      CALL SSS$EOMTIME(RTIME);
+      198     2158    7                                      RTIME=(RTIME-S$CU$->B$U.MISC)/1000;
+      199     2159                                           %UPDATE_BUCKET (BUCKET=P_RT,
+      200     2160                                           DIST_VAL=RTIME,
+      201     2161                                           SCRATCH=KS);
+      202     2170    7                                      P_NINTS=P_NINTS+1; /* Count interactions   */
+      203     2171                                           %UNLOCK (G# = P_GATE);
+      204     2174    7                                   END;
+      205     2175    6                             END;
+      206     2176
+      207     2177    5                          CALL SSC$MONTIMRWU;
+      208     2178    5                          CALL SSC$SERV;
+      209     2179    5                          RETURN;
+      210     2180    5                       END;
+      211     2181    4                    ELSE
+      212     2182    4   NEXT_USER:          ;
+      213     2183    4                    K = S$CU$ -> B$U.FL;
+      214     2184                                           /* Try next user in this queue, if any     */
+      215     2185    4                 END;
+      216     2186    3              END;
+      217     2187                   %UNLOCK (G# = S_SCHDGATE);
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:7    
+      218     2190    3              DO WHILE (EVFLG = S_EVF AND S_STOP(S_PNO) = 0);
+      219     2191    3                 S_IDLCPU=S_PNO;
+      220     2192    3                 IF S_HQ(%SS_SIOW) = 0 THEN
+      221     2193    3                    IF S_HQ(%SS_SQR) = 0 THEN
+      222     2194    3                       CALL SSC$IDLE;
+      223     2195    3                    ELSE
+      224     2196    3                       CALL SSC$RESW;
+      225     2197    3                 ELSE
+      226     2198    3                    IF S_HQ(%SS_SQR) = 0 THEN
+      227     2199    3                       CALL SSC$IOW;
+      228     2200    3                    ELSE
+      229     2201    3                       CALL SSC$RESIOW;
+      230     2202                                                /* First, cleanup any warping         */
+      231     2203    3                 IF H_RELIEF AND H_NURSE=S_PNO THEN CALL SSS$WARP;
+      232     2204
+      233     2205    3                 CALL SSC$QTIMR(IDLQUAN);
+      234     2206    3                 CALL SSS$IDLE;
+      235     2207    3                 CALL SSC$SASYNC;
+      236     2208    3                 CALL SSC$MONTIMRWU;       /* Do interval timer                  */
+      237     2209    3                 CALL SSS$CCAC;
+      238     2210    3              END;
+      239     2211    2           END;
+      240     2212    1   END;
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:8    
+--  Include file information  --
+
+   B$JIT_C.:E05TOU  is referenced.
+   HF_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   P_PMDAT_C.:E05TOU  is referenced.
+   P_PMDAT_R.:E05TOU  cannot be made into a system file and is referenced.
+   PM_BUCKET_C.:E05TOU  is referenced.
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRLD_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRL_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_R.:E05TOU  cannot be made into a system file and is referenced.
+   S_WSPTD_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   F$DCB.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure SSX$XSCHD.
+
+   Procedure SSX$XSCHD requires 361 words for executable code.
+   Procedure SSX$XSCHD requires 12 words of local(AUTO) storage.
+
+    No errors detected in file SSX$XSCHD.:E05TSI    .
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:9    
+
+ Object Unit name= SSX$XSCHD                                  File name= SSX$XSCHD.:E05TOU
+ UTS= JUL 30 '97 06:01:24.08 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   361    551  SSX$XSCHD
+    1  RoData even  none    15     17  SSX$XSCHD
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        0  SSX$XSCHD
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       0 KCC$BASE
+         yes           Std       1 HFC$UNLOCK
+         yes           Std       3 HFC$ASSOCCLR
+         yes           Std       0 SSC$RESW
+         yes           Std       0 SSC$IOW
+         yes           Std       0 SSC$SERV
+         yes           Std       1 HFC$LOCK
+         yes           Std       0 SSS$CCAC
+         yes           Std       1 SSR$CHSE
+         yes           Std       0 SSS$STOP
+ yes     yes           Std       0 SSS$MIXED
+         yes           Std       1 SSC$QTIMR
+         yes           Std       0 SSS$IDLE
+         yes           Std       0 SSC$MONTIMRWU
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:10   
+ yes     yes           Std       0 SSS$WARP
+         yes           Std       0 SSC$IDLE
+         yes           Std       0 SSC$RESIOW
+         yes           Std       1 SSR$SKIP
+         yes           Std       1 SSR$CHS
+         yes           Std       1 SSS$EOMTIME
+         yes           Std       0 SSC$SASYNC
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_AUTO_0
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KQ_BASEDELAY                          S_PNO                                 S_CUN
+     S_UXTSCHD                             S_USTSCHD                        r    B$JIT$
+r    MM_BYP$                               S_WSPTD                               S_HQ
+     S_PINC                                S_EVF                                 S_CUP
+     S_HIR                                 S_PCU                                 S_PORTNR
+     S_STOP                                S_NSCPUA                              S_IDLCPU
+     S_ASFGATE                             S_SCHDGATE                            S$CU$
+     B$USRT$                               P_RESOURCE$                           P_SCHD#
+     P_NINTS                               P_UPTIME                              P_GATE
+     P_NSCPU                               H_RELIEF                              H_NURSE
+r    H_MIXED_MP                            HW_SMART_CACHE                        P_RT
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ROSID                                 ISSID
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:11   
+
+
+        1        1        /*M*  EXECUTION SCHEDULER                                             */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*  AND,DTI=3  */
+        8        8                                                /**/
+        9        9        SSX$XSCHD: PROC;
+
+      9  0 000000   000000 700200 xent  SSX$XSCHD    TSX0  ! X66_AUTO_0
+         0 000001   000014 000000                    ZERO    12,0
+
+       10       10                                                /**/
+       11       11    1   DCL   J UBIN;                           /* STATE INDEX                        */
+       12       12    1   DCL   K UBIN;                           /* TEMP USER NUMBER                   */
+       13       13    1   DCL KS REDEF K SBIN;
+       14       14    1   DCL   EVFLG SBIN;                       /* TEMP EVENT FLAG                    */
+       15       15        %EQU  PRIODEC = 1;                      /* PRIORITY DECREMENT STEP            */
+       16       16    1   DCL   RTIME UBIN;                       /* TEMP RESPONSE TIME                 */
+       17       17    1   DCL DCB# UBIN;
+       18       18        /*                                                                    */
+       19       19    1   DCL   KQ_BASEDELAY UBIN SYMREF;
+       20       20    1   DCL   S_PNO SBIN SYMREF;
+       21       21    1   DCL   S_CUN UBIN SYMREF;
+       22       22    1   DCL    S_UXTSCHD UBIN SYMREF;
+       23       23    1   DCL    S_USTSCHD UBIN SYMREF;
+       24       24    1   DCL   B$JIT$ PTR SYMREF READONLY;
+       25       25    1   DCL  B$ROSEG$ PTR SYMREF READONLY;
+       26       26        /*                                                                    */
+       27       27    1   DCL   HFC$ASSOCCLR ENTRY(3);            /* CLEAR PAGE TABLE ASSOC. MEMORY     */
+       28       28    1   DCL   KCC$BASE ENTRY;                   /* DO DELAYED COMGROUP STUFF          */
+       29       29    1   DCL   SSC$IDLE ENTRY;                   /* ACCOUNT FOR IDLE TIME              */
+       30       30    1   DCL   SSC$IOW ENTRY;                    /* ACCOUNT FOR I/O WAIT               */
+       31       31    1   DCL   SSC$MONTIMRWU ENTRY;              /* DO PERIODIC SERVICES               */
+       32       32    1   DCL   SSC$QTIMR ENTRY(1);               /* SET TIMER REGISTER                 */
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:12   
+       33       33    1   DCL   SSC$RESIOW ENTRY;                 /* ACCOUNT FOR RESOURCE & I/O WAIT    */
+       34       34    1   DCL   SSC$RESW ENTRY;                   /* ACCOUNT FOR RESOURCE WAIT          */
+       35       35    1   DCL   SSC$SASYNC ENTRY;                 /* ACCOUNT FOR MONITOR EXECUTION      */
+       36       36    1   DCL   SSC$SERV ENTRY;                   /* ACCOUNT FOR USER SERVICE           */
+       37       37    1   DCL   SSR$CHS ENTRY(1);                 /* CHANGE STATE TO CURRENT USER       */
+       38       38    1   DCL   SSR$CHSE ENTRY(1);                /* CHANGE STATE TO COMPUTE            */
+       39       39    1   DCL   SSR$SKIP ENTRY(1);                /* PUT USER AT END OF HIS QUEUE       */
+       40       40    1   DCL   SSS$CACHE ENTRY;                  /* USE CACHE ISR DSCR                 */
+       41       41    1   DCL   SSS$CACHEBP ENTRY;                /* BYPASS CACHE ON ISR ACCESS         */
+       42       42    1   DCL   SSS$CCAC ENTRY;                   /* CLEAR CACHE AND PG TBL AM          */
+       43       43    1   DCL   SSS$EOMTIME ENTRY(1);             /* CURRENT TIME                       */
+       44       44    1   DCL   SSS$IDLE ENTRY;                   /* WAIT ON DIS INSTRUCTION            */
+       45       45    1   DCL   SSS$STOP ENTRY;                   /* STOP EXECUTING, WAIT FOR START     */
+       46       46    1   DCL   SSS$MIXED ENTRY ALTRET;      /* TEST FOR REQUIRED CPU TYPE IN MIXED MP  */
+       47       47    1   DCL   SSS$WARP ENTRY ALTRET;            /* FINISH UP ANY WARPING              */
+       48       48        %INCLUDE F$DCB;
+       49       97        %INCLUDE MM_DATA_R;                     /* Needed to reference MM$VCB         */
+       50      617        %INCLUDE SS_SCHED_C;
+       51      850        %INCLUDE S_WSPTD_R;
+       52      866        %INCLUDE SS_SCHED_R;
+       53      909        %INCLUDE B$USER;
+       54     1125        %B$USERREFS;
+       55     1129        %INCLUDE PM_BUCKET_C;
+       56     1214        %INCLUDE P_PMDAT_R;
+       57     1522        %INCLUDE HF_LOCK_C;
+       58     1536        %INCLUDE HF_DATA_R;
+       59     1579        /*                                                                    */
+       60     1580        %DUMMY_BUCKET (NAME=P_RT,STCLASS=SYMREF);
+       61     1586        %INCLUDE B$JIT_C;
+       62     1900        %B$JIT0;
+       63     1989        %U$JIT1X;
+       64     1992        %M$JIT2;
+       65     2002        %F$JIT3X;
+       66     2005        %S$JIT4;
+       67     2011        %J$JIT5X;
+       68     2014        %A$JIT6X;
+       69     2017        /*                                                                    */
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:13   
+       70     2018        %SUB    IDLQUAN=100000;
+       71     2019        %EJECT;
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:14   
+       72     2020    2           DO UNTIL ('0'B);           /* Keep doing it until we get it right     */
+
+       73     2021    2              IF KQ_BASEDELAY ~= 0 THEN
+
+   2021  0 000002   000000 235000 xsym               LDA     KQ_BASEDELAY
+         0 000003   000011 600000 0                  TZE     s:2025
+
+       74     2022    2                 IF S_PNO = 0 THEN
+
+   2022  0 000004   000000 236000 xsym               LDQ     S_PNO
+         0 000005   000011 601000 0                  TNZ     s:2025
+
+       75     2023    2                    CALL KCC$BASE;
+
+   2023  0 000006   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000007   000000 701000 xent               TSX1    KCC$BASE
+         0 000010   000000 011000                    NOP     0
+
+       76     2024                   %LOCK (G# = S_SCHDGATE);
+
+   2025  0 000011   000000 630400 1                  EPPR0   0
+         0 000012   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000013   000000 701000 xent               TSX1    HFC$LOCK
+         0 000014   000000 011000                    NOP     0
+
+       77     2027    2              IF NOT HW_SMART_CACHE
+
+   2027  0 000015   000000 234000 xsym               SZN     HW_SMART_CACHE
+         0 000016   000022 604000 0                  TMI     s:2032
+
+       78     2028    2              THEN CALL SSS$CCAC;
+
+   2028  0 000017   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000020   000000 701000 xent               TSX1    SSS$CCAC
+         0 000021   000000 011000                    NOP     0
+
+       79     2029                   /* Clears cache for static scheduler tables;
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:15   
+       80     2030                      also clears cache and PTWAM for (possible) new user */
+       81     2031
+       82     2032    2              J = S_PCU (S_PNO);
+
+   2032  0 000022   000000 720000 xsym               LXL0    S_PNO
+         0 000023   000000 235010 xsym               LDA     S_PCU,X0
+         0 000024   200003 755100                    STA     J,,AUTO
+
+       83     2033    2              S_PCU (S_PNO) = 0;
+
+   2033  0 000025   000000 450010 xsym               STZ     S_PCU,X0
+
+       84     2034    2              IF J ~= 0
+
+   2034  0 000026   000035 600000 0                  TZE     s:2038
+
+       85     2035    2              THEN
+       86     2036    2                 CALL SSR$CHSE (J);
+
+   2036  0 000027   200003 630500                    EPPR0   J,,AUTO
+         0 000030   200010 450500                    STP0    DCB#+1,,AUTO
+         0 000031   200010 630500                    EPPR0   DCB#+1,,AUTO
+         0 000032   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000033   000000 701000 xent               TSX1    SSR$CHSE
+         0 000034   000000 011000                    NOP     0
+
+       87     2037
+       88     2038    2              IF S_STOP (S_PNO) ~= 0
+
+   2038  0 000035   000000 720000 xsym               LXL0    S_PNO
+         0 000036   000000 235010 xsym               LDA     S_STOP,X0
+         0 000037   000047 600000 0                  TZE     s:2046
+
+       89     2039    3              THEN DO;
+
+       90     2040                         %UNLOCK (G# = S_SCHDGATE);
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:16   
+   2041  0 000040   000000 630400 1                  EPPR0   0
+         0 000041   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000042   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000043   000000 011000                    NOP     0
+
+       91     2043    3                    CALL SSS$STOP;
+
+   2043  0 000044   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000045   000000 701000 xent               TSX1    SSS$STOP
+         0 000046   000000 011000                    NOP     0
+
+       92     2044    3                 END;
+
+       93     2045
+       94     2046    2              EVFLG = S_EVF;
+
+   2046  0 000047   000000 235000 xsym               LDA     S_EVF
+         0 000050   200005 755100                    STA     EVFLG,,AUTO
+
+       95     2047                                           /* So we know when to try again, from idle */
+       96     2048
+       97     2049    3              DO J = 1 TO %SS_SCU - 1;
+
+   2049  0 000051   000001 236007                    LDQ     1,DL
+         0 000052   200003 756100                    STQ     J,,AUTO
+         0 000053   000453 710000 0                  TRA     s:2186+3
+
+       98     2050                                                /* Run the executable queues...       */
+       99     2051    3                 K = S_HQ (J);
+
+   2051  0 000054   200003 720100                    LXL0    J,,AUTO
+         0 000055   000000 235010 xsym               LDA     S_HQ,X0
+         0 000056   200004 755100                    STA     K,,AUTO
+
+      100     2052    4                 DO WHILE (K ~= 0);
+
+   2052  0 000057   000450 600000 0                  TZE     s:2186
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:17   
+
+      101     2053    4                    S$CU$ = ADDR (B$USRT$ -> B$USER (K));
+
+   2053  0 000060   200004 236100                    LDQ     K,,AUTO
+         0 000061   000026 736000                    QLS     22
+         0 000062   000000 036000 xsym               ADLQ    B$USRT$
+         0 000063   000000 756000 xsym               STQ     S$CU$
+
+      102     2054    4                    IF ((NOT S$CU$ -> B$U.FLG & %U_MSTR)
+
+   2054  0 000064   000000 470400 xsym               LDP0    S$CU$
+         0 000065   000000 236100                    LDQ     0,,PR0
+         0 000066   000022 376000 xsym               ANQ     B_VECTNIL+18
+         0 000067   000100 601000 0                  TNZ     s:2054+12
+         0 000070   000010 236100                    LDQ     8,,PR0
+         0 000071   000777 316007                    CANQ    511,DL
+         0 000072   000105 600000 0                  TZE     s:2064
+         0 000073   000010 236100                    LDQ     8,,PR0
+         0 000074   000777 376007                    ANQ     511,DL
+         0 000075   000001 136007                    SBLQ    1,DL
+         0 000076   000000 116000 xsym               CMPQ    S_PNO
+         0 000077   000105 600000 0                  TZE     s:2064
+         0 000100   000000 236100                    LDQ     0,,PR0
+         0 000101   000022 376000 xsym               ANQ     B_VECTNIL+18
+         0 000102   000444 600000 0                  TZE     NEXT_USER
+         0 000103   000000 235000 xsym               LDA     S_PNO
+         0 000104   000444 601000 0                  TNZ     NEXT_USER
+
+      103     2055    4                      AND (S$CU$ -> B$U.CPU = 0
+      104     2056    4                      OR S$CU$ -> B$U.CPU - 1 = S_PNO))
+      105     2057                            /* If master is not required and this is not a user
+      106     2058                               requiring a specific CPU or this is the required
+      107     2059                               CPU then we got a live one */
+      108     2060    4                      OR (S$CU$ -> B$U.FLG & %U_MSTR AND S_PNO = 0)
+      109     2061                                 /* also cool if master req'd and this is the master  */
+      110     2062
+      111     2063    5                    THEN DO;               /* we have a user to run              */
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:18   
+
+      112     2064    5                          S_WSPTD.BLKNO(%USERWSQ)=S$CU$->B$U.PT;
+
+   2064  0 000105   000014 220100                    LDX0    12,,PR0
+         0 000106   000010 740000 xsym               STX0    S_WSPTD+8
+
+      113     2065    5                          IF S$CU$->B$U.FLG.BIGPT THEN
+
+   2065  0 000107   000000 236100                    LDQ     0,,PR0
+         0 000110   000400 316007                    CANQ    256,DL
+         0 000111   000115 600000 0                  TZE     s:2068
+
+      114     2066    5                             S_WSPTD.NBLKS(%USERWSQ)= 32;
+
+   2066  0 000112   000040 236007                    LDQ     32,DL
+         0 000113   000010 752003 xsym               STCQ    S_WSPTD+8,'03'O
+         0 000114   000117 710000 0                  TRA     s:2069
+
+      115     2067    5                          ELSE
+      116     2068    5                             S_WSPTD.NBLKS(%USERWSQ)= 16;
+
+   2068  0 000115   000020 236007                    LDQ     16,DL
+         0 000116   000010 752003 xsym               STCQ    S_WSPTD+8,'03'O
+
+      117     2069    5                          S_PCU(S_PNO)=K;
+
+   2069  0 000117   200004 235100                    LDA     K,,AUTO
+         0 000120   000000 721000 xsym               LXL1    S_PNO
+         0 000121   000000 755011 xsym               STA     S_PCU,X1
+
+      118     2070    5                          S_CUN=K;
+
+   2070  0 000122   000000 755000 xsym               STA     S_CUN
+
+      119     2071
+      120     2072    5                          CALL HFC$ASSOCCLR (%USERWSQ,0,16384); /*MAX DENSE PT*/
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:19   
+   2072  0 000123   000002 630400 1                  EPPR0   2
+         0 000124   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000125   000000 701000 xent               TSX1    HFC$ASSOCCLR
+         0 000126   000000 011000                    NOP     0
+
+      121     2073
+      122     2074    5                          IF H_MIXED_MP ~= 0
+
+   2074  0 000127   000000 235000 xsym               LDA     H_MIXED_MP
+         0 000130   000135 600000 0                  TZE     s:2078
+
+      123     2075    5                          THEN CALL SSS$MIXED ALTRET(NEXT_USER);
+
+   2075  0 000131   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000132   000000 701000 xent               TSX1    SSS$MIXED
+         0 000133   000444 702000 0                  TSX2    NEXT_USER
+         0 000134   000151 710000 0                  TRA     s:2090
+
+      124     2076                                                /* MIXED_MP flag is set               */
+      125     2077                                 /* Check to see if sepcific CPU type is required     */
+      126     2078    5                          ELSE IF S_PORTNR(7) ~= 0 AND S_PORTNR(7) = S_PNO
+
+   2078  0 000135   000007 236000 xsym               LDQ     S_PORTNR+7
+         0 000136   000151 600000 0                  TZE     s:2090
+         0 000137   000151 604000 0                  TMI     s:2090
+         0 000140   000000 116000 xsym               CMPQ    S_PNO
+         0 000141   000151 601000 0                  TNZ     s:2090
+         0 000142   000000 470400 xsym               LDP0    S$CU$
+         0 000143   000010 236100                    LDQ     8,,PR0
+         0 000144   000777 316007                    CANQ    511,DL
+         0 000145   000151 601000 0                  TNZ     s:2090
+
+      127     2079    5                               AND S$CU$->B$U.CPU = 0
+      128     2080    6                             THEN DO;
+
+      129     2081        /*
+      130     2082                                  We are running on the partitioned CPU.  Since
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:20   
+      131     2083                                  user did not request to be run on this CPU,
+      132     2084                                  look for another user to run on this CPU.
+      133     2085        */
+      134     2086    6                                   S_PCU(S_PNO) = 0;
+
+   2086  0 000146   000000 720000 xsym               LXL0    S_PNO
+         0 000147   000000 450010 xsym               STZ     S_PCU,X0
+
+      135     2087    6                                   GOTO NEXT_USER;
+
+   2087  0 000150   000444 710000 0                  TRA     NEXT_USER
+
+      136     2088    6                                END;
+      137     2089
+      138     2090    5                          IF S$CU$->B$U.FLG.NOQUAN
+
+   2090  0 000151   000000 470400 xsym               LDP0    S$CU$
+         0 000152   000000 236100                    LDQ     0,,PR0
+         0 000153   001000 316007                    CANQ    512,DL
+         0 000154   000202 600000 0                  TZE     s:2101
+         0 000155   000011 236100                    LDQ     9,,PR0
+         0 000156   000014 772000                    QRL     12
+         0 000157   000077 376007                    ANQ     63,DL
+         0 000160   200010 756100                    STQ     DCB#+1,,AUTO
+         0 000161   000011 236100                    LDQ     9,,PR0
+         0 000162   000022 772000                    QRL     18
+         0 000163   000077 376007                    ANQ     63,DL
+         0 000164   200010 116100                    CMPQ    DCB#+1,,AUTO
+         0 000165   000202 601000 0                  TNZ     s:2101
+
+      139     2091    5                            AND S$CU$->B$U.PRIO = S$CU$->B$U.PRIOB THEN
+      140     2092    6                             DO;
+
+      141     2093                                   /* He already got a free quantum,
+      142     2094                                      pass him up this time */
+      143     2095    6                                CALL SSR$SKIP(K);
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:21   
+   2095  0 000166   200004 631500                    EPPR1   K,,AUTO
+         0 000167   200010 451500                    STP1    DCB#+1,,AUTO
+         0 000170   200010 630500                    EPPR0   DCB#+1,,AUTO
+         0 000171   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000172   000000 701000 xent               TSX1    SSR$SKIP
+         0 000173   000000 011000                    NOP     0
+
+      144     2096    6                                S$CU$->B$U.FLG.NOQUAN = '0'B;
+
+   2096  0 000174   000000 470400 xsym               LDP0    S$CU$
+         0 000175   000005 236000 1                  LDQ     5
+         0 000176   000000 356100                    ANSQ    0,,PR0
+
+      145     2097    6                                S_PCU(S_PNO) = 0;
+
+   2097  0 000177   000000 720000 xsym               LXL0    S_PNO
+         0 000200   000000 450010 xsym               STZ     S_PCU,X0
+
+      146     2098    6                                GOTO NEXT_USER;
+
+   2098  0 000201   000444 710000 0                  TRA     NEXT_USER
+
+      147     2099    6                             END;
+      148     2100
+      149     2101    5                          S_HIR=S_HIR-1;   /* One less executable user waiting   */
+
+   2101  0 000202   000001 336007                    LCQ     1,DL
+         0 000203   000000 056000 xsym               ASQ     S_HIR
+
+      150     2102    5                          CALL SSR$CHS(K); /* Make him the current user          */
+
+   2102  0 000204   200004 631500                    EPPR1   K,,AUTO
+         0 000205   200010 451500                    STP1    DCB#+1,,AUTO
+         0 000206   200010 630500                    EPPR0   DCB#+1,,AUTO
+         0 000207   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000210   000000 701000 xent               TSX1    SSR$CHS
+         0 000211   000000 011000                    NOP     0
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:22   
+
+      151     2103
+      152     2104    5                          IF S_NSCPUA = 0
+
+   2104  0 000212   000000 235000 xsym               LDA     S_NSCPUA
+         0 000213   000222 601000 0                  TNZ     s:2110
+
+      153     2105    6                          THEN DO INHIBIT;
+
+      154     2106    6                                S$CU$ -> B$U.ASYNCH = S$CU$ -> B$U.ASYNCH&~%U_RESET;
+
+   2106  0 000214   000003 236200 xsym               LDQ   ! B_VECTNIL+3
+         0 000215   000027 676200 xsym               ERQ   ! B_VECTNIL+23
+         0 000216   000000 470600 xsym               LDP0  ! S$CU$
+         0 000217   000001 376300                    ANQ   ! 1,,PR0
+         0 000220   000001 756300                    STQ   ! 1,,PR0
+
+      155     2107    6                             END;
+
+   2107  0 000221   000237 710000 0                  TRA     s:2118
+
+      156     2108    6                          ELSE DO;
+
+      157     2109                                     %LOCK (G# = S_ASFGATE);
+
+   2110  0 000222   000006 630400 1                  EPPR0   6
+         0 000223   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000224   000000 701000 xent               TSX1    HFC$LOCK
+         0 000225   000000 011000                    NOP     0
+
+      158     2112    6                                S$CU$ -> B$U.ASYNCH = S$CU$ -> B$U.ASYNCH&~%U_RESET;
+
+   2112  0 000226   000003 236000 xsym               LDQ     B_VECTNIL+3
+         0 000227   000027 676000 xsym               ERQ     B_VECTNIL+23
+         0 000230   000000 470400 xsym               LDP0    S$CU$
+         0 000231   000001 376100                    ANQ     1,,PR0
+         0 000232   000001 756100                    STQ     1,,PR0
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:23   
+
+      159     2113                                     %UNLOCK (G# = S_ASFGATE);
+
+   2114  0 000233   000006 630400 1                  EPPR0   6
+         0 000234   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000235   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000236   000000 011000                    NOP     0
+
+      160     2116    6                             END;
+
+      161     2117
+      162     2118    5                          IF S$CU$->B$U.PRIO = S$CU$->B$U.PRIOB + S_PINC(3)
+
+   2118  0 000237   000000 470400 xsym               LDP0    S$CU$
+         0 000240   000011 236100                    LDQ     9,,PR0
+         0 000241   000014 772000                    QRL     12
+         0 000242   000077 376007                    ANQ     63,DL
+         0 000243   000003 036000 xsym               ADLQ    S_PINC+3
+         0 000244   200010 756100                    STQ     DCB#+1,,AUTO
+         0 000245   000011 236100                    LDQ     9,,PR0
+         0 000246   000022 772000                    QRL     18
+         0 000247   000077 376007                    ANQ     63,DL
+         0 000250   200010 116100                    CMPQ    DCB#+1,,AUTO
+         0 000251   000254 601000 0                  TNZ     s:2122
+
+      163     2119                                           /* Mark him, so we pass him up next time   */
+      164     2120    5                          THEN S$CU$->B$U.FLG.NOQUAN = '1'B;
+
+   2120  0 000252   001000 236007                    LDQ     512,DL
+         0 000253   000000 256100                    ORSQ    0,,PR0
+
+      165     2121
+      166     2122    5                          S_CUP=S$CU$->B$U.PRIO;
+
+   2122  0 000254   000000 470400 xsym               LDP0    S$CU$
+         0 000255   000011 236100                    LDQ     9,,PR0
+         0 000256   000022 772000                    QRL     18
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:24   
+         0 000257   000077 376007                    ANQ     63,DL
+         0 000260   000000 756000 xsym               STQ     S_CUP
+
+      167     2123    5                          IF S_CUP > S$CU$ -> B$U.PRIOB
+
+   2123  0 000261   000011 236100                    LDQ     9,,PR0
+         0 000262   000014 772000                    QRL     12
+         0 000263   000077 376007                    ANQ     63,DL
+         0 000264   000000 116000 xsym               CMPQ    S_CUP
+         0 000265   000274 603000 0                  TRC     s:2130
+
+      168     2124    6                          THEN DO;
+
+      169     2125    6                                S_CUP = S_CUP - %PRIODEC;
+
+   2125  0 000266   000000 235000 xsym               LDA     S_CUP
+         0 000267   000001 135007                    SBLA    1,DL
+         0 000270   000000 755000 xsym               STA     S_CUP
+
+      170     2126    6                                S$CU$ -> B$U.PRIO = S_CUP;
+
+   2126  0 000271   000000 236000 xsym               LDQ     S_CUP
+         0 000272   000022 736000                    QLS     18
+         0 000273   000011 752110                    STCQ    9,'10'O,PR0
+
+      171     2127    6                             END;
+
+      172     2128
+      173     2129                               %UNLOCK (G# = S_SCHDGATE);
+
+   2130  0 000274   000000 630400 1                  EPPR0   0
+         0 000275   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000276   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000277   000000 011000                    NOP     0
+
+      174     2132        /* If the virtual segments are defined move in the appropiate wsptd */
+      175     2133    6                          DO J = 0 TO 2;
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:25   
+
+   2133  0 000300   200003 450100                    STZ     J,,AUTO
+
+      176     2134    6                             S_WSPTD (%VS1WSQ + J) = '0'B;
+
+   2134  0 000301   200003 720100                    LXL0    J,,AUTO
+         0 000302   000011 450010 xsym               STZ     S_WSPTD+9,X0
+
+      177     2135
+      178     2136    6                             DCB# = B$JIT.VIRTUAL.DCB#(J);
+
+   2136  0 000303   000000 470400 xsym               LDP0    B$JIT$
+         0 000304   200003 235100                    LDA     J,,AUTO
+         0 000305   000100 101505                    MRL     fill='000'O
+         0 000306   000217 000001                    ADSC9   143,A,PR0                cn=0,n=1
+         0 000307   200007 000004                    ADSC9   DCB#,,AUTO               cn=0,n=4
+
+      179     2137    6                             IF DCB# ~= 0
+
+   2137  0 000310   200007 236100                    LDQ     DCB#,,AUTO
+         0 000311   000332 600000 0                  TZE     s:2143
+
+      180     2138    7                             THEN DO;
+
+      181     2139    7                                   S_WSPTD(%VS1WSQ + J) = DCBADDR(DCB#)->F$DCB.SETSTA$
+              2139                                            ->MM$VCB.WSPTD;
+
+   2139  0 000312   000007 471400 1                  LDP1    7
+         0 000313   100000 473500                    LDP3    0,,PR1
+         0 000314   300000 474506                    LDP4    0,QL,PR3
+         0 000315   400006 475500                    LDP5    6,,PR4
+         0 000316   500005 236100                    LDQ     5,,PR5
+         0 000317   000011 756010 xsym               STQ     S_WSPTD+9,X0
+
+      182     2140    7                                   CALL HFC$ASSOCCLR (%VS1WSQ+J,0,1024*4096);
+              2140                                            /*MAX frag WS*/
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:26   
+   2140  0 000320   000011 035007                    ADLA    9,DL
+         0 000321   200010 755100                    STA     DCB#+1,,AUTO
+         0 000322   000012 237000 1                  LDAQ    10
+         0 000323   200012 757100                    STAQ    DCB#+3,,AUTO
+         0 000324   200010 634500                    EPPR4   DCB#+1,,AUTO
+         0 000325   200011 454500                    STP4    DCB#+2,,AUTO
+         0 000326   200011 630500                    EPPR0   DCB#+2,,AUTO
+         0 000327   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000330   000000 701000 xent               TSX1    HFC$ASSOCCLR
+         0 000331   000000 011000                    NOP     0
+
+      183     2141    7                                END;
+
+      184     2142
+      185     2143    6                          END;
+
+   2143  0 000332   200003 235100                    LDA     J,,AUTO
+         0 000333   000001 035007                    ADLA    1,DL
+         0 000334   200003 755100                    STA     J,,AUTO
+         0 000335   000003 115007                    CMPA    3,DL
+         0 000336   000301 602000 0                  TNC     s:2134
+
+      186     2144    5                          S_UXTSCHD=B$JIT.XTIME;
+
+   2144  0 000337   000000 470400 xsym               LDP0    B$JIT$
+         0 000340   000262 235100                    LDA     178,,PR0
+         0 000341   000000 755000 xsym               STA     S_UXTSCHD
+
+      187     2145    5                          S_USTSCHD=B$JIT.STIME;
+
+   2145  0 000342   000261 235100                    LDA     177,,PR0
+         0 000343   000000 755000 xsym               STA     S_USTSCHD
+
+      188     2146    5                          B$JIT.SCHTIME=B$JIT.XTIME+B$JIT.STIME+B$JIT.CTIME;
+
+   2146  0 000344   000262 236100                    LDQ     178,,PR0
+         0 000345   000261 036100                    ADLQ    177,,PR0
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:27   
+         0 000346   000263 036100                    ADLQ    179,,PR0
+         0 000347   000265 756100                    STQ     181,,PR0
+
+      189     2147    5                          P_SCHD#(S_PNO)=P_SCHD#(S_PNO)+1;
+
+   2147  0 000350   000000 720000 xsym               LXL0    S_PNO
+         0 000351   000000 054010 xsym               AOS     P_SCHD#,X0
+
+      190     2148
+      191     2149    5                          IF S$CU$->B$U.FLG.INTUSR THEN
+
+   2149  0 000352   000000 471400 xsym               LDP1    S$CU$
+         0 000353   100000 236100                    LDQ     0,,PR1
+         0 000354   200000 316003                    CANQ    65536,DU
+         0 000355   000435 600000 0                  TZE     s:2177
+
+      192     2150    6                             DO;
+
+      193     2151    6                                S$CU$->B$U.FLG.INTUSR='0'B;
+
+   2151  0 000356   000011 236000 1                  LDQ     9
+         0 000357   100000 356100                    ANSQ    0,,PR1
+
+      194     2152    6                                IF B$JIT.MODE = %M_INT# THEN
+
+   2152  0 000360   000000 236100                    LDQ     0,,PR0
+         0 000361   740000 376003                    ANQ     -16384,DU
+         0 000362   140000 116003                    CMPQ    49152,DU
+         0 000363   000435 601000 0                  TNZ     s:2177
+
+      195     2153    7                                   DO;
+
+      196     2154                                           %LOCK (G# = P_GATE);
+
+   2155  0 000364   000014 630400 1                  EPPR0   12
+         0 000365   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000366   000000 701000 xent               TSX1    HFC$LOCK
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:28   
+         0 000367   000000 011000                    NOP     0
+
+      197     2157    7                                      CALL SSS$EOMTIME(RTIME);
+
+   2157  0 000370   200006 630500                    EPPR0   RTIME,,AUTO
+         0 000371   200010 450500                    STP0    DCB#+1,,AUTO
+         0 000372   200010 630500                    EPPR0   DCB#+1,,AUTO
+         0 000373   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000374   000000 701000 xent               TSX1    SSS$EOMTIME
+         0 000375   000000 011000                    NOP     0
+
+      198     2158    7                                      RTIME=(RTIME-S$CU$->B$U.MISC)/1000;
+
+   2158  0 000376   000000 470400 xsym               LDP0    S$CU$
+         0 000377   200006 236100                    LDQ     RTIME,,AUTO
+         0 000400   000017 136100                    SBLQ    15,,PR0
+         0 000401   001750 506007                    DIV     1000,DL
+         0 000402   200006 756100                    STQ     RTIME,,AUTO
+
+      199     2159                                           %UPDATE_BUCKET (BUCKET=P_RT,
+      200     2160                                           DIST_VAL=RTIME,
+      201     2161                                           SCRATCH=KS);
+
+   2162  0 000403   200004 450100                    STZ     K,,AUTO
+
+   2163  0 000404   000406 710000 0                  TRA     s:2166
+
+   2165  0 000405   200004 054100                    AOS     K,,AUTO
+
+   2166  0 000406   200004 236100                    LDQ     K,,AUTO
+         0 000407   000412 604000 0                  TMI     s:2166+4
+         0 000410   000000 116000 xsym               CMPQ    P_RT
+         0 000411   000417 603000 0                  TRC     s:2167
+         0 000412   000000 620006                    EAX0    0,QL
+         0 000413   200006 236100                    LDQ     RTIME,,AUTO
+         0 000414   000405 604000 0                  TMI     s:2165
+         0 000415   000002 116010 xsym               CMPQ    P_RT+2,X0
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:29   
+         0 000416   000405 605400 0                  TPNZ    s:2165
+
+   2167  0 000417   200004 236100                    LDQ     K,,AUTO
+         0 000420   000000 036000 xsym               ADLQ    P_RT
+         0 000421   200010 756100                    STQ     DCB#+1,,AUTO
+         0 000422   200004 236100                    LDQ     K,,AUTO
+         0 000423   000000 036000 xsym               ADLQ    P_RT
+         0 000424   200010 720100                    LXL0    DCB#+1,,AUTO
+         0 000425   000003 235006 xsym               LDA     P_RT+3,QL
+         0 000426   000001 035007                    ADLA    1,DL
+         0 000427   000003 755010 xsym               STA     P_RT+3,X0
+
+      202     2170    7                                      P_NINTS=P_NINTS+1; /* Count interactions   */
+
+   2170  0 000430   000000 054000 xsym               AOS     P_NINTS
+
+      203     2171                                           %UNLOCK (G# = P_GATE);
+
+   2172  0 000431   000014 630400 1                  EPPR0   12
+         0 000432   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000433   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000434   000000 011000                    NOP     0
+
+      204     2174    7                                   END;
+
+      205     2175    6                             END;
+
+      206     2176
+      207     2177    5                          CALL SSC$MONTIMRWU;
+
+   2177  0 000435   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000436   000000 701000 xent               TSX1    SSC$MONTIMRWU
+         0 000437   000000 011000                    NOP     0
+
+      208     2178    5                          CALL SSC$SERV;
+
+   2178  0 000440   000002 631400 xsym               EPPR1   B_VECTNIL+2
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:30   
+         0 000441   000000 701000 xent               TSX1    SSC$SERV
+         0 000442   000000 011000                    NOP     0
+
+      209     2179    5                          RETURN;
+
+   2179  0 000443   000000 702200 xent               TSX2  ! X66_ARET
+
+   2179  0 000444                       NEXT_USER    null
+      210     2180    5                       END;
+      211     2181    4                    ELSE
+      212     2182    4   NEXT_USER:          ;
+      213     2183    4                    K = S$CU$ -> B$U.FL;
+
+   2183  0 000444   000000 470400 xsym               LDP0    S$CU$
+         0 000445   000002 235100                    LDA     2,,PR0
+         0 000446   200004 755100                    STA     K,,AUTO
+
+      214     2184                                           /* Try next user in this queue, if any     */
+      215     2185    4                 END;
+
+   2185  0 000447   000060 601000 0                  TNZ     s:2053
+
+      216     2186    3              END;
+
+   2186  0 000450   200003 236100                    LDQ     J,,AUTO
+         0 000451   000001 036007                    ADLQ    1,DL
+         0 000452   200003 756100                    STQ     J,,AUTO
+         0 000453   000014 116007                    CMPQ    12,DL
+         0 000454   000054 602000 0                  TNC     s:2051
+
+      217     2187                   %UNLOCK (G# = S_SCHDGATE);
+
+   2188  0 000455   000000 630400 1                  EPPR0   0
+         0 000456   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000457   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000460   000000 011000                    NOP     0
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:31   
+      218     2190    3              DO WHILE (EVFLG = S_EVF AND S_STOP(S_PNO) = 0);
+
+   2190  0 000461   000542 710000 0                  TRA     s:2210
+
+      219     2191    3                 S_IDLCPU=S_PNO;
+
+   2191  0 000462   000000 235000 xsym               LDA     S_PNO
+         0 000463   000000 755000 xsym               STA     S_IDLCPU
+
+      220     2192    3                 IF S_HQ(%SS_SIOW) = 0 THEN
+
+   2192  0 000464   000016 236000 xsym               LDQ     S_HQ+14
+         0 000465   000500 601000 0                  TNZ     s:2198
+
+      221     2193    3                    IF S_HQ(%SS_SQR) = 0 THEN
+
+   2193  0 000466   000024 235000 xsym               LDA     S_HQ+20
+         0 000467   000474 601000 0                  TNZ     s:2196
+
+      222     2194    3                       CALL SSC$IDLE;
+
+   2194  0 000470   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000471   000000 701000 xent               TSX1    SSC$IDLE
+         0 000472   000000 011000                    NOP     0
+         0 000473   000511 710000 0                  TRA     s:2203
+
+      223     2195    3                    ELSE
+      224     2196    3                       CALL SSC$RESW;
+
+   2196  0 000474   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000475   000000 701000 xent               TSX1    SSC$RESW
+         0 000476   000000 011000                    NOP     0
+         0 000477   000511 710000 0                  TRA     s:2203
+
+      225     2197    3                 ELSE
+      226     2198    3                    IF S_HQ(%SS_SQR) = 0 THEN
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:32   
+   2198  0 000500   000024 235000 xsym               LDA     S_HQ+20
+         0 000501   000506 601000 0                  TNZ     s:2201
+
+      227     2199    3                       CALL SSC$IOW;
+
+   2199  0 000502   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000503   000000 701000 xent               TSX1    SSC$IOW
+         0 000504   000000 011000                    NOP     0
+         0 000505   000511 710000 0                  TRA     s:2203
+
+      228     2200    3                    ELSE
+      229     2201    3                       CALL SSC$RESIOW;
+
+   2201  0 000506   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000507   000000 701000 xent               TSX1    SSC$RESIOW
+         0 000510   000000 011000                    NOP     0
+
+      230     2202                                                /* First, cleanup any warping         */
+      231     2203    3                 IF H_RELIEF AND H_NURSE=S_PNO THEN CALL SSS$WARP;
+
+   2203  0 000511   000000 234000 xsym               SZN     H_RELIEF
+         0 000512   000522 605000 0                  TPL     s:2205
+         0 000513   000000 236000 xsym               LDQ     H_NURSE
+         0 000514   000522 604000 0                  TMI     s:2205
+         0 000515   000000 116000 xsym               CMPQ    S_PNO
+         0 000516   000522 601000 0                  TNZ     s:2205
+
+   2203  0 000517   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000520   000000 701000 xent               TSX1    SSS$WARP
+         0 000521   000000 011000                    NOP     0
+
+      232     2204
+      233     2205    3                 CALL SSC$QTIMR(IDLQUAN);
+
+   2205  0 000522   000016 630400 1                  EPPR0   14
+         0 000523   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000524   000000 701000 xent               TSX1    SSC$QTIMR
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:33   
+         0 000525   000000 011000                    NOP     0
+
+      234     2206    3                 CALL SSS$IDLE;
+
+   2206  0 000526   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000527   000000 701000 xent               TSX1    SSS$IDLE
+         0 000530   000000 011000                    NOP     0
+
+      235     2207    3                 CALL SSC$SASYNC;
+
+   2207  0 000531   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000532   000000 701000 xent               TSX1    SSC$SASYNC
+         0 000533   000000 011000                    NOP     0
+
+      236     2208    3                 CALL SSC$MONTIMRWU;       /* Do interval timer                  */
+
+   2208  0 000534   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000535   000000 701000 xent               TSX1    SSC$MONTIMRWU
+         0 000536   000000 011000                    NOP     0
+
+      237     2209    3                 CALL SSS$CCAC;
+
+   2209  0 000537   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000540   000000 701000 xent               TSX1    SSS$CCAC
+         0 000541   000000 011000                    NOP     0
+
+      238     2210    3              END;
+
+   2210  0 000542   200005 236100                    LDQ     EVFLG,,AUTO
+         0 000543   000000 116000 xsym               CMPQ    S_EVF
+         0 000544   000550 601000 0                  TNZ     s:2211
+         0 000545   000000 720000 xsym               LXL0    S_PNO
+         0 000546   000000 235010 xsym               LDA     S_STOP,X0
+         0 000547   000462 600000 0                  TZE     s:2191
+
+      239     2211    2           END;
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:34   
+   2211  0 000550   000002 710000 0                  TRA     s:2021
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 006000   000000 040000   000012 006000   000002 006000    ...... .........
+   1     004   000001 006000   777777 776777   000000 006000   000000 006003    ................
+   1     010   000020 000000   577777 777777   000002 006000   000010 006000    ................
+   1     014   000000 006000   000000 303240   000015 006000                    ............
+      240     2212    1   END;
+
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:35   
+--  Include file information  --
+
+   B$JIT_C.:E05TOU  is referenced.
+   HF_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   P_PMDAT_C.:E05TOU  is referenced.
+   P_PMDAT_R.:E05TOU  cannot be made into a system file and is referenced.
+   PM_BUCKET_C.:E05TOU  is referenced.
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRLD_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRL_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_R.:E05TOU  cannot be made into a system file and is referenced.
+   S_WSPTD_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   F$DCB.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure SSX$XSCHD.
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:36   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     7-0-0/w UBIN        r     1 DCB#                       5-0-0/w SBIN        r     1 EVFLG
+     3-0-0/w UBIN        r     1 J                          4-0-0/w UBIN        r     1 K
+     4-0-0/w SBIN        r     1 KS                         6-0-0/w UBIN        r     1 RTIME
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$JIT$                     0-0-0/w PTR         r     1 B$USRT$
+     0-0-0/w BIT         r     1 HW_SMART_CACHE             0-0-0/w SBIN        r     1 H_MIXED_MP
+     0-0-0/w UBIN        r     1 H_NURSE                    0-0-0/w BIT         r     1 H_RELIEF
+     0-0-0/w UBIN        r     1 KQ_BASEDELAY               0-0-0/w PTR         r     1 MM_BYP$
+     0-0-0/w SBIN        r     1 P_GATE                     0-0-0/w SBIN        r     1 P_NINTS
+     0-0-0/w PTR         r     1 P_RESOURCE$                0-0-0/d STRC(108)   r     1 P_RT
+     0-0-0/w SBIN        r     1 P_SCHD#(0:7)
+     0-0-0/w PTR         r     1 S$CU$                      0-0-0/b BIT (72)    r     1 S_ASFGATE
+     0-0-0/w UBIN        r     1 S_CUN                      0-0-0/w UBIN        r     1 S_CUP
+     0-0-0/w SBIN        r     1 S_EVF                      0-0-0/w SBIN        r     1 S_HIR
+     0-0-0/w SBIN        r     1 S_HQ(0:8191)               0-0-0/w SBIN        r     1 S_IDLCPU
+     0-0-0/w UBIN        r     1 S_NSCPUA                   0-0-0/w SBIN        r     1 S_PCU(0:7)
+     0-0-0/w UBIN        r     1 S_PINC(0:5)                0-0-0/w SBIN        r     1 S_PNO
+     0-0-0/w UBIN        r     1 S_PORTNR(0:7)
+     0-0-0/b BIT (72)    r     1 S_SCHDGATE                 0-0-0/w SBIN        r     1 S_STOP(0:7)
+     0-0-0/w UBIN        r     1 S_USTSCHD                  0-0-0/w UBIN        r     1 S_UXTSCHD
+     0-0-0/w STRC        r     1 S_WSPTD(0:28)
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:37   
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(8856)  r     1 B$JIT                      0-0-0/d STRC(576)   r     1 B$U
+     0-0-0/w STRC(576)   r     1 B$USER(0:0)                0-0-0/d ASTR(3528)  r     1 F$DCB
+     0-0-0/w STRC(432)   r     1 MM$VCB
+
+
+   Procedure SSX$XSCHD requires 361 words for executable code.
+   Procedure SSX$XSCHD requires 12 words of local(AUTO) storage.
+
+    No errors detected in file SSX$XSCHD.:E05TSI    .
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:38   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:39   
+          MINI XREF LISTING
+
+B$DO.ECCINFO
+      1060**DCL      1061--REDEF
+B$JIT.CTIME
+      2006**DCL      2146>>ASSIGN
+B$JIT.ERR.MID
+      1907**DCL      1907--REDEF
+B$JIT.JRESPEAK
+      1997**DCL      1998--REDEF
+B$JIT.MODE
+      1901**DCL      2152>>IF
+B$JIT.PNR
+      2008**DCL      2008--REDEF
+B$JIT.SCHTIME
+      2006**DCL      2146<<ASSIGN
+B$JIT.STIME
+      2006**DCL      2145>>ASSIGN   2146>>ASSIGN
+B$JIT.VIRTUAL.DCB#
+      2000**DCL      2136>>ASSIGN
+B$JIT.XTIME
+      2006**DCL      2144>>ASSIGN   2146>>ASSIGN
+B$JIT$
+        24**DCL      1901--IMP-PTR  2136>>ASSIGN   2144>>ASSIGN   2145>>ASSIGN   2146>>ASSIGN   2146>>ASSIGN
+      2146>>ASSIGN   2146>>ASSIGN   2152>>IF
+B$U.ASYNCH
+       997**DCL      2106<<ASSIGN   2106>>ASSIGN   2112<<ASSIGN   2112>>ASSIGN
+B$U.CPU
+      1025**DCL      2054>>IF       2054>>IF       2078>>IF
+B$U.FL
+      1011**DCL      2183>>ASSIGN
+B$U.FLG
+       926**DCL      2054>>IF       2054>>IF
+B$U.FLG.BIGPT
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:40   
+       963**DCL      2065>>IF
+B$U.FLG.INTUSR
+       928**DCL      2149>>IF       2151<<ASSIGN
+B$U.FLG.NOQUAN
+       961**DCL      2090>>IF       2096<<ASSIGN   2120<<ASSIGN
+B$U.MISC
+      1039**DCL      1040--REDEF    2158>>ASSIGN
+B$U.PRIO
+      1028**DCL      2090>>IF       2118>>IF       2122>>ASSIGN   2126<<ASSIGN
+B$U.PRIOB
+      1029**DCL      2090>>IF       2118>>IF       2123>>IF
+B$U.PT
+      1033**DCL      2064>>ASSIGN
+B$USER
+      1084**DCL      2053--ASSIGN
+B$USER.MISC
+      1115**DCL      1116--REDEF
+B$USRT$
+      1127**DCL      2053>>ASSIGN
+DCB#
+        17**DCL      2136<<ASSIGN   2137>>IF       2139--ASSIGN
+EVFLG
+        14**DCL      2046<<ASSIGN   2190>>DOWHILE
+F$DCB.ACTPOS
+        74**DCL        74--REDEF
+F$DCB.ARS
+        49**DCL        49--REDEF
+F$DCB.ATTR
+        67**DCL        68--REDEF
+F$DCB.BORROW
+        82**DCL        82--REDEF      82--REDEF      82--REDEF
+F$DCB.DCBNAME.L
+        96**DCL        96--IMP-SIZ
+F$DCB.EOMCHAR
+        53**DCL        53--REDEF
+F$DCB.FLDID
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:41   
+        77**DCL        77--REDEF
+F$DCB.FORM$
+        71**DCL        71--REDEF
+F$DCB.FSECT
+        87**DCL        87--REDEF
+F$DCB.FSN
+        64**DCL        64--REDEF      64--REDEF      65--REDEF
+F$DCB.HEADER$
+        70**DCL        70--REDEF
+F$DCB.IXTNSIZE
+        68**DCL        68--REDEF
+F$DCB.LASTSTA$
+        58**DCL        58--REDEF
+F$DCB.LVL
+        83**DCL        83--REDEF
+F$DCB.NAME.C
+        58**DCL        58--REDEF
+F$DCB.NOEOF
+        79**DCL        79--REDEF
+F$DCB.NRECS
+        69**DCL        69--REDEF
+F$DCB.NRECX
+        88**DCL        88--REDEF
+F$DCB.OHDR
+        80**DCL        80--REDEF
+F$DCB.ORG
+        63**DCL        63--REDEF
+F$DCB.PRECNO
+        86**DCL        86--REDEF
+F$DCB.RCSZ
+        91**DCL        91--REDEF
+F$DCB.RES
+        59**DCL        59--REDEF
+F$DCB.SETSTA$
+        58**DCL      2139>>ASSIGN
+F$DCB.SETX
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:42   
+        71**DCL        71--REDEF
+F$DCB.TAB$
+        70**DCL        71--REDEF
+F$DCB.TDA
+        85**DCL        85--REDEF
+F$DCB.WSN
+        60**DCL        60--REDEF
+HFC$ASSOCCLR
+        27**DCL-ENT  2072--CALL     2140--CALL
+HFC$LOCK
+      1535**DCL-ENT  2025--CALL     2110--CALL     2155--CALL
+HFC$UNLOCK
+      1535**DCL-ENT  2041--CALL     2114--CALL     2130--CALL     2172--CALL     2188--CALL
+HW_SMART_CACHE
+      1576**DCL      2027>>IF
+H_MIXED_MP
+      1557**DCL      2074>>IF
+H_NURSE
+      1550**DCL      2203>>IF
+H_RELIEF
+      1550**DCL      2203>>IF
+J
+        11**DCL      2032<<ASSIGN   2034>>IF       2036<>CALL     2049<<DOINDEX  2051>>ASSIGN   2133<<DOINDEX
+      2134>>ASSIGN   2136>>ASSIGN   2139>>ASSIGN   2140>>CALL
+K
+        12**DCL        13--REDEF    2051<<ASSIGN   2052>>DOWHILE  2053>>ASSIGN   2069>>ASSIGN   2070>>ASSIGN
+      2095<>CALL     2102<>CALL     2183<<ASSIGN
+KCC$BASE
+        28**DCL-ENT  2023--CALL
+KQ_BASEDELAY
+        19**DCL      2021>>IF
+KS
+        13**DCL      2162<<ASSIGN   2163>>DOWHILE  2163>>DOWHILE  2165<<ASSIGN   2165>>ASSIGN   2167>>ASSIGN
+      2167>>ASSIGN
+MM$DESC.BOUND
+       568**DCL       569--REDEF
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:43   
+MM$DESC.FLGS
+       569**DCL       569--REDEF
+MM$PPUT.USER#
+       557**DCL       557--REDEF
+MM$VCB.WSPTD
+       561**DCL      2139>>ASSIGN
+MM_BYP$
+       488**DCL       488--IMP-PTR
+NEXT_USER
+      2179**LABEL    2075--CALLALT  2087--GOTO     2098--GOTO
+P_GATE
+      1501**DCL      2155<>CALL     2172<>CALL
+P_NINTS
+      1476**DCL      2170<<ASSIGN   2170>>ASSIGN
+P_NSCPU
+      1502**DCL      1503--REDEF
+P_RESOURCE.RES
+      1375**DCL      1442--REDEF
+P_RESOURCE$
+      1455**DCL      1343--IMP-PTR
+P_RT.DATA
+      1584**DCL      2163>>DOWHILE  2167<<ASSIGN   2167>>ASSIGN
+P_RT.SIZE
+      1582**DCL      2163>>DOWHILE  2167>>ASSIGN   2167>>ASSIGN
+P_SCHD#
+      1474**DCL      2147<<ASSIGN   2147>>ASSIGN
+P_UPTIME
+      1491**DCL      1492--REDEF
+RTIME
+        16**DCL      2157<>CALL     2158<<ASSIGN   2158>>ASSIGN   2163>>DOWHILE
+S$CU$
+      1126**DCL      2053<<ASSIGN   2054>>IF       2054>>IF       2054>>IF       2054>>IF       2064>>ASSIGN
+      2065>>IF       2078>>IF       2090>>IF       2090>>IF       2090>>IF       2096>>ASSIGN   2106>>ASSIGN
+      2106>>ASSIGN   2112>>ASSIGN   2112>>ASSIGN   2118>>IF       2118>>IF       2120>>ASSIGN   2122>>ASSIGN
+      2123>>IF       2126>>ASSIGN   2149>>IF       2151>>ASSIGN   2158>>ASSIGN   2183>>ASSIGN
+SSC$IDLE
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:44   
+        29**DCL-ENT  2194--CALL
+SSC$IOW
+        30**DCL-ENT  2199--CALL
+SSC$MONTIMRWU
+        31**DCL-ENT  2177--CALL     2208--CALL
+SSC$QTIMR
+        32**DCL-ENT  2205--CALL
+SSC$RESIOW
+        33**DCL-ENT  2201--CALL
+SSC$RESW
+        34**DCL-ENT  2196--CALL
+SSC$SASYNC
+        35**DCL-ENT  2207--CALL
+SSC$SERV
+        36**DCL-ENT  2178--CALL
+SSR$CHS
+        37**DCL-ENT  2102--CALL
+SSR$CHSE
+        38**DCL-ENT  2036--CALL
+SSR$SKIP
+        39**DCL-ENT  2095--CALL
+SSS$CCAC
+        42**DCL-ENT  2028--CALL     2209--CALL
+SSS$EOMTIME
+        43**DCL-ENT  2157--CALL
+SSS$IDLE
+        44**DCL-ENT  2206--CALL
+SSS$MIXED
+        46**DCL-ENT  2075--CALL
+SSS$STOP
+        45**DCL-ENT  2043--CALL
+SSS$WARP
+        47**DCL-ENT  2203--CALL
+S_ASFGATE
+       907**DCL      2110<>CALL     2114<>CALL
+S_CUN
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:45   
+        21**DCL      2070<<ASSIGN
+S_CUP
+       894**DCL      2122<<ASSIGN   2123>>IF       2125<<ASSIGN   2125>>ASSIGN   2126>>ASSIGN
+S_EVF
+       894**DCL      2046>>ASSIGN   2190>>DOWHILE
+S_HIR
+       894**DCL      2101<<ASSIGN   2101>>ASSIGN
+S_HQ
+       893**DCL      2051>>ASSIGN   2192>>IF       2193>>IF       2198>>IF
+S_IDLCPU
+       897**DCL      2191<<ASSIGN
+S_NSCPUA
+       896**DCL      2104>>IF
+S_PCU
+       895**DCL      2032>>ASSIGN   2033<<ASSIGN   2069<<ASSIGN   2086<<ASSIGN   2097<<ASSIGN
+S_PINC
+       894**DCL      2118>>IF
+S_PNO
+        20**DCL      2022>>IF       2032>>ASSIGN   2033>>ASSIGN   2038>>IF       2054>>IF       2054>>IF
+      2069>>ASSIGN   2078>>IF       2086>>ASSIGN   2097>>ASSIGN   2147>>ASSIGN   2147>>ASSIGN   2190>>DOWHILE
+      2191>>ASSIGN   2203>>IF
+S_PORTNR
+       895**DCL      2078>>IF       2078>>IF
+S_SCHDGATE
+       907**DCL      2025<>CALL     2041<>CALL     2130<>CALL     2188<>CALL
+S_STOP
+       895**DCL      2038>>IF       2190>>DOWHILE
+S_USTSCHD
+        23**DCL      2145<<ASSIGN
+S_UXTSCHD
+        22**DCL      2144<<ASSIGN
+S_WSPTD
+       858**DCL      2134<<ASSIGN   2139<<ASSIGN
+S_WSPTD.BLKNO
+       858**DCL      2064<<ASSIGN
+S_WSPTD.NBLKS
+PL6.E3A0      #001=SSX$XSCHD File=SSX$XSCHD.:E05TSI                              WED 07/30/97 06:01 Page:46   
+       858**DCL      2066<<ASSIGN   2068<<ASSIGN

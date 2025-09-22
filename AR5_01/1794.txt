@@ -1,0 +1,2156 @@
+VERSION E05
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:1    
+        1        1        /*M* PMC$COLLECT  Massage performance data once per minute                    */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* CLM=77,CRM=80,CRT=1,PLM=3,CTI=1,THI=2                                    */
+        8        8        PMC$COLLECT: PROC;
+        9        9    1   DCL SSC$MONTIMR ENTRY (3);
+       10       10    1   DCL SSS$CURTIME ENTRY (1);
+       11       11    1   DCL SSS$CCAC ENTRY;
+       12       12    1   DCL PMC$FIXDEV ENTRY;
+       13       13    1   DCL I SBIN;
+       14       14    1   DCL J SBIN;
+       15       15    1   DCL K SBIN;
+       16       16    1   DCL L SBIN;
+       17       17    1   DCL TTIME SBIN;
+       18       18    1   DCL TIME_BUSY UBIN;
+       19       19    1   DCL TIME_WAITING UBIN;
+       20       20    1   DCL TIME_WAITING_SBIN REDEF TIME_WAITING SBIN ;
+       21       21    1   DCL TIME_TOTAL   UBIN ;
+       22       22    1   DCL TIME_TOTAL_SBIN REDEF TIME_TOTAL SBIN ;
+       23       23    1   DCL P$ PTR;
+       24       24    1   DCL T_RT90 UBIN(36) STATIC INIT(0);
+       25       25    1   DCL T_RT(0:11) UBIN(36) STATIC INIT(0*0);
+       26       26    1   DCL T_NINTS UBIN STATIC INIT(0);
+       27       27    1   DCL T_ETMF UBIN STATIC INIT (0);
+       28       28    1   DCL T_ETMF_SBIN REDEF T_ETMF SBIN ;
+       29       29    1   DCL T_CUIS (0:4) UBIN STATIC INIT (0*0);
+       30       30    1   DCL T_CUIS_SBIN(0:4) REDEF T_CUIS SBIN ;
+       31       31    1   DCL T_IOLOAD UBIN STATIC INIT (0);
+       32       32    1   DCL T_USERS SBIN WORD;                       /* # of users waiting to compute */
+       33       33    1   DCL T_TOTAL_WAIT UBIN STATIC INIT (0);
+       34       34    1   DCL T_TOTAL_WAIT_SBIN REDEF T_TOTAL_WAIT SBIN ;
+       35       35    1   DCL T_TOTAL_BUSY UBIN STATIC INIT (0);
+       36       36    1   DCL T_AVAIL_MEM UBIN STATIC INIT(0);
+       37       37    1   DCL T_AVAIL_MEM_SBIN REDEF T_AVAIL_MEM SBIN ;
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:2    
+       38       38    1   DCL NK_MXLOCAL UBIN WORD SYMREF; /* # of highest local (TIGR-built) DCT entry */
+       39       39        %INCLUDE SS_SCHED_R;
+       40       82        %INCLUDE P_PMDAT_R;
+       41      390        %INCLUDE PM_BUCKET_C;
+       42      475        %INCLUDE B$USER;
+       43      691        %INCLUDE SS_SCHED_C;
+       44      924        %INCLUDE HF_LOCK_C;
+       45      938        %INCLUDE NI_DATA_R;
+       46     1375        %INCLUDE PM$NI;
+       47     1399        %INCLUDE MM_DATA_R;
+       48     1919        %INCLUDE XUD_UTS_M;
+       49     2001        %XUD$UTS_ENTRIES;
+       50     2033
+       51     2034        %NI$DCT (STCLASS="BASED(P$)");
+       52     2082        %NI$DVT;
+       53     2089
+       54     2090        %DUMMY_BUCKET (NAME = P_RT, STCLASS = SYMREF);
+       55     2096        %DUMMY_BUCKET (NAME = P_USERSIZE, STCLASS = SYMREF);
+       56     2102        %B$USERREFS;
+       57     2106        %EJECT;
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:3    
+       58     2107    1   RESET_RESOURCE: PROC (RESOURCE);
+       59     2108
+       60     2109    2   DCL 1 RESOURCE,
+       61     2110    2         2 CURRENT UBIN,
+       62     2111    2         2 PEAK UBIN,
+       63     2112    2         2 MIN UBIN,
+       64     2113    2         2 SIGMA UBIN,
+       65     2114    2         2 AVERAGE UBIN,
+       66     2115    2         2 TOTAL UBIN;
+       67     2116
+       68     2117    2      RESOURCE.PEAK = RESOURCE.CURRENT;
+       69     2118    2      RESOURCE.MIN = RESOURCE.CURRENT;
+       70     2119
+       71     2120    2      IF RESOURCE.SIGMA > RESOURCE.CURRENT * 5
+       72     2121    3        THEN DO;
+       73     2122
+       74     2123    3         RESOURCE.AVERAGE = RESOURCE.CURRENT;
+       75     2124    3         RESOURCE.SIGMA = RESOURCE.CURRENT * 5;
+       76     2125
+       77     2126    3         END;
+       78     2127
+       79     2128    2      RETURN;
+       80     2129
+       81     2130    2   END RESET_RESOURCE;
+       82     2131
+       83     2132        %EJECT;
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:4    
+       84     2133    1      CALL SSS$CURTIME (I);
+       85     2134
+       86     2135        /* this code has been updated because the argument I for SSC$MONTIMR
+       87     2136           must be a centisecond value.  It used to say:
+       88     2137            I = P_STARTUP + (P_UPTIME + 2)*6000 - I;
+       89     2138           which is more easily understood as:
+       90     2139            I = (P_UPTIME +2)*6000 - (I - P_STARTUP);
+       91     2140           or in English, subtract the current uptime (I-P_STARTUP, both uts values)
+       92     2141           from the desired uptime ((P_UPTIME+2)*6000, P_UPTIME being in minutes since
+       93     2142           P_STARTUP, and we haven't incremented it yet this trip).  I and P_STARTUP
+       94     2143           are both UTS values, so use XUD$UTS_DIFF to get their difference in
+       95     2144           centiseconds, and the rest is easy.
+       96     2145        */
+       97     2146    1      CALL XUD$UTS_DIFF (I, I, P_STARTUP);
+       98     2147    1      I = (P_UPTIME+2)*6000 - I;
+       99     2148                                                                                    /**/
+      100     2149
+      101     2150    1      IF I <= 0                     /* if we overshot due to XDELTA or some such */
+      102     2151    1        THEN                                /* then come around again in another */
+      103     2152    1         I = 200;                            /* couple of seconds & re-calculate */
+      104     2153
+      105     2154    1      CALL SSC$MONTIMR (I, ENTADDR(PMC$COLLECT), 0);
+      106     2155
+      107     2156           %LOCK (G#=S_SCHDGATE);
+      108     2159
+      109     2160    1      CALL SSS$CCAC;                 /* clear cache to ensure getting valid data */
+      110     2161
+      111     2162    1      T_USERS = 0;
+      112     2163    2      DO I = 1 TO %SS_STI;                       /* Count users and figure sizes */
+      113     2164
+      114     2165    2         J = S_HQ(I);
+      115     2166
+      116     2167    3         DO WHILE (J ~= 0);
+      117     2168
+      118     2169    3            IF I <= %SS_SCU
+      119     2170    3              THEN
+      120     2171    3               T_USERS = T_USERS + 1;
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:5    
+      121     2172
+      122     2173    3            K = B$USRT$ -> B$USER.PCT(J);
+      123     2174                 %UPDATE_BUCKET (BUCKET=P_USERSIZE, SCRATCH=L, DIST_VAL=K);
+      124     2183    3            J = B$USRT$ -> B$USER.FL(J);
+      125     2184
+      126     2185    3            END;
+      127     2186
+      128     2187    2         END;
+      129     2188
+      130     2189           %UNLOCK (G#=S_SCHDGATE);
+      131     2192
+      132     2193    1      P_NSCPU = S_NSCPUA+1;
+      133     2194    1      P_ETMF = ( P_ETMF + T_USERS / P_NSCPU_SBIN ) / 2;
+      134     2195
+      135     2196    1      IF P_ETMF = 0
+      136     2197    1        THEN P_ETMF = 1;
+      137     2198
+      138     2199    1      J = ((P_NINTS - T_NINTS) * 9) / 10;                   /* 90% response time */
+      139     2200
+      140     2201    2      IF J > 0 THEN DO;
+      141     2202
+      142     2203    2         I = 0;
+      143     2204
+      144     2205    2         TTIME = 0;
+      145     2206
+      146     2207    3         DO WHILE (J>TTIME);                                /* Locate 90% bucket */
+      147     2208
+      148     2209    3            TTIME = TTIME + P_RT.DATA(I + P_RT.SIZE + 1) - T_RT(I);
+      149     2210
+      150     2211    3            I = I + 1;
+      151     2212
+      152     2213    3            END;
+      153     2214
+      154     2215    2         P_RT90 = (P_RT90 - T_RT90 + P_RT.DATA(I)) / 2;
+      155     2216
+      156     2217    2         P_AVGRT90 = 0;
+      157     2218
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:6    
+      158     2219    2         TTIME = P_NINTS * 9 / 10;
+      159     2220
+      160     2221    3         DO I  =  0 TO P_RT.SIZE;                  /* Save interval-start values */
+      161     2222
+      162     2223    3            T_RT(I) = P_RT.DATA(I + P_RT.SIZE + 1);
+      163     2224
+      164     2225    3            IF P_AVGRT90 = 0
+      165     2226    4              THEN DO;
+      166     2227
+      167     2228    4               TTIME = TTIME - T_RT(I);
+      168     2229
+      169     2230    4               IF TTIME <= 0
+      170     2231    4                 THEN P_AVGRT90 = P_RT.DATA (I);
+      171     2232
+      172     2233    4               END;
+      173     2234
+      174     2235    3            END;
+      175     2236
+      176     2237    2         T_RT90 = P_RT90;
+      177     2238
+      178     2239    2         T_NINTS = P_NINTS;
+      179     2240
+      180     2241    2         END;
+      181     2242
+      182     2243    1      P_UPTIME = P_UPTIME + 1;
+      183     2244
+      184     2245    2      DO I = 0 TO %(RESOURCES - 1);
+      185     2246
+      186     2247    2         P_RESOURCE.RESX.SIGMA(I) = P_RESOURCE.RESX.SIGMA(I) +
+      187     2248    2          P_RESOURCE.RESX.CURRENT(I);
+      188     2249
+      189     2250    2         P_RESOURCE.RESX.AVERAGE(I) = ( P_RESOURCE.RESX.SIGMA(I) + P_UPTIME_SBIN / 2 )
+              2250                  /
+      190     2251    2          P_UPTIME_SBIN ;
+      191     2252
+      192     2253    2         END;
+      193     2254
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:7    
+      194     2255    1      IF P_UPTIME = 5
+      195     2256    2        THEN DO;
+      196     2257
+      197     2258    2         END;
+      198     2259
+      199     2260    1      T_CUIS (0) = T_CUIS (0) + S_CTUIS;
+      200     2261    1      P_AUIS(0) = T_CUIS_SBIN(0) / P_UPTIME_SBIN ;
+      201     2262
+      202     2263    2      DO I = 1 TO 4;
+      203     2264
+      204     2265    2         T_CUIS(I) = T_CUIS(I) + S_CUIS(I);
+      205     2266    2         P_AUIS(I) = T_CUIS_SBIN(I) / P_UPTIME_SBIN ;
+      206     2267
+      207     2268    2         END;
+      208     2269
+      209     2270           %LOCK (G#=MM_LOCK);
+      210     2273    1      T_AVAIL_MEM = T_AVAIL_MEM + MM_FPPC + MM_AUTO;
+      211     2274           %UNLOCK (G#=MM_LOCK);
+      212     2277    1      P_AVGAVAIL_MEM = T_AVAIL_MEM_SBIN / P_UPTIME_SBIN ;
+      213     2278
+      214     2279    1      T_ETMF = T_ETMF + P_ETMF;
+      215     2280
+      216     2281    1      P_AVGETMF = T_ETMF_SBIN / P_UPTIME_SBIN ;
+      217     2282
+      218     2283    1      CALL PMC$FIXDEV;                             /* Update DCT time-use values */
+      219     2284
+      220     2285    1      TIME_BUSY = 0;
+      221     2286    1      TIME_WAITING = 0;
+      222     2287
+      223     2288    2      DO I = 1 TO NK_MXLOCAL;                     /* Calculate the disk I/O load */
+      224     2289
+      225     2290    2         P$ = N$DCT$$->N$DCT$(I);
+      226     2291
+      227     2292    2         IF P$ ~= ADDR(NIL)
+      228     2293    2          AND NI$DCT.PMD$ ~= ADDR(NIL)
+      229     2294    3           THEN DO;
+      230     2295
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:8    
+      231     2296    3            TIME_BUSY = TIME_BUSY +
+      232     2297    3             NI$DCT.PMD$->P$IODATA.BUSY - NI$DCT.PM.ELAPSED_TIME(%PM_BUSY);
+      233     2298
+      234     2299    3            TIME_WAITING = TIME_WAITING +
+      235     2300    3             (NI$DCT.PMD$->P$IODATA.WAIT - NI$DCT.PM.ELAPSED_TIME(%PM_WAIT)) +
+      236     2301    3             (NI$DCT.PMD$->P$IODATA.BACKLOG - NI$DCT.PM.ELAPSED_TIME(%PM_QUED));
+      237     2302
+      238     2303    3            NI$DCT.PMD$->P$IODATA = NI$DCT.PM;
+      239     2304
+      240     2305    3            END;
+      241     2306
+      242     2307    2         END;
+      243     2308
+      244     2309    1      T_TOTAL_WAIT = T_TOTAL_WAIT + TIME_WAITING;
+      245     2310    1      T_TOTAL_BUSY = T_TOTAL_BUSY + TIME_BUSY;
+      246     2311
+      247     2312    1      TIME_TOTAL = TIME_WAITING + TIME_BUSY ;
+      248     2313    1      IF TIME_TOTAL = 0 THEN
+      249     2314    1         P_IOLOAD = 0;
+      250     2315    1        ELSE
+      251     2316    1         P_IOLOAD = ( TIME_WAITING_SBIN * 100 ) / TIME_TOTAL_SBIN ;
+      252     2317
+      253     2318    1      TIME_TOTAL = T_TOTAL_WAIT + T_TOTAL_BUSY ;
+      254     2319    1      IF TIME_TOTAL = 0 THEN
+      255     2320    1         P_AVGIOL = 0;
+      256     2321    1        ELSE
+      257     2322    1         P_AVGIOL = ( T_TOTAL_WAIT_SBIN * 100 ) / TIME_TOTAL_SBIN ;
+      258     2323
+      259     2324    1      RETURN;
+      260     2325
+      261     2326    1   END PMC$COLLECT;
+      262     2327        %EOD;
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:9    
+--  Include file information  --
+
+   XUD_UTS_M.:E05TOU  is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   PM$NI.:E05TOU  is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+   PM_BUCKET_C.:E05TOU  is referenced.
+   P_PMDAT_C.:E05TOU  is referenced.
+   P_PMDAT_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRLD_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRL_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure PMC$COLLECT.
+
+   Procedure PMC$COLLECT requires 316 words for executable code.
+   Procedure PMC$COLLECT requires 20 words of local(AUTO) storage.
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:10   
+
+ Object Unit name= PMC$COLLECT                                File name= PMC$COLLECT.:E05TOU
+ UTS= JUL 30 '97 04:25:12.40 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Data  even  none    24     30  PMC$COLLECT
+    1   Proc  even  none   316    474  PMC$COLLECT
+    2  RoData even  none     4      4  PMC$COLLECT
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        0  PMC$COLLECT
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 SSS$CURTIME
+         yes           Std       3 SSC$MONTIMR
+         yes           Std       1 HFC$UNLOCK
+         yes           Std       1 HFC$LOCK
+         yes           Std       0 SSS$CCAC
+         yes           Std       0 PMC$FIXDEV
+ yes     yes           Std       3 XUD$UTS_DIFF
+         yes           Std       0 PMC$COLLECT
+                       nStd      0 X66_AUTO_0
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:11   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     NK_MXLOCAL                            S_CUIS                                S_CTUIS
+     S_HQ                                  S_NSCPUA                              S_SCHDGATE
+     P_RESOURCE$                           P_ETMF                                P_NINTS
+     P_RT90                                P_STARTUP                             P_UPTIME
+     P_AVGRT90                             P_AVGETMF                             P_IOLOAD
+     P_AVGIOL                              P_AUIS                                P_NSCPU
+     P_AVGAVAIL_MEM                        N$DCT$$                               N$FQ$
+     NI$FQ$                                NI$IBUF$                              NI$RP$
+     MM_LOCK                               MM_FPPC                               MM_AUTO
+r    MM_BYP$                               P_RT                                  P_USERSIZE
+     B$USRT$                               B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:12   
+
+
+        1        1        /*M* PMC$COLLECT  Massage performance data once per minute                    */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* CLM=77,CRM=80,CRT=1,PLM=3,CTI=1,THI=2                                    */
+        8        8        PMC$COLLECT: PROC;
+
+      8  1 000000   000000 700200 xent  PMC$COLLECT  TSX0  ! X66_AUTO_0
+         1 000001   000024 000000                    ZERO    20,0
+         1 000002   000021 710000 1                  TRA     s:2133
+
+        9        9    1   DCL SSC$MONTIMR ENTRY (3);
+       10       10    1   DCL SSS$CURTIME ENTRY (1);
+       11       11    1   DCL SSS$CCAC ENTRY;
+       12       12    1   DCL PMC$FIXDEV ENTRY;
+       13       13    1   DCL I SBIN;
+       14       14    1   DCL J SBIN;
+       15       15    1   DCL K SBIN;
+       16       16    1   DCL L SBIN;
+       17       17    1   DCL TTIME SBIN;
+       18       18    1   DCL TIME_BUSY UBIN;
+       19       19    1   DCL TIME_WAITING UBIN;
+       20       20    1   DCL TIME_WAITING_SBIN REDEF TIME_WAITING SBIN ;
+       21       21    1   DCL TIME_TOTAL   UBIN ;
+       22       22    1   DCL TIME_TOTAL_SBIN REDEF TIME_TOTAL SBIN ;
+       23       23    1   DCL P$ PTR;
+       24       24    1   DCL T_RT90 UBIN(36) STATIC INIT(0);
+       25       25    1   DCL T_RT(0:11) UBIN(36) STATIC INIT(0*0);
+       26       26    1   DCL T_NINTS UBIN STATIC INIT(0);
+       27       27    1   DCL T_ETMF UBIN STATIC INIT (0);
+       28       28    1   DCL T_ETMF_SBIN REDEF T_ETMF SBIN ;
+       29       29    1   DCL T_CUIS (0:4) UBIN STATIC INIT (0*0);
+       30       30    1   DCL T_CUIS_SBIN(0:4) REDEF T_CUIS SBIN ;
+       31       31    1   DCL T_IOLOAD UBIN STATIC INIT (0);
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:13   
+       32       32    1   DCL T_USERS SBIN WORD;                       /* # of users waiting to compute */
+       33       33    1   DCL T_TOTAL_WAIT UBIN STATIC INIT (0);
+       34       34    1   DCL T_TOTAL_WAIT_SBIN REDEF T_TOTAL_WAIT SBIN ;
+       35       35    1   DCL T_TOTAL_BUSY UBIN STATIC INIT (0);
+       36       36    1   DCL T_AVAIL_MEM UBIN STATIC INIT(0);
+       37       37    1   DCL T_AVAIL_MEM_SBIN REDEF T_AVAIL_MEM SBIN ;
+       38       38    1   DCL NK_MXLOCAL UBIN WORD SYMREF; /* # of highest local (TIGR-built) DCT entry */
+       39       39        %INCLUDE SS_SCHED_R;
+       40       82        %INCLUDE P_PMDAT_R;
+       41      390        %INCLUDE PM_BUCKET_C;
+       42      475        %INCLUDE B$USER;
+       43      691        %INCLUDE SS_SCHED_C;
+       44      924        %INCLUDE HF_LOCK_C;
+       45      938        %INCLUDE NI_DATA_R;
+       46     1375        %INCLUDE PM$NI;
+       47     1399        %INCLUDE MM_DATA_R;
+       48     1919        %INCLUDE XUD_UTS_M;
+       49     2001        %XUD$UTS_ENTRIES;
+       50     2033
+       51     2034        %NI$DCT (STCLASS="BASED(P$)");
+       52     2082        %NI$DVT;
+       53     2089
+       54     2090        %DUMMY_BUCKET (NAME = P_RT, STCLASS = SYMREF);
+       55     2096        %DUMMY_BUCKET (NAME = P_USERSIZE, STCLASS = SYMREF);
+       56     2102        %B$USERREFS;
+       57     2106        %EJECT;
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:14   
+       58     2107    1   RESET_RESOURCE: PROC (RESOURCE);
+
+   2107  1 000003   200016 741300       RESET_RESOU* STX1  ! T_USERS+2,,AUTO
+
+       59     2108
+       60     2109    2   DCL 1 RESOURCE,
+       61     2110    2         2 CURRENT UBIN,
+       62     2111    2         2 PEAK UBIN,
+       63     2112    2         2 MIN UBIN,
+       64     2113    2         2 SIGMA UBIN,
+       65     2114    2         2 AVERAGE UBIN,
+       66     2115    2         2 TOTAL UBIN;
+       67     2116
+       68     2117    2      RESOURCE.PEAK = RESOURCE.CURRENT;
+
+   2117  1 000004   200017 470500                    LDP0    @RESOURCE,,AUTO
+         1 000005   000000 235100                    LDA     0,,PR0
+         1 000006   000001 755100                    STA     1,,PR0
+
+       69     2118    2      RESOURCE.MIN = RESOURCE.CURRENT;
+
+   2118  1 000007   000002 755100                    STA     2,,PR0
+
+       70     2119
+       71     2120    2      IF RESOURCE.SIGMA > RESOURCE.CURRENT * 5
+
+   2120  1 000010   000000 236100                    LDQ     0,,PR0
+         1 000011   000005 402007                    MPY     5,DL
+         1 000012   000003 116100                    CMPQ    3,,PR0
+         1 000013   000017 603000 1                  TRC     s:2128
+
+       72     2121    3        THEN DO;
+
+       73     2122
+       74     2123    3         RESOURCE.AVERAGE = RESOURCE.CURRENT;
+
+   2123  1 000014   000000 235100                    LDA     0,,PR0
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:15   
+         1 000015   000004 755100                    STA     4,,PR0
+
+       75     2124    3         RESOURCE.SIGMA = RESOURCE.CURRENT * 5;
+
+   2124  1 000016   000003 756100                    STQ     3,,PR0
+
+       76     2125
+       77     2126    3         END;
+
+       78     2127
+       79     2128    2      RETURN;
+
+   2128  1 000017   200016 221300                    LDX1  ! T_USERS+2,,AUTO
+         1 000020   000001 702211                    TSX2  ! 1,X1
+
+       80     2129
+       81     2130    2   END RESET_RESOURCE;
+       82     2131
+       83     2132        %EJECT;
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:16   
+       84     2133    1      CALL SSS$CURTIME (I);
+
+   2133  1 000021   200003 630500                    EPPR0   I,,AUTO
+         1 000022   200020 450500                    STP0    @RESOURCE+1,,AUTO
+         1 000023   200020 630500                    EPPR0   @RESOURCE+1,,AUTO
+         1 000024   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000025   000000 701000 xent               TSX1    SSS$CURTIME
+         1 000026   000000 011000                    NOP     0
+
+       85     2134
+       86     2135        /* this code has been updated because the argument I for SSC$MONTIMR
+       87     2136           must be a centisecond value.  It used to say:
+       88     2137            I = P_STARTUP + (P_UPTIME + 2)*6000 - I;
+       89     2138           which is more easily understood as:
+       90     2139            I = (P_UPTIME +2)*6000 - (I - P_STARTUP);
+       91     2140           or in English, subtract the current uptime (I-P_STARTUP, both uts values)
+       92     2141           from the desired uptime ((P_UPTIME+2)*6000, P_UPTIME being in minutes since
+       93     2142           P_STARTUP, and we haven't incremented it yet this trip).  I and P_STARTUP
+       94     2143           are both UTS values, so use XUD$UTS_DIFF to get their difference in
+       95     2144           centiseconds, and the rest is easy.
+       96     2145        */
+       97     2146    1      CALL XUD$UTS_DIFF (I, I, P_STARTUP);
+
+   2146  1 000027   000000 236000 2                  LDQ     0
+         1 000030   200022 756100                    STQ     @RESOURCE+3,,AUTO
+         1 000031   200003 630500                    EPPR0   I,,AUTO
+         1 000032   200021 450500                    STP0    @RESOURCE+2,,AUTO
+         1 000033   200003 631500                    EPPR1   I,,AUTO
+         1 000034   200020 451500                    STP1    @RESOURCE+1,,AUTO
+         1 000035   200020 630500                    EPPR0   @RESOURCE+1,,AUTO
+         1 000036   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         1 000037   000000 701000 xent               TSX1    XUD$UTS_DIFF
+         1 000040   000000 011000                    NOP     0
+
+       98     2147    1      I = (P_UPTIME+2)*6000 - I;
+
+   2147  1 000041   000000 236003                    LDQ     0,DU
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:17   
+         1 000042   000000 136000 xsym               SBLQ    P_UPTIME
+         1 000043   013560 402007                    MPY     6000,DL
+         1 000044   200003 036100                    ADLQ    I,,AUTO
+         1 000045   000027 676000 xsym               ERQ     B_VECTNIL+23
+         1 000046   027341 036007                    ADLQ    12001,DL
+         1 000047   200003 756100                    STQ     I,,AUTO
+
+       99     2148                                                                                    /**/
+      100     2149
+      101     2150    1      IF I <= 0                     /* if we overshot due to XDELTA or some such */
+
+   2150  1 000050   000053 605400 1                  TPNZ    s:2154
+
+      102     2151    1        THEN                                /* then come around again in another */
+      103     2152    1         I = 200;                            /* couple of seconds & re-calculate */
+
+   2152  1 000051   000310 235007                    LDA     200,DL
+         1 000052   200003 755100                    STA     I,,AUTO
+
+      104     2153
+      105     2154    1      CALL SSC$MONTIMR (I, ENTADDR(PMC$COLLECT), 0);
+
+   2154  1 000053   000000 636000 1                  EAQ     s:8
+         1 000054   200020 756100                    STQ     @RESOURCE+1,,AUTO
+         1 000055   000001 236000 2                  LDQ     1
+         1 000056   200023 756100                    STQ     @RESOURCE+4,,AUTO
+         1 000057   200020 630500                    EPPR0   @RESOURCE+1,,AUTO
+         1 000060   200022 450500                    STP0    @RESOURCE+3,,AUTO
+         1 000061   200003 631500                    EPPR1   I,,AUTO
+         1 000062   200021 451500                    STP1    @RESOURCE+2,,AUTO
+         1 000063   200021 630500                    EPPR0   @RESOURCE+2,,AUTO
+         1 000064   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         1 000065   000000 701000 xent               TSX1    SSC$MONTIMR
+         1 000066   000000 011000                    NOP     0
+
+      106     2155
+      107     2156           %LOCK (G#=S_SCHDGATE);
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:18   
+
+   2157  1 000067   000002 630400 2                  EPPR0   2
+         1 000070   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000071   000000 701000 xent               TSX1    HFC$LOCK
+         1 000072   000000 011000                    NOP     0
+
+      108     2159
+      109     2160    1      CALL SSS$CCAC;                 /* clear cache to ensure getting valid data */
+
+   2160  1 000073   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         1 000074   000000 701000 xent               TSX1    SSS$CCAC
+         1 000075   000000 011000                    NOP     0
+
+      110     2161
+      111     2162    1      T_USERS = 0;
+
+   2162  1 000076   200014 450100                    STZ     T_USERS,,AUTO
+
+      112     2163    2      DO I = 1 TO %SS_STI;                       /* Count users and figure sizes */
+
+   2163  1 000077   000001 235007                    LDA     1,DL
+         1 000100   200003 755100                    STA     I,,AUTO
+
+      113     2164
+      114     2165    2         J = S_HQ(I);
+
+   2165  1 000101   200003 720100                    LXL0    I,,AUTO
+         1 000102   000000 235010 xsym               LDA     S_HQ,X0
+         1 000103   200004 755100                    STA     J,,AUTO
+
+      115     2166
+      116     2167    3         DO WHILE (J ~= 0);
+
+   2167  1 000104   000151 600000 1                  TZE     s:2187
+
+      117     2168
+      118     2169    3            IF I <= %SS_SCU
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:19   
+
+   2169  1 000105   200003 235100                    LDA     I,,AUTO
+         1 000106   000014 115007                    CMPA    12,DL
+         1 000107   000111 605400 1                  TPNZ    s:2173
+
+      119     2170    3              THEN
+      120     2171    3               T_USERS = T_USERS + 1;
+
+   2171  1 000110   200014 054100                    AOS     T_USERS,,AUTO
+
+      121     2172
+      122     2173    3            K = B$USRT$ -> B$USER.PCT(J);
+
+   2173  1 000111   200004 236100                    LDQ     J,,AUTO
+         1 000112   000004 736000                    QLS     4
+         1 000113   000000 470400 xsym               LDP0    B$USRT$
+         1 000114   000010 236106                    LDQ     8,QL,PR0
+         1 000115   000022 772000                    QRL     18
+         1 000116   200005 756100                    STQ     K,,AUTO
+
+      123     2174                 %UPDATE_BUCKET (BUCKET=P_USERSIZE, SCRATCH=L, DIST_VAL=K);
+
+   2175  1 000117   200006 450100                    STZ     L,,AUTO
+
+   2176  1 000120   000122 710000 1                  TRA     s:2179
+
+   2178  1 000121   200006 054100                    AOS     L,,AUTO
+
+   2179  1 000122   200006 236100                    LDQ     L,,AUTO
+         1 000123   000126 604000 1                  TMI     s:2179+4
+         1 000124   000000 116000 xsym               CMPQ    P_USERSIZE
+         1 000125   000132 603000 1                  TRC     s:2180
+         1 000126   000000 620006                    EAX0    0,QL
+         1 000127   200005 236100                    LDQ     K,,AUTO
+         1 000130   000002 116010 xsym               CMPQ    P_USERSIZE+2,X0
+         1 000131   000121 605400 1                  TPNZ    s:2178
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:20   
+   2180  1 000132   200006 236100                    LDQ     L,,AUTO
+         1 000133   000000 036000 xsym               ADLQ    P_USERSIZE
+         1 000134   200020 756100                    STQ     @RESOURCE+1,,AUTO
+         1 000135   200006 236100                    LDQ     L,,AUTO
+         1 000136   000000 036000 xsym               ADLQ    P_USERSIZE
+         1 000137   200020 720100                    LXL0    @RESOURCE+1,,AUTO
+         1 000140   000003 235006 xsym               LDA     P_USERSIZE+3,QL
+         1 000141   000001 035007                    ADLA    1,DL
+         1 000142   000003 755010 xsym               STA     P_USERSIZE+3,X0
+
+      124     2183    3            J = B$USRT$ -> B$USER.FL(J);
+
+   2183  1 000143   200004 235100                    LDA     J,,AUTO
+         1 000144   000004 735000                    ALS     4
+         1 000145   000000 470400 xsym               LDP0    B$USRT$
+         1 000146   000002 235105                    LDA     2,AL,PR0
+         1 000147   200004 755100                    STA     J,,AUTO
+
+      125     2184
+      126     2185    3            END;
+
+   2185  1 000150   000105 601000 1                  TNZ     s:2169
+
+      127     2186
+      128     2187    2         END;
+
+   2187  1 000151   200003 054100                    AOS     I,,AUTO
+         1 000152   200003 236100                    LDQ     I,,AUTO
+         1 000153   000025 116007                    CMPQ    21,DL
+         1 000154   000101 604400 1                  TMOZ    s:2165
+
+      129     2188
+      130     2189           %UNLOCK (G#=S_SCHDGATE);
+
+   2190  1 000155   000002 630400 2                  EPPR0   2
+         1 000156   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000157   000000 701000 xent               TSX1    HFC$UNLOCK
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:21   
+         1 000160   000000 011000                    NOP     0
+
+      131     2192
+      132     2193    1      P_NSCPU = S_NSCPUA+1;
+
+   2193  1 000161   000000 235000 xsym               LDA     S_NSCPUA
+         1 000162   000001 035007                    ADLA    1,DL
+         1 000163   000000 755000 xsym               STA     P_NSCPU
+
+      133     2194    1      P_ETMF = ( P_ETMF + T_USERS / P_NSCPU_SBIN ) / 2;
+
+   2194  1 000164   200014 236100                    LDQ     T_USERS,,AUTO
+         1 000165   000000 506000 xsym               DIV     P_NSCPU
+         1 000166   000000 036000 xsym               ADLQ    P_ETMF
+         1 000167   000002 506007                    DIV     2,DL
+         1 000170   000000 756000 xsym               STQ     P_ETMF
+
+      134     2195
+      135     2196    1      IF P_ETMF = 0
+
+   2196  1 000171   000000 116003                    CMPQ    0,DU
+         1 000172   000175 601000 1                  TNZ     s:2199
+
+      136     2197    1        THEN P_ETMF = 1;
+
+   2197  1 000173   000001 235007                    LDA     1,DL
+         1 000174   000000 755000 xsym               STA     P_ETMF
+
+      137     2198
+      138     2199    1      J = ((P_NINTS - T_NINTS) * 9) / 10;                   /* 90% response time */
+
+   2199  1 000175   000000 236000 xsym               LDQ     P_NINTS
+         1 000176   000015 136000 0                  SBLQ    T_NINTS
+         1 000177   000011 402007                    MPY     9,DL
+         1 000200   000012 506007                    DIV     10,DL
+         1 000201   200004 756100                    STQ     J,,AUTO
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:22   
+      139     2200
+      140     2201    2      IF J > 0 THEN DO;
+
+   2201  1 000202   000000 116003                    CMPQ    0,DU
+         1 000203   000266 604400 1                  TMOZ    s:2243
+
+      141     2202
+      142     2203    2         I = 0;
+
+   2203  1 000204   200003 450100                    STZ     I,,AUTO
+
+      143     2204
+      144     2205    2         TTIME = 0;
+
+   2205  1 000205   200007 450100                    STZ     TTIME,,AUTO
+
+      145     2206
+      146     2207    3         DO WHILE (J>TTIME);                                /* Locate 90% bucket */
+
+   2207  1 000206   200007 116100                    CMPQ    TTIME,,AUTO
+         1 000207   000223 604400 1                  TMOZ    s:2215
+
+      147     2208
+      148     2209    3            TTIME = TTIME + P_RT.DATA(I + P_RT.SIZE + 1) - T_RT(I);
+
+   2209  1 000210   200003 236100                    LDQ     I,,AUTO
+         1 000211   000000 036000 xsym               ADLQ    P_RT
+         1 000212   000000 620006                    EAX0    0,QL
+         1 000213   200007 236100                    LDQ     TTIME,,AUTO
+         1 000214   000003 036010 xsym               ADLQ    P_RT+3,X0
+         1 000215   200003 720100                    LXL0    I,,AUTO
+         1 000216   000001 136010 0                  SBLQ    T_RT,X0
+         1 000217   200007 756100                    STQ     TTIME,,AUTO
+
+      149     2210
+      150     2211    3            I = I + 1;
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:23   
+   2211  1 000220   200003 054100                    AOS     I,,AUTO
+
+      151     2212
+      152     2213    3            END;
+
+   2213  1 000221   200004 116100                    CMPQ    J,,AUTO
+         1 000222   000210 604000 1                  TMI     s:2209
+
+      153     2214
+      154     2215    2         P_RT90 = (P_RT90 - T_RT90 + P_RT.DATA(I)) / 2;
+
+   2215  1 000223   000000 236000 xsym               LDQ     P_RT90
+         1 000224   000000 136000 0                  SBLQ    T_RT90
+         1 000225   200003 720100                    LXL0    I,,AUTO
+         1 000226   000002 036010 xsym               ADLQ    P_RT+2,X0
+         1 000227   000002 506007                    DIV     2,DL
+         1 000230   000000 756000 xsym               STQ     P_RT90
+
+      155     2216
+      156     2217    2         P_AVGRT90 = 0;
+
+   2217  1 000231   000000 450000 xsym               STZ     P_AVGRT90
+
+      157     2218
+      158     2219    2         TTIME = P_NINTS * 9 / 10;
+
+   2219  1 000232   000000 236000 xsym               LDQ     P_NINTS
+         1 000233   000011 402007                    MPY     9,DL
+         1 000234   000012 506007                    DIV     10,DL
+         1 000235   200007 756100                    STQ     TTIME,,AUTO
+
+      159     2220
+      160     2221    3         DO I  =  0 TO P_RT.SIZE;                  /* Save interval-start values */
+
+   2221  1 000236   200003 450100                    STZ     I,,AUTO
+         1 000237   000256 710000 1                  TRA     s:2235+1
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:24   
+      161     2222
+      162     2223    3            T_RT(I) = P_RT.DATA(I + P_RT.SIZE + 1);
+
+   2223  1 000240   200003 236100                    LDQ     I,,AUTO
+         1 000241   000000 036000 xsym               ADLQ    P_RT
+         1 000242   000003 235006 xsym               LDA     P_RT+3,QL
+         1 000243   200003 720100                    LXL0    I,,AUTO
+         1 000244   000001 755010 0                  STA     T_RT,X0
+
+      163     2224
+      164     2225    3            IF P_AVGRT90 = 0
+
+   2225  1 000245   000000 236000 xsym               LDQ     P_AVGRT90
+         1 000246   000255 601000 1                  TNZ     s:2235
+
+      165     2226    4              THEN DO;
+
+      166     2227
+      167     2228    4               TTIME = TTIME - T_RT(I);
+
+   2228  1 000247   200007 236100                    LDQ     TTIME,,AUTO
+         1 000250   000001 136010 0                  SBLQ    T_RT,X0
+         1 000251   200007 756100                    STQ     TTIME,,AUTO
+
+      168     2229
+      169     2230    4               IF TTIME <= 0
+
+   2230  1 000252   000255 605400 1                  TPNZ    s:2235
+
+      170     2231    4                 THEN P_AVGRT90 = P_RT.DATA (I);
+
+   2231  1 000253   000002 235010 xsym               LDA     P_RT+2,X0
+         1 000254   000000 755000 xsym               STA     P_AVGRT90
+
+      171     2232
+      172     2233    4               END;
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:25   
+      173     2234
+      174     2235    3            END;
+
+   2235  1 000255   200003 054100                    AOS     I,,AUTO
+         1 000256   000000 236000 xsym               LDQ     P_RT
+         1 000257   000240 604000 1                  TMI     s:2223
+         1 000260   200003 116100                    CMPQ    I,,AUTO
+         1 000261   000240 605000 1                  TPL     s:2223
+
+      175     2236
+      176     2237    2         T_RT90 = P_RT90;
+
+   2237  1 000262   000000 235000 xsym               LDA     P_RT90
+         1 000263   000000 755000 0                  STA     T_RT90
+
+      177     2238
+      178     2239    2         T_NINTS = P_NINTS;
+
+   2239  1 000264   000000 235000 xsym               LDA     P_NINTS
+         1 000265   000015 755000 0                  STA     T_NINTS
+
+      179     2240
+      180     2241    2         END;
+
+      181     2242
+      182     2243    1      P_UPTIME = P_UPTIME + 1;
+
+   2243  1 000266   000000 235000 xsym               LDA     P_UPTIME
+         1 000267   000001 035007                    ADLA    1,DL
+         1 000270   000000 755000 xsym               STA     P_UPTIME
+
+      183     2244
+      184     2245    2      DO I = 0 TO %(RESOURCES - 1);
+
+   2245  1 000271   200003 450100                    STZ     I,,AUTO
+
+      185     2246
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:26   
+      186     2247    2         P_RESOURCE.RESX.SIGMA(I) = P_RESOURCE.RESX.SIGMA(I) +
+
+   2247  1 000272   200003 236100                    LDQ     I,,AUTO
+         1 000273   000006 402007                    MPY     6,DL
+         1 000274   000000 470400 xsym               LDP0    P_RESOURCE$
+         1 000275   000000 620006                    EAX0    0,QL
+         1 000276   000000 621006                    EAX1    0,QL
+         1 000277   000044 236110                    LDQ     36,X0,PR0
+         1 000300   000041 036110                    ADLQ    33,X0,PR0
+         1 000301   000044 756111                    STQ     36,X1,PR0
+
+      187     2248    2          P_RESOURCE.RESX.CURRENT(I);
+      188     2249
+      189     2250    2         P_RESOURCE.RESX.AVERAGE(I) = ( P_RESOURCE.RESX.SIGMA(I) + P_UPTIME_SBIN / 2 )
+              2250                  /
+
+   2250  1 000302   200003 236100                    LDQ     I,,AUTO
+         1 000303   000006 402007                    MPY     6,DL
+         1 000304   000000 620006                    EAX0    0,QL
+         1 000305   000000 236000 xsym               LDQ     P_UPTIME
+         1 000306   000002 506007                    DIV     2,DL
+         1 000307   000000 470400 xsym               LDP0    P_RESOURCE$
+         1 000310   000044 036110                    ADLQ    36,X0,PR0
+         1 000311   000000 506000 xsym               DIV     P_UPTIME
+         1 000312   000045 756110                    STQ     37,X0,PR0
+
+      190     2251    2          P_UPTIME_SBIN ;
+      191     2252
+      192     2253    2         END;
+
+   2253  1 000313   200003 054100                    AOS     I,,AUTO
+         1 000314   200003 235100                    LDA     I,,AUTO
+         1 000315   000004 115007                    CMPA    4,DL
+         1 000316   000272 604400 1                  TMOZ    s:2247
+
+      193     2254
+      194     2255    1      IF P_UPTIME = 5
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:27   
+
+   2255  1 000317   000000 236000 xsym               LDQ     P_UPTIME
+         1 000320   000005 116007                    CMPQ    5,DL
+         1 000321   000322 601000 1                  TNZ     s:2260
+
+      195     2256    2        THEN DO;
+
+      196     2257
+      197     2258    2         END;
+
+      198     2259
+      199     2260    1      T_CUIS (0) = T_CUIS (0) + S_CTUIS;
+
+   2260  1 000322   000017 236000 0                  LDQ     T_CUIS
+         1 000323   000000 036000 xsym               ADLQ    S_CTUIS
+         1 000324   000017 756000 0                  STQ     T_CUIS
+
+      200     2261    1      P_AUIS(0) = T_CUIS_SBIN(0) / P_UPTIME_SBIN ;
+
+   2261  1 000325   000017 236000 0                  LDQ     T_CUIS
+         1 000326   000000 506000 xsym               DIV     P_UPTIME
+         1 000327   000000 756000 xsym               STQ     P_AUIS
+
+      201     2262
+      202     2263    2      DO I = 1 TO 4;
+
+   2263  1 000330   000001 235007                    LDA     1,DL
+         1 000331   200003 755100                    STA     I,,AUTO
+
+      203     2264
+      204     2265    2         T_CUIS(I) = T_CUIS(I) + S_CUIS(I);
+
+   2265  1 000332   200003 720100                    LXL0    I,,AUTO
+         1 000333   000017 236010 0                  LDQ     T_CUIS,X0
+         1 000334   000000 036010 xsym               ADLQ    S_CUIS,X0
+         1 000335   000017 756010 0                  STQ     T_CUIS,X0
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:28   
+      205     2266    2         P_AUIS(I) = T_CUIS_SBIN(I) / P_UPTIME_SBIN ;
+
+   2266  1 000336   000017 236010 0                  LDQ     T_CUIS,X0
+         1 000337   000000 506000 xsym               DIV     P_UPTIME
+         1 000340   000000 756010 xsym               STQ     P_AUIS,X0
+
+      206     2267
+      207     2268    2         END;
+
+   2268  1 000341   200003 054100                    AOS     I,,AUTO
+         1 000342   200003 235100                    LDA     I,,AUTO
+         1 000343   000004 115007                    CMPA    4,DL
+         1 000344   000332 604400 1                  TMOZ    s:2265
+
+      208     2269
+      209     2270           %LOCK (G#=MM_LOCK);
+
+   2271  1 000345   000003 630400 2                  EPPR0   3
+         1 000346   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000347   000000 701000 xent               TSX1    HFC$LOCK
+         1 000350   000000 011000                    NOP     0
+
+      210     2273    1      T_AVAIL_MEM = T_AVAIL_MEM + MM_FPPC + MM_AUTO;
+
+   2273  1 000351   000027 236000 0                  LDQ     T_AVAIL_MEM
+         1 000352   000000 036000 xsym               ADLQ    MM_FPPC
+         1 000353   000000 036000 xsym               ADLQ    MM_AUTO
+         1 000354   000027 756000 0                  STQ     T_AVAIL_MEM
+
+      211     2274           %UNLOCK (G#=MM_LOCK);
+
+   2275  1 000355   000003 630400 2                  EPPR0   3
+         1 000356   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000357   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000360   000000 011000                    NOP     0
+
+      212     2277    1      P_AVGAVAIL_MEM = T_AVAIL_MEM_SBIN / P_UPTIME_SBIN ;
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:29   
+
+   2277  1 000361   000027 236000 0                  LDQ     T_AVAIL_MEM
+         1 000362   000000 506000 xsym               DIV     P_UPTIME
+         1 000363   000000 756000 xsym               STQ     P_AVGAVAIL_MEM
+
+      213     2278
+      214     2279    1      T_ETMF = T_ETMF + P_ETMF;
+
+   2279  1 000364   000016 236000 0                  LDQ     T_ETMF
+         1 000365   000000 036000 xsym               ADLQ    P_ETMF
+         1 000366   000016 756000 0                  STQ     T_ETMF
+
+      215     2280
+      216     2281    1      P_AVGETMF = T_ETMF_SBIN / P_UPTIME_SBIN ;
+
+   2281  1 000367   000016 236000 0                  LDQ     T_ETMF
+         1 000370   000000 506000 xsym               DIV     P_UPTIME
+         1 000371   000000 756000 xsym               STQ     P_AVGETMF
+
+      217     2282
+      218     2283    1      CALL PMC$FIXDEV;                             /* Update DCT time-use values */
+
+   2283  1 000372   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         1 000373   000000 701000 xent               TSX1    PMC$FIXDEV
+         1 000374   000000 011000                    NOP     0
+
+      219     2284
+      220     2285    1      TIME_BUSY = 0;
+
+   2285  1 000375   200010 450100                    STZ     TIME_BUSY,,AUTO
+
+      221     2286    1      TIME_WAITING = 0;
+
+   2286  1 000376   200011 450100                    STZ     TIME_WAITING,,AUTO
+
+      222     2287
+      223     2288    2      DO I = 1 TO NK_MXLOCAL;                     /* Calculate the disk I/O load */
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:30   
+
+   2288  1 000377   000001 235007                    LDA     1,DL
+         1 000400   200003 755100                    STA     I,,AUTO
+         1 000401   000435 710000 1                  TRA     s:2307+1
+
+      224     2289
+      225     2290    2         P$ = N$DCT$$->N$DCT$(I);
+
+   2290  1 000402   000000 470400 xsym               LDP0    N$DCT$$
+         1 000403   200003 720100                    LXL0    I,,AUTO
+         1 000404   000000 236110                    LDQ     0,X0,PR0
+         1 000405   200013 756100                    STQ     P$,,AUTO
+
+      226     2291
+      227     2292    2         IF P$ ~= ADDR(NIL)
+
+   2292  1 000406   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000407   000434 600000 1                  TZE     s:2307
+         1 000410   200013 471500                    LDP1    P$,,AUTO
+         1 000411   100044 236100                    LDQ     36,,PR1
+         1 000412   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000413   000434 600000 1                  TZE     s:2307
+
+      228     2293    2          AND NI$DCT.PMD$ ~= ADDR(NIL)
+      229     2294    3           THEN DO;
+
+      230     2295
+      231     2296    3            TIME_BUSY = TIME_BUSY +
+
+   2296  1 000414   100044 473500                    LDP3    36,,PR1
+         1 000415   200010 236100                    LDQ     TIME_BUSY,,AUTO
+         1 000416   300005 036100                    ADLQ    5,,PR3
+         1 000417   100015 136100                    SBLQ    13,,PR1
+         1 000420   200010 756100                    STQ     TIME_BUSY,,AUTO
+
+      232     2297    3             NI$DCT.PMD$->P$IODATA.BUSY - NI$DCT.PM.ELAPSED_TIME(%PM_BUSY);
+      233     2298
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:31   
+      234     2299    3            TIME_WAITING = TIME_WAITING +
+
+   2299  1 000421   300004 236100                    LDQ     4,,PR3
+         1 000422   100014 136100                    SBLQ    12,,PR1
+         1 000423   200011 036100                    ADLQ    TIME_WAITING,,AUTO
+         1 000424   200020 756100                    STQ     @RESOURCE+1,,AUTO
+         1 000425   300006 236100                    LDQ     6,,PR3
+         1 000426   100016 136100                    SBLQ    14,,PR1
+         1 000427   200020 036100                    ADLQ    @RESOURCE+1,,AUTO
+         1 000430   200011 756100                    STQ     TIME_WAITING,,AUTO
+
+      235     2300    3             (NI$DCT.PMD$->P$IODATA.WAIT - NI$DCT.PM.ELAPSED_TIME(%PM_WAIT)) +
+      236     2301    3             (NI$DCT.PMD$->P$IODATA.BACKLOG - NI$DCT.PM.ELAPSED_TIME(%PM_QUED));
+      237     2302
+      238     2303    3            NI$DCT.PMD$->P$IODATA = NI$DCT.PM;
+
+   2303  1 000431   000100 100500                    MLR     fill='000'O
+         1 000432   100010 000034                    ADSC9   8,,PR1                   cn=0,n=28
+         1 000433   300000 000034                    ADSC9   0,,PR3                   cn=0,n=28
+
+      239     2304
+      240     2305    3            END;
+
+      241     2306
+      242     2307    2         END;
+
+   2307  1 000434   200003 054100                    AOS     I,,AUTO
+         1 000435   000000 236000 xsym               LDQ     NK_MXLOCAL
+         1 000436   000402 604000 1                  TMI     s:2290
+         1 000437   200003 116100                    CMPQ    I,,AUTO
+         1 000440   000402 605000 1                  TPL     s:2290
+
+      243     2308
+      244     2309    1      T_TOTAL_WAIT = T_TOTAL_WAIT + TIME_WAITING;
+
+   2309  1 000441   000025 236000 0                  LDQ     T_TOTAL_WAIT
+         1 000442   200011 036100                    ADLQ    TIME_WAITING,,AUTO
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:32   
+         1 000443   000025 756000 0                  STQ     T_TOTAL_WAIT
+
+      245     2310    1      T_TOTAL_BUSY = T_TOTAL_BUSY + TIME_BUSY;
+
+   2310  1 000444   000026 236000 0                  LDQ     T_TOTAL_BUSY
+         1 000445   200010 036100                    ADLQ    TIME_BUSY,,AUTO
+         1 000446   000026 756000 0                  STQ     T_TOTAL_BUSY
+
+      246     2311
+      247     2312    1      TIME_TOTAL = TIME_WAITING + TIME_BUSY ;
+
+   2312  1 000447   200011 236100                    LDQ     TIME_WAITING,,AUTO
+         1 000450   200010 036100                    ADLQ    TIME_BUSY,,AUTO
+         1 000451   200012 756100                    STQ     TIME_TOTAL,,AUTO
+
+      248     2313    1      IF TIME_TOTAL = 0 THEN
+
+   2313  1 000452   000455 601000 1                  TNZ     s:2316
+
+      249     2314    1         P_IOLOAD = 0;
+
+   2314  1 000453   000000 450000 xsym               STZ     P_IOLOAD
+         1 000454   000461 710000 1                  TRA     s:2318
+
+      250     2315    1        ELSE
+      251     2316    1         P_IOLOAD = ( TIME_WAITING_SBIN * 100 ) / TIME_TOTAL_SBIN ;
+
+   2316  1 000455   200011 236100                    LDQ     TIME_WAITING,,AUTO
+         1 000456   000144 402007                    MPY     100,DL
+         1 000457   200012 506100                    DIV     TIME_TOTAL,,AUTO
+         1 000460   000000 756000 xsym               STQ     P_IOLOAD
+
+      252     2317
+      253     2318    1      TIME_TOTAL = T_TOTAL_WAIT + T_TOTAL_BUSY ;
+
+   2318  1 000461   000025 236000 0                  LDQ     T_TOTAL_WAIT
+         1 000462   000026 036000 0                  ADLQ    T_TOTAL_BUSY
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:33   
+         1 000463   200012 756100                    STQ     TIME_TOTAL,,AUTO
+
+      254     2319    1      IF TIME_TOTAL = 0 THEN
+
+   2319  1 000464   000467 601000 1                  TNZ     s:2322
+
+      255     2320    1         P_AVGIOL = 0;
+
+   2320  1 000465   000000 450000 xsym               STZ     P_AVGIOL
+         1 000466   000473 710000 1                  TRA     s:2324
+
+      256     2321    1        ELSE
+      257     2322    1         P_AVGIOL = ( T_TOTAL_WAIT_SBIN * 100 ) / TIME_TOTAL_SBIN ;
+
+   2322  1 000467   000025 236000 0                  LDQ     T_TOTAL_WAIT
+         1 000470   000144 402007                    MPY     100,DL
+         1 000471   200012 506100                    DIV     TIME_TOTAL,,AUTO
+         1 000472   000000 756000 xsym               STQ     P_AVGIOL
+
+      258     2323
+      259     2324    1      RETURN;
+
+   2324  1 000473   000000 702200 xent               TSX2  ! X66_ARET
+
+T_RT90
+ Sect OctLoc
+   0     000   000000 000000                                                    ....
+
+T_RT
+ Sect OctLoc
+   0     001   000000 000000   000000 000000   000000 000000   000000 000000    ................
+   0     011*  000000 000000   000000 000000   000000 000000   000000 000000    ................
+
+T_NINTS
+ Sect OctLoc
+   0     015   000000 000000                                                    ....
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:34   
+T_ETMF
+ Sect OctLoc
+   0     016   000000 000000                                                    ....
+
+T_CUIS
+ Sect OctLoc
+   0     017   000000 000000   000000 000000   000000 000000   000000 000000    ................
+   0     023   000000 000000                                                    ....
+
+(unnamed)
+ Sect OctLoc
+   0     024   000000 000000                                                    ....
+
+T_TOTAL_WAIT
+ Sect OctLoc
+   0     025   000000 000000                                                    ....
+
+T_TOTAL_BUSY
+ Sect OctLoc
+   0     026   000000 000000                                                    ....
+
+T_AVAIL_MEM
+ Sect OctLoc
+   0     027   000000 000000                                                    ....
+
+(unnamed)
+ Sect OctLoc
+   2     000   000000 006000   000002 006000   000000 006000   000000 006000    ................
+      260     2325
+      261     2326    1   END PMC$COLLECT;
+      262     2327        %EOD;
+
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:35   
+--  Include file information  --
+
+   XUD_UTS_M.:E05TOU  is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   PM$NI.:E05TOU  is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+   PM_BUCKET_C.:E05TOU  is referenced.
+   P_PMDAT_C.:E05TOU  is referenced.
+   P_PMDAT_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRLD_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_CNTRL_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure PMC$COLLECT.
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:36   
+
+ **** Variables and constants ****
+
+  ****  Section 000  Data  PMC$COLLECT
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    27-0-0/w UBIN        r     1 T_AVAIL_MEM               27-0-0/w SBIN        r     1 T_AVAIL_MEM_SBIN
+    17-0-0/w UBIN        r     1 T_CUIS(0:4)
+    17-0-0/w SBIN        r     1 T_CUIS_SBIN(0:4)
+    16-0-0/w UBIN        r     1 T_ETMF                    16-0-0/w SBIN        r     1 T_ETMF_SBIN
+    15-0-0/w UBIN        r     1 T_NINTS                    1-0-0/w UBIN        r     1 T_RT(0:11)
+     0-0-0/w UBIN        r     1 T_RT90                    26-0-0/w UBIN        r     1 T_TOTAL_BUSY
+    25-0-0/w UBIN        r     1 T_TOTAL_WAIT              25-0-0/w SBIN        r     1 T_TOTAL_WAIT_SBIN
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    17-0-0/w PTR         r     1 @RESOURCE                  3-0-0/w SBIN        r     1 I
+     4-0-0/w SBIN        r     1 J                          5-0-0/w SBIN        r     1 K
+     6-0-0/w SBIN        r     1 L                         13-0-0/w PTR         r     1 P$
+    *0-0-0/w STRC(216)   r     1 RESOURCE                  10-0-0/w UBIN        r     1 TIME_BUSY
+    12-0-0/w UBIN        r     1 TIME_TOTAL                12-0-0/w SBIN        r     1 TIME_TOTAL_SBIN
+    11-0-0/w UBIN        r     1 TIME_WAITING              11-0-0/w SBIN        r     1 TIME_WAITING_SBIN
+     7-0-0/w SBIN        r     1 TTIME                     14-0-0/w SBIN        r     1 T_USERS
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$USRT$                    0-0-0/w SBIN        r     1 MM_AUTO
+     0-0-0/w PTR         r     1 MM_BYP$                    0-0-0/w SBIN        r     1 MM_FPPC
+     0-0-0/d BIT (72)    r     1 MM_LOCK                    0-0-0/w PTR         r     1 N$DCT$$
+     0-0-0/w PTR         r     1 N$FQ$                      0-0-0/w PTR         r     1 NI$FQ$
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:37   
+     0-0-0/w PTR         r     1 NI$IBUF$                   0-0-0/w PTR         r     1 NI$RP$
+     0-0-0/w UBIN        r     1 NK_MXLOCAL                 0-0-0/w UBIN        r     1 P_AUIS(0:4)
+     0-0-0/w UBIN        r     1 P_AVGAVAIL_MEM             0-0-0/w UBIN        r     1 P_AVGETMF
+     0-0-0/w UBIN        r     1 P_AVGIOL                   0-0-0/w UBIN        r     1 P_AVGRT90
+     0-0-0/w SBIN        r     1 P_ETMF                     0-0-0/w UBIN        r     1 P_IOLOAD
+     0-0-0/w SBIN        r     1 P_NINTS                    0-0-0/w UBIN        r     1 P_NSCPU
+     0-0-0/w SBIN        r     1 P_NSCPU_SBIN               0-0-0/w PTR         r     1 P_RESOURCE$
+     0-0-0/d STRC(108)   r     1 P_RT                       0-0-0/w SBIN        r     1 P_RT90
+     0-0-0/w SBIN        r     1 P_STARTUP                  0-0-0/w UBIN        r     1 P_UPTIME
+     0-0-0/w SBIN        r     1 P_UPTIME_SBIN              0-0-0/d STRC(108)   r     1 P_USERSIZE
+     0-0-0/w SBIN        r     1 S_CTUIS                    0-0-0/w SBIN        r     1 S_CUIS(0:4)
+     0-0-0/w SBIN        r     1 S_HQ(0:8191)               0-0-0/w UBIN        r     1 S_NSCPUA
+     0-0-0/b BIT (72)    r     1 S_SCHDGATE
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(576)   r     1 B$USER(0:0)                0-0-0/w PTR         r     1 N$DCT$(0:0)
+     0-0-0/w STRC(1332)  r     1 NI$DCT                     0-0-0/w STRC(252)   r     1 P$IODATA
+     0-0-0/w STRC(2268)  r     1 P_RESOURCE
+
+
+   Procedure PMC$COLLECT requires 316 words for executable code.
+   Procedure PMC$COLLECT requires 20 words of local(AUTO) storage.
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:38   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:39   
+          MINI XREF LISTING
+
+B$DO.ECCINFO
+       626**DCL       627--REDEF
+B$U.MISC
+       605**DCL       606--REDEF
+B$USER.FL
+       653**DCL      2183>>ASSIGN
+B$USER.MISC
+       681**DCL       682--REDEF
+B$USER.PCT
+       665**DCL      2173>>ASSIGN
+B$USRT$
+      2104**DCL      2173>>ASSIGN   2183>>ASSIGN
+HFC$LOCK
+       937**DCL-ENT  2157--CALL     2271--CALL
+HFC$UNLOCK
+       937**DCL-ENT  2190--CALL     2275--CALL
+I
+        13**DCL      2133<>CALL     2146<>CALL     2146<>CALL     2147<<ASSIGN   2147>>ASSIGN   2150>>IF
+      2152<<ASSIGN   2154<>CALL     2163<<DOINDEX  2165>>ASSIGN   2169>>IF       2203<<ASSIGN   2209>>ASSIGN
+      2209>>ASSIGN   2211<<ASSIGN   2211>>ASSIGN   2215>>ASSIGN   2221<<DOINDEX  2223>>ASSIGN   2223>>ASSIGN
+      2228>>ASSIGN   2231>>ASSIGN   2245<<DOINDEX  2247>>ASSIGN   2247>>ASSIGN   2247>>ASSIGN   2250>>ASSIGN
+      2250>>ASSIGN   2263<<DOINDEX  2265>>ASSIGN   2265>>ASSIGN   2265>>ASSIGN   2266>>ASSIGN   2266>>ASSIGN
+      2288<<DOINDEX  2290>>ASSIGN
+J
+        14**DCL      2165<<ASSIGN   2167>>DOWHILE  2173>>ASSIGN   2183<<ASSIGN   2183>>ASSIGN   2199<<ASSIGN
+      2201>>IF       2207>>DOWHILE
+K
+        15**DCL      2173<<ASSIGN   2176>>DOWHILE
+L
+        16**DCL      2175<<ASSIGN   2176>>DOWHILE  2176>>DOWHILE  2178<<ASSIGN   2178>>ASSIGN   2180>>ASSIGN
+      2180>>ASSIGN
+MM$DESC.BOUND
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:40   
+      1870**DCL      1871--REDEF
+MM$DESC.FLGS
+      1871**DCL      1871--REDEF
+MM$PPUT.USER#
+      1859**DCL      1859--REDEF
+MM_AUTO
+      1789**DCL      2273>>ASSIGN
+MM_BYP$
+      1790**DCL      1790--IMP-PTR
+MM_FPPC
+      1787**DCL      2273>>ASSIGN
+MM_LOCK
+      1787**DCL      2271<>CALL     2275<>CALL
+N$DCT$
+      1370**DCL      2290>>ASSIGN
+N$DCT$$
+      1236**DCL      1370--IMP-PTR  2290>>ASSIGN
+N$FQ$
+      1236**DCL      1371--IMP-PTR
+N$REQ_INIT.BUFADDR
+      1255**DCL      1256--REDEF    1256--REDEF
+N$REQ_INIT.DLA.DRELADDR
+      1247**DCL      1247--REDEF
+N$REQ_INIT.DVE.EOMCHAR
+      1284**DCL      1285--REDEF
+N$REQ_INIT.EAINFO
+      1278**DCL      1278--REDEF
+N$REQ_INIT.EAINFOX
+      1278**DCL      1279--REDEF
+N$REQ_INIT.EVNTINFO
+      1279**DCL      1279--REDEF
+N$REQ_INIT.STATUS
+      1260**DCL      1266--REDEF
+NI$DCT.DP
+      2063**DCL      2070--REDEF    2073--REDEF    2074--REDEF    2076--REDEF    2076--REDEF    2077--REDEF
+      2078--REDEF    2078--REDEF
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:41   
+NI$DCT.MPC.IOCHANX
+      2071**DCL      2071--REDEF
+NI$DCT.PM
+      2054**DCL      2303>>ASSIGN
+NI$DCT.PM.ELAPSED_TIME
+      2055**DCL      2296>>ASSIGN   2299>>ASSIGN   2299>>ASSIGN
+NI$DCT.PMD$
+      2079**DCL      2292>>IF       2296>>ASSIGN   2299>>ASSIGN   2299>>ASSIGN   2303>>ASSIGN
+NI$DVT.MPC
+      2085**DCL      2086--REDEF
+NI$FQ$
+      1296**DCL      1372--IMP-PTR
+NI$IBUF$
+      1296**DCL      1372--IMP-PTR
+NI$IMXMBX_INIT.PAGED_BASE
+      1306**DCL      1307--REDEF    1307--REDEF
+NI$IMXMBX_INIT.SIZE
+      1308**DCL      1308--REDEF
+NI$REQ_INIT.DCW
+      1330**DCL      1333--REDEF
+NI$REQ_INIT.DCW.TALLY
+      1331**DCL      1331--REDEF
+NI$REQ_INIT.IDCW.EXTA
+      1333**DCL      1333--REDEF
+NI$REQ_INIT.PCW
+      1335**DCL      1339--REDEF
+NI$REQ_INIT.SEEK
+      1340**DCL      1341--REDEF    1342--REDEF
+NI$RP$
+      1344**DCL      1374--IMP-PTR
+NI_MBX_INIT.DCW.CONTROL.AE
+      1366**DCL      1366--REDEF
+NI_MBX_INIT.LPW.CONTROL.AE
+      1362**DCL      1362--REDEF
+NK_MXLOCAL
+        38**DCL      2288>>DOINDEX
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:42   
+P$
+        23**DCL      2043--IMP-PTR  2290<<ASSIGN   2292>>IF       2292>>IF       2296>>ASSIGN   2296>>ASSIGN
+      2299>>ASSIGN   2299>>ASSIGN   2299>>ASSIGN   2299>>ASSIGN   2303>>ASSIGN   2303>>ASSIGN
+P$IODATA
+       324**DCL      2303<<ASSIGN
+P$IODATA.BACKLOG
+       331**DCL      2299>>ASSIGN
+P$IODATA.BUSY
+       330**DCL      2296>>ASSIGN
+P$IODATA.WAIT
+       329**DCL      2299>>ASSIGN
+PMC$COLLECT
+         8**PROC     2154--CALL
+PMC$FIXDEV
+        12**DCL-ENT  2283--CALL
+P_AUIS
+       365**DCL      2261<<ASSIGN   2266<<ASSIGN
+P_AVGAVAIL_MEM
+       373**DCL      2277<<ASSIGN
+P_AVGETMF
+       362**DCL      2281<<ASSIGN
+P_AVGIOL
+       364**DCL      2320<<ASSIGN   2322<<ASSIGN
+P_AVGRT90
+       361**DCL      2217<<ASSIGN   2225>>IF       2231<<ASSIGN
+P_ETMF
+       343**DCL      2194<<ASSIGN   2194>>ASSIGN   2196>>IF       2197<<ASSIGN   2279>>ASSIGN
+P_IOLOAD
+       363**DCL      2314<<ASSIGN   2316<<ASSIGN
+P_NINTS
+       344**DCL      2199>>ASSIGN   2219>>ASSIGN   2239>>ASSIGN
+P_NSCPU
+       370**DCL       371--REDEF    2193<<ASSIGN
+P_NSCPU_SBIN
+       371**DCL      2194>>ASSIGN
+P_RESOURCE.RES
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:43   
+       243**DCL       310--REDEF
+P_RESOURCE.RESX.AVERAGE
+       315**DCL      2250<<ASSIGN
+P_RESOURCE.RESX.CURRENT
+       311**DCL      2247>>ASSIGN
+P_RESOURCE.RESX.SIGMA
+       314**DCL      2247<<ASSIGN   2247>>ASSIGN   2250>>ASSIGN
+P_RESOURCE$
+       323**DCL       211--IMP-PTR  2247>>ASSIGN   2247>>ASSIGN   2247>>ASSIGN   2250>>ASSIGN   2250>>ASSIGN
+P_RT.DATA
+      2094**DCL      2209>>ASSIGN   2215>>ASSIGN   2223>>ASSIGN   2231>>ASSIGN
+P_RT.SIZE
+      2092**DCL      2209>>ASSIGN   2221>>DOINDEX  2223>>ASSIGN
+P_RT90
+       345**DCL      2215<<ASSIGN   2215>>ASSIGN   2237>>ASSIGN
+P_STARTUP
+       346**DCL      2146<>CALL
+P_UPTIME
+       359**DCL       360--REDEF    2147>>ASSIGN   2243<<ASSIGN   2243>>ASSIGN   2255>>IF
+P_UPTIME_SBIN
+       360**DCL      2250>>ASSIGN   2250>>ASSIGN   2261>>ASSIGN   2266>>ASSIGN   2277>>ASSIGN   2281>>ASSIGN
+P_USERSIZE.DATA
+      2100**DCL      2176>>DOWHILE  2180<<ASSIGN   2180>>ASSIGN
+P_USERSIZE.SIZE
+      2098**DCL      2176>>DOWHILE  2180>>ASSIGN   2180>>ASSIGN
+RESOURCE IN PROCEDURE RESET_RESOURCE
+      2109**DCL      2107--PROC
+RESOURCE.AVERAGE IN PROCEDURE RESET_RESOURCE
+      2114**DCL      2123<<ASSIGN
+RESOURCE.CURRENT IN PROCEDURE RESET_RESOURCE
+      2110**DCL      2117>>ASSIGN   2118>>ASSIGN   2120>>IF       2123>>ASSIGN   2124>>ASSIGN
+RESOURCE.MIN IN PROCEDURE RESET_RESOURCE
+      2112**DCL      2118<<ASSIGN
+RESOURCE.PEAK IN PROCEDURE RESET_RESOURCE
+      2111**DCL      2117<<ASSIGN
+RESOURCE.SIGMA IN PROCEDURE RESET_RESOURCE
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:44   
+      2113**DCL      2120>>IF       2124<<ASSIGN
+SSC$MONTIMR
+         9**DCL-ENT  2154--CALL
+SSS$CCAC
+        11**DCL-ENT  2160--CALL
+SSS$CURTIME
+        10**DCL-ENT  2133--CALL
+S_CTUIS
+        65**DCL      2260>>ASSIGN
+S_CUIS
+        65**DCL      2265>>ASSIGN
+S_HQ
+        66**DCL      2165>>ASSIGN
+S_NSCPUA
+        69**DCL      2193>>ASSIGN
+S_SCHDGATE
+        80**DCL      2157<>CALL     2190<>CALL
+TIME_BUSY
+        18**DCL      2285<<ASSIGN   2296<<ASSIGN   2296>>ASSIGN   2310>>ASSIGN   2312>>ASSIGN
+TIME_TOTAL
+        21**DCL        22--REDEF    2312<<ASSIGN   2313>>IF       2318<<ASSIGN   2319>>IF
+TIME_TOTAL_SBIN
+        22**DCL      2316>>ASSIGN   2322>>ASSIGN
+TIME_WAITING
+        19**DCL        20--REDEF    2286<<ASSIGN   2299<<ASSIGN   2299>>ASSIGN   2309>>ASSIGN   2312>>ASSIGN
+TIME_WAITING_SBIN
+        20**DCL      2316>>ASSIGN
+TTIME
+        17**DCL      2205<<ASSIGN   2207>>DOWHILE  2209<<ASSIGN   2209>>ASSIGN   2219<<ASSIGN   2228<<ASSIGN
+      2228>>ASSIGN   2230>>IF
+T_AVAIL_MEM
+        36**DCL        37--REDEF    2273<<ASSIGN   2273>>ASSIGN
+T_AVAIL_MEM_SBIN
+        37**DCL      2277>>ASSIGN
+T_CUIS
+        29**DCL        30--REDEF    2260<<ASSIGN   2260>>ASSIGN   2265<<ASSIGN   2265>>ASSIGN
+PL6.E3A0      #001=PMC$COLLECT File=PMC$COLLECT.:E05TSI                          WED 07/30/97 04:25 Page:45   
+T_CUIS_SBIN
+        30**DCL      2261>>ASSIGN   2266>>ASSIGN
+T_ETMF
+        27**DCL        28--REDEF    2279<<ASSIGN   2279>>ASSIGN
+T_ETMF_SBIN
+        28**DCL      2281>>ASSIGN
+T_NINTS
+        26**DCL      2199>>ASSIGN   2239<<ASSIGN
+T_RT
+        25**DCL      2209>>ASSIGN   2223<<ASSIGN   2228>>ASSIGN
+T_RT90
+        24**DCL      2215>>ASSIGN   2237<<ASSIGN
+T_TOTAL_BUSY
+        35**DCL      2310<<ASSIGN   2310>>ASSIGN   2318>>ASSIGN
+T_TOTAL_WAIT
+        33**DCL        34--REDEF    2309<<ASSIGN   2309>>ASSIGN   2318>>ASSIGN
+T_TOTAL_WAIT_SBIN
+        34**DCL      2322>>ASSIGN
+T_USERS
+        32**DCL      2162<<ASSIGN   2171<<ASSIGN   2171>>ASSIGN   2194>>ASSIGN
+XUD$UTS_DIFF
+      2002**DCL-ENT  2146--CALL
+
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:46   
+      263        1        /*M*  PMC$FIXDEV  Update device-timing statistics in DCT tables               */
+      264        2        /*T***********************************************************/
+      265        3        /*T*                                                         */
+      266        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      267        5        /*T*                                                         */
+      268        6        /*T***********************************************************/
+      269        7        /*P*  NAME: PMC$FIXDEV
+      270        8              URPOSE:  Update device-timing statistics in DCT tables on demand.
+      271        9                       Called by PMI$INIT to initialize the DCT clocking value.
+      272       10                       Called by PMC$COLLECT to update things so that the IOLOAD
+      273       11                       value can be properly calculated;  also called by PHA$ERS
+      274       12                       when an M$GETPM PMME is issued, to ensure that the M$GETPM
+      275       13                       user gets up-to-the-millisecond values in his buffer.          */
+      276       14
+      277       15        PMC$FIXDEV: PROC;
+      278       16
+      279       17        %INCLUDE P_PMDAT_R;
+      280      325        %INCLUDE HF_LOCK_C;
+      281      339        %INCLUDE NI_DATA_R;
+      282      776        %INCLUDE NI_DATA_C;
+      283      889
+      284      890        %NI$DCT;
+      285      938        %NI$SQH;
+      286      951        %NI$CHT;
+      287      954        %NI$DQH;
+      288      977        %NI$DVT;
+      289      984
+      290      985    1   DCL P$ PTR;
+      291      986    1   DCL Q$ PTR;
+      292      987    1   DCL I UBIN;
+      293      988    1   DCL J UBIN WORD;                     /* Save-variable for current device mode */
+      294      989    1   DCL TYPE UBIN;
+      295      990    1   DCL NK_MXLOCAL UBIN WORD SYMREF; /* # of highest local (TIGR-built) DCT entry */
+      296      991    1   DCL PMN$COLLECT ENTRY (2);
+      297      992        %EJECT;
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:47   
+      298      993           %LOCK (G#=P_GATE);
+      299      996
+      300      997    1      P_IOS = '0'B;
+      301      998
+      302      999    2      DO I = 0 TO NK_MXLOCAL;
+      303     1000
+      304     1001    2         P$ = N$DCT$$->N$DCT$(I);
+      305     1002
+      306     1003    2         IF P$ ~= ADDR(NIL)
+      307     1004    3           THEN DO;
+      308     1005
+      309     1006    3            Q$ = P$ -> NI$DCT.SQH$;
+      310     1007
+      311     1008                 %LOCK (G#="Q$->NI$SQH.GATE");
+      312     1011
+      313     1012    3            J = P$->NI$DCT.PM.MODE;
+      314     1013
+      315     1014    3            CALL PMN$COLLECT(P$->NI$DCT.PM, J);
+      316     1015
+      317     1016                 %UNLOCK (G#="Q$->NI$SQH.GATE");
+      318     1019
+      319     1020    3            TYPE = P$ -> NI$DCT.TYPE;
+      320     1021
+      321     1022    3            P_IOS(TYPE) = P_IOS(TYPE) + P$ -> NI$DCT.PM.CONNCT;
+      322     1023
+      323     1024    3            END;
+      324     1025
+      325     1026    2         END;
+      326     1027
+      327     1028           %UNLOCK (G#=P_GATE);
+      328     1031
+      329     1032    2      DO I = 0 TO NI_MAX_CHANS - 1;
+      330     1033
+      331     1034    2         P$ = NI$CHT$->NI$CHT.DQH$(I);
+      332     1035
+      333     1036    2         IF (P$ ~= ADDR(NIL)) AND (MOD(I, %N_MAXCHANS) >= 8)
+      334     1037    2           THEN
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:48   
+      335     1038    2            IF P$ -> NI$DQH.FEX = 0
+      336     1039    2              THEN
+      337     1040    2               IF P$ -> NI$DQH.SQH$ ~= ADDR(NIL)
+      338     1041    3                 THEN DO;
+      339     1042
+      340     1043                       %LOCK (G#="P$ -> NI$DQH.SQH$ -> NI$SQH.GATE");
+      341     1046
+      342     1047    3                  J = P$->NI$DQH.PM.MODE;
+      343     1048
+      344     1049    3                  CALL PMN$COLLECT (P$->NI$DQH.PM, J);
+      345     1050
+      346     1051                       %UNLOCK (G#="P$ -> NI$DQH.SQH$ -> NI$SQH.GATE");
+      347     1054
+      348     1055    3                  END;
+      349     1056
+      350     1057    2         END;
+      351     1058
+      352     1059    1      RETURN;
+      353     1060
+      354     1061    1   END PMC$FIXDEV;
+
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:49   
+--  Include file information  --
+
+   NI_DATA_C.:E05TOU  is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   P_PMDAT_C.:E05TOU  is referenced.
+   P_PMDAT_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure PMC$FIXDEV.
+
+   Procedure PMC$FIXDEV requires 111 words for executable code.
+   Procedure PMC$FIXDEV requires 10 words of local(AUTO) storage.
+
+    No errors detected in file PMC$COLLECT.:E05TSI    .
+
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:50   
+
+ Object Unit name= PMC$FIXDEV                                 File name= PMC$COLLECT.:E05TOU
+ UTS= JUL 30 '97 04:25:44.72 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   111    157  PMC$FIXDEV
+    1  RoData even  none     1      1  PMC$FIXDEV
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        0  PMC$FIXDEV
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 HFC$LOCK
+         yes           Std       2 PMN$COLLECT
+         yes           Std       1 HFC$UNLOCK
+                       nStd      0 X66_AUTO_0
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:51   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     P_RESOURCE$                           P_IOS                                 P_UPTIME
+     P_GATE                                P_NSCPU                               N$DCT$$
+     N$FQ$                                 NI$CHT$                               NI$FQ$
+     NI$IBUF$                              NI$RP$                                NI_MAX_CHANS
+     NK_MXLOCAL                            B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:52   
+
+
+      263        1        /*M*  PMC$FIXDEV  Update device-timing statistics in DCT tables               */
+      264        2        /*T***********************************************************/
+      265        3        /*T*                                                         */
+      266        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      267        5        /*T*                                                         */
+      268        6        /*T***********************************************************/
+      269        7        /*P*  NAME: PMC$FIXDEV
+      270        8              URPOSE:  Update device-timing statistics in DCT tables on demand.
+      271        9                       Called by PMI$INIT to initialize the DCT clocking value.
+      272       10                       Called by PMC$COLLECT to update things so that the IOLOAD
+      273       11                       value can be properly calculated;  also called by PHA$ERS
+      274       12                       when an M$GETPM PMME is issued, to ensure that the M$GETPM
+      275       13                       user gets up-to-the-millisecond values in his buffer.          */
+      276       14
+      277       15        PMC$FIXDEV: PROC;
+
+     15  0 000000   000000 700200 xent  PMC$FIXDEV   TSX0  ! X66_AUTO_0
+         0 000001   000012 000000                    ZERO    10,0
+
+      278       16
+      279       17        %INCLUDE P_PMDAT_R;
+      280      325        %INCLUDE HF_LOCK_C;
+      281      339        %INCLUDE NI_DATA_R;
+      282      776        %INCLUDE NI_DATA_C;
+      283      889
+      284      890        %NI$DCT;
+      285      938        %NI$SQH;
+      286      951        %NI$CHT;
+      287      954        %NI$DQH;
+      288      977        %NI$DVT;
+      289      984
+      290      985    1   DCL P$ PTR;
+      291      986    1   DCL Q$ PTR;
+      292      987    1   DCL I UBIN;
+      293      988    1   DCL J UBIN WORD;                     /* Save-variable for current device mode */
+      294      989    1   DCL TYPE UBIN;
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:53   
+      295      990    1   DCL NK_MXLOCAL UBIN WORD SYMREF; /* # of highest local (TIGR-built) DCT entry */
+      296      991    1   DCL PMN$COLLECT ENTRY (2);
+      297      992        %EJECT;
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:54   
+      298      993           %LOCK (G#=P_GATE);
+
+    994  0 000002   000000 630400 1                  EPPR0   0
+         0 000003   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000004   000000 701000 xent               TSX1    HFC$LOCK
+         0 000005   000000 011000                    NOP     0
+
+      299      996
+      300      997    1      P_IOS = '0'B;
+
+    997  0 000006   000000 100400                    MLR     fill='000'O
+         0 000007   000002 000001 xsym               ADSC9   B_VECTNIL+2              cn=0,n=1
+         0 000010   000000 000050 xsym               ADSC9   P_IOS                    cn=0,n=40
+
+      301      998
+      302      999    2      DO I = 0 TO NK_MXLOCAL;
+
+    999  0 000011   200005 450100                    STZ     I,,AUTO
+         0 000012   000064 710000 0                  TRA     s:1026+3
+
+      303     1000
+      304     1001    2         P$ = N$DCT$$->N$DCT$(I);
+
+   1001  0 000013   000000 470400 xsym               LDP0    N$DCT$$
+         0 000014   200005 720100                    LXL0    I,,AUTO
+         0 000015   000000 236110                    LDQ     0,X0,PR0
+         0 000016   200003 756100                    STQ     P$,,AUTO
+
+      305     1002
+      306     1003    2         IF P$ ~= ADDR(NIL)
+
+   1003  0 000017   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         0 000020   000061 600000 0                  TZE     s:1026
+
+      307     1004    3           THEN DO;
+
+      308     1005
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:55   
+      309     1006    3            Q$ = P$ -> NI$DCT.SQH$;
+
+   1006  0 000021   200003 471500                    LDP1    P$,,AUTO
+         0 000022   100022 236100                    LDQ     18,,PR1
+         0 000023   200004 756100                    STQ     Q$,,AUTO
+
+      310     1007
+      311     1008                 %LOCK (G#="Q$->NI$SQH.GATE");
+
+   1009  0 000024   200004 630500                    EPPR0   Q$,,AUTO
+         0 000025   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000026   000000 701000 xent               TSX1    HFC$LOCK
+         0 000027   000000 011000                    NOP     0
+
+      312     1011
+      313     1012    3            J = P$->NI$DCT.PM.MODE;
+
+   1012  0 000030   200003 470500                    LDP0    P$,,AUTO
+         0 000031   000010 235100                    LDA     8,,PR0
+         0 000032   200006 755100                    STA     J,,AUTO
+
+      314     1013
+      315     1014    3            CALL PMN$COLLECT(P$->NI$DCT.PM, J);
+
+   1014  0 000033   200006 631500                    EPPR1   J,,AUTO
+         0 000034   200011 451500                    STP1    TYPE+2,,AUTO
+         0 000035   200003 236100                    LDQ     P$,,AUTO
+         0 000036   000010 036003                    ADLQ    8,DU
+         0 000037   200010 756100                    STQ     TYPE+1,,AUTO
+         0 000040   200010 630500                    EPPR0   TYPE+1,,AUTO
+         0 000041   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000042   000000 701000 xent               TSX1    PMN$COLLECT
+         0 000043   000000 011000                    NOP     0
+
+      316     1015
+      317     1016                 %UNLOCK (G#="Q$->NI$SQH.GATE");
+
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:56   
+   1017  0 000044   200004 630500                    EPPR0   Q$,,AUTO
+         0 000045   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000046   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000047   000000 011000                    NOP     0
+
+      318     1019
+      319     1020    3            TYPE = P$ -> NI$DCT.TYPE;
+
+   1020  0 000050   200003 470500                    LDP0    P$,,AUTO
+         0 000051   000007 236100                    LDQ     7,,PR0
+         0 000052   000006 772000                    QRL     6
+         0 000053   000077 376007                    ANQ     63,DL
+         0 000054   200007 756100                    STQ     TYPE,,AUTO
+
+      320     1021
+      321     1022    3            P_IOS(TYPE) = P_IOS(TYPE) + P$ -> NI$DCT.PM.CONNCT;
+
+   1022  0 000055   000000 236006 xsym               LDQ     P_IOS,QL
+         0 000056   000011 036100                    ADLQ    9,,PR0
+         0 000057   200007 720100                    LXL0    TYPE,,AUTO
+         0 000060   000000 756010 xsym               STQ     P_IOS,X0
+
+      322     1023
+      323     1024    3            END;
+
+      324     1025
+      325     1026    2         END;
+
+   1026  0 000061   200005 235100                    LDA     I,,AUTO
+         0 000062   000001 035007                    ADLA    1,DL
+         0 000063   200005 755100                    STA     I,,AUTO
+         0 000064   000000 236000 xsym               LDQ     NK_MXLOCAL
+         0 000065   200005 116100                    CMPQ    I,,AUTO
+         0 000066   000013 603000 0                  TRC     s:1001
+
+      326     1027
+      327     1028           %UNLOCK (G#=P_GATE);
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:57   
+
+   1029  0 000067   000000 630400 1                  EPPR0   0
+         0 000070   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000071   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000072   000000 011000                    NOP     0
+
+      328     1031
+      329     1032    2      DO I = 0 TO NI_MAX_CHANS - 1;
+
+   1032  0 000073   200005 450100                    STZ     I,,AUTO
+         0 000074   000153 710000 0                  TRA     s:1057+3
+
+      330     1033
+      331     1034    2         P$ = NI$CHT$->NI$CHT.DQH$(I);
+
+   1034  0 000075   200005 235100                    LDA     I,,AUTO
+         0 000076   000001 735000                    ALS     1
+         0 000077   000000 470400 xsym               LDP0    NI$CHT$
+         0 000100   000000 236105                    LDQ     0,AL,PR0
+         0 000101   200003 756100                    STQ     P$,,AUTO
+
+      332     1035
+      333     1036    2         IF (P$ ~= ADDR(NIL)) AND (MOD(I, %N_MAXCHANS) >= 8)
+
+   1036  0 000102   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         0 000103   000150 600000 0                  TZE     s:1057
+         0 000104   200005 236100                    LDQ     I,,AUTO
+         0 000105   000177 376007                    ANQ     127,DL
+         0 000106   000010 116007                    CMPQ    8,DL
+         0 000107   000150 602000 0                  TNC     s:1057
+
+      334     1037    2           THEN
+      335     1038    2            IF P$ -> NI$DQH.FEX = 0
+
+   1038  0 000110   200003 471500                    LDP1    P$,,AUTO
+         0 000111   100001 236100                    LDQ     1,,PR1
+         0 000112   007700 316007                    CANQ    4032,DL
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:58   
+         0 000113   000150 601000 0                  TNZ     s:1057
+
+      336     1039    2              THEN
+      337     1040    2               IF P$ -> NI$DQH.SQH$ ~= ADDR(NIL)
+
+   1040  0 000114   100013 236100                    LDQ     11,,PR1
+         0 000115   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         0 000116   000150 600000 0                  TZE     s:1057
+
+      338     1041    3                 THEN DO;
+
+      339     1042
+      340     1043                       %LOCK (G#="P$ -> NI$DQH.SQH$ -> NI$SQH.GATE");
+
+   1044  0 000117   100013 473500                    LDP3    11,,PR1
+         0 000120   200010 453500                    STP3    TYPE+1,,AUTO
+         0 000121   200010 630500                    EPPR0   TYPE+1,,AUTO
+         0 000122   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000123   000000 701000 xent               TSX1    HFC$LOCK
+         0 000124   000000 011000                    NOP     0
+
+      341     1046
+      342     1047    3                  J = P$->NI$DQH.PM.MODE;
+
+   1047  0 000125   200003 470500                    LDP0    P$,,AUTO
+         0 000126   000002 235100                    LDA     2,,PR0
+         0 000127   200006 755100                    STA     J,,AUTO
+
+      343     1048
+      344     1049    3                  CALL PMN$COLLECT (P$->NI$DQH.PM, J);
+
+   1049  0 000130   200006 631500                    EPPR1   J,,AUTO
+         0 000131   200011 451500                    STP1    TYPE+2,,AUTO
+         0 000132   200003 236100                    LDQ     P$,,AUTO
+         0 000133   000002 036003                    ADLQ    2,DU
+         0 000134   200010 756100                    STQ     TYPE+1,,AUTO
+         0 000135   200010 630500                    EPPR0   TYPE+1,,AUTO
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:59   
+         0 000136   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000137   000000 701000 xent               TSX1    PMN$COLLECT
+         0 000140   000000 011000                    NOP     0
+
+      345     1050
+      346     1051                       %UNLOCK (G#="P$ -> NI$DQH.SQH$ -> NI$SQH.GATE");
+
+   1052  0 000141   200003 470500                    LDP0    P$,,AUTO
+         0 000142   000013 471500                    LDP1    11,,PR0
+         0 000143   200010 451500                    STP1    TYPE+1,,AUTO
+         0 000144   200010 630500                    EPPR0   TYPE+1,,AUTO
+         0 000145   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000146   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000147   000000 011000                    NOP     0
+
+      347     1054
+      348     1055    3                  END;
+
+      349     1056
+      350     1057    2         END;
+
+   1057  0 000150   200005 235100                    LDA     I,,AUTO
+         0 000151   000001 035007                    ADLA    1,DL
+         0 000152   200005 755100                    STA     I,,AUTO
+         0 000153   200005 236100                    LDQ     I,,AUTO
+         0 000154   000000 116000 xsym               CMPQ    NI_MAX_CHANS
+         0 000155   000075 602000 0                  TNC     s:1034
+
+      351     1058
+      352     1059    1      RETURN;
+
+   1059  0 000156   000000 702200 xent               TSX2  ! X66_ARET
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 006000                                                    ....
+      353     1060
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:60   
+      354     1061    1   END PMC$FIXDEV;
+
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:61   
+--  Include file information  --
+
+   NI_DATA_C.:E05TOU  is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   P_PMDAT_C.:E05TOU  is referenced.
+   P_PMDAT_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure PMC$FIXDEV.
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:62   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     5-0-0/w UBIN        r     1 I                          6-0-0/w UBIN        r     1 J
+     3-0-0/w PTR         r     1 P$                         4-0-0/w PTR         r     1 Q$
+     7-0-0/w UBIN        r     1 TYPE
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 N$DCT$$                    0-0-0/w PTR         r     1 N$FQ$
+     0-0-0/w PTR         r     1 NI$CHT$                    0-0-0/w PTR         r     1 NI$FQ$
+     0-0-0/w PTR         r     1 NI$IBUF$                   0-0-0/w PTR         r     1 NI$RP$
+     0-0-0/w UBIN        r     1 NI_MAX_CHANS               0-0-0/w UBIN        r     1 NK_MXLOCAL
+     0-0-0/w SBIN        r     1 P_GATE                     0-0-0/w UBIN        r     1 P_IOS(0:9)
+     0-0-0/w PTR         r     1 P_RESOURCE$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 N$DCT$(0:0)                0-0-0/w STRC(72)    r     1 NI$CHT(0:127)
+     0-0-0/w STRC(1332)  r     1 NI$DCT                     0-0-0/w STRC(648)   r     1 NI$DQH
+     0-0-0/w STRC(252)   r     1 NI$SQH
+
+
+   Procedure PMC$FIXDEV requires 111 words for executable code.
+   Procedure PMC$FIXDEV requires 10 words of local(AUTO) storage.
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:63   
+
+    No errors detected in file PMC$COLLECT.:E05TSI    .
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:64   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:65   
+          MINI XREF LISTING
+
+HFC$LOCK
+       338**DCL-ENT   994--CALL     1009--CALL     1044--CALL
+HFC$UNLOCK
+       338**DCL-ENT  1017--CALL     1029--CALL     1052--CALL
+I
+       987**DCL       999<<DOINDEX  1001>>ASSIGN   1032<<DOINDEX  1034>>ASSIGN   1036>>IF
+J
+       988**DCL      1012<<ASSIGN   1014<>CALL     1047<<ASSIGN   1049<>CALL
+N$DCT$
+       771**DCL      1001>>ASSIGN
+N$DCT$$
+       637**DCL       771--IMP-PTR  1001>>ASSIGN
+N$FQ$
+       637**DCL       772--IMP-PTR
+N$REQ_INIT.BUFADDR
+       656**DCL       657--REDEF     657--REDEF
+N$REQ_INIT.DLA.DRELADDR
+       648**DCL       648--REDEF
+N$REQ_INIT.DVE.EOMCHAR
+       685**DCL       686--REDEF
+N$REQ_INIT.EAINFO
+       679**DCL       679--REDEF
+N$REQ_INIT.EAINFOX
+       679**DCL       680--REDEF
+N$REQ_INIT.EVNTINFO
+       680**DCL       680--REDEF
+N$REQ_INIT.STATUS
+       661**DCL       667--REDEF
+NI$CHT.DQH$
+       952**DCL      1034>>ASSIGN
+NI$CHT$
+       696**DCL       952--IMP-PTR  1034>>ASSIGN
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:66   
+NI$DCT.DP
+       919**DCL       926--REDEF     929--REDEF     930--REDEF     932--REDEF     932--REDEF     933--REDEF
+       934--REDEF     934--REDEF
+NI$DCT.MPC.IOCHANX
+       927**DCL       927--REDEF
+NI$DCT.PM
+       910**DCL      1014<>CALL
+NI$DCT.PM.CONNCT
+       910**DCL      1022>>ASSIGN
+NI$DCT.PM.MODE
+       910**DCL      1012>>ASSIGN
+NI$DCT.SQH$
+       914**DCL      1006>>ASSIGN
+NI$DCT.TYPE
+       909**DCL      1020>>ASSIGN
+NI$DQH.FEX
+       966**DCL      1038>>IF
+NI$DQH.IOCHANX
+       965**DCL       966--REDEF
+NI$DQH.MBX$
+       974**DCL       975--REDEF
+NI$DQH.PM
+       967**DCL      1049<>CALL
+NI$DQH.PM.MODE
+       967**DCL      1047>>ASSIGN
+NI$DQH.SQH$
+       969**DCL      1040>>IF       1044>>CALL     1052>>CALL
+NI$DVT.MPC
+       980**DCL       981--REDEF
+NI$FQ$
+       697**DCL       773--IMP-PTR
+NI$IBUF$
+       697**DCL       773--IMP-PTR
+NI$IMXMBX_INIT.PAGED_BASE
+       707**DCL       708--REDEF     708--REDEF
+NI$IMXMBX_INIT.SIZE
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:67   
+       709**DCL       709--REDEF
+NI$REQ_INIT.DCW
+       731**DCL       734--REDEF
+NI$REQ_INIT.DCW.TALLY
+       732**DCL       732--REDEF
+NI$REQ_INIT.IDCW.EXTA
+       734**DCL       734--REDEF
+NI$REQ_INIT.PCW
+       736**DCL       740--REDEF
+NI$REQ_INIT.SEEK
+       741**DCL       742--REDEF     743--REDEF
+NI$RP$
+       745**DCL       775--IMP-PTR
+NI$SQH.DOOR
+       947**DCL       947--REDEF
+NI$SQH.GATE
+       947**DCL      1009<>CALL     1017<>CALL     1044<>CALL     1052<>CALL
+NI_MAX_CHANS
+       750**DCL      1032>>DOINDEX
+NI_MBX_INIT.DCW.CONTROL.AE
+       767**DCL       767--REDEF
+NI_MBX_INIT.LPW.CONTROL.AE
+       763**DCL       763--REDEF
+NK_MXLOCAL
+       990**DCL       999>>DOINDEX
+P$
+       985**DCL      1001<<ASSIGN   1003>>IF       1006>>ASSIGN   1012>>ASSIGN   1014>>CALL     1020>>ASSIGN
+      1022>>ASSIGN   1034<<ASSIGN   1036>>IF       1038>>IF       1040>>IF       1044>>CALL     1047>>ASSIGN
+      1049>>CALL     1052>>CALL
+PMN$COLLECT
+       991**DCL-ENT  1014--CALL     1049--CALL
+P_GATE
+       304**DCL       994<>CALL     1029<>CALL
+P_IOS
+       293**DCL       997<<ASSIGN   1022<<ASSIGN   1022>>ASSIGN
+P_NSCPU
+PL6.E3A0      #002=PMC$FIXDEV File=PMC$COLLECT.:E05TSI                           WED 07/30/97 04:25 Page:68   
+       305**DCL       306--REDEF
+P_RESOURCE.RES
+       178**DCL       245--REDEF
+P_RESOURCE$
+       258**DCL       146--IMP-PTR
+P_UPTIME
+       294**DCL       295--REDEF
+Q$
+       986**DCL      1006<<ASSIGN   1009>>CALL     1017>>CALL
+TYPE
+       989**DCL      1020<<ASSIGN   1022>>ASSIGN   1022>>ASSIGN

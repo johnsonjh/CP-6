@@ -1,0 +1,1544 @@
+VERSION E05
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:1    
+        1        1        /*M* FSA$ROSPACE  Read-Only Segment space manager. */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* CLM=8,ICP,MOC,DMR */
+        8        8        /*P*     NAME:    FSA$ROSPACE
+        9        9         *       PURPOSE: MANAGES FREE SPACE IN THE READ-ONLY SEGMENT.
+       10       10         *                THIS SPACE IS USED FOR DYNAMIC DCBS AND FOR
+       11       11         *                MONITOR STREAM DCBS.
+       12       12         **/
+       13       13        /*F*     NAME:    FSA$GSP
+       14       14         *       PURPOSE: GET A BLOCK OF SPACE IN ROSEG.
+       15       15         *       DESCRIPTION:  EXAMINE FREE SPACE CHAIN; IF BLOCK FOUND,
+       16       16         *                RETURN IT; ELSE GET A NEW PAGE TO GIVE SPACE.
+       17       17         **/
+       18       18        /*D*     NAME:    FSA$GSP
+       19       19         *       CALL:    CALL FSA$GSP (N,P$) ALTRET;
+       20       20         *                      N SBIN; NUMBER OF WORDS NEEDED.
+       21       21         *                      P$ PTR; RETURNED POINTER TO SPACE.
+       22       22         *       INTERFACE: MMG$SGVP
+       23       23         *       ENVIRONMENT: MONITOR (FOR USER) LS.
+       24       24         *       INPUT:   N = # WORDS WANTED.
+       25       25         *                B$JIT.PCROS = # PAGES IN ROSEG ALREADY.
+       26       26         *                B$ROSEG.AVAIL$ POINTS TO AVAILABLE BLOCKS.
+       27       27         *       OUTPUT:  P$ POINTS TO SPACE GOTTEN.
+       28       28         *                B$ROSEG.AVAIL$ UPDATED.
+       29       29         **/
+       30       30        FSA$GSP: PROC(USERN,P$) ALTRET;
+       31       31    1   DCL USERN SBIN; /* Number of words to get or return*/
+       32       32    1   DCL P$ PTR; /* WILL POINT TO SPACE GOTTEN (OR POINTS TO
+       33       33                SPACE TO BE FREED */
+       34       34    1   DCL 1 P REDEF P$,
+       35       35    1         2 OFF UBIN(24) UNAL,
+       36       36    1         2 SEGID BIT(12);
+       37       37    1   DCL B$JIT$ PTR SYMREF; /* POINTS TO JIT                      */
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:2    
+       38       38    1   DCL B$ROSEG$ PTR SYMREF; /* POINTS TO READ-ONLY SEGMENT        */
+       39       39    1   DCL MMG$SGVP ENTRY(5)ALTRET; /* GETS PAGES IN SEGMENTS             */
+       40       40    1   DCL MMG$SFVP ENTRY(5)ALTRET; /* FREES PAGES IN SEGMENTS            */
+       41       41    1   DCL SC_FSBADRO ENTRY CONV(2,0);
+       42       42        /*** INCLUDE FILES ***/
+       43       43        %INCLUDE B_STRINGS_C;
+       44      172        %INCLUDE B$JIT;
+       45      775        %INCLUDE B$ROSEG;
+       46      838        %INCLUDE B_SEGIDS_C;
+       47     1377        /*** AUTOMATIC STORAGE ***/
+       48     1378    1   DCL CURR$ PTR; /* Points to current available ROS block*/
+       49     1379    1   DCL PREV$ PTR; /* Points to prev available ROS block*/
+       50     1380    1   DCL N UBIN; /* User-suplied # words adjusted to doubleword*/
+       51     1381    1   DCL MM#PCROS SBIN; /* PAGE # FOR MM TO GET OR FREE       */
+       52     1382    1   DCL MM#NPG SBIN; /* # OF PAGES FOR MM TO GET OR FREE   */
+       53     1383    1   DCL MM#ERR SBIN; /* ERROR CODE FOR MM TO RETURN IF BAD */
+       54     1384        /*** CONSTANT STORAGE ***/
+       55     1385    1   DCL MM#WSQ SBIN CONSTANT INIT(%CPWSQ); /* WSQ for MM routines*/
+       56     1386    1   DCL MM#SEGID SBIN CONSTANT INIT(BITBIN(%ROSID)); /* SEGID of ROS*/
+       57     1387    1   DCL 1 CANNEDERR CONSTANT, /* ERROR ITEMS TO SURROUND MM'S ERR   */
+       58     1388    1         2 FCG BIT(12)INIT('0623'O), /*'FS'*/
+       59     1389    1         2 MID BIT(6) INIT('01'O), /*'A'*/
+       60     1390    1         2 CODE UBIN(15) UNAL INIT(0),
+       61     1391    1         2 SEV UBIN(3) UNAL INIT(2); /* ABN ON OPEN                        */
+       62     1392        /**/
+       63     1393        %EJECT;
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:3    
+       64     1394    2           IF USERN<=0 THEN DO;
+       65     1395    2              CALL SC_FSBADRO;
+       66     1396    2              P$=ADDR(NIL);
+       67     1397    2              ALTRETURN;
+       68     1398    2              END;
+       69     1399    1           N=((USERN+1)/2)*2;
+       70     1400    1   GSPLOOP:;
+       71     1401    1           PREV$=ADDR(NIL);
+       72     1402    1           CURR$=B$ROSEG$->B$ROSEG.AVAIL$;
+       73     1403    2           DO WHILE('1'B);
+       74     1404    3              DO WHILE (CURR$~=ADDR(NIL));
+       75     1405    4                 IF CURR$->B$ROAVAIL.NWORDS>=N THEN DO;
+       76     1406    5                    IF CURR$->B$ROAVAIL.NWORDS>N THEN DO;
+       77     1407                /*Partial chunk must be preserved.*/
+       78     1408    5                       CURR$->B$ROAVAIL.NWORDS=
+       79     1409    5                         CURR$->B$ROAVAIL.NWORDS-N;
+       80     1410    5                       PINCRW(CURR$,N)->B$ROAVAIL=CURR$->B$ROAVAIL;
+       81     1411    5                       CURR$->B$ROAVAIL.NEXT$=PINCRW(CURR$,N);
+       82     1412    5                       END;
+       83     1413    4                    IF PREV$=ADDR(NIL) THEN /*Chunk was head of chain*/
+       84     1414    4                       B$ROSEG$->B$ROSEG.AVAIL$=CURR$->B$ROAVAIL.NEXT$;
+       85     1415    4                    ELSE /*Chunk was not head of chain*/
+       86     1416    4                       PREV$->B$ROAVAIL.NEXT$=CURR$->B$ROAVAIL.NEXT$;
+       87     1417    4                    P$= CURR$;
+       88     1418    4                    RETURN;
+       89     1419    4                    END;
+       90     1420                /*This chunk wasn't big enough.*/
+       91     1421    3                 PREV$=CURR$;
+       92     1422    3                 CURR$=PREV$->B$ROAVAIL.NEXT$;
+       93     1423    3                 END;
+       94     1424                /*No chunk big enough. If PREV$ is NIL, no chunks at all.*/
+       95     1425    2              MM#PCROS= B$JIT.PCROS;
+       96     1426    2              MM#NPG=1;
+       97     1427    2              CALL MMG$SGVP(MM#WSQ,MM#SEGID,MM#PCROS,MM#NPG,MM#ERR)
+       98     1428    2                ALTRET(NOSPACE);
+       99     1429    2              CURR$=PINCRW(B$ROSEG$,1024*MM#PCROS);
+      100     1430    2              CURR$->B$ROAVAIL.NEXT$= ADDR(NIL);
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:4    
+      101     1431    2              CURR$->B$ROAVAIL.NWORDS=1024;
+      102     1432    2              IF PREV$=ADDR(NIL) THEN /*This is only chunk*/
+      103     1433    2                 B$ROSEG$->B$ROSEG.AVAIL$= CURR$;
+      104     1434    2              ELSE
+      105     1435    2                 IF PINCRW(PREV$,PREV$->B$ROAVAIL.NWORDS)~=CURR$
+      106     1436    2                 THEN /*This chunk is by itself.*/
+      107     1437    2                    PREV$->B$ROAVAIL.NEXT$=CURR$;
+      108     1438    3                 ELSE DO; /*This chunk is next to PREV.*/
+      109     1439    3                    PREV$->B$ROAVAIL.NWORDS=
+      110     1440    3                      PREV$->B$ROAVAIL.NWORDS+1024;
+      111     1441    3                    GOTO GSPLOOP; /*Restart; we lost PREV$.*/
+      112     1442    3                    END;
+      113     1443    2              END /*DO FOREVER*/;
+      114     1444    1   NOSPACE: /* ERRORS                             */
+      115     1445    1           B$JIT$->B$JIT.ERR= CANNEDERR;
+      116     1446    1           B$JIT$->B$JIT.ERR.CODE= MM#ERR;
+      117     1447    1           ALTRETURN;
+      118     1448        /**/
+      119     1449        %EJECT;
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:5    
+      120     1450        /*F*     NAME:    FSA$FSP
+      121     1451         *       PURPOSE: FREE A BLOCK OF SPACE IN ROSEG.
+      122     1452         *       DESCRIPTION:  ADD BLOCK TO FREE SPACE CHAIN.  IF THIS
+      123     1453         *                YIELDS FREE PAGES, FREE THEM.
+      124     1454         **/
+      125     1455        /*D*     NAME:    FSA$FSP
+      126     1456         *       CALL:    CALL FSA$FSP (N,P$) ALTRET;
+      127     1457         *                N SBIN; NUMBER OF WORDS RETURNED.
+      128     1458         *                P$ PTR; POINTER TO RETURNED SPACE.
+      129     1459         *       INTERFACE: MMG$SFVP
+      130     1460         *       ENVIRONMENT: MONITOR (FOR USER) LS.
+      131     1461         *       INPUT:   N = # WORDS TO FREE.
+      132     1462         *                P$ POINTS TO BLOCK TO FREE.
+      133     1463         *                B$ROSEG.AVAIL$ POINTS TO OLD FREE SPACE.
+      134     1464         *                B$JIT.PCROS = # PAGES NOW IN ROSEG.
+      135     1465         *       OUTPUT:  B$ROSEG.AVAIL$ UPDATED.
+      136     1466         *                P$ IS ADDR(NIL).
+      137     1467         **/
+      138     1468    1   FSA$FSP: ENTRY(USERN,P$) ALTRET;
+      139     1469    1           IF USERN<=0 OR P.SEGID~=%ROSID OR P.OFF=0 THEN GOTO BADREL;
+      140     1470    1           N= ((USERN+1)/2)*2;
+      141     1471    1           PREV$= ADDR(NIL);
+      142     1472    1           CURR$= B$ROSEG$->B$ROSEG.AVAIL$;
+      143     1473    2           DO WHILE ((CURR$ ~= ADDR(NIL)) AND (P$ > CURR$));
+      144     1474    2              PREV$= CURR$;
+      145     1475    2              CURR$= CURR$->B$ROAVAIL.NEXT$;
+      146     1476    2              END;
+      147     1477    2           IF (PINCRW(P$,N) = CURR$) THEN DO;
+      148     1478    2              P$->B$ROAVAIL.NWORDS= CURR$->B$ROAVAIL.NWORDS +N;
+      149     1479    2              P$->B$ROAVAIL.NEXT$= CURR$->B$ROAVAIL.NEXT$;
+      150     1480    2              END;
+      151     1481    1           ELSE IF P$=CURR$ THEN GOTO BADREL;
+      152     1482    2              ELSE DO;
+      153     1483    2                 P$->B$ROAVAIL.NWORDS=N;
+      154     1484    2                 P$->B$ROAVAIL.NEXT$= CURR$;
+      155     1485    2                 END;
+      156     1486    1           CURR$= P$;
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:6    
+      157     1487                /*CURR$ is (maybe combined) new chunk.*/
+      158     1488    1           P$= ADDR(NIL);
+      159     1489    1           IF PREV$~=ADDR(NIL) THEN /*Not first chunk*/
+      160     1490    2              IF PINCRW(PREV$,PREV$->B$ROAVAIL.NWORDS)=CURR$ THEN DO;
+      161     1491    2                 PREV$->B$ROAVAIL.NWORDS=PREV$->B$ROAVAIL.NWORDS+
+      162     1492    2                   CURR$->B$ROAVAIL.NWORDS;
+      163     1493    2                 PREV$->B$ROAVAIL.NEXT$=CURR$->B$ROAVAIL.NEXT$;
+      164     1494    2                 CURR$=PREV$;
+      165     1495    2                 END;
+      166     1496    1              ELSE /*Not first chunk, not next to prev chunk*/
+      167     1497    1                 PREV$->B$ROAVAIL.NEXT$=CURR$;
+      168     1498    1           ELSE /*First chunk*/
+      169     1499    1              B$ROSEG$->B$ROSEG.AVAIL$=CURR$;
+      170     1500    1           IF CURR$->B$ROAVAIL.NEXT$~=ADDR(NIL) THEN RETURN;
+      171     1501    1           IF CURR$->B$ROAVAIL.NWORDS<1024 THEN RETURN;
+      172     1502    1           IF CURR$->B$ROAVAIL.NWORDS + POFFW(CURR$,B$ROSEG$) ~=
+      173     1503    1             1024*B$JIT.PCROS THEN RETURN;
+      174     1504    2           IF MOD(CURR$->B$ROAVAIL.NWORDS,1024)=0 THEN DO;
+      175     1505    2              IF PREV$=ADDR(NIL) THEN /*Rel all of first chunk*/
+      176     1506    2                 B$ROSEG$->B$ROSEG.AVAIL$=ADDR(NIL);
+      177     1507    3              ELSE IF PREV$=CURR$ THEN DO; /*Rel PREV+CURR*/
+      178     1508    3                    PREV$=ADDR(B$ROSEG$->B$ROSEG.AVAIL$);
+      179     1509    4                    DO WHILE (PREV$->B$ROAVAIL.NEXT$~=CURR$);
+      180     1510    4                       PREV$=PREV$->B$ROAVAIL.NEXT$;
+      181     1511    4                       END;
+      182     1512    3                    PREV$->B$ROAVAIL.NEXT$=ADDR(NIL);
+      183     1513    3                    END;
+      184     1514    2                 ELSE /*Rel CURR, not first*/
+      185     1515    2                    PREV$->B$ROAVAIL.NEXT$=ADDR(NIL);
+      186     1516    2              END;
+      187     1517    1           MM#NPG=CURR$->B$ROAVAIL.NWORDS/1024;
+      188     1518    1           CURR$->B$ROAVAIL.NWORDS=MOD(CURR$->B$ROAVAIL.NWORDS,1024);
+      189     1519    1           MM#PCROS= B$JIT$->B$JIT.PCROS -1;
+      190     1520    1           CALL MMG$SFVP(MM#WSQ,MM#SEGID,MM#PCROS,MM#NPG,MM#ERR)
+      191     1521    1             ALTRET(BADREL);
+      192     1522    1           RETURN;
+      193     1523    1   BADREL: ;
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:7    
+      194     1524    1           CALL SC_FSBADRO;
+      195     1525        /*S*    SCREECH_CODE:  FSA-S$FSBADRO
+      196     1526                TYPE: SNAP
+      197     1527                MESSAGE: Read-Only Segment Space Foulup.
+      198     1528        */
+      199     1529    1           P$=ADDR(NIL);
+      200     1530    1           RETURN;
+      201     1531    1   END;
+      202     1532        %EOD;
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:8    
+--  Include file information  --
+
+   B_SEGIDS_C.:E05TOU  is referenced.
+   B$ROSEG.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+   B$JIT.:E05TOU  cannot be made into a system file and is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+      No diagnostics issued in procedure FSA$GSP.
+
+   Procedure FSA$GSP requires 294 words for executable code.
+   Procedure FSA$GSP requires 18 words of local(AUTO) storage.
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:9    
+
+ Object Unit name= FSA$GSP                                    File name= FSA$ROSPACE.:E05TOU
+ UTS= JUL 29 '97 17:27:06.80 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS      3      3  FSA$GSP
+    1   Proc  even  none   294    446  FSA$GSP
+    2  RoData even  none     4      4  FSA$GSP
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes    yes     yes      Std        2  FSA$GSP
+     1    164          yes     yes      Std        2  FSA$FSP
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       5 MMG$SGVP
+ yes     yes           Std       5 MMG$SFVP
+                       nStd      0 X66_AUTO_2
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_AALT
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:10   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_FSBADRO                            B$JIT$                                B$ROSEG$
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ASLENTSID                             ISSID
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:11   
+
+
+        1        1        /*M* FSA$ROSPACE  Read-Only Segment space manager. */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* CLM=8,ICP,MOC,DMR */
+        8        8        /*P*     NAME:    FSA$ROSPACE
+        9        9         *       PURPOSE: MANAGES FREE SPACE IN THE READ-ONLY SEGMENT.
+       10       10         *                THIS SPACE IS USED FOR DYNAMIC DCBS AND FOR
+       11       11         *                MONITOR STREAM DCBS.
+       12       12         **/
+       13       13        /*F*     NAME:    FSA$GSP
+       14       14         *       PURPOSE: GET A BLOCK OF SPACE IN ROSEG.
+       15       15         *       DESCRIPTION:  EXAMINE FREE SPACE CHAIN; IF BLOCK FOUND,
+       16       16         *                RETURN IT; ELSE GET A NEW PAGE TO GIVE SPACE.
+       17       17         **/
+       18       18        /*D*     NAME:    FSA$GSP
+       19       19         *       CALL:    CALL FSA$GSP (N,P$) ALTRET;
+       20       20         *                      N SBIN; NUMBER OF WORDS NEEDED.
+       21       21         *                      P$ PTR; RETURNED POINTER TO SPACE.
+       22       22         *       INTERFACE: MMG$SGVP
+       23       23         *       ENVIRONMENT: MONITOR (FOR USER) LS.
+       24       24         *       INPUT:   N = # WORDS WANTED.
+       25       25         *                B$JIT.PCROS = # PAGES IN ROSEG ALREADY.
+       26       26         *                B$ROSEG.AVAIL$ POINTS TO AVAILABLE BLOCKS.
+       27       27         *       OUTPUT:  P$ POINTS TO SPACE GOTTEN.
+       28       28         *                B$ROSEG.AVAIL$ UPDATED.
+       29       29         **/
+       30       30        FSA$GSP: PROC(USERN,P$) ALTRET;
+
+     30  1 000000   000000 700200 xent  FSA$GSP      TSX0  ! X66_AUTO_2
+         1 000001   000022 000002                    ZERO    18,2
+
+       31       31    1   DCL USERN SBIN; /* Number of words to get or return*/
+       32       32    1   DCL P$ PTR; /* WILL POINT TO SPACE GOTTEN (OR POINTS TO
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:12   
+       33       33                SPACE TO BE FREED */
+       34       34    1   DCL 1 P REDEF P$,
+       35       35    1         2 OFF UBIN(24) UNAL,
+       36       36    1         2 SEGID BIT(12);
+       37       37    1   DCL B$JIT$ PTR SYMREF; /* POINTS TO JIT                      */
+       38       38    1   DCL B$ROSEG$ PTR SYMREF; /* POINTS TO READ-ONLY SEGMENT        */
+       39       39    1   DCL MMG$SGVP ENTRY(5)ALTRET; /* GETS PAGES IN SEGMENTS             */
+       40       40    1   DCL MMG$SFVP ENTRY(5)ALTRET; /* FREES PAGES IN SEGMENTS            */
+       41       41    1   DCL SC_FSBADRO ENTRY CONV(2,0);
+       42       42        /*** INCLUDE FILES ***/
+       43       43        %INCLUDE B_STRINGS_C;
+       44      172        %INCLUDE B$JIT;
+       45      775        %INCLUDE B$ROSEG;
+       46      838        %INCLUDE B_SEGIDS_C;
+       47     1377        /*** AUTOMATIC STORAGE ***/
+       48     1378    1   DCL CURR$ PTR; /* Points to current available ROS block*/
+       49     1379    1   DCL PREV$ PTR; /* Points to prev available ROS block*/
+       50     1380    1   DCL N UBIN; /* User-suplied # words adjusted to doubleword*/
+       51     1381    1   DCL MM#PCROS SBIN; /* PAGE # FOR MM TO GET OR FREE       */
+       52     1382    1   DCL MM#NPG SBIN; /* # OF PAGES FOR MM TO GET OR FREE   */
+       53     1383    1   DCL MM#ERR SBIN; /* ERROR CODE FOR MM TO RETURN IF BAD */
+       54     1384        /*** CONSTANT STORAGE ***/
+       55     1385    1   DCL MM#WSQ SBIN CONSTANT INIT(%CPWSQ); /* WSQ for MM routines*/
+       56     1386    1   DCL MM#SEGID SBIN CONSTANT INIT(BITBIN(%ROSID)); /* SEGID of ROS*/
+       57     1387    1   DCL 1 CANNEDERR CONSTANT, /* ERROR ITEMS TO SURROUND MM'S ERR   */
+       58     1388    1         2 FCG BIT(12)INIT('0623'O), /*'FS'*/
+       59     1389    1         2 MID BIT(6) INIT('01'O), /*'A'*/
+       60     1390    1         2 CODE UBIN(15) UNAL INIT(0),
+       61     1391    1         2 SEV UBIN(3) UNAL INIT(2); /* ABN ON OPEN                        */
+       62     1392        /**/
+       63     1393        %EJECT;
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:13   
+       64     1394    2           IF USERN<=0 THEN DO;
+
+   1394  1 000002   200003 470500                    LDP0    @USERN,,AUTO
+         1 000003   000000 235100                    LDA     0,,PR0
+         1 000004   000013 605400 1                  TPNZ    s:1399
+
+       65     1395    2              CALL SC_FSBADRO;
+
+   1395  1 000005   000000 713400 xsym               CLIMB   SC_FSBADRO
+         1 000006   000000 600000 xsid               climb   nvectors=         0
+
+       66     1396    2              P$=ADDR(NIL);
+
+   1396  1 000007   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000010   200004 470500                    LDP0    @P$,,AUTO
+         1 000011   000000 756100                    STQ     0,,PR0
+
+       67     1397    2              ALTRETURN;
+
+   1397  1 000012   000000 702200 xent               TSX2  ! X66_AALT
+
+       68     1398    2              END;
+       69     1399    1           N=((USERN+1)/2)*2;
+
+   1399  1 000013   000000 236100                    LDQ     0,,PR0
+         1 000014   000001 036007                    ADLQ    1,DL
+         1 000015   000002 506007                    DIV     2,DL
+         1 000016   000001 736000                    QLS     1
+         1 000017   200007 756100                    STQ     N,,AUTO
+
+   1399  1 000020                       GSPLOOP      null
+       70     1400    1   GSPLOOP:;
+       71     1401    1           PREV$=ADDR(NIL);
+
+   1401  1 000020   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000021   200006 756100                    STQ     PREV$,,AUTO
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:14   
+       72     1402    1           CURR$=B$ROSEG$->B$ROSEG.AVAIL$;
+
+   1402  1 000022   000000 470400 xsym               LDP0    B$ROSEG$
+         1 000023   000003 236100                    LDQ     3,,PR0
+         1 000024   200005 756100                    STQ     CURR$,,AUTO
+
+       73     1403    2           DO WHILE('1'B);
+
+       74     1404    3              DO WHILE (CURR$~=ADDR(NIL));
+
+   1404  1 000025   000071 710000 1                  TRA     s:1423
+
+       75     1405    4                 IF CURR$->B$ROAVAIL.NWORDS>=N THEN DO;
+
+   1405  1 000026   200005 470500                    LDP0    CURR$,,AUTO
+         1 000027   000001 236100                    LDQ     1,,PR0
+         1 000030   200007 116100                    CMPQ    N,,AUTO
+         1 000031   000064 602000 1                  TNC     s:1421
+
+       76     1406    5                    IF CURR$->B$ROAVAIL.NWORDS>N THEN DO;
+
+   1406  1 000032   000046 602000 1                  TNC     s:1413
+         1 000033   000046 600000 1                  TZE     s:1413
+
+       77     1407                /*Partial chunk must be preserved.*/
+       78     1408    5                       CURR$->B$ROAVAIL.NWORDS=
+
+   1408  1 000034   200007 136100                    SBLQ    N,,AUTO
+         1 000035   000001 756100                    STQ     1,,PR0
+
+       79     1409    5                         CURR$->B$ROAVAIL.NWORDS-N;
+       80     1410    5                       PINCRW(CURR$,N)->B$ROAVAIL=CURR$->B$ROAVAIL;
+
+   1410  1 000036   200007 720100                    LXL0    N,,AUTO
+         1 000037   000000 237100                    LDAQ    0,,PR0
+         1 000040   000000 755110                    STA     0,X0,PR0
+         1 000041   000001 756110                    STQ     1,X0,PR0
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:15   
+
+       81     1411    5                       CURR$->B$ROAVAIL.NEXT$=PINCRW(CURR$,N);
+
+   1411  1 000042   200007 236100                    LDQ     N,,AUTO
+         1 000043   000022 736000                    QLS     18
+         1 000044   200005 036100                    ADLQ    CURR$,,AUTO
+         1 000045   000000 756100                    STQ     0,,PR0
+
+       82     1412    5                       END;
+
+       83     1413    4                    IF PREV$=ADDR(NIL) THEN /*Chunk was head of chain*/
+
+   1413  1 000046   200006 236100                    LDQ     PREV$,,AUTO
+         1 000047   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000050   000055 601000 1                  TNZ     s:1416
+
+       84     1414    4                       B$ROSEG$->B$ROSEG.AVAIL$=CURR$->B$ROAVAIL.NEXT$;
+
+   1414  1 000051   000000 236100                    LDQ     0,,PR0
+         1 000052   000000 471400 xsym               LDP1    B$ROSEG$
+         1 000053   100003 756100                    STQ     3,,PR1
+         1 000054   000060 710000 1                  TRA     s:1417
+
+       85     1415    4                    ELSE /*Chunk was not head of chain*/
+       86     1416    4                       PREV$->B$ROAVAIL.NEXT$=CURR$->B$ROAVAIL.NEXT$;
+
+   1416  1 000055   000000 236100                    LDQ     0,,PR0
+         1 000056   200006 471500                    LDP1    PREV$,,AUTO
+         1 000057   100000 756100                    STQ     0,,PR1
+
+       87     1417    4                    P$= CURR$;
+
+   1417  1 000060   200005 236100                    LDQ     CURR$,,AUTO
+         1 000061   200004 471500                    LDP1    @P$,,AUTO
+         1 000062   100000 756100                    STQ     0,,PR1
+
+       88     1418    4                    RETURN;
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:16   
+
+   1418  1 000063   000000 702200 xent               TSX2  ! X66_ARET
+
+       89     1419    4                    END;
+       90     1420                /*This chunk wasn't big enough.*/
+       91     1421    3                 PREV$=CURR$;
+
+   1421  1 000064   200005 236100                    LDQ     CURR$,,AUTO
+         1 000065   200006 756100                    STQ     PREV$,,AUTO
+
+       92     1422    3                 CURR$=PREV$->B$ROAVAIL.NEXT$;
+
+   1422  1 000066   200006 471500                    LDP1    PREV$,,AUTO
+         1 000067   100000 236100                    LDQ     0,,PR1
+         1 000070   200005 756100                    STQ     CURR$,,AUTO
+
+       93     1423    3                 END;
+
+   1423  1 000071   200005 236100                    LDQ     CURR$,,AUTO
+         1 000072   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000073   000026 601000 1                  TNZ     s:1405
+
+       94     1424                /*No chunk big enough. If PREV$ is NIL, no chunks at all.*/
+       95     1425    2              MM#PCROS= B$JIT.PCROS;
+
+   1425  1 000074   000000 470400 xsym               LDP0    B$JIT$
+         1 000075   000203 236100                    LDQ     131,,PR0
+         1 000076   000022 772000                    QRL     18
+         1 000077   200010 756100                    STQ     MM#PCROS,,AUTO
+
+       96     1426    2              MM#NPG=1;
+
+   1426  1 000100   000001 235007                    LDA     1,DL
+         1 000101   200011 755100                    STA     MM#NPG,,AUTO
+
+       97     1427    2              CALL MMG$SGVP(MM#WSQ,MM#SEGID,MM#PCROS,MM#NPG,MM#ERR)
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:17   
+   1427  1 000102   200012 631500                    EPPR1   MM#ERR,,AUTO
+         1 000103   200020 451500                    STP1    MM#ERR+6,,AUTO
+         1 000104   200011 633500                    EPPR3   MM#NPG,,AUTO
+         1 000105   200017 453500                    STP3    MM#ERR+5,,AUTO
+         1 000106   200010 634500                    EPPR4   MM#PCROS,,AUTO
+         1 000107   200016 454500                    STP4    MM#ERR+4,,AUTO
+         1 000110   000000 237000 2                  LDAQ    0
+         1 000111   200014 757100                    STAQ    MM#ERR+2,,AUTO
+         1 000112   200014 630500                    EPPR0   MM#ERR+2,,AUTO
+         1 000113   000023 631400 xsym               EPPR1   B_VECTNIL+19
+         1 000114   000000 701000 xent               TSX1    MMG$SGVP
+         1 000115   000153 702000 1                  TSX2    NOSPACE
+
+       98     1428    2                ALTRET(NOSPACE);
+       99     1429    2              CURR$=PINCRW(B$ROSEG$,1024*MM#PCROS);
+
+   1429  1 000116   200010 236100                    LDQ     MM#PCROS,,AUTO
+         1 000117   000034 736000                    QLS     28
+         1 000120   000000 036000 xsym               ADLQ    B$ROSEG$
+         1 000121   200005 756100                    STQ     CURR$,,AUTO
+
+      100     1430    2              CURR$->B$ROAVAIL.NEXT$= ADDR(NIL);
+
+   1430  1 000122   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000123   200005 470500                    LDP0    CURR$,,AUTO
+         1 000124   000000 756100                    STQ     0,,PR0
+
+      101     1431    2              CURR$->B$ROAVAIL.NWORDS=1024;
+
+   1431  1 000125   002000 235007                    LDA     1024,DL
+         1 000126   000001 755100                    STA     1,,PR0
+
+      102     1432    2              IF PREV$=ADDR(NIL) THEN /*This is only chunk*/
+
+   1432  1 000127   200006 236100                    LDQ     PREV$,,AUTO
+         1 000130   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000131   000136 601000 1                  TNZ     s:1435
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:18   
+
+      103     1433    2                 B$ROSEG$->B$ROSEG.AVAIL$= CURR$;
+
+   1433  1 000132   200005 236100                    LDQ     CURR$,,AUTO
+         1 000133   000000 471400 xsym               LDP1    B$ROSEG$
+         1 000134   100003 756100                    STQ     3,,PR1
+         1 000135   000025 710000 1                  TRA     s:1404
+
+      104     1434    2              ELSE
+      105     1435    2                 IF PINCRW(PREV$,PREV$->B$ROAVAIL.NWORDS)~=CURR$
+
+   1435  1 000136   200006 471500                    LDP1    PREV$,,AUTO
+         1 000137   100001 720100                    LXL0    1,,PR1
+         1 000140   000000 636010                    EAQ     0,X0
+         1 000141   200006 036100                    ADLQ    PREV$,,AUTO
+         1 000142   200005 116100                    CMPQ    CURR$,,AUTO
+         1 000143   000147 600000 1                  TZE     s:1439
+
+      106     1436    2                 THEN /*This chunk is by itself.*/
+      107     1437    2                    PREV$->B$ROAVAIL.NEXT$=CURR$;
+
+   1437  1 000144   200005 236100                    LDQ     CURR$,,AUTO
+         1 000145   100000 756100                    STQ     0,,PR1
+         1 000146   000025 710000 1                  TRA     s:1404
+
+      108     1438    3                 ELSE DO; /*This chunk is next to PREV.*/
+
+      109     1439    3                    PREV$->B$ROAVAIL.NWORDS=
+
+   1439  1 000147   100001 235100                    LDA     1,,PR1
+         1 000150   002000 035007                    ADLA    1024,DL
+         1 000151   100001 755100                    STA     1,,PR1
+
+      110     1440    3                      PREV$->B$ROAVAIL.NWORDS+1024;
+      111     1441    3                    GOTO GSPLOOP; /*Restart; we lost PREV$.*/
+
+   1441  1 000152   000020 710000 1                  TRA     GSPLOOP
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:19   
+
+      112     1442    3                    END;
+      113     1443    2              END /*DO FOREVER*/;
+
+      114     1444    1   NOSPACE: /* ERRORS                             */
+      115     1445    1           B$JIT$->B$JIT.ERR= CANNEDERR;
+
+   1445  1 000153   000002 236000 0     NOSPACE      LDQ     CANNEDERR
+         1 000154   000000 470400 xsym               LDP0    B$JIT$
+         1 000155   000012 756100                    STQ     10,,PR0
+
+      116     1446    1           B$JIT$->B$JIT.ERR.CODE= MM#ERR;
+
+   1446  1 000156   200012 236100                    LDQ     MM#ERR,,AUTO
+         1 000157   000003 736000                    QLS     3
+         1 000160   000012 676100                    ERQ     10,,PR0
+         1 000161   377770 376007                    ANQ     131064,DL
+         1 000162   000012 656100                    ERSQ    10,,PR0
+
+      117     1447    1           ALTRETURN;
+
+   1447  1 000163   000000 702200 xent               TSX2  ! X66_AALT
+
+      118     1448        /**/
+      119     1449        %EJECT;
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:20   
+      120     1450        /*F*     NAME:    FSA$FSP
+      121     1451         *       PURPOSE: FREE A BLOCK OF SPACE IN ROSEG.
+      122     1452         *       DESCRIPTION:  ADD BLOCK TO FREE SPACE CHAIN.  IF THIS
+      123     1453         *                YIELDS FREE PAGES, FREE THEM.
+      124     1454         **/
+      125     1455        /*D*     NAME:    FSA$FSP
+      126     1456         *       CALL:    CALL FSA$FSP (N,P$) ALTRET;
+      127     1457         *                N SBIN; NUMBER OF WORDS RETURNED.
+      128     1458         *                P$ PTR; POINTER TO RETURNED SPACE.
+      129     1459         *       INTERFACE: MMG$SFVP
+      130     1460         *       ENVIRONMENT: MONITOR (FOR USER) LS.
+      131     1461         *       INPUT:   N = # WORDS TO FREE.
+      132     1462         *                P$ POINTS TO BLOCK TO FREE.
+      133     1463         *                B$ROSEG.AVAIL$ POINTS TO OLD FREE SPACE.
+      134     1464         *                B$JIT.PCROS = # PAGES NOW IN ROSEG.
+      135     1465         *       OUTPUT:  B$ROSEG.AVAIL$ UPDATED.
+      136     1466         *                P$ IS ADDR(NIL).
+      137     1467         **/
+      138     1468    1   FSA$FSP: ENTRY(USERN,P$) ALTRET;
+
+   1468  1 000164   000000 700200 xent  FSA$FSP      TSX0  ! X66_AUTO_2
+         1 000165   000022 000002                    ZERO    18,2
+
+      139     1469    1           IF USERN<=0 OR P.SEGID~=%ROSID OR P.OFF=0 THEN GOTO BADREL;
+
+   1469  1 000166   200003 470500                    LDP0    @USERN,,AUTO
+         1 000167   000000 235100                    LDA     0,,PR0
+         1 000170   000440 604400 1                  TMOZ    BADREL
+         1 000171   200004 471500                    LDP1    @P$,,AUTO
+         1 000172   100000 236100                    LDQ     0,,PR1
+         1 000173   007777 376007                    ANQ     4095,DL
+         1 000174   006003 116007                    CMPQ    3075,DL
+         1 000175   000440 601000 1                  TNZ     BADREL
+         1 000176   100000 236100                    LDQ     0,,PR1
+         1 000177   000002 316000 2                  CANQ    2
+         1 000200   000440 600000 1                  TZE     BADREL
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:21   
+      140     1470    1           N= ((USERN+1)/2)*2;
+
+   1470  1 000201   000000 236100                    LDQ     0,,PR0
+         1 000202   000001 036007                    ADLQ    1,DL
+         1 000203   000002 506007                    DIV     2,DL
+         1 000204   000001 736000                    QLS     1
+         1 000205   200007 756100                    STQ     N,,AUTO
+
+      141     1471    1           PREV$= ADDR(NIL);
+
+   1471  1 000206   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000207   200006 756100                    STQ     PREV$,,AUTO
+
+      142     1472    1           CURR$= B$ROSEG$->B$ROSEG.AVAIL$;
+
+   1472  1 000210   000000 473400 xsym               LDP3    B$ROSEG$
+         1 000211   300003 236100                    LDQ     3,,PR3
+         1 000212   200005 756100                    STQ     CURR$,,AUTO
+
+      143     1473    2           DO WHILE ((CURR$ ~= ADDR(NIL)) AND (P$ > CURR$));
+
+   1473  1 000213   000221 710000 1                  TRA     s:1476
+
+      144     1474    2              PREV$= CURR$;
+
+   1474  1 000214   200005 236100                    LDQ     CURR$,,AUTO
+         1 000215   200006 756100                    STQ     PREV$,,AUTO
+
+      145     1475    2              CURR$= CURR$->B$ROAVAIL.NEXT$;
+
+   1475  1 000216   200005 470500                    LDP0    CURR$,,AUTO
+         1 000217   000000 236100                    LDQ     0,,PR0
+         1 000220   200005 756100                    STQ     CURR$,,AUTO
+
+      146     1476    2              END;
+
+   1476  1 000221   000001 116000 xsym               CMPQ    B_VECTNIL+1
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:22   
+         1 000222   000226 600000 1                  TZE     s:1477
+         1 000223   200004 470500                    LDP0    @P$,,AUTO
+         1 000224   000000 116100                    CMPQ    0,,PR0
+         1 000225   000214 602000 1                  TNC     s:1474
+
+      147     1477    2           IF (PINCRW(P$,N) = CURR$) THEN DO;
+
+   1477  1 000226   200004 470500                    LDP0    @P$,,AUTO
+         1 000227   000000 471500                    LDP1    0,,PR0
+         1 000230   200007 720100                    LXL0    N,,AUTO
+         1 000231   100000 633510                    EPPR3   0,X0,PR1
+         1 000232   200014 453500                    STP3    MM#ERR+2,,AUTO
+         1 000233   200014 236100                    LDQ     MM#ERR+2,,AUTO
+         1 000234   200005 116100                    CMPQ    CURR$,,AUTO
+         1 000235   000247 601000 1                  TNZ     s:1481
+
+      148     1478    2              P$->B$ROAVAIL.NWORDS= CURR$->B$ROAVAIL.NWORDS +N;
+
+   1478  1 000236   000000 471500                    LDP1    0,,PR0
+         1 000237   200005 473500                    LDP3    CURR$,,AUTO
+         1 000240   300001 236100                    LDQ     1,,PR3
+         1 000241   200007 036100                    ADLQ    N,,AUTO
+         1 000242   100001 756100                    STQ     1,,PR1
+
+      149     1479    2              P$->B$ROAVAIL.NEXT$= CURR$->B$ROAVAIL.NEXT$;
+
+   1479  1 000243   000000 471500                    LDP1    0,,PR0
+         1 000244   300000 236100                    LDQ     0,,PR3
+         1 000245   100000 756100                    STQ     0,,PR1
+
+      150     1480    2              END;
+
+   1480  1 000246   000260 710000 1                  TRA     s:1486
+
+      151     1481    1           ELSE IF P$=CURR$ THEN GOTO BADREL;
+
+   1481  1 000247   000000 236100                    LDQ     0,,PR0
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:23   
+         1 000250   200005 116100                    CMPQ    CURR$,,AUTO
+         1 000251   000440 600000 1                  TZE     BADREL
+
+      152     1482    2              ELSE DO;
+
+      153     1483    2                 P$->B$ROAVAIL.NWORDS=N;
+
+   1483  1 000252   000000 471500                    LDP1    0,,PR0
+         1 000253   200007 235100                    LDA     N,,AUTO
+         1 000254   100001 755100                    STA     1,,PR1
+
+      154     1484    2                 P$->B$ROAVAIL.NEXT$= CURR$;
+
+   1484  1 000255   000000 471500                    LDP1    0,,PR0
+         1 000256   200005 236100                    LDQ     CURR$,,AUTO
+         1 000257   100000 756100                    STQ     0,,PR1
+
+      155     1485    2                 END;
+
+      156     1486    1           CURR$= P$;
+
+   1486  1 000260   000000 236100                    LDQ     0,,PR0
+         1 000261   200005 756100                    STQ     CURR$,,AUTO
+
+      157     1487                /*CURR$ is (maybe combined) new chunk.*/
+      158     1488    1           P$= ADDR(NIL);
+
+   1488  1 000262   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000263   000000 756100                    STQ     0,,PR0
+
+      159     1489    1           IF PREV$~=ADDR(NIL) THEN /*Not first chunk*/
+
+   1489  1 000264   200006 236100                    LDQ     PREV$,,AUTO
+         1 000265   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000266   000311 600000 1                  TZE     s:1499
+
+      160     1490    2              IF PINCRW(PREV$,PREV$->B$ROAVAIL.NWORDS)=CURR$ THEN DO;
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:24   
+
+   1490  1 000267   200006 471500                    LDP1    PREV$,,AUTO
+         1 000270   100001 721100                    LXL1    1,,PR1
+         1 000271   000000 636011                    EAQ     0,X1
+         1 000272   200006 036100                    ADLQ    PREV$,,AUTO
+         1 000273   200005 116100                    CMPQ    CURR$,,AUTO
+         1 000274   000306 601000 1                  TNZ     s:1497
+
+      161     1491    2                 PREV$->B$ROAVAIL.NWORDS=PREV$->B$ROAVAIL.NWORDS+
+
+   1491  1 000275   200005 473500                    LDP3    CURR$,,AUTO
+         1 000276   100001 236100                    LDQ     1,,PR1
+         1 000277   300001 036100                    ADLQ    1,,PR3
+         1 000300   100001 756100                    STQ     1,,PR1
+
+      162     1492    2                   CURR$->B$ROAVAIL.NWORDS;
+      163     1493    2                 PREV$->B$ROAVAIL.NEXT$=CURR$->B$ROAVAIL.NEXT$;
+
+   1493  1 000301   300000 236100                    LDQ     0,,PR3
+         1 000302   100000 756100                    STQ     0,,PR1
+
+      164     1494    2                 CURR$=PREV$;
+
+   1494  1 000303   200006 236100                    LDQ     PREV$,,AUTO
+         1 000304   200005 756100                    STQ     CURR$,,AUTO
+
+      165     1495    2                 END;
+
+   1495  1 000305   000314 710000 1                  TRA     s:1500
+
+      166     1496    1              ELSE /*Not first chunk, not next to prev chunk*/
+      167     1497    1                 PREV$->B$ROAVAIL.NEXT$=CURR$;
+
+   1497  1 000306   200005 236100                    LDQ     CURR$,,AUTO
+         1 000307   100000 756100                    STQ     0,,PR1
+         1 000310   000314 710000 1                  TRA     s:1500
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:25   
+      168     1498    1           ELSE /*First chunk*/
+      169     1499    1              B$ROSEG$->B$ROSEG.AVAIL$=CURR$;
+
+   1499  1 000311   200005 236100                    LDQ     CURR$,,AUTO
+         1 000312   000000 471400 xsym               LDP1    B$ROSEG$
+         1 000313   100003 756100                    STQ     3,,PR1
+
+      170     1500    1           IF CURR$->B$ROAVAIL.NEXT$~=ADDR(NIL) THEN RETURN;
+
+   1500  1 000314   200005 471500                    LDP1    CURR$,,AUTO
+         1 000315   100000 236100                    LDQ     0,,PR1
+         1 000316   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000317   000321 600000 1                  TZE     s:1501
+
+   1500  1 000320   000000 702200 xent               TSX2  ! X66_ARET
+
+      171     1501    1           IF CURR$->B$ROAVAIL.NWORDS<1024 THEN RETURN;
+
+   1501  1 000321   100001 235100                    LDA     1,,PR1
+         1 000322   002000 115007                    CMPA    1024,DL
+         1 000323   000325 603000 1                  TRC     s:1502
+
+   1501  1 000324   000000 702200 xent               TSX2  ! X66_ARET
+
+      172     1502    1           IF CURR$->B$ROAVAIL.NWORDS + POFFW(CURR$,B$ROSEG$) ~=
+
+   1502  1 000325   000000 235000 xsym               LDA     B$ROSEG$
+         1 000326   000022 771000                    ARL     18
+         1 000327   200014 755100                    STA     MM#ERR+2,,AUTO
+         1 000330   200005 236100                    LDQ     CURR$,,AUTO
+         1 000331   000022 772000                    QRL     18
+         1 000332   200014 136100                    SBLQ    MM#ERR+2,,AUTO
+         1 000333   100001 036100                    ADLQ    1,,PR1
+         1 000334   000000 473400 xsym               LDP3    B$JIT$
+         1 000335   200015 756100                    STQ     MM#ERR+3,,AUTO
+         1 000336   300203 236100                    LDQ     131,,PR3
+         1 000337   000010 772000                    QRL     8
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:26   
+         1 000340   000003 376000 2                  ANQ     3
+         1 000341   200016 756100                    STQ     MM#ERR+4,,AUTO
+         1 000342   200015 236100                    LDQ     MM#ERR+3,,AUTO
+         1 000343   200016 116100                    CMPQ    MM#ERR+4,,AUTO
+         1 000344   000346 600000 1                  TZE     s:1504
+
+      173     1503    1             1024*B$JIT.PCROS THEN RETURN;
+
+   1503  1 000345   000000 702200 xent               TSX2  ! X66_ARET
+
+      174     1504    2           IF MOD(CURR$->B$ROAVAIL.NWORDS,1024)=0 THEN DO;
+
+   1504  1 000346   100001 236100                    LDQ     1,,PR1
+         1 000347   001777 376007                    ANQ     1023,DL
+         1 000350   000407 601000 1                  TNZ     s:1517
+
+      175     1505    2              IF PREV$=ADDR(NIL) THEN /*Rel all of first chunk*/
+
+   1505  1 000351   200006 236100                    LDQ     PREV$,,AUTO
+         1 000352   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000353   000360 601000 1                  TNZ     s:1507
+
+      176     1506    2                 B$ROSEG$->B$ROSEG.AVAIL$=ADDR(NIL);
+
+   1506  1 000354   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000355   000000 474400 xsym               LDP4    B$ROSEG$
+         1 000356   400003 756100                    STQ     3,,PR4
+         1 000357   000407 710000 1                  TRA     s:1517
+
+      177     1507    3              ELSE IF PREV$=CURR$ THEN DO; /*Rel PREV+CURR*/
+
+   1507  1 000360   200005 116100                    CMPQ    CURR$,,AUTO
+         1 000361   000404 601000 1                  TNZ     s:1515
+
+      178     1508    3                    PREV$=ADDR(B$ROSEG$->B$ROSEG.AVAIL$);
+
+   1508  1 000362   000000 236000 xsym               LDQ     B$ROSEG$
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:27   
+         1 000363   000003 036003                    ADLQ    3,DU
+         1 000364   200006 756100                    STQ     PREV$,,AUTO
+
+      179     1509    4                    DO WHILE (PREV$->B$ROAVAIL.NEXT$~=CURR$);
+
+   1509  1 000365   200006 474500                    LDP4    PREV$,,AUTO
+         1 000366   400000 236100                    LDQ     0,,PR4
+         1 000367   200005 116100                    CMPQ    CURR$,,AUTO
+         1 000370   000400 600000 1                  TZE     s:1512
+
+      180     1510    4                       PREV$=PREV$->B$ROAVAIL.NEXT$;
+
+   1510  1 000371   200006 470500                    LDP0    PREV$,,AUTO
+         1 000372   000000 236100                    LDQ     0,,PR0
+         1 000373   200006 756100                    STQ     PREV$,,AUTO
+
+      181     1511    4                       END;
+
+   1511  1 000374   200006 470500                    LDP0    PREV$,,AUTO
+         1 000375   000000 236100                    LDQ     0,,PR0
+         1 000376   200005 116100                    CMPQ    CURR$,,AUTO
+         1 000377   000371 601000 1                  TNZ     s:1510
+
+      182     1512    3                    PREV$->B$ROAVAIL.NEXT$=ADDR(NIL);
+
+   1512  1 000400   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000401   200006 470500                    LDP0    PREV$,,AUTO
+         1 000402   000000 756100                    STQ     0,,PR0
+
+      183     1513    3                    END;
+
+   1513  1 000403   000407 710000 1                  TRA     s:1517
+
+      184     1514    2                 ELSE /*Rel CURR, not first*/
+      185     1515    2                    PREV$->B$ROAVAIL.NEXT$=ADDR(NIL);
+
+   1515  1 000404   000001 236000 xsym               LDQ     B_VECTNIL+1
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:28   
+         1 000405   200006 474500                    LDP4    PREV$,,AUTO
+         1 000406   400000 756100                    STQ     0,,PR4
+
+      186     1516    2              END;
+
+      187     1517    1           MM#NPG=CURR$->B$ROAVAIL.NWORDS/1024;
+
+   1517  1 000407   200005 470500                    LDP0    CURR$,,AUTO
+         1 000410   000001 236100                    LDQ     1,,PR0
+         1 000411   000012 772000                    QRL     10
+         1 000412   200011 756100                    STQ     MM#NPG,,AUTO
+
+      188     1518    1           CURR$->B$ROAVAIL.NWORDS=MOD(CURR$->B$ROAVAIL.NWORDS,1024);
+
+   1518  1 000413   000001 236100                    LDQ     1,,PR0
+         1 000414   001777 376007                    ANQ     1023,DL
+         1 000415   000001 756100                    STQ     1,,PR0
+
+      189     1519    1           MM#PCROS= B$JIT$->B$JIT.PCROS -1;
+
+   1519  1 000416   000000 471400 xsym               LDP1    B$JIT$
+         1 000417   100203 236100                    LDQ     131,,PR1
+         1 000420   000022 772000                    QRL     18
+         1 000421   000001 136007                    SBLQ    1,DL
+         1 000422   200010 756100                    STQ     MM#PCROS,,AUTO
+
+      190     1520    1           CALL MMG$SFVP(MM#WSQ,MM#SEGID,MM#PCROS,MM#NPG,MM#ERR)
+
+   1520  1 000423   200012 633500                    EPPR3   MM#ERR,,AUTO
+         1 000424   200020 453500                    STP3    MM#ERR+6,,AUTO
+         1 000425   200011 634500                    EPPR4   MM#NPG,,AUTO
+         1 000426   200017 454500                    STP4    MM#ERR+5,,AUTO
+         1 000427   200010 635500                    EPPR5   MM#PCROS,,AUTO
+         1 000430   200016 455500                    STP5    MM#ERR+4,,AUTO
+         1 000431   000000 237000 2                  LDAQ    0
+         1 000432   200014 757100                    STAQ    MM#ERR+2,,AUTO
+         1 000433   200014 630500                    EPPR0   MM#ERR+2,,AUTO
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:29   
+         1 000434   000023 631400 xsym               EPPR1   B_VECTNIL+19
+         1 000435   000000 701000 xent               TSX1    MMG$SFVP
+         1 000436   000440 702000 1                  TSX2    BADREL
+
+      191     1521    1             ALTRET(BADREL);
+      192     1522    1           RETURN;
+
+   1522  1 000437   000000 702200 xent               TSX2  ! X66_ARET
+
+   1519  1 000440                       BADREL       null
+      193     1523    1   BADREL: ;
+      194     1524    1           CALL SC_FSBADRO;
+
+   1524  1 000440   000000 713400 xsym               CLIMB   SC_FSBADRO
+         1 000441   000000 600000 xsid               climb   nvectors=         0
+
+      195     1525        /*S*    SCREECH_CODE:  FSA-S$FSBADRO
+      196     1526                TYPE: SNAP
+      197     1527                MESSAGE: Read-Only Segment Space Foulup.
+      198     1528        */
+      199     1529    1           P$=ADDR(NIL);
+
+   1529  1 000442   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000443   200004 470500                    LDP0    @P$,,AUTO
+         1 000444   000000 756100                    STQ     0,,PR0
+
+      200     1530    1           RETURN;
+
+   1530  1 000445   000000 702200 xent               TSX2  ! X66_ARET
+
+MM#WSQ
+ Sect OctLoc
+   0     000   000000 000004                                                    ....
+
+MM#SEGID
+ Sect OctLoc
+   0     001   000000 006003                                                    ....
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:30   
+
+CANNEDERR
+ Sect OctLoc
+   0     002   062301 000002                                                    2...
+
+(unnamed)
+ Sect OctLoc
+   2     000   000000 006000   000001 006000   777777 770000   001777 776000    ................
+      201     1531    1   END;
+      202     1532        %EOD;
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:31   
+--  Include file information  --
+
+   B_SEGIDS_C.:E05TOU  is referenced.
+   B$ROSEG.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+   B$JIT.:E05TOU  cannot be made into a system file and is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+      No diagnostics issued in procedure FSA$GSP.
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:32   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData FSA$GSP
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     2-0-0/b STRC        r     1 CANNEDERR                  1-0-0/w SBIN        r     1 MM#SEGID
+     0-0-0/w SBIN        r     1 MM#WSQ
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @P$                        3-0-0/w PTR         r     1 @USERN
+     5-0-0/w PTR         r     1 CURR$                     12-0-0/w SBIN        r     1 MM#ERR
+    11-0-0/w SBIN        r     1 MM#NPG                    10-0-0/w SBIN        r     1 MM#PCROS
+     7-0-0/w UBIN        r     1 N                         *0-0-0/w STRC        r     1 P
+    *0-0-0/w PTR         r     1 P$                         6-0-0/w PTR         r     1 PREV$
+    *0-0-0/w SBIN        r     1 USERN
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$JIT$                     0-0-0/w PTR         r     1 B$ROSEG$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(8856)  r     1 B$JIT                      0-0-0/d STRC(72)    r     1 B$ROAVAIL
+     0-0-0/d STRC(3024)  r     1 B$ROSEG
+
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:33   
+
+   Procedure FSA$GSP requires 294 words for executable code.
+   Procedure FSA$GSP requires 18 words of local(AUTO) storage.
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:34   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:35   
+          MINI XREF LISTING
+
+B$JIT.CPFLAGS1.SLEAZE
+       593**DCL       593--REDEF
+B$JIT.ERR
+       499**DCL      1445<<ASSIGN
+B$JIT.ERR.CODE
+       500**DCL      1446<<ASSIGN
+B$JIT.ERR.MID
+       500**DCL       500--REDEF
+B$JIT.JRESPEAK
+       661**DCL       662--REDEF
+B$JIT.ORIGINATOR_PORT.FROM_CR
+       770**DCL       770--REDEF     771--REDEF
+B$JIT.PCROS
+       658**DCL      1425>>ASSIGN   1502>>IF       1519>>ASSIGN
+B$JIT.PNR
+       674**DCL       674--REDEF
+B$JIT.TSLINE
+       768**DCL       769--REDEF
+B$JIT$
+        37**DCL       494--IMP-PTR  1425>>ASSIGN   1445>>ASSIGN   1446>>ASSIGN   1502>>IF       1519>>ASSIGN
+B$ROAVAIL
+       825**DCL      1410<<ASSIGN   1410>>ASSIGN
+B$ROAVAIL.NEXT$
+       826**DCL      1411<<ASSIGN   1414>>ASSIGN   1416<<ASSIGN   1416>>ASSIGN   1422>>ASSIGN   1430<<ASSIGN
+      1437<<ASSIGN   1475>>ASSIGN   1479<<ASSIGN   1479>>ASSIGN   1484<<ASSIGN   1493<<ASSIGN   1493>>ASSIGN
+      1497<<ASSIGN   1500>>IF       1509>>DOWHILE  1510>>ASSIGN   1512<<ASSIGN   1515<<ASSIGN
+B$ROAVAIL.NWORDS
+       827**DCL      1405>>IF       1406>>IF       1408<<ASSIGN   1408>>ASSIGN   1431<<ASSIGN   1435>>IF
+      1439<<ASSIGN   1439>>ASSIGN   1478<<ASSIGN   1478>>ASSIGN   1483<<ASSIGN   1490>>IF       1491<<ASSIGN
+      1491>>ASSIGN   1491>>ASSIGN   1501>>IF       1502>>IF       1504>>IF       1517>>ASSIGN   1518<<ASSIGN
+      1518>>ASSIGN
+B$ROSEG.AVAIL$
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:36   
+       790**DCL      1402>>ASSIGN   1414<<ASSIGN   1433<<ASSIGN   1472>>ASSIGN   1499<<ASSIGN   1506<<ASSIGN
+      1508--ASSIGN
+B$ROSEG$
+        38**DCL      1402>>ASSIGN   1414>>ASSIGN   1429>>ASSIGN   1433>>ASSIGN   1472>>ASSIGN   1499>>ASSIGN
+      1502>>IF       1506>>ASSIGN   1508>>ASSIGN
+BADREL
+      1519**LABEL    1469--GOTO     1481--GOTO     1520--CALLALT
+CANNEDERR
+      1387**DCL      1445>>ASSIGN
+CURR$
+      1378**DCL      1402<<ASSIGN   1404>>DOWHILE  1405>>IF       1406>>IF       1408>>ASSIGN   1408>>ASSIGN
+      1410>>ASSIGN   1410>>ASSIGN   1411>>ASSIGN   1411>>ASSIGN   1414>>ASSIGN   1416>>ASSIGN   1417>>ASSIGN
+      1421>>ASSIGN   1422<<ASSIGN   1429<<ASSIGN   1430>>ASSIGN   1431>>ASSIGN   1433>>ASSIGN   1435>>IF
+      1437>>ASSIGN   1472<<ASSIGN   1473>>DOWHILE  1473>>DOWHILE  1474>>ASSIGN   1475<<ASSIGN   1475>>ASSIGN
+      1477>>IF       1478>>ASSIGN   1479>>ASSIGN   1481>>IF       1484>>ASSIGN   1486<<ASSIGN   1490>>IF
+      1491>>ASSIGN   1493>>ASSIGN   1494<<ASSIGN   1497>>ASSIGN   1499>>ASSIGN   1500>>IF       1501>>IF
+      1502>>IF       1502>>IF       1504>>IF       1507>>IF       1509>>DOWHILE  1517>>ASSIGN   1518>>ASSIGN
+      1518>>ASSIGN
+GSPLOOP
+      1399**LABEL    1441--GOTO
+MM#ERR
+      1383**DCL      1427<>CALL     1446>>ASSIGN   1520<>CALL
+MM#NPG
+      1382**DCL      1426<<ASSIGN   1427<>CALL     1517<<ASSIGN   1520<>CALL
+MM#PCROS
+      1381**DCL      1425<<ASSIGN   1427<>CALL     1429>>ASSIGN   1519<<ASSIGN   1520<>CALL
+MM#SEGID
+      1386**DCL      1427<>CALL     1520<>CALL
+MM#WSQ
+      1385**DCL      1427<>CALL     1520<>CALL
+MMG$SFVP
+        40**DCL-ENT  1520--CALL
+MMG$SGVP
+        39**DCL-ENT  1427--CALL
+N
+      1380**DCL      1399<<ASSIGN   1405>>IF       1406>>IF       1408>>ASSIGN   1410>>ASSIGN   1411>>ASSIGN
+PL6.E3A0      #001=FSA$GSP File=FSA$ROSPACE.:E05TSI                              TUE 07/29/97 17:27 Page:37   
+      1470<<ASSIGN   1477>>IF       1478>>ASSIGN   1483>>ASSIGN
+NOSPACE
+      1445**LABEL    1427--CALLALT
+P.OFF
+        35**DCL      1469>>IF
+P.SEGID
+        36**DCL      1469>>IF
+P$
+        32**DCL        30--PROC       34--REDEF    1396<<ASSIGN   1417<<ASSIGN   1468--ENTRY    1473>>DOWHILE
+      1477>>IF       1478>>ASSIGN   1479>>ASSIGN   1481>>IF       1483>>ASSIGN   1484>>ASSIGN   1486>>ASSIGN
+      1488<<ASSIGN   1529<<ASSIGN
+PREV$
+      1379**DCL      1401<<ASSIGN   1413>>IF       1416>>ASSIGN   1421<<ASSIGN   1422>>ASSIGN   1432>>IF
+      1435>>IF       1435>>IF       1437>>ASSIGN   1439>>ASSIGN   1439>>ASSIGN   1471<<ASSIGN   1474<<ASSIGN
+      1489>>IF       1490>>IF       1490>>IF       1491>>ASSIGN   1491>>ASSIGN   1493>>ASSIGN   1494>>ASSIGN
+      1497>>ASSIGN   1505>>IF       1507>>IF       1508<<ASSIGN   1509>>DOWHILE  1510<<ASSIGN   1510>>ASSIGN
+      1512>>ASSIGN   1515>>ASSIGN
+SC_FSBADRO
+        41**DCL-ENT  1395--CALL     1524--CALL
+USERN
+        31**DCL        30--PROC     1394>>IF       1399>>ASSIGN   1468--ENTRY    1469>>IF       1470>>ASSIGN
+
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:38   
+      203        1        /*T***********************************************************/
+      204        2        /*T*                                                         */
+      205        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      206        4        /*T*                                                         */
+      207        5        /*T***********************************************************/
+      208        6        /*F*    NAME: FSA$FDCB
+      209        7         *      PURPOSE: Free a DCB, including all its appendage blocks.
+      210        8         *      DESCRIPTION:   Free a TAB$ block if there is one.
+      211        9         *         Free a HEADER$ block if there is one.
+      212       10         *         Free a FORM$ block if there is one.
+      213       11         *         Free the DCB space.
+      214       12         */
+      215       13        /*D*    NAME: FSA$FDCB
+      216       14                CALL:  CALL  FSA$FDCB(DCB$);
+      217       15                INPUT: DCB$ points to the DCB to be freed.
+      218       16                OUTPUT: DCB$ is ADDR(NIL).
+      219       17        */
+      220       18        FSA$FDCB: PROC(DCB$);
+      221       19    1   DCL DCB$ PTR; /* Points to DCB to be freed          */
+      222       20        /**/
+      223       21    1   DCL FSA$FSP ENTRY(2)ALTRET; /* ROSEG space freer                  */
+      224       22        /**/
+      225       23        %INCLUDE F$DCB;
+      226       72        %INCLUDE F_CP6;
+      227     1097        %VLP_TAB(FPTN=VLP$TAB,STCLASS=BASED);
+      228     1111        %VLP_HDR(FPTN=VLP$HDR,STCLASS=BASED,LEN=160);
+      229     1127        %INCLUDE FM$FIT;
+      230     1348        %CODE16;
+      231     1356        /**/
+      232     1357    1           CALL SCRUB;
+      233     1358    1           CALL FSA$FSP(SIZEW(DCB$->F$DCB),DCB$);
+      234     1359    1           RETURN;
+      235     1360        /*F*    NAME: FSA$SCRUB
+      236     1361                PURPOSE: Free the appendages of a DCB.
+      237     1362                DESCRIPTION: Free a TAB$ block if there is one.
+      238     1363                   Free a HEADER$ block if there is one.
+      239     1364                   Free a FORM$ block if there is one.
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:39   
+      240     1365        */
+      241     1366        /*D*    NAME: FSA$SCRUB
+      242     1367                CALL:  CALL  FSA$SCRUB(DCB$);
+      243     1368                INPUT: DCB$ points to the DCB whose appendages are to be
+      244     1369                   freed.
+      245     1370                OUTPUT:  DCB's TAB$, FORM$, and HEADER$ are ADDR(NIL).
+      246     1371        */
+      247     1372    1   FSA$SCRUB: ENTRY(DCB$);
+      248     1373    1           CALL SCRUB;
+      249     1374    1           RETURN;
+      250     1375        /**/
+      251     1376    1   SCRUB:  PROC;
+      252     1377    2           IF DCB$->F$DCB.TAB$~=ADDR(NIL) THEN
+      253     1378    2              CALL FSA$FSP(SIZEW(VLP$TAB),DCB$->F$DCB.TAB$);
+      254     1379    2           IF DCB$->F$DCB.HEADER$~=ADDR(NIL) THEN
+      255     1380    2              CALL FSA$FSP(SIZEW(VLP$HDR),DCB$->F$DCB.HEADER$);
+      256     1381    2           IF DCB$->F$DCB.FORM$~=ADDR(NIL) THEN
+      257     1382    2              CALL FSA$FSP(SIZEW(CODE16),DCB$->F$DCB.FORM$);
+      258     1383    2           RETURN;
+      259     1384    2   END SCRUB;
+      260     1385    1   END;
+
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:40   
+--  Include file information  --
+
+   FM$FIT.:E05TOU  is referenced.
+   F_CP6.:E05TOU  is referenced.
+   F$DCB.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure FSA$FDCB.
+
+   Procedure FSA$FDCB requires 72 words for executable code.
+   Procedure FSA$FDCB requires 10 words of local(AUTO) storage.
+
+    No errors detected in file FSA$ROSPACE.:E05TSI    .
+
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:41   
+
+ Object Unit name= FSA$FDCB                                   File name= FSA$ROSPACE.:E05TOU
+ UTS= JUL 29 '97 17:27:15.92 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none    72    110  FSA$FDCB
+    1  RoData even  none     5      5  FSA$FDCB
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  FSA$FDCB
+     0     31                  yes      Std        1  FSA$SCRUB
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       2 FSA$FSP
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     B_VECTNIL
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:42   
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:43   
+
+
+      203        1        /*T***********************************************************/
+      204        2        /*T*                                                         */
+      205        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      206        4        /*T*                                                         */
+      207        5        /*T***********************************************************/
+      208        6        /*F*    NAME: FSA$FDCB
+      209        7         *      PURPOSE: Free a DCB, including all its appendage blocks.
+      210        8         *      DESCRIPTION:   Free a TAB$ block if there is one.
+      211        9         *         Free a HEADER$ block if there is one.
+      212       10         *         Free a FORM$ block if there is one.
+      213       11         *         Free the DCB space.
+      214       12         */
+      215       13        /*D*    NAME: FSA$FDCB
+      216       14                CALL:  CALL  FSA$FDCB(DCB$);
+      217       15                INPUT: DCB$ points to the DCB to be freed.
+      218       16                OUTPUT: DCB$ is ADDR(NIL).
+      219       17        */
+      220       18        FSA$FDCB: PROC(DCB$);
+
+     18  0 000000   000000 700200 xent  FSA$FDCB     TSX0  ! X66_AUTO_1
+         0 000001   000012 000001                    ZERO    10,1
+
+      221       19    1   DCL DCB$ PTR; /* Points to DCB to be freed          */
+      222       20        /**/
+      223       21    1   DCL FSA$FSP ENTRY(2)ALTRET; /* ROSEG space freer                  */
+      224       22        /**/
+      225       23        %INCLUDE F$DCB;
+      226       72        %INCLUDE F_CP6;
+      227     1097        %VLP_TAB(FPTN=VLP$TAB,STCLASS=BASED);
+      228     1111        %VLP_HDR(FPTN=VLP$HDR,STCLASS=BASED,LEN=160);
+      229     1127        %INCLUDE FM$FIT;
+      230     1348        %CODE16;
+      231     1356        /**/
+      232     1357    1           CALL SCRUB;
+
+   1357  0 000002   000036 701000 0                  TSX1    SCRUB
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:44   
+         0 000003   000000 011000                    NOP     0
+
+      233     1358    1           CALL FSA$FSP(SIZEW(DCB$->F$DCB),DCB$);
+
+   1358  0 000004   200003 470500                    LDP0    @DCB$,,AUTO
+         0 000005   000000 471500                    LDP1    0,,PR0
+         0 000006   100140 236100                    LDQ     96,,PR1
+         0 000007   000033 772000                    QRL     27
+         0 000010   000037 376007                    ANQ     31,DL
+         0 000011   000601 620006                    EAX0    385,QL
+         0 000012   000000 636010                    EAQ     0,X0
+         0 000013   000022 772000                    QRL     18
+         0 000014   000011 402007                    MPY     9,DL
+         0 000015   000043 036007                    ADLQ    35,DL
+         0 000016   000044 506007                    DIV     36,DL
+         0 000017   200006 756100                    STQ     @DCB$+3,,AUTO
+         0 000020   200003 236100                    LDQ     @DCB$,,AUTO
+         0 000021   200011 756100                    STQ     @DCB$+6,,AUTO
+         0 000022   200006 631500                    EPPR1   @DCB$+3,,AUTO
+         0 000023   200010 451500                    STP1    @DCB$+5,,AUTO
+         0 000024   200010 630500                    EPPR0   @DCB$+5,,AUTO
+         0 000025   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000026   000000 701000 xent               TSX1    FSA$FSP
+         0 000027   000000 011000                    NOP     0
+
+      234     1359    1           RETURN;
+
+   1359  0 000030   000000 702200 xent               TSX2  ! X66_ARET
+
+      235     1360        /*F*    NAME: FSA$SCRUB
+      236     1361                PURPOSE: Free the appendages of a DCB.
+      237     1362                DESCRIPTION: Free a TAB$ block if there is one.
+      238     1363                   Free a HEADER$ block if there is one.
+      239     1364                   Free a FORM$ block if there is one.
+      240     1365        */
+      241     1366        /*D*    NAME: FSA$SCRUB
+      242     1367                CALL:  CALL  FSA$SCRUB(DCB$);
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:45   
+      243     1368                INPUT: DCB$ points to the DCB whose appendages are to be
+      244     1369                   freed.
+      245     1370                OUTPUT:  DCB's TAB$, FORM$, and HEADER$ are ADDR(NIL).
+      246     1371        */
+      247     1372    1   FSA$SCRUB: ENTRY(DCB$);
+
+   1372  0 000031   000000 700200 xent  FSA$SCRUB    TSX0  ! X66_AUTO_1
+         0 000032   000012 000001                    ZERO    10,1
+
+      248     1373    1           CALL SCRUB;
+
+   1373  0 000033   000036 701000 0                  TSX1    SCRUB
+         0 000034   000000 011000                    NOP     0
+
+      249     1374    1           RETURN;
+
+   1374  0 000035   000000 702200 xent               TSX2  ! X66_ARET
+
+      250     1375        /**/
+      251     1376    1   SCRUB:  PROC;
+
+   1376  0 000036   200004 741300       SCRUB        STX1  ! @DCB$+1,,AUTO
+
+      252     1377    2           IF DCB$->F$DCB.TAB$~=ADDR(NIL) THEN
+
+   1377  0 000037   200003 470500                    LDP0    @DCB$,,AUTO
+         0 000040   000000 471500                    LDP1    0,,PR0
+         0 000041   100047 236100                    LDQ     39,,PR1
+         0 000042   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         0 000043   000054 600000 0                  TZE     s:1379
+
+      253     1378    2              CALL FSA$FSP(SIZEW(VLP$TAB),DCB$->F$DCB.TAB$);
+
+   1378  0 000044   100047 633500                    EPPR3   39,,PR1
+         0 000045   200007 453500                    STP3    @DCB$+4,,AUTO
+         0 000046   000000 236000 1                  LDQ     0
+         0 000047   200006 756100                    STQ     @DCB$+3,,AUTO
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:46   
+         0 000050   200006 630500                    EPPR0   @DCB$+3,,AUTO
+         0 000051   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000052   000000 701000 xent               TSX1    FSA$FSP
+         0 000053   000000 011000                    NOP     0
+
+      254     1379    2           IF DCB$->F$DCB.HEADER$~=ADDR(NIL) THEN
+
+   1379  0 000054   200003 470500                    LDP0    @DCB$,,AUTO
+         0 000055   000000 471500                    LDP1    0,,PR0
+         0 000056   100046 236100                    LDQ     38,,PR1
+         0 000057   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         0 000060   000071 600000 0                  TZE     s:1381
+
+      255     1380    2              CALL FSA$FSP(SIZEW(VLP$HDR),DCB$->F$DCB.HEADER$);
+
+   1380  0 000061   100046 633500                    EPPR3   38,,PR1
+         0 000062   200007 453500                    STP3    @DCB$+4,,AUTO
+         0 000063   000002 236000 1                  LDQ     2
+         0 000064   200006 756100                    STQ     @DCB$+3,,AUTO
+         0 000065   200006 630500                    EPPR0   @DCB$+3,,AUTO
+         0 000066   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000067   000000 701000 xent               TSX1    FSA$FSP
+         0 000070   000000 011000                    NOP     0
+
+      256     1381    2           IF DCB$->F$DCB.FORM$~=ADDR(NIL) THEN
+
+   1381  0 000071   200003 470500                    LDP0    @DCB$,,AUTO
+         0 000072   000000 471500                    LDP1    0,,PR0
+         0 000073   100050 236100                    LDQ     40,,PR1
+         0 000074   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         0 000075   000106 600000 0                  TZE     s:1383
+
+      257     1382    2              CALL FSA$FSP(SIZEW(CODE16),DCB$->F$DCB.FORM$);
+
+   1382  0 000076   100050 633500                    EPPR3   40,,PR1
+         0 000077   200007 453500                    STP3    @DCB$+4,,AUTO
+         0 000100   000004 236000 1                  LDQ     4
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:47   
+         0 000101   200006 756100                    STQ     @DCB$+3,,AUTO
+         0 000102   200006 630500                    EPPR0   @DCB$+3,,AUTO
+         0 000103   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000104   000000 701000 xent               TSX1    FSA$FSP
+         0 000105   000000 011000                    NOP     0
+
+      258     1383    2           RETURN;
+
+   1383  0 000106   200004 221300                    LDX1  ! @DCB$+1,,AUTO
+         0 000107   000001 702211                    TSX2  ! 1,X1
+
+(unnamed)
+ Sect OctLoc
+   1     000   000012 006000   000000 000052   000001 006000   000000 000047    .......*.......'
+   1     004   000003 006000                                                    ....
+      259     1384    2   END SCRUB;
+      260     1385    1   END;
+
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:48   
+--  Include file information  --
+
+   FM$FIT.:E05TOU  is referenced.
+   F_CP6.:E05TOU  is referenced.
+   F$DCB.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure FSA$FDCB.
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:49   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @DCB$                     *0-0-0/w PTR         r     1 DCB$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(1404)  r     1 CODE16                     0-0-0/d ASTR(3528)  r     1 F$DCB
+     0-0-0/w STRC(1485)  r     1 VLP$HDR                    0-0-0/w STRC(288)   r     1 VLP$TAB
+
+
+   Procedure FSA$FDCB requires 72 words for executable code.
+   Procedure FSA$FDCB requires 10 words of local(AUTO) storage.
+
+    No errors detected in file FSA$ROSPACE.:E05TSI    .
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:50   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:51   
+          MINI XREF LISTING
+
+CODE16
+      1349**DCL      1382--CALL
+DCB$
+        19**DCL        18--PROC     1358>>CALL     1358>>CALL     1358<>CALL     1372--ENTRY    1377>>IF
+      1378>>CALL     1379>>IF       1380>>CALL     1381>>IF       1382>>CALL
+F$DCB
+        24**DCL      1358--CALL
+F$DCB.ACTPOS
+        49**DCL        49--REDEF
+F$DCB.ARS
+        24**DCL        24--REDEF
+F$DCB.ATTR
+        42**DCL        43--REDEF
+F$DCB.BORROW
+        57**DCL        57--REDEF      57--REDEF      57--REDEF
+F$DCB.DCBNAME.L
+        71**DCL        71--IMP-SIZ  1358>>CALL
+F$DCB.EOMCHAR
+        28**DCL        28--REDEF
+F$DCB.FLDID
+        52**DCL        52--REDEF
+F$DCB.FORM$
+        46**DCL        46--REDEF    1381>>IF       1382<>CALL
+F$DCB.FSECT
+        62**DCL        62--REDEF
+F$DCB.FSN
+        39**DCL        39--REDEF      39--REDEF      40--REDEF
+F$DCB.HEADER$
+        45**DCL        45--REDEF    1379>>IF       1380<>CALL
+F$DCB.IXTNSIZE
+        43**DCL        43--REDEF
+F$DCB.LASTSTA$
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:52   
+        33**DCL        33--REDEF
+F$DCB.LVL
+        58**DCL        58--REDEF
+F$DCB.NAME.C
+        33**DCL        33--REDEF
+F$DCB.NOEOF
+        54**DCL        54--REDEF
+F$DCB.NRECS
+        44**DCL        44--REDEF
+F$DCB.NRECX
+        63**DCL        63--REDEF
+F$DCB.OHDR
+        55**DCL        55--REDEF
+F$DCB.ORG
+        38**DCL        38--REDEF
+F$DCB.PRECNO
+        61**DCL        61--REDEF
+F$DCB.RCSZ
+        66**DCL        66--REDEF
+F$DCB.RES
+        34**DCL        34--REDEF
+F$DCB.SETX
+        46**DCL        46--REDEF
+F$DCB.TAB$
+        45**DCL        46--REDEF    1377>>IF       1378<>CALL
+F$DCB.TDA
+        60**DCL        60--REDEF
+F$DCB.WSN
+        35**DCL        35--REDEF
+FSA$FSP
+        21**DCL-ENT  1358--CALL     1378--CALL     1380--CALL     1382--CALL
+SCRUB
+      1376**PROC     1357--CALL     1373--CALL
+VLP$HDR
+      1122**DCL      1380--CALL
+VLP$TAB
+PL6.E3A0      #002=FSA$FDCB File=FSA$ROSPACE.:E05TSI                             TUE 07/29/97 17:27 Page:53   
+      1108**DCL      1378--CALL

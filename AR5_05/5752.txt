@@ -1,0 +1,1017 @@
+/*M*    NSRELAY_SIc1                                                    */
+/*
+        nsrelay.c       (poor man's quick domain name resolver)
+        Usage: NSRELAY [-d] [-t] [-hb | -ha] [-sA.B.C]... ipaddr [ipaddr]...
+        where each ipaddr identifies a remote system running 'named'.
+        -d      Enables display of low-level debugging info.
+        -t      Forces use of TCP streams rather than UDP datagrams.
+        -hb     Consults etc:hosts.:SYS before DNS is queried.
+        -ha     Consults etc:hosts.:SYS after DNS is queried.
+        -s      Supplies domain suffix A.B.C for unqualified byname requests.
+*/
+ 
+#include <ctype.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "xsl_errno:h"
+#include "xsl_in:h"
+#include "xsl_netdb:h"
+#include "xsl_select:h"
+#include "xsl_socket:h"
+#include "NSRELAY_Cc1"
+ 
+extern int      errno;
+ 
+/* interface to nsrelay's PL6 support routines */
+extern void     CGINIT();
+extern void     CGEVNT(void *);
+extern void     CGSEND();
+extern char     RQS[40];
+extern char     RQSSTATION[8];
+extern char     RSP[132];
+extern char     RSPSTATION[8];
+extern void     (*CLSCALLBACK)();
+extern void     (*RQSCALLBACK)();
+ 
+#define GETBYNAME       1
+#define GETBYADDR       2
+#define GETNEXT         3
+#define PHASE_HB        1       /* -hb in effect for this request */
+#define PHASE_DNS       2       /* DNS in effect for this request */
+#define PHASE_HA        3       /* -ha in effect for this request */
+#define PHASE_INVALID   4       /* reserved */
+#define RETRY_COUNT     3       /* number of times each 'named' is queried */
+#define RETRY_INTERVAL  10      /* number of seconds between each retry */
+#define UTS_PER_SECOND  25      /* number of CP-6 UTS units per second */
+#define SELECT_ERRMAX   3       /* number of errored select()s to tolerate */
+#define MAX_TCP_SIZE    514     /* max number of bytes allowed for msg */
+#define MAX_UDP_SIZE    512     /* max number of bytes allowed for dgram */
+#define MAX_SERVERS     8       /* max number of servers to contact */
+#define MAX_SUFFIXES    8       /* max number of -s suffixes allowed */
+#define NUL             0000
+ 
+/* miscellaneous variables */
+int             debugging = 0;  /* MUST BE ZERO.  Enable with -d at runtime */
+int             maxsock = 0;
+int             numsockets = 0;
+struct in_addr  peeraddr[MAX_SERVERS];
+fd_set          readmask;
+int             sockets[MAX_SERVERS];
+char            *suffixes[MAX_SUFFIXES];
+int             useHostsAfter = 0;  /* MBZ.  Enable with -ha at runtime */
+int             useHostsBefore = 0;  /* MBZ.  Enable with -hb at runtime */
+int             useSuffixes = 0;  /* MBZ.  Enable with -s at runtime */
+int             useTCP = 0;  /* MUST BE ZERO.  Enable with -t at runtime */
+char            sndbuf[MAX_TCP_SIZE];
+char            rcvbuf[MAX_TCP_SIZE];
+int             sndlen, rcvlen;
+int             optcount;
+ 
+struct rqsblock {
+    /* station MUST be the first item, for RQSCallback() errors to work */
+    char                station[8];     /* CG STATION to send RSP to */
+    struct {
+        int             type: 18;       /* GETBYNAME, GETBYADDR, or GETNEXT */
+        int             len: 18;
+        char            *reloc$;        /* app's result buffer */
+        char            data[32];       /* hostname or dotted address */
+        } rqs;
+    unsigned long       uts;            /* timeout UTS value for next try */
+    int                 id;             /* most recent query sequence # */
+    int                 rqsphase;       /* PHASE_HB, PHASE_DNS, or PHASE_HA */
+    char                *splice;        /* addr where suffixes are spliced */
+    int                 suffseq;        /* most recent suffix tried */
+    int                 sockseq;        /* most recent server tried */
+    int                 socktry;        /* most recent try for this server */
+    char                qtype;          /* most recent query type */
+    char                rspsent;        /* set if response sent to client */
+    char                forgotten;      /* set if client has given up */
+    struct rqsblock     *next;          /* forward link */
+    struct rqsblock     *prev;          /* backward link */
+    };
+struct rqsblock *rqsListHd = NULL, *rqsListTl = NULL;
+ 
+void
+Usage()
+{
+    fprintf (stderr, "Usage: NSRELAY [-d] [-t] [-hb | -ha] [-sA.B.C]... ipaddr [ipaddr]...\n");
+    fprintf (stderr, "where each ipaddr identifies a system to query.\n");
+    fprintf (stderr, "-d   Enables display of low-level debugging info.\n");
+    fprintf (stderr, "-t   Forces use of TCP rather than UDP.\n");
+    fprintf (stderr, "-hb  Consults etc:hosts.:SYS before DNS is queried.\n");
+    fprintf (stderr, "-ha  Consults etc:hosts.:SYS after DNS is queried.\n");
+    fprintf (stderr, "-s   Supplies domain suffix A.B.C for unqualified byname requests.\n");
+    exit (1);
+}
+ 
+void
+Bailout(char *str)
+{       /* prints message indicating fatal error and exits */
+    perror (str);
+    fprintf (stderr, "NSRELAY exiting due to unexpected error.\n");
+    exit (2);
+}
+ 
+void
+DumpBytes(char *ptr, int len)
+{
+    register char       c;
+    register int        i;
+    static char         chars[16];
+ 
+    memset (chars, ' ', 16);
+    for (i = 0; i < len; i++) {
+        if (! (i % 16))
+            printf ("%04X: ", i);
+        c = *ptr++;
+        printf ("%02X ", c);
+        chars[i % 16] = (isprint (c)) ? c : '.';
+        if (! ((i + 1) % 16)) {
+            printf ("%.16s\n", chars);
+            memset (chars, ' ', 16);
+            }
+        }
+    if (i % 16) {
+        i = 16 - (i % 16);
+        while (i--)
+            printf ("   ");
+        printf ("%.16s\n", chars);
+        }
+    return;
+}
+ 
+struct rqsblock *
+GetRqsBlock()
+{       /* obtains space for a new request block and initializes it */
+    struct rqsblock     *rqsblk;
+ 
+    rqsblk = (struct rqsblock *) calloc (1, sizeof (struct rqsblock));
+    if (rqsblk) {
+        rqsblk->next = NULL;
+        rqsblk->prev = rqsListTl;
+        if (rqsListTl)
+            rqsListTl->next = rqsblk;
+        rqsListTl = rqsblk;
+        if (!rqsListHd)
+            rqsListHd = rqsblk;
+        }
+    return (rqsblk);
+}
+ 
+void
+FreeRqsBlock(struct rqsblock *rqsblk)
+{       /* frees a request block when no longer needed */
+    if (rqsblk == rqsListHd)
+        rqsListHd = rqsblk->next;
+    if (rqsblk == rqsListTl)
+        rqsListTl = rqsblk->prev;
+    if (rqsblk->prev)
+        rqsblk->prev->next = rqsblk->next;
+    if (rqsblk->next)
+        rqsblk->next->prev = rqsblk->prev;
+    free (rqsblk);
+    return;
+}
+ 
+void
+SendErrRSP(struct rqsblock *rqsblk, int status)
+{       /* if status nonzero, sends error RSP back to application */
+    long                *rsp = (long *) &RSP;
+ 
+    if (status) {
+        *rsp++ = -1;
+        *rsp++ = (status >> 3) & 037777;
+        memcpy (RSPSTATION, rqsblk->station, 8);
+        ++rqsblk->rspsent;
+        CGSEND ();
+        if (debugging)
+            printf ("'%.8s' told: %s\n", rqsblk->station, strerror (status));
+        }
+    return;
+}
+ 
+void
+RQSCallback()
+{       /* called from PL6 support routines on client RQS reception */
+    struct rqsblock     *rqsblk;
+ 
+    rqsblk = GetRqsBlock ();
+    if (rqsblk) {
+        memcpy (rqsblk->station, RQSSTATION, 8);
+        memcpy (&rqsblk->rqs, RQS, 40);
+        if (debugging) {
+            printf ("'%.8s' asks: ", rqsblk->station);
+            switch (rqsblk->rqs.type) {
+                case GETBYNAME:
+                    printf ("gethostbyname(%s)\n", rqsblk->rqs.data);
+                    break;
+                case GETBYADDR:
+                    printf ("gethostbyaddr(%s)\n",
+                            inet_ntoa (*(struct in_addr *) rqsblk->rqs.data));
+                    break;
+                default:
+                    printf ("(something unintelligible)\n");
+                    break;
+                }
+            }
+        rqsblk->splice = NULL;
+        if (rqsblk->rqs.type == GETBYNAME && useSuffixes)
+            if (!strchr (rqsblk->rqs.data, '.'))
+                rqsblk->splice = strchr (rqsblk->rqs.data, ' ');
+        rqsblk->rqsphase = useHostsBefore ? PHASE_HB : PHASE_DNS;
+        }
+    else
+        SendErrRSP ((struct rqsblock *) &RQSSTATION, ENOBUFFS);
+    return;
+}
+ 
+void
+CLSCallback()
+{       /* called from PL6 support routines on client DCB station close */
+    struct rqsblock     *rqsblk;
+ 
+    rqsblk = rqsListHd;
+    while (rqsblk) {
+        if (!memcmp (rqsblk->station, RQSSTATION, 8)) {
+            if (debugging && !rqsblk->rspsent)
+                printf ("'%.8s' says: never mind\n", rqsblk->station);
+            ++rqsblk->forgotten;
+            return;
+            }
+        rqsblk = rqsblk->next;
+        }
+    return;
+}
+ 
+void
+InitComgroup()
+{       /* performs initialization of nsrelay's comgroup interface */
+    CLSCALLBACK = CLSCallback;
+    RQSCALLBACK = RQSCallback;
+    CGINIT ();
+    return;
+}
+ 
+void
+InitSockets(int argc, char **argv)
+{       /* performs initialization of the Socket Library and sockets */
+    int                 i, status, sock;
+    struct servent      *sp;
+    sockaddr_in         rmtsa;
+    struct xsl_sockinit sockinit;
+    union {
+        struct in_addr  sin_addr;
+        unsigned long   ulong;
+        } scratch;
+ 
+    sockinit.maxsock = argc - optcount - 1;
+    sockinit.nwsocks = -1;
+    sockinit.bufsize = useTCP ? MAX_TCP_SIZE : MAX_UDP_SIZE;
+    sockinit.mem$ = NULL;
+    sockinit.evnt$ = CGEVNT;
+    sockinit.maxrds = 2;
+    sockinit.maxbuf = 0;
+    XSL$SOCKINIT (&sockinit);
+    sp = getservbyname ("domain", NULL);
+    if (!sp)
+        Bailout ("getservbyname");
+    rmtsa.sin_family = AF_INET;
+    rmtsa.sin_port = sp->s_port;
+    for (i = 1; i < argc; i++) {
+        if ('-' == argv[i][0])
+            continue;  /* skip options */
+        scratch.ulong = inet_addr (argv[i]);
+        if (-1 == (long) scratch.ulong) {
+            fprintf (stderr, "ipaddr '%s' not understood\n", argv[i]);
+            continue;
+            }
+        peeraddr[numsockets] = rmtsa.sin_addr = scratch.sin_addr;
+        status = socket (AF_INET, useTCP ? SOCK_STREAM : SOCK_DGRAM, 0);
+        if (status < 0)
+            Bailout ("socket");
+        sock = status;
+        status = connect (sock, (struct sockaddr *) &rmtsa, sizeof (rmtsa));
+        if (status < 0) {
+            fprintf (stderr, "ipaddr '%s' connect: %s\n",
+                         argv[i], strerror (errno));
+            continue;  /* try other ip addrs if given */
+            }
+        status = fcntl (sock, F_SETFL, O_NDELAY);
+        if (status < 0)
+            Bailout ("fcntl");
+        sockets[numsockets++] = sock;
+        if (sock > maxsock)
+            maxsock = sock;
+        FD_SET (sock, &readmask);
+        }
+    if (numsockets == 0) {
+        fprintf (stderr, "No query paths established.\n");
+        Usage ();  /* doesn't return */
+        }
+    return;
+}
+ 
+int
+NewGlobalId()
+{
+    static long         globalid = 0;
+ 
+    if (++globalid > 65535)
+        globalid = 1;
+    return (globalid);
+}
+ 
+struct header *
+NewHeader()
+{
+    struct header       *result;
+ 
+    result = (struct header *) calloc (1, sizeof (struct header));
+    result->qdptr = NULL;
+    result->anptr = result->nsptr = result->arptr = NULL;
+    return (result);
+}
+ 
+struct resource *
+NewResources(int count)
+{       /* creates a chain of resources of length 'count' */
+    struct resource     *result = NULL, *ptr;
+ 
+    while (count--) {
+        ptr = (struct resource *) calloc (1, sizeof (struct resource));
+        ptr->name = ptr->rdata = NULL;
+        ptr->next = result;
+        result = ptr;
+        }
+    return (result);
+}
+ 
+struct question *
+NewQuestions(int count)
+{       /* creates a chain of questions of length 'count' */
+    struct question     *result = NULL, *ptr;
+ 
+    while (count--) {
+        ptr = (struct question *) calloc (1, sizeof (struct question));
+        ptr->qname = NULL;
+        ptr->next = result;
+        result = ptr;
+        }
+    return (result);
+}
+ 
+void
+FreeQuestionChain(struct question *ptr)
+{
+    struct question     *next;
+ 
+    while (ptr) {
+        next = ptr->next;
+        if (ptr->qname)
+            free (ptr->qname);
+        free (ptr);
+        ptr = next;
+        }
+    return;
+}
+ 
+void
+FreeResourceChain(struct resource *ptr)
+{
+    struct resource     *next;
+ 
+    while (ptr) {
+        next = ptr->next;
+        if (ptr->name)
+            free (ptr->name);
+        if (ptr->rdata && ptr->type == QT_PTR)
+            free (ptr->rdata);
+        free (ptr);
+        ptr = next;
+        }
+    return;
+}
+ 
+void
+FreeHeader(struct header *hdr)
+{
+    FreeQuestionChain (hdr->qdptr);
+    FreeResourceChain (hdr->anptr);
+    FreeResourceChain (hdr->nsptr);
+    FreeResourceChain (hdr->arptr);
+    free (hdr);
+    return;
+}
+ 
+void
+TransformQuery(struct rqsblock *rqsblk, struct header *hdr)
+{       /* got answer(s) to PTR query; build an A query for real answer */
+    int                 len = 0;
+    struct resource     *answer = NULL, *ptr;
+ 
+    /* find answer with longest rdata; assume that's the best answer */
+    ptr = hdr->anptr;
+    while (ptr) {
+        if (strlen (ptr->rdata) > len) {
+            len = strlen (ptr->rdata);
+            answer = ptr;
+            }
+        ptr = ptr->next;
+        }
+    if (!answer) {
+        SendErrRSP (rqsblk, EFAULT);  /* no usable answer found */
+        FreeRqsBlock (rqsblk);
+        return;
+        }
+    ++len;
+    memcpy (rqsblk->rqs.data, answer->rdata, len);
+    rqsblk->rqs.type = GETBYNAME;
+    rqsblk->uts = rqsblk->socktry = rqsblk->sockseq = 0;
+    rqsblk->rqsphase = PHASE_DNS;
+    return;
+}
+
+struct header *
+Hostent2Header(struct hostent *hp)
+{
+    static struct header *hdr = NULL;
+    struct resource     *answer;
+    int                 len;
+
+    if (hdr)
+        FreeHeader (hdr);
+    hdr = NewHeader ();
+    answer = hdr->anptr = NewResources (hdr->ancount = 1);
+    answer->type = QT_A;
+    answer->class = QC_IN;
+    len = 1 + strlen (hp->h_name);
+    answer->name = (char *) malloc (len);
+    memcpy (answer->name, hp->h_name, len);
+    answer->rdlength = hp->h_length;
+    answer->rdata = hp->h_addr_list[0];
+    return (hdr);
+}
+ 
+void
+SendRSP(struct rqsblock *rqsblk, struct header *hdr)
+{       /* construct a positive response and send it back to client */
+    /*N* In the interest of getting this going, we do the bare minimum...
+        E.g., use only first A-type answer, don't return aliases, and
+        return only the first network address of a multihomed host. */
+    int                 aliascnt = 0, addrcnt = 1;  /*N* for now */
+    int                 i, len;
+    char                *txt;
+    long                *rspwords = (long *) &RSP;
+    char                **rsppntrs = (char **) &RSP;
+    struct resource     *answer;
+    char                *ipaddr;
+ 
+    /* correct for trailing NULL ptrs if necessary */
+    if (aliascnt)  ++aliascnt;
+    if (addrcnt)  ++addrcnt;
+    /* find the first answer that we can use */
+    answer = hdr->anptr;
+    while (answer && (answer->type != QT_A || answer->class != QC_IN))
+        answer = answer->next;
+    if (!answer) {
+        SendErrRSP (rqsblk, EFAULT);  /* in lieu of something useful... */
+        return;
+        }
+    /* save char version of ipaddr for later */
+    if (debugging) {
+        ipaddr = answer->rdata;
+        ipaddr = inet_ntoa (*(struct in_addr *) ipaddr);
+        }
+    /* build h_name */
+    rsppntrs[0] = txt = (char *) &rspwords[5 + aliascnt + addrcnt];
+    len = 1 + strlen (answer->name);
+    memcpy (txt, answer->name, len);
+    txt += 4 * ((len + 3) / 4);
+    rsppntrs[1] = NULL;  /* build h_aliases, but not for now */
+    rspwords[2] = AF_INET;  /* build h_addrtype */
+    rspwords[3] = 4;  /* build h_length, viz., answer->rdlength */
+    /* build h_addr_list */
+    rsppntrs[4] = (char *) &rspwords[5 + aliascnt];
+    rsppntrs[5 + aliascnt] = txt;
+    memcpy (txt, answer->rdata, 4);
+    txt += 4;
+    rsppntrs[5 + aliascnt + 1] = NULL;
+    txt += 4;
+    /* now relocate per client's buffer address... sigh... */
+    for (i = 0; i < (4 + aliascnt + addrcnt); i++)
+        if (i != 2 && i != 3 && rsppntrs[i] != NULL)
+            rsppntrs[i] = rqsblk->rqs.reloc$ + (rsppntrs[i] - (char *) &RSP);
+    /* and send it to client */
+    memcpy (RSPSTATION, rqsblk->station, 8);
+    ++rqsblk->rspsent;
+    CGSEND ();
+    if (debugging)
+        printf ("'%.8s' told: %s, %s\n", rqsblk->station,
+                answer->name, ipaddr);
+    return;
+}
+ 
+void
+Header2RqsBlock(struct header *hdr)
+{       /* finds rqsblock this header holds an answer to */
+    struct rqsblock     *rqsblk;
+    int                 status;
+ 
+    rqsblk = rqsListHd;
+    while (rqsblk) {
+        if (rqsblk->id == hdr->id && hdr->qr == QR_RESPONSE) {
+            /* here's an answer to a pending client rqs */
+            switch (hdr->rcode) {
+                case RC_SUCCESS:
+                    if (rqsblk->rqs.type == GETBYADDR) {
+                        /* gethostbyaddr() needs another step */
+                        TransformQuery (rqsblk, hdr);
+                        return;
+                        }
+                    status = ESUCCESS;
+                    break;
+                case RC_NAME:
+                    status = (hdr->aa == AA_AUTHORITY) ? ENOENT : EOPNOTSUPP;
+                    break;
+                case RC_FORMAT:  status = EINVAL;      break;
+                case RC_SERVER:  status = EIO;         break;
+                case RC_UNIMPL:  status = EOPNOTSUPP;  break;
+                case RC_REFUSED: status = EACCES;      break;
+                }
+            if (status) {
+                rqsblk->uts = rqsblk->socktry = 0;
+                if (rqsblk->splice) {
+                    if (++rqsblk->suffseq < useSuffixes)
+                        return;  /* try next suffix */
+                    rqsblk->suffseq = 0;
+                    }
+                if (++rqsblk->sockseq < numsockets)
+                    return;  /* try next server */
+                if (useHostsAfter) {
+                    rqsblk->rqsphase = PHASE_HA;
+                    if (rqsblk->splice)
+                        *rqsblk->splice = NUL;  /* neglect splicing */
+                    return;  /* DNS was no help; try etc:hosts */
+                    }
+                SendErrRSP (rqsblk, status);
+                }
+            else
+                SendRSP (rqsblk, hdr);
+            FreeRqsBlock (rqsblk);
+            return;
+            }
+        rqsblk = rqsblk->next;
+        }
+    /* this answer doesn't match any outstanding request.  discard it. */
+    return;
+}
+ 
+char *
+label2name (char **ptr)
+{       /* scans a domain name, incrementing ptr by the name's length */
+    char                *result, *dst, *src = *ptr;
+    int                 len, count = 0, pointered = 0;
+ 
+    result = dst = (char *) malloc (256);  /* assume max len, realloc later */
+    while (*src) {
+        len = *src++;
+        if (len > 63) {  /* follow ptr */
+            src = &rcvbuf[((len & 0x3F) * 256) + *src++];
+            if (useTCP)
+                src += 2;
+            if (!pointered)
+                count += 2;
+            ++pointered;
+            continue;
+            }
+        memcpy (dst, src, len);
+        dst += len,  src += len;
+        *dst++ = (*src) ? '.' : NUL;
+        if (!pointered)
+            count += len + 1;
+        }
+    if (!pointered)
+        ++count;
+    *ptr += count;  /* incr global scan ptr by non-compressed part of name */
+    result = realloc (result, dst - result);  /* free up some space */
+    return (result);
+}
+ 
+char *
+TimeStamp()
+{
+    time_t              curtime;
+    struct tm           *tmptr;
+    static char         scratch[9];
+ 
+    curtime = time (NULL);
+    tmptr = localtime (&curtime);
+    sprintf (scratch, "%02d:%02d:%02d",
+            tmptr->tm_hour, tmptr->tm_min, tmptr->tm_sec);
+    return (scratch);
+}
+ 
+int
+DecodeQuestions(struct question *qptr, char *ptr)
+{       /* decodes list of questions; returns number of bytes scanned */
+    char                *startptr = ptr;
+ 
+    while (qptr) {
+        qptr->qname = label2name (&ptr);
+        *ptr++;  qptr->qtype = *ptr++;  /* qtype < 256 */
+        *ptr++;  qptr->qclass = *ptr++;  /* qclass < 256 */
+        qptr = qptr->next;
+        }
+    return (ptr - startptr);
+}
+ 
+int
+DecodeResources(struct resource *rptr, char *ptr)
+{       /* decodes list of resources; returns number of bytes scanned */
+    char                *tmp, *startptr = ptr;
+ 
+    while (rptr) {
+        rptr->name = label2name (&ptr);
+        *ptr++;  rptr->type = *ptr++;  /* type < 256 */
+        *ptr++;  rptr->class = *ptr++;  /* class < 256 */
+        rptr->ttl = *ptr++ * 256 * 256 * 256;
+        rptr->ttl += *ptr++ * 256 * 256;
+        rptr->ttl += *ptr++ * 256;
+        rptr->ttl += *ptr++;
+        rptr->rdlength = *ptr++ * 256;  rptr->rdlength += *ptr++;
+        if (rptr->type == QT_PTR) {
+            tmp = ptr;
+            rptr->rdata = label2name (&tmp);
+            }
+        else
+            rptr->rdata = ptr;
+        ptr += rptr->rdlength;
+        rptr = rptr->next;
+        }
+    return (ptr - startptr);
+}
+ 
+int
+DecodeAnswer(int sock)
+{       /* reads and decodes an NS answer on given socket */
+    char                c, *ptr = rcvbuf;
+    struct header       *hdr;
+    struct sockaddr_in  rmtsa;
+    int                 status, sleepcount, buflen, rmtsalen = sizeof (rmtsa);
+ 
+    buflen = useTCP ? MAX_TCP_SIZE : MAX_UDP_SIZE;
+    rcvlen = sleepcount = 0;
+reread:
+    status = recvfrom (sock, &rcvbuf[rcvlen], buflen - rcvlen,
+            0, (struct sockaddr *) &rmtsa, &rmtsalen);
+    if (status < 0)
+        Bailout ("recvfrom");  /* what the ....? */
+    rcvlen += status;
+    if (debugging && status) {
+        printf ("%s, rcvd from %s...\n", TimeStamp (), inet_ntoa (rmtsa.sin_addr));
+        DumpBytes (rcvbuf, rcvlen);
+        }
+    if (useTCP) {
+        if (rcvbuf[0] * 256 + rcvbuf[1] + 2 > rcvlen) {
+            /* haven't got the complete message yet */
+            if (++sleepcount >= 5)
+                return (0);  /* ...and we've waited long enough.  Bail. */
+            if (debugging)
+                printf ("Incomplete answer.  Waiting for more data...\n");
+            sleep (1);  /* wait for more bytes to arrive */
+            goto reread;
+            }
+        ptr += 2;  /* skip past TCP msg length */
+        }
+    hdr = NewHeader ();
+    hdr->id = *ptr++ * 256;  hdr->id += *ptr++;  /* top and bottom of id */
+    c = *ptr++;  /* top of flags */
+    if (c & 0x01)  hdr->rd = 1;
+    if (c & 0x02)  hdr->tc = 1;
+    if (c & 0x04)  hdr->aa = 1;
+    hdr->opcode = (c & 0x78) >> 3;
+    if (c & 0x80)  hdr->qr = 1;
+    c = *ptr++;  /* bottom of flags */
+    hdr->rcode = (c & 0x0F);
+    if (c & 0x80)  hdr->ra = 1;
+    hdr->qdcount = *ptr++ * 256;  hdr->qdcount += *ptr++;  /* top & bottom */
+    hdr->ancount = *ptr++ * 256;  hdr->ancount += *ptr++;  /*    ditto     */
+    hdr->nscount = *ptr++ * 256;  hdr->nscount += *ptr++;  /*    ditto     */
+    hdr->arcount = *ptr++ * 256;  hdr->arcount += *ptr++;  /*    ditto     */
+    hdr->qdptr = NewQuestions (hdr->qdcount);
+    hdr->anptr = NewResources (hdr->ancount);
+    hdr->nsptr = NewResources (hdr->nscount);
+    hdr->arptr = NewResources (hdr->arcount);
+    ptr += DecodeQuestions (hdr->qdptr, ptr);
+    ptr += DecodeResources (hdr->anptr, ptr);
+    ptr += DecodeResources (hdr->nsptr, ptr);
+    ptr += DecodeResources (hdr->arptr, ptr);
+    Header2RqsBlock (hdr);
+    FreeHeader (hdr);
+    return (0);
+}
+ 
+int
+EncodeHeader(struct header *hdr)
+{       /* encodes a single NS query into sndbuf, returning its length */
+    char                *ptr = sndbuf;
+    int                 len;
+ 
+    if (useTCP)
+        *ptr++ = *ptr++ = 0;  /* TCP msg length filled in later */
+    *ptr++ = hdr->id >> 8;  /* top half of id */
+    *ptr++ = hdr->id & 0xFF;  /* bottom half of id */
+    *ptr++ = (hdr->qr << 7) | (hdr->opcode << 3) | hdr->rd;
+    *ptr++ = hdr->rcode;
+    *ptr++ = 0;  *ptr++ = 1;  /* qdcount assumed 1 */
+    *ptr++ = 0;  *ptr++ = 0;  /* ancount assumed 0 */
+    *ptr++ = 0;  *ptr++ = 0;  /* nscount assumed 0 */
+    *ptr++ = 0;  *ptr++ = 0;  /* arcount assumed 0 */
+    len = strlen (hdr->qdptr->qname);
+    memcpy (ptr, hdr->qdptr->qname, len);
+    ptr += len;
+    *ptr++ = NUL;
+    *ptr++ = 0;  *ptr++ = hdr->qdptr->qtype;  /* qtype < 256 */
+    *ptr++ = 0;  *ptr++ = hdr->qdptr->qclass;  /* qclass < 256 */
+    FreeHeader (hdr);
+    len = ptr - sndbuf - 2;
+    if (useTCP) {  /* now that we know the TCP msg length, fill it in */
+        sndbuf[0] = len >> 8;
+        sndbuf[1] = len & 0xFF;
+        }
+    return (len + 2);
+}
+ 
+char *
+name2label(char *src)
+{
+    register int        i = 0, len;
+    static char         dst[100];
+ 
+    while (src[i] != ' ' && src[i] != NUL)
+        ++i;
+    memcpy (&dst[1], src, i);
+    dst[i+1] = NUL;
+    len = 0;
+    while (i > 0) {
+        if (dst[i] == '.') {
+            dst[i] = len;
+            len = 0;
+            }
+        else
+            ++len;
+        --i;
+        }
+    dst[0] = len;
+    return (dst);
+}
+ 
+char *
+addr2label(char *str)
+{
+    char                scratch[32];
+ 
+    sprintf (scratch, "%d.%d.%d.%d.IN-ADDR.ARPA.\000",
+            str[3], str[2], str[1], str[0]);
+    return (name2label (scratch));
+}
+
+int
+EncodeQuery(struct rqsblock *rqsblk)
+{       /* calls encoder to build NS query and returns its length */
+    struct header       *hdr;
+ 
+    hdr = NewHeader ();
+    /* only nonzero fields need be set.. */
+    hdr->id = rqsblk->id;
+    hdr->rd = RD_DORECURSE;
+    hdr->qdptr = NewQuestions (hdr->qdcount = 1);
+    switch (rqsblk->rqs.type) {
+        case GETBYNAME: /* gethostbyname */
+            hdr->qdptr->qname = name2label (rqsblk->rqs.data);
+            hdr->qdptr->qtype = QT_A;
+            break;
+        case GETBYADDR: /* gethostbyaddr */
+            hdr->qdptr->qname = addr2label (rqsblk->rqs.data);
+            hdr->qdptr->qtype = QT_PTR;
+            break;
+        }
+    hdr->qdptr->qclass = QC_IN;
+    return (EncodeHeader (hdr));
+}
+ 
+int
+SendQuery(struct rqsblock *rqsblk)
+{       /* sets up and writes an NS query to a particular 'named' */
+    struct sockaddr     rmtsa;
+    int                 status, buflen, rmtsalen = sizeof (rmtsa);
+    char                *dst = rqsblk->splice;
+ 
+    if (rqsblk->sockseq >= numsockets)
+        return (EIO);
+    if (rqsblk->splice) {
+        if (suffixes[rqsblk->suffseq][0] != '.')
+            *dst++ = '.';
+        strcpy (dst, suffixes[rqsblk->suffseq]);
+        }
+    rqsblk->id = NewGlobalId ();
+    getpeername (sockets[rqsblk->sockseq], &rmtsa, &rmtsalen);
+    buflen = EncodeQuery (rqsblk);
+    sndlen = 0;
+resend:
+    status = sendto (sockets[rqsblk->sockseq], &sndbuf[sndlen], buflen,
+            0, &rmtsa, rmtsalen);
+    if (status < 0)
+        if (errno == EWOULDBLOCK) {
+            sleep (1);
+            goto resend;
+            }
+        else
+            return (errno);
+    sndlen += status;
+    buflen -= status;
+    if (buflen > 0)
+        goto resend;
+    if (debugging) {
+        printf ("%s, sent to %s...\n", TimeStamp (),
+                inet_ntoa (peeraddr[rqsblk->sockseq]));
+        DumpBytes (sndbuf, sndlen);
+        }
+    if (++rqsblk->socktry < RETRY_COUNT)
+        return (ESUCCESS);  /* try this server again next time */
+    rqsblk->socktry = 0;
+    if (rqsblk->splice) {
+        if (++rqsblk->suffseq < useSuffixes)
+            return (ESUCCESS);  /* try next suffix next time */
+        rqsblk->suffseq = 0;
+        }
+    if (++rqsblk->sockseq < numsockets)
+        return (ESUCCESS);  /* try next server next time */
+    if (useHostsAfter) {
+        rqsblk->rqsphase = PHASE_HA;  /* try etc:hosts next time */
+        if (rqsblk->splice)
+            *rqsblk->splice = NUL;  /* neglect splicing */
+        }
+    return (ESUCCESS);  /* else return EIO next time (sockseq too big) */
+}
+ 
+unsigned long
+SendQueries()
+{       /* sends all pending NS queries to appropriate places */
+    struct rqsblock     *rqsblk, *nxtblk;
+    unsigned long       lowuts, curuts;
+    int                 status;
+    struct hostent      *hp;
+    const int           af = AF_INET;
+ 
+    curuts = utstime (NULL);
+    lowuts = 0777777777777;
+    rqsblk = rqsListHd;
+    while (rqsblk) {
+        status = ESUCCESS;
+        hp = NULL;
+        if (rqsblk->uts < curuts) {
+            if (rqsblk->uts == 0)
+                rqsblk->uts = curuts;
+            switch (rqsblk->rqs.type) {
+                case GETBYNAME: /* client gethostbyname() */
+                case GETBYADDR: /* client gethostbyaddr() */
+                    if (rqsblk->rqsphase != PHASE_DNS) {
+                        if (rqsblk->rqs.type == GETBYNAME)
+                            XSL$$GETHOSTBYNAME (&hp, rqsblk->rqs.data);
+                        else
+                            XSL$$GETHOSTBYADDR (&hp, rqsblk->rqs.data, &status, &af);
+                        status = hp ? ESUCCESS : ENOENT;
+                        ++rqsblk->rqsphase;
+                        }
+                    if (rqsblk->rqsphase == PHASE_DNS && !hp)
+                        status = SendQuery (rqsblk);
+                    break;
+                case GETNEXT:   /* client gethostent() */
+                    status = EOPNOTSUPP;
+                    break;
+                default:        /* anything else */
+                    status = EINVAL;
+                    break;
+                }
+            rqsblk->uts += RETRY_INTERVAL * UTS_PER_SECOND;
+            }
+        if (status || hp || rqsblk->forgotten) {
+            if (hp)
+                SendRSP (rqsblk, Hostent2Header (hp));
+            else if (status)
+                SendErrRSP (rqsblk, status);
+            nxtblk = rqsblk->next;
+            FreeRqsBlock (rqsblk);
+            rqsblk = nxtblk;
+            }
+        else {
+            if (rqsblk->uts < lowuts)
+                lowuts = rqsblk->uts;
+            rqsblk = rqsblk->next;
+            }
+        }
+    return (lowuts);
+}
+ 
+void
+RecvAnswers(unsigned long uts)
+{       /* waits until uts time (or new rqs) for NS answers and handles 'em */
+    unsigned long       curuts;
+    int                 status, i, scratch, errcount = 0;
+    struct timeval      timeout;
+    fd_set              rdmask;
+
+    if (!uts)
+        return;
+    timeout.tv_usec = 0;
+reselect:
+    curuts = utstime (NULL);
+    if (uts <= curuts)
+        return;
+    timeout.tv_sec = ((UTS_PER_SECOND - 1) + uts - curuts) / UTS_PER_SECOND;
+    rdmask = readmask;
+    if (debugging)
+        printf ("select()ing for %d seconds, rdmask: %012o\n",
+                timeout.tv_sec, rdmask);
+    status = select (maxsock+1, &rdmask, NULL, NULL, &timeout);
+    if (debugging)
+        printf ("select() returns %d, rdmask: %012o\n", status, rdmask);
+    if (status < 0) {
+        if (++errcount >= SELECT_ERRMAX)
+            Bailout ("select");
+        goto reselect;
+        }
+    if (status) {
+        for (i = 0; i < numsockets; i++)
+            if (FD_ISSET (sockets[i], &rdmask)) {
+                /* data available or EOF.. determine which */
+                status = recv (sockets[i], (char *) &scratch, 1, MSG_PEEK);
+                if (status < 0)
+                    Bailout ("recv");
+                if (status)
+                    DecodeAnswer (sockets[i]);
+                else
+                    if (debugging)
+                        printf ("ipaddr '%s' EOF from network\n",
+                                inet_ntoa (peeraddr[i]));
+                }
+        }
+    return;
+}
+ 
+void
+main(int argc, char **argv)
+{
+    int                 i;
+    char                c;
+ 
+    for (i = 1; i < argc; i++)
+        if ('-' == argv[i][0])
+            switch (argv[i][1]) {
+                case 'd':       case 'D':
+                    ++debugging;
+                    ++optcount;
+                    continue;
+                case 't':       case 'T':
+                    ++useTCP;
+                    ++optcount;
+                    continue;
+                case 's':       case 'S':
+                    suffixes[useSuffixes] = &argv[i][2];
+                    if (!isprint (argv[i][2])) {
+                        fprintf (stderr, "empty suffix specified\n");
+                        fprintf (stderr, "(no blanks between -s and suffix, please)\n\n");
+                        Usage ();  /* doesn't return */
+                        }
+                    ++useSuffixes;
+                    ++optcount;
+                    continue;
+                case 'h':       case 'H':
+                    c = argv[i][2];
+                    if (c == 'a' || c == 'A') {
+                        ++useHostsAfter;
+                        ++optcount;
+                        continue;
+                        }
+                    else if (c == 'b' || c == 'B') {
+                        ++useHostsBefore;
+                        ++optcount;
+                        continue;
+                        }
+                    /* else fall thru */
+                default:
+                    optcount = argc;  /* force later Usage() and bail */
+                    fprintf (stderr, "option '%s' not understood\n", argv[i]);
+                    continue;
+                }
+    if ((argc - optcount) < 2)
+        Usage ();  /* doesn't return */
+    InitSockets (argc, argv);
+    InitComgroup ();
+    while (1)
+        RecvAnswers (SendQueries ());
+}

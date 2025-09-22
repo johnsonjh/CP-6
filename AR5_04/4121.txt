@@ -1,0 +1,799 @@
+/*M* ALPINE - forms an index of subroutines, procs, etc. from input */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*T*/
+/*X* DMR,PLM=5,IND=5,CTI=5,SDI=5,MCL=10,CSI=0,ECI=0 */
+ 
+/* Author: Steve Bygren, LADC
+   Date: 7/85                     */
+ 
+ALPINE: PROC MAIN;
+ 
+%SUB TOTALSIZ#=10240;
+ 
+ 
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE XS_MACRO_C;
+%INCLUDE B$JIT;
+%INCLUDE XU_MACRO_C;
+%INCLUDE XU_SUBS_C;
+%INCLUDE XU_PERR_C;
+%INCLUDE XUW_MACRO_C;
+ 
+%F$DCB;
+ 
+DCL X$PARSE ENTRY(1) ALTRET;
+DCL XSA$OPEN ENTRY(2) ALTRET;
+DCL XSA$CLOSE ENTRY(2) ALTRET;
+DCL XSA$READ ENTRY(2) ALTRET;
+DCL XSA$WRITE ENTRY(2) ALTRET;
+ 
+                                        /* POINTERS TO DCBS */
+DCL M$SI$ PTR STATIC;
+DCL M$OU$ PTR STATIC;
+DCL TESTFILE$ PTR STATIC;
+DCL B$JIT$ PTR SYMREF;
+ 
+                                        /* PROGRAM VARIABLES */
+DCL INBUF CHAR(256) STATIC INIT(' ');
+DCL OUTBUF CHAR(80) STATIC INIT(' ');
+DCL 1 ARRAY(0:99),
+         2 STRING CHAR(256);
+DCL 1 KEYIN ALIGNED STATIC,
+         2 CNT SBIN BYTE UNAL INIT(3),
+         2 KEY UBIN(27) UNAL;
+DCL EOF BIT(1) ALIGNED STATIC INIT('0'B);
+DCL 1 FILE_KEY STATIC CALIGNED,
+         2 COUNT_ UBIN BYTE CALIGNED INIT(3),
+         2 KEY_ UBIN(27) CALIGNED INIT(1000);
+DCL I SBIN WORD STATIC ALIGNED INIT(0);
+DCL X UBIN WORD ALIGNED;
+DCL FORTRAN BIT(1) STATIC INIT('0'B);
+DCL PL6 BIT(1) STATIC INIT('0'B);
+DCL INDEX_WORKSPACE(0:49) SBIN WORD STATIC SYMDEF;
+DCL INDEX_NODES SBIN WORD SYMREF;
+DCL WILD BIT(1) STATIC INIT('0'B);
+DCL INPUTNAME CHAR(31) STATIC;
+DCL PATTNAME CHAR(31) STATIC;
+ 
+%VLP_NAME(FPTN=INNAME,
+           NAME='                               ');
+%VLP_ACCT(FPTN=INACCT,
+           ACCT='        ');
+ 
+                                        /* DCBS USED IN PROGRAM */
+DCL M$DO DCB;
+DCL M$SI DCB;
+DCL M$OU DCB;
+DCL TESTFILE DCB;
+ 
+ 
+ 
+                                        /* OPEN INPUT FILE */
+%FPT_OPEN(FPTN=OPEN_INPUT,
+           NAME=INNAME,
+           ACCT=INACCT,
+           DCB=M$SI,
+           ASN=FILE,
+           FUN=IN);
+ 
+                                        /* OPEN OUTPUT FILE */
+%FPT_OPEN(FPTN=OPEN_OUTPUT,
+           DCB=M$OU,
+           EXIST=NEWFILE,
+           ASN=FILE,
+           FUN=CREATE,
+           DISP=NAMED);
+ 
+                                        /* 'TEST' OPEN FOR WILDCARD READ */
+%FPT_OPEN(FPTN=THIS_TEST,
+           ACCT=INACCT,
+           NAME=INNAME,
+           ASN=FILE,
+           FUN=IN,
+           DCB=TESTFILE);
+ 
+                                        /* CLOSE FOR ABOVE 'TEST' OPEN */
+%FPT_CLOSE(FPTN=THAT_TEST,
+           ACCT=INACCT,
+           NAME=INNAME,
+           DCB=TESTFILE);
+ 
+                                        /* OPEN NEXT FILE IN ACCOUNT */
+%FPT_OPEN(FPTN=NEXT_TEST,
+           NXTF=YES,
+           ACCT=INACCT,
+           TEST=YES,
+           ASN=FILE,
+           DCB=TESTFILE);
+ 
+                                        /* READ FROM INPUT FILE */
+%FPT_READ(FPTN=READLN,
+           BUF=INBUF,
+           DCB=M$SI,
+           KEYR=YES,
+           KEY=KEYIN);
+ 
+                                        /* WRITE TO OUTPUT FILE */
+%FPT_WRITE(FPTN=WRITELN,
+           BUF=OUTBUF,
+           DCB=M$OU);
+ 
+                                        /* WRITE ERROR MESSAGES */
+%FPT_WRITE(FPTN=WRITE_ERROR,
+           BUF=OUTBUF,
+           DCB=M$DO);
+ 
+                                        /* CLOSE INPUT FILE */
+%FPT_CLOSE(FPTN=CLOSE_INPUT,
+           DISP=SAVE,
+           DCB=M$SI);
+ 
+                                        /* CLOSE OUTPUT FILE */
+%FPT_CLOSE(FPTN=CLOSE_OUTPUT,
+           DISP=SAVE,
+           DCB=M$OU);
+ 
+                                        /* FAST ACCESS READ BUFFERS */
+%XSA_PARAM(FPTN=SI_PARAM,
+           BBUF=NIL,
+           KBUF=NIL);
+ 
+%FPT_GDS(FPTN=GET_DATA,
+           RESULTS=DATA_VECTOR,
+           SEGSIZE=TOTALSIZ#);
+ 
+%VLP_VECTOR(FPTN=DATA_VECTOR);
+ 
+%P_PCB(NAME=INDEX_PCB,
+           STCLASS="STATIC SYMDEF",
+           R=NIL,
+           W=INDEX_WORKSPACE,
+           U$=NIL,
+           WSZ=50,
+           N#=0);
+ 
+ 
+%PARSE$SYM (NAME=INDEX$SYM,
+           STCLASS="BASED");
+ 
+%PARSE$OUT (NAME=INDEX$OUTBLK,
+           STCLASS="BASED");
+ 
+                                        /* WILDCARDING */
+%XUW_WILDCARD(FPTN=XUW_WILDCARD,INPUT=INPUTNAME,PATTERN=PATTNAME);
+%XUW_ENTRIES;
+ 
+/*****************************************************************/
+/*****    BEGIN MAIN PROGRAM    **********************************/
+/*****************************************************************/
+ 
+                                        /* SET UP ACCESS TO DCBS */
+     M$SI$=DCBADDR(DCBNUM(M$SI));
+     M$OU$=DCBADDR(DCBNUM(M$OU));
+     TESTFILE$=DCBADDR(DCBNUM(TESTFILE));
+ 
+                                        /* SET UP FOR FAST ACCESS READ */
+     CALL M$GDS(GET_DATA) ALTRET(MX01);
+     SI_PARAM.BBUF_.BUF$=DATA_VECTOR.PTR$;
+     SI_PARAM.BBUF_.BOUND=8192*4-1;
+     SI_PARAM.KBUF_.BUF$=PINCRW(SI_PARAM.BBUF_.BUF$,8192);
+     SI_PARAM.KBUF_.BOUND=1024*4-1;
+ 
+                                        /* SET UP TO OPEN OUTPUT FILE */
+     OPEN_OUTPUT.NAME_=VECTOR(M$OU$ -> F$DCB.NAME#);
+     OPEN_OUTPUT.ACCT_=VECTOR(M$OU$ -> F$DCB.ACCT#);
+     CALL M$OPEN(OPEN_OUTPUT) ALTRET (MX04);
+     INDEX_PCB.ROOT$=ADDR(INDEX_NODES);
+     IF B$JIT$ -> B$JIT.CCARS > B$JIT$ -> B$JIT.CCDISP THEN DO;
+          INDEX_PCB.TEXT$=PINCRC(ADDR(B$JIT.CCBUF),B$JIT.CCDISP+1);
+          INDEX_PCB.NCHARS=B$JIT.CCARS-B$JIT.CCDISP-1;
+ 
+                                        /* PARSE LANGUAGE OPTIONS */
+          CALL X$PARSE(INDEX_PCB) ALTRET (MX05);
+          DO CASE (INDEX_PCB.OUT$ -> INDEX$OUTBLK.SUBLK$(0) ->
+               INDEX$OUTBLK.CODE);
+          CASE(1);
+             FORTRAN='1'B;
+          CASE(2);
+             PL6='1'B;
+          END;                          /* CASE */
+        END;                            /* IF */
+     ELSE
+          PL6='1'B;                     /* DEFAULT LANGUAGE */
+ 
+                                   /* CHECK FOR WILDCARD CHARACTER IN FID */
+     CALL TESTWILD;
+     IF WILD THEN DO;
+                          /* GET FIRST FILE IN ACCOUNT MATCHING THE
+                             WILDCARD PATTERN  */
+          CALL FIRSTFILE ALTRET(NOFILES);
+          DO WHILE ('1'B);
+               INNAME.NAME#=INPUTNAME;
+               X=0;
+               DO WHILE (SUBSTR(INNAME.NAME#,X,1)~=' ');
+                    X=X+1;
+                  END;
+               INNAME.L#=X;
+                                        /* SET UP ACCOUNT TO GET FILE FROM */
+               INACCT.ACCT#=M$SI$->F$DCB.ACCT#;
+               CALL XSA$OPEN(OPEN_INPUT,SI_PARAM) ALTRET(MX02);
+               CALL XSA$READ(READLN,SI_PARAM) ALTRET(MX03);
+                                        /* PROCESS FILE ACCORDING TO LANGUAGE */
+               IF FORTRAN THEN
+                    CALL SCANFORTRAN;
+ 
+               IF PL6 THEN
+                    CALL SCANPL6;
+ 
+                                        /* SORT NAMES ALPHABETICALLY */
+               CALL SORT(I);
+ 
+                                        /* WRITE INFO TO OUTPUT FILE */
+               CALL DUMP(I);
+               CALL XSA$CLOSE(CLOSE_INPUT,SI_PARAM) ALTRET(MX06);
+                                        /* GET NEXT FILE TO BE PROCESSED */
+               CALL NEXTFILE ALTRET(NOFILES);
+             END;                       /* WHILE */
+        END;                            /* IF WILD */
+     ELSE DO;
+ 
+                                        /* PROCESS ONLY NAMED FILE */
+          INACCT.ACCT#=M$SI$->F$DCB.ACCT#;
+          INNAME=M$SI$->F$DCB.NAME#;
+          CALL XSA$OPEN(OPEN_INPUT,SI_PARAM) ALTRET(MX02);
+          CALL XSA$READ(READLN,SI_PARAM) ALTRET(MX03);
+ 
+          IF FORTRAN THEN
+               CALL SCANFORTRAN;
+ 
+          IF PL6 THEN
+               CALL SCANPL6;
+ 
+          CALL SORT(I);
+          CALL DUMP(I);
+          CALL XSA$CLOSE(CLOSE_INPUT,SI_PARAM) ALTRET(MX06);
+        END;                            /* ELSE */
+ 
+NOFILES:
+ 
+                                        /* CLOSE OUTPUT FILE */
+     CALL M$CLOSE(CLOSE_OUTPUT) ALTRET(MX07);
+ 
+                                        /* ERROR MESSAGES */
+     DO WHILE('0'B);
+MX01:     ;                             /* CANT GET DATA SEG FOR FAST ACCESS */
+          OUTBUF=' *** ERROR ***  Unable to get data seg for fast access ';
+          CALL M$WRITE(WRITE_ERROR);
+          GOTO QUIT;
+MX02:     ;                        /* CANT OPEN INPUT FILE FOR FAST ACCESS */
+          OUTBUF=' *** ERROR ***  Unable to open input file for fast access ';
+          CALL M$WRITE(WRITE_ERROR);
+          GOTO QUIT;
+MX03:     ;                             /* CANT READ FROM FAST ACCESS FILE */
+          OUTBUF=' *** ERROR ***  Unable to read from fast access file ';
+          CALL M$WRITE(WRITE_ERROR);
+          GOTO QUIT;
+MX04:     ;                             /* CANT OPEN OUTPUT FILE */
+          OUTBUF=' *** ERROR ***  Unable to open output file ';
+          CALL M$WRITE(WRITE_ERROR);
+          GOTO QUIT;
+MX05:     ;                             /* ILLEGAL OPTION FROM NODE PARSER */
+          OUTBUF=' *** ERROR ***  Illegal option used on invocation line ';
+          CALL M$WRITE(WRITE_ERROR);
+          GOTO QUIT;
+MX06:     ;                             /* CANT CLOSE FAST ACCESS FILE */
+          OUTBUF=' *** ERROR ***  Unable to close fast access input file ';
+          CALL M$WRITE(WRITE_ERROR);
+          GOTO QUIT;
+MX07:     ;                             /* CANT CLOSE OUTPUT FILE */
+          OUTBUF=' *** ERROR ***  Unable to close output file ';
+          CALL M$WRITE(WRITE_ERROR);
+ 
+QUIT:   END;                            /* WHILE */
+ 
+ 
+/******************************************************************/
+ 
+CHECKFILE: PROC ALTRET;
+/* PROCEDURE TO CHECK WILDCARD AGAINST FILE ID FOR LEGALITY */
+ 
+     INPUTNAME=TESTFILE$->F$DCB.NAME#.C;
+     XUW_WILDCARD.INPUT_=VECTOR(SUBSTR(INPUTNAME,0,TESTFILE$->F$DCB.NAME#.L));
+     CALL X$WILDCMP(XUW_WILDCARD) ALTRET(NOMATCH);
+ 
+                                   /* IF FID IS LEGAL, RETURN ELSE ALTRETURN */
+     RETURN;
+ 
+NOMATCH:
+     ALTRETURN;
+ 
+END CHECKFILE;
+ 
+/*******************************************************************/
+ 
+TESTWILD: PROC;
+ 
+/* PROCEDURE TO CHECK IF WILDCARDING IS USED IN INVOCATION LINE */
+ 
+DCL LOC1 UBIN WORD ALIGNED;
+ 
+                                        /* SEARCH M$SI FOR '?' AND SETS FLAG */
+     CALL INDEX(LOC1,'?',M$SI$->F$DCB.NAME#.C,0) ALTRET(NONE);
+     IF M$SI$->F$DCB.NAME#.L > LOC1 THEN DO;
+          WILD='1'B;
+          RETURN;
+        END;
+NONE:
+     WILD='0'B;
+     RETURN;
+ 
+END TESTWILD;
+ 
+/***************************************************************/
+ 
+FIRSTFILE: PROC ALTRET;
+ 
+/* PROCEDURE TO FIND THE FIRST FILE IN AN ACCOUNT FOR WILDCARDING */
+ 
+DCL LOC1 UBIN WORD ALIGNED;
+ 
+                                   /* USE FID UP TO '?' AS INITIAL OPEN FID */
+     INACCT.ACCT#=M$SI$->F$DCB.ACCT#;
+     CALL INDEX(LOC1,'?',M$SI$->F$DCB.NAME#.C,0) ALTRET(ERR1);
+     PATTNAME=M$SI$->F$DCB.NAME#.C;
+     XUW_WILDCARD.PATTERN_=VECTOR(SUBSTR(PATTNAME,0,M$SI$->F$DCB.NAME#.L));
+                          /* IF '?' FIRST CHAR IN FID, OPEN TO FIRST
+                             FILE IN ACCOUNT, ELSE... */
+     IF LOC1=0 THEN
+          CALL M$OPEN(NEXT_TEST) ALTRET(NOLUCK);
+                                        /* ...USE FID UP TO '?' AS FID */
+     ELSE DO;
+          LOC1=0;
+          DO WHILE(SUBSTR(M$SI$->F$DCB.NAME#.C,LOC1,1)~='?');
+               LOC1=LOC1+1;
+             END;
+          INNAME.NAME#=SUBSTR(M$SI$->F$DCB.NAME#.C,0,LOC1);
+          INNAME.L#=LOC1;
+          CALL M$OPEN(THIS_TEST) ALTRET(NEXTTRY);
+          CALL M$CLOSE(THAT_TEST) ALTRET(ERR1);
+                                        /* CHECK IF FILE OPENED IS LEGAL */
+        END;
+     CALL CHECKFILE ALTRET(NEXTTRY);
+     RETURN;
+ 
+                          /* IF FILE OPENED MATCHES WILDCARD PATTERN,
+                             RETURN ELSE ALTRETURN */
+NEXTTRY:
+     CALL M$OPEN(NEXT_TEST) ALTRET(NOLUCK);
+     CALL CHECKFILE ALTRET(NEXTTRY);
+     RETURN;
+ 
+ERR1: ;
+ 
+NOLUCK:
+     ALTRETURN;
+ 
+END FIRSTFILE;
+ 
+/*******************************************************************/
+ 
+NEXTFILE: PROC ALTRET;
+ 
+/* PROCEDURE TO FIND THE NEXT FILE MATCHING THE WILDCARD */
+ 
+                          /* CONTINUE SEARCHING ACCOUNT FOR FILE MATCHING
+                             WILDCARD PATTERN AND RETURN, IF NO FILES
+                             FOUND, ALTRETURN  */
+NEXTTRY:
+     CALL M$OPEN(NEXT_TEST) ALTRET(NOLUCK);
+     CALL CHECKFILE ALTRET(NEXTTRY);
+     RETURN;
+ 
+NOLUCK:
+     ALTRETURN;
+ 
+END NEXTFILE;
+ 
+ 
+/*****************************************************************/
+ 
+SCANFORTRAN: PROC;
+ 
+/* PROCEDURE TO GET FORTRAN KEYWORDS FOR INDEX */
+ 
+DCL X UBIN WORD ALIGNED;
+DCL LOC1 UBIN WORD ALIGNED;
+DCL LOC2 UBIN WORD ALIGNED;
+DCL LOC3 UBIN WORD ALIGNED;
+DCL QUOTE BIT(1) STATIC INIT('0'B);
+DCL NUM CHAR(9);
+DCL VFCC BIT(1) STATIC;
+ 
+     VFCC=M$SI$->F$DCB.DVBYTE.VFC#;     /* CHECK IF VFC IS PRESENT */
+     DO WHILE (~EOF);
+          IF VFCC='1'B THEN             /* REMOVE VFC IF PRESENT */
+               SUBSTR(INBUF,0,1)=' ';
+ 
+                                   /* CHECK FOR 'C' IN FIRST COLUMN ..COMMENT */
+          CALL INDEX(LOC1,'C',INBUF,0) ALTRET(COMM1);
+          IF LOC1=0 THEN GOTO NEXT;
+ 
+                                        /* CHECK FOR '*' IN FIRST COLUMN */
+COMM1:
+          CALL INDEX(LOC1,'*',INBUF,0) ALTRET(COMM2);
+          IF LOC1=0 THEN GOTO NEXT;
+ 
+                                        /* CHECK FOR '/' IN FIRST COLUMN */
+COMM2:
+          CALL INDEX(LOC1,'/',INBUF,0) ALTRET(COMM3);
+          IF LOC1=0 THEN GOTO NEXT;
+ 
+                                        /* CHECK FOR '"' IN FIRST COLUMN */
+COMM3:
+          CALL INDEX(LOC1,'"',INBUF,0) ALTRET(COMM4);
+          IF LOC1=0 THEN GOTO NEXT;
+ 
+                                        /* CHECK FOR '!' IN FIRST COLUMN */
+COMM4:
+          CALL INDEX(LOC1,'!',INBUF,0) ALTRET(COMM5);
+          IF LOC1=0 THEN GOTO NEXT;
+ 
+                                        /* CHECK FOR LABEL IN COLUMN 1-6 */
+COMM5:
+          CALL INDEX(LOC1,'      ',INBUF,0) ALTRET(NEXT);
+          IF LOC1=0 THEN GOTO CHECK;
+          GOTO NEXT;
+ 
+                          /* CHECK FOR STRING CONTAINING QUOTED STRING
+                             WITH A FORTRAN KEY WORD CONTAINED IN THE
+                             QUOTES */
+CHECK:
+          IF QUOTE THEN DO;
+               CALL INDEX(LOC1,'''',INBUF,0) ALTRET(NEXT);
+               SUBSTR(INBUF,0,LOC1)=' ';
+               QUOTE='0'B;
+             END;
+          CALL INDEX(LOC1,'''',INBUF,0) ALTRET(CONT);
+          SUBSTR(INBUF,LOC1,1)=' ';
+          QUOTE='1'B;
+          CALL INDEX(LOC2,'''',INBUF,LOC1) ALTRET(NOEND);
+          SUBSTR(INBUF,LOC1,LOC2-LOC1)=' ';
+          QUOTE='0'B;
+          GOTO CONT;
+ 
+NOEND:
+          SUBSTR(INBUF,LOC1,256-LOC1)=' ';
+ 
+                                        /* FIND 'PROGRAM' IN STRING */
+CONT:
+          CALL INDEX(LOC1,'PROGRAM',INBUF,6) ALTRET(NOPE1);
+          CALL INDEX(LOC2,' ',INBUF,LOC1+7) ALTRET(LOST1);
+          DO WHILE (SUBSTR(INBUF,LOC2,1)=' ');
+               LOC2=LOC2+1;             /* GET FIRST CHAR OF NAME */
+             END;
+          LOC3=LOC2;
+          DO WHILE (SUBSTR(INBUF,LOC3,1)~=' ') AND (SUBSTR(INBUF,LOC3,1)~='(');
+               LOC3=LOC3+1;             /* FIND END OF NAME */
+             END;
+          CALL BINCHAR(NUM,KEYIN.KEY);
+          X=0;
+          DO WHILE SUBSTR(NUM,X,1)='0';
+               SUBSTR(NUM,X,1)=' ';
+               X=X+1;
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(NUM,0,6),'.',SUBSTR(NUM,6,3),' ..... ',SUBSTR(INBUF,LOC1,7),' ');
+          DO X=25 TO 31;
+               SUBSTR(ARRAY.STRING(I),X,1)='.';
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(ARRAY.STRING(I),0,32),SUBSTR(INBUF,LOC2,LOC3-LOC2));
+          I=I+1;
+          GOTO NEXT;
+ 
+                                        /* FIND 'SUBROUTINE' IN STRING */
+NOPE1:
+          CALL INDEX(LOC1,'SUBROUTINE',INBUF,6) ALTRET(NOPE2);
+          CALL INDEX(LOC2,' ',INBUF,LOC1+10) ALTRET(LOST1);
+          DO WHILE (SUBSTR(INBUF,LOC2,1)=' ');
+               LOC2=LOC2+1;             /* GET FIRST CHAR OF NAME */
+             END;
+          LOC3=LOC2;
+          DO WHILE (SUBSTR(INBUF,LOC3,1)~=' ') AND (SUBSTR(INBUF,LOC3,1)~='(');
+               LOC3=LOC3+1;             /* FIND END OF NAME */
+             END;
+          CALL BINCHAR(NUM,KEYIN.KEY);
+          X=0;
+          DO WHILE SUBSTR(NUM,X,1)='0';
+               SUBSTR(NUM,X,1)=' ';
+               X=X+1;
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(NUM,0,6),'.',SUBSTR(NUM,6,3),' ..... ',SUBSTR(INBUF,LOC1,10),' ');
+          DO X=28 TO 31;
+               SUBSTR(ARRAY.STRING(I),X,1)='.';
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(ARRAY.STRING(I),0,32),SUBSTR(INBUF,LOC2,LOC3-LOC2));
+          I=I+1;
+          GOTO NEXT;
+ 
+                                        /* FIND 'FUNCTION' IN STRING */
+NOPE2:
+ 
+          CALL INDEX(LOC1,'FUNCTION',INBUF,6) ALTRET(NEXT);
+          CALL INDEX(LOC2,' ',INBUF,LOC1+8) ALTRET(LOST1);
+          DO WHILE (SUBSTR(INBUF,LOC2,1)=' ');
+               LOC2=LOC2+1;             /* GET FIRST CHAR OF NAME */
+             END;
+          LOC3=LOC2;
+          DO WHILE (SUBSTR(INBUF,LOC3,1)~=' ') AND (SUBSTR(INBUF,LOC3,1)~='(');
+               LOC3=LOC3+1;             /* FIND END OF NAME */
+             END;
+          CALL BINCHAR(NUM,KEYIN.KEY);
+          X=0;
+          DO WHILE SUBSTR(NUM,X,1)='0';
+               SUBSTR(NUM,X,1)=' ';
+               X=X+1;
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(NUM,0,6),'.',SUBSTR(NUM,6,3),' ..... ',SUBSTR(INBUF,LOC1,8),' ');
+          DO X=26 TO 31;
+               SUBSTR(ARRAY.STRING(I),X,1)='.';
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(ARRAY.STRING(I),0,32),SUBSTR(INBUF,LOC2,LOC3-LOC2));
+          I=I+1;
+ 
+                                        /* READ NEXT LINE FROM FILE */
+NEXT:     INBUF=' ';
+          CALL XSA$READ(READLN,SI_PARAM) ALTRET(NOPE3);
+ 
+LOST1:    ;                             /* THERES SOMETHING WRONG HERE....*/
+                                        /* SHOULDN'T BE HERE IF FILE COMPILED */
+        END;                            /* DO WHILE ~EOF */
+ 
+ 
+NOPE3: RETURN;
+END SCANFORTRAN;
+ 
+/*******************************************************************/
+ 
+SCANPL6: PROC;
+ 
+/* PROCEDURE TO GET PL6 KEYWORDS FOR INDEX */
+ 
+DCL X UBIN WORD ALIGNED;
+DCL LOC1 UBIN WORD ALIGNED;
+DCL LOC2 UBIN WORD ALIGNED;
+DCL LOC3 UBIN WORD ALIGNED;
+DCL LOC4 UBIN WORD ALIGNED;
+DCL QUOTE BIT(1) STATIC INIT('0'B);
+DCL COMMENT BIT(1) STATIC INIT('0'B);
+DCL NUM CHAR(9);
+DCL VFCC BIT(1) STATIC;
+ 
+     VFCC=M$SI$->F$DCB.DVBYTE.VFC#;     /* SEE IF VFC IS PRESENT */
+     DO WHILE (~EOF);
+          IF VFCC='1'B THEN             /* REMOVE VFC IF PRESENT */
+               SUBSTR(INBUF,0,1)=' ';
+ 
+                                        /* CHECK IF INSIDE A COMMENT */
+          IF COMMENT THEN DO;
+               CALL INDEX(LOC1,'*/',INBUF,0) ALTRET(NEXT);
+               SUBSTR(INBUF,0,LOC1+1)=' ';
+               COMMENT='0'B;
+             END;
+          CALL INDEX(LOC1,'/*',INBUF,0) ALTRET(LITER);
+          COMMENT='1'B;
+          CALL INDEX(LOC2,'*/',INBUF,LOC1) ALTRET(NOEND);
+          SUBSTR(INBUF,LOC1,LOC2-LOC1+1)=' ';
+          COMMENT='0'B;
+          GOTO LITER;
+ 
+NOEND:
+          SUBSTR(INBUF,LOC1,256-LOC1)=' ';
+ 
+LITER:
+                                        /* CHECK IF INSIDE A QUOTED STRING */
+          IF QUOTE THEN DO;
+               CALL INDEX(LOC1,'''',INBUF,0) ALTRET(NEXT);
+               SUBSTR(INBUF,0,LOC1)=' ';
+               QUOTE='0'B;
+             END;
+          CALL INDEX(LOC1,'''',INBUF,0) ALTRET(CONT);
+          QUOTE='1'B;
+          CALL INDEX(LOC2,'''',INBUF,LOC1) ALTRET(NOEND2);
+          SUBSTR(INBUF,LOC1,LOC2-LOC1)=' ';
+          QUOTE='0'B;
+          GOTO CONT;
+ 
+NOEND2:
+          SUBSTR(INBUF,LOC1,256-LOC1)=' ';
+ 
+CONT:
+          CALL INDEX(LOC1,'PROC',INBUF,2) ALTRET(NOPE1);
+          CALL INDEX(LOC2,'MAIN',INBUF,7) ALTRET(NOPE2);
+ 
+/* BELOW: STRING 'PROC MAIN' */
+ 
+                                        /* PROCESS FOR STRING 'PROC MAIN' */
+          LOC3=0;
+          DO WHILE(SUBSTR(INBUF,LOC3,1)=' ');
+               LOC3=LOC3+1;
+             END;
+          LOC4=LOC3;
+          DO WHILE(SUBSTR(INBUF,LOC4,1)~=':');
+               LOC4=LOC4+1;
+               IF LOC4 > 255 THEN GOTO NEXT;
+             END;
+          CALL BINCHAR(NUM,KEYIN.KEY);
+          X=0;
+          DO WHILE SUBSTR(NUM,X,1)='0';
+               SUBSTR(NUM,X,1)=' ';
+               X=X+1;
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(NUM,0,6),'.',SUBSTR(NUM,6,3),' ..... ',SUBSTR(INBUF,LOC1,9),' ');
+          DO X=27 TO 31;
+               SUBSTR(ARRAY.STRING(I),X,1)='.';
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(ARRAY.STRING(I),0,32),SUBSTR(INBUF,LOC3,LOC4-LOC3));
+          I=I+1;
+          GOTO NEXT;
+ 
+NOPE1: /* BELOW: STRING 'ENTRY' */
+ 
+                                        /* PROCESS FOR STRING 'ENTRY' */
+          CALL INDEX(LOC1,'ENTRY',INBUF,2) ALTRET(NEXT);
+          CALL INDEX(LOC2,':',INBUF,1) ALTRET(NEXT);
+          IF LOC2>LOC1 THEN GOTO NEXT;
+          LOC3=0;
+          DO WHILE(SUBSTR(INBUF,LOC3,1)=' ');
+               LOC3=LOC3+1;
+             END;
+          LOC4=LOC3;
+          DO WHILE(SUBSTR(INBUF,LOC4,1)~=':');
+               LOC4=LOC4+1;
+               IF LOC4 > 255 THEN GOTO NEXT;
+             END;
+          CALL BINCHAR(NUM,KEYIN.KEY);
+          X=0;
+          DO WHILE SUBSTR(NUM,X,1)='0';
+               SUBSTR(NUM,X,1)=' ';
+               X=X+1;
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(NUM,0,6),'.',SUBSTR(NUM,6,3),' ..... ',SUBSTR(INBUF,LOC1,5),' ');
+          DO X=23 TO 31;
+               SUBSTR(ARRAY.STRING(I),X,1)='.';
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(ARRAY.STRING(I),0,32),SUBSTR(INBUF,LOC3,LOC4-LOC3));
+          I=I+1;
+          GOTO NEXT;
+ 
+NOPE2: /* BELOW: STRING 'PROC' */
+ 
+                                        /* PROCESS FOR STRING 'PROC' */
+          LOC3=0;
+          DO WHILE(SUBSTR(INBUF,LOC3,1)=' ');
+               LOC3=LOC3+1;
+             END;
+          LOC4=LOC3;
+          DO WHILE(SUBSTR(INBUF,LOC4,1)~=':');
+               LOC4=LOC4+1;
+               IF LOC4 > 255 THEN GOTO NEXT;
+             END;
+          CALL BINCHAR(NUM,KEYIN.KEY);
+          X=0;
+          DO WHILE SUBSTR(NUM,X,1)='0';
+               SUBSTR(NUM,X,1)=' ';
+               X=X+1;
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(NUM,0,6),'.',SUBSTR(NUM,6,3),' ..... ',SUBSTR(INBUF,LOC1,4),' ');
+          DO X=22 TO 31;
+               SUBSTR(ARRAY.STRING(I),X,1)='.';
+             END;
+          CALL CONCAT(ARRAY.STRING(I),SUBSTR(ARRAY.STRING(I),0,32),SUBSTR(INBUF,LOC3,LOC4-LOC3));
+          I=I+1;
+ 
+                                        /* READ NEXT LINE FROM FILE */
+NEXT:     INBUF=' ';
+          CALL XSA$READ(READLN,SI_PARAM) ALTRET(NOPE3);
+ 
+        END;                            /*  DO WHILE ~EOF */
+ 
+ 
+ 
+ 
+ 
+NOPE3: RETURN;
+END SCANPL6;
+ 
+/*******************************************************************/
+ 
+SORT: PROC(I);
+ 
+/* PROCEDURE TO SORT THE INDEX ENTRIES BY ALPHABETICAL ORDER */
+ 
+DCL DIF BIT(1) STATIC INIT('0'B);
+DCL I SBIN WORD ALIGNED;
+DCL X UBIN STATIC INIT(0);
+DCL Y UBIN STATIC INIT(0);
+DCL TEMP CHAR(256) STATIC INIT(' ');
+DCL ORGG SBIN WORD STATIC ALIGNED;
+ 
+                                        /* SORT USING BUBBLE SORT */
+     DO X = 1 TO I-1;
+          DIF='0'B;
+          DO Y = 1 TO I-1;
+               IF SUBSTR(ARRAY.STRING(Y),30,31) < SUBSTR(ARRAY.STRING(Y-1),30,31) THEN DO;
+                    TEMP=ARRAY.STRING(Y-1);
+                    ARRAY.STRING(Y-1)=ARRAY.STRING(Y);
+                    ARRAY.STRING(Y)=TEMP;
+                    DIF='1'B;
+                  END;                  /* IF */
+             END;                       /* DO Y...*/
+          IF ~DIF THEN GOTO CHECK_ORG;
+        END;                            /* DO X...*/
+ 
+                                   /* HANDLE KEYS FROM VARIOUS ORGANIZATIONS */
+CHECK_ORG:;
+     ORGG=M$SI$->F$DCB.ORG#;
+     DO CASE ORGG;
+     CASE(2);                           /* FILE ORG=2   KEYED FILE */
+     CASE(1,4);                         /* FILE ORG=1,4 CONSEQ OR UR FILE */
+        DO X=0 TO I-1;             /* SHIFT KEY LEFT THREE DECIMAL PLACES */
+             TEMP=ARRAY.STRING(X);
+             ARRAY.STRING(X)=' ';
+             CALL CONCAT(ARRAY.STRING(X),SUBSTR(TEMP,3,3),SUBSTR(TEMP,7,3),'.000',SUBSTR(TEMP,10,70));
+           END;                         /* DO X=...  */
+     CASE(ELSE);                        /* FILE NOT CON,UR,KEYED  */
+                                        /*   YOU SHOULDN'T BE HERE  */
+     END;                               /* CASE ORGG */
+ 
+                                        /* FILL IN BLANKS IN KEY WITH ZEROS */
+     DO X=1 TO I-I;
+          IF SUBSTR(ARRAY.STRING(X),5,1)=' ' THEN
+               SUBSTR(ARRAY.STRING(X),5,1)='0';
+          IF SUBSTR(ARRAY.STRING(X),7,1)=' ' THEN
+               SUBSTR(ARRAY.STRING(X),7,1)='0';
+          IF SUBSTR(ARRAY.STRING(X),8,1)=' ' THEN
+               SUBSTR(ARRAY.STRING(X),8,1)='0';
+        END;                            /* DO X = ....*/
+ 
+     RETURN;
+END SORT;
+ 
+/********************************************************************/
+ 
+DUMP: PROC(I);
+ 
+/* PROCEDURE TO DUMP THE ORDERED INDEX TO THE OUTPUT FILE */
+ 
+DCL I SBIN WORD ALIGNED;
+DCL X UBIN STATIC INIT(0);
+ 
+                                        /* WRITE FILE INFO TO OUTPUT FILE */
+     IF I~=0 THEN DO;
+          OUTBUF=' ';
+          CALL M$WRITE(WRITELN);
+          CALL CONCAT(OUTBUF,'   FILE: ',M$SI$->F$DCB.NAME#.C,'ACCOUNT: ',M$SI$->F$DCB.ACCT#);
+          CALL M$WRITE(WRITELN);
+          OUTBUF=' ';
+          CALL M$WRITE(WRITELN);
+          OUTBUF='    KEY        ROUTINE TYPE   ROUTINE NAME   ';
+          CALL M$WRITE(WRITELN);
+          OUTBUF='    ---        ------------   ------------   ';
+          CALL M$WRITE(WRITELN);
+        END;
+ 
+                                   /* WRITE RECORD FORMED EARLIER TO FILE */
+     DO X = 0 TO I-1;
+          OUTBUF=SUBSTR(ARRAY.STRING(X),0,80);
+          CALL M$WRITE(WRITELN);
+          ARRAY.STRING(X)=' ';
+        END;                            /* DO X...*/
+     I=0;
+END DUMP;
+ 
+/******************************************************************/
+ 
+END ALPINE;

@@ -1,0 +1,1420 @@
+VERSION A06
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:1    
+        1        1        /*M* X9MA$ALLOCATE -- ALLOCATE/FREE FOR USAGE IS POINTER */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*P*
+        8        8               NAME:  X9MA$ALLOCATE
+        9        9             AUTHOR:  Albert H. Wigchert
+       10       10            Revised:  Charles F LaCasse III (for inclusion in shared library)
+       11       11            PURPOSE:  Allocate/free memory as needed for USAGE IS POINTER.
+       12       12        */
+       13       13        /*D*
+       14       14               NAME:  X9MA$ALLOCATE
+       15       15               CALL:  CALL "X9MA$ALLOCATE" USING [BY REFERENCE] [ADDRESS OF]
+       16       16                      identifier-1 {BY CONTENT LENGTH OF identifier-2 |
+       17       17                                    [BY CONTENT] identifier-3}.
+       18       18          INTERFACE:  X9AS$SHRINK_PTR -- Take a 2048K super segment and by
+       19       19                                         shrinks split it into 8 regular
+       20       20                                         segments, returning pointers to them.
+       21       21              INPUT:  LENGTH OF identifier-2 -- Set up an allocated block the
+       22       22                          same size as this identifier.
+       23       23                      identifier-3 -- Set up an allocated block where this
+       24       24                          variable = the number of bytes of storage needed.
+       25       25             OUTPUT:  identifier-1 -- Must be USAGE IS POINTER; it gets set to
+       26       26                          the address of the allocated block's body.
+       27       27                      ADDRESS OF identifier-1 -- In this case it can be any
+       28       28                          USAGE, including POINTER, as long as it is a level 01
+       29       29                          or 77 item in the LINKAGE SECTION. The variable gets
+       30       30                          allocated and its pointer in the pseudostack is set.
+       31       31        DESCRIPTION:  Find out which bucket this block is to be in; bucket
+       32       32                      number is the number of doublewords needed to hold it and
+       33       33                      its 4-word header, mod 128. Check if there are any
+       34       34                      currently non-allocated blocks of exactly the right size.
+       35       35                      If so, allocate one. Otherwise search the heap chain.
+       36       36                      Take the first that is big enough. If it is big enough
+       37       37                      with at most 4 words to spare, use the whole thing. If
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:2    
+       38       38                      there are at least 128 words to spare then remove the
+       39       39                      number of words needed from the low end of the heap item
+       40       40                      and leave the balance of it linked where it already was in
+       41       41                      the chain. (Generally they are linked in increasing order
+       42       42                      of size but this will not always be the case.) If the
+       43       43                      number of spare words is at least 6 but less than 128 (it
+       44       44                      will always be an even number) the remove the whole thing
+       45       45                      from the heap chain and place the remainder in whichever
+       46       46                      bucket is appropriate for a block of its size. Then again
+       47       47                      consider what was found about blocks already in the desired
+       48       48                      bucket. If none, just place it in the bucket. If everything
+       49       49                      in the bucket is bigger than the new item then insert the
+       50       50                      new item at the head of the chain. If at least one item
+       51       51                      is smaller but none are the same size then insert the new
+       52       52                      item as the ROP of the largest one not bigger than the new
+       53       53                      item, and make that one's old ROP the ROP of the new item.
+       54       54                      If there is exactly one of the right size already then
+       55       55                      attach the new one as its LOP; if more than one then
+       56       56                      make the new one the LOP of the first one in the chain,
+       57       57                      and make its old LOP the LOP of the new item.
+       58       58        */
+       59       59        %eject;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:3    
+       60       60        /*-------------*/
+       61       61          X9MA$ALLOCATE:       PROC (ADDR$, LENGTH);
+       62       62        /*-------------*/
+       63       63
+       64       64        %INCLUDE X8A_SYS_FILE;
+       65     6334        %EQU AUTO_STORAGE_PAGES = 12;
+       66     6335        %EQU MAX_SIZE = 262144;
+       67     6336        %EQU MANAGED_BLOCK = 390625;
+       68     6337        %FPT_GDDL (FPTN=GDDL_FPT, STCLASS=AUTO);
+       69     6350        %VLP_GDDL (FPTN=GDDL_RESULTS, STCLASS=AUTO);
+       70     6364        %FPT_OPEN (FPTN=FPT_OPEN, STCLASS=AUTO);
+       71     6473        %FPT_OPEN (FPTN=FPT_OPEN_CONST, STCLASS=CONSTANT, ORG=KEYED, ASN=FILE,
+       72     6474                   DISP=SCRATCH, FUN=CREATE);
+       73     6583        %FPT_GETDCB (FPTN=M$VIRTUAL1, DCBNUM="VIRTUAL_DCBNUMS(0)");
+       74     6598        %FPT_GETDCB (FPTN=M$VIRTUAL2, DCBNUM="VIRTUAL_DCBNUMS(1)");
+       75     6613        %FPT_GETDCB (FPTN=M$VIRTUAL3, DCBNUM="VIRTUAL_DCBNUMS(2)");
+       76     6628    1   DCL ADDR$ PTR;
+       77     6629    1   DCL LENGTH SBIN;
+       78     6630    1   DCL DYNAMIC_SEG$ (0:7) PTR STATIC INIT (ADDR (NIL) * 8);
+       79     6631    1   DCL DYNAMIC_SEG# SBIN STATIC INIT (7);
+       80     6632        %VLP_VIRTUAL (FPTN=VIRTUAL_VLP, INITIALIZE=YES, INITVALUE=0,
+       81     6633            PHYSICAL=10, SEGNUM=VS1, SEGSIZE=2097152);
+       82     6653    1   DCL VIRTUAL_DCBNUMS (0:2) UBIN STATIC;
+       83     6654    1   DCL 1 STORAGE_BLOCK BASED ALIGNED,
+       84     6655    1         2 HEADER,
+       85     6656    1           3 IDENT SBIN,
+       86     6657    1           3 SIZE UBIN HALF HALIGNED,
+       87     6658    1           3 ALLOCATED UBIN HALF HALIGNED,
+       88     6659    1           3 LOP$ PTR,
+       89     6660    1           3 ROP$ PTR,
+       90     6661    1         2 BODY (0:%(MAX_SIZE-2)) UBIN;
+       91     6662    1   DCL BACKUP_PAGES SBIN STATIC;
+       92     6663    1   DCL FIRST_TIME_FLAG BIT (1) STATIC INIT ('1'B);
+       93     6664    1   DCL HEAP_HEAD$ PTR STATIC INIT (ADDR (NIL));
+       94     6665    1   DCL BUCKET$ (0:127) PTR STATIC INIT (ADDR (NIL) * 128);
+       95     6666    1   DCL BUCKETNUM SBIN;
+       96     6667    1   DCL BLKSIZE SBIN;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:4    
+       97     6668    1   DCL BLK$ PTR;
+       98     6669    1   DCL PREV_BLK$ PTR;
+       99     6670    1   DCL HEAP$ PTR;
+      100     6671    1   DCL HEAP1$ PTR;
+      101     6672    1   DCL HEAP2$ PTR;
+      102     6673    1   DCL VLPVEC VECTOR CONSTANT INIT (VECTOR (VIRTUAL_VLP));
+      103     6674    1   DCL SIZE1 UBIN;
+      104     6675    1   DCL TEMP_SBIN SBIN;
+      105     6676    1   DCL TEMP$ PTR;
+      106     6677    1   DCL X9AS$SHRINK_PTR ENTRY (2);
+      107     6678        %EJECT;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:5    
+      108     6679    1     IF FIRST_TIME_FLAG THEN
+      109     6680    2       DO;
+      110     6681    2         FIRST_TIME_FLAG = '0'B;
+      111     6682    2         CALL M$GETDCB (M$VIRTUAL1);
+      112     6683    2         CALL M$GETDCB (M$VIRTUAL2);
+      113     6684    2         CALL M$GETDCB (M$VIRTUAL3);
+      114     6685    2         GDDL_FPT.RESULTS_ = VECTOR (GDDL_RESULTS);
+      115     6686    2         CALL M$GDDL (GDDL_FPT);
+      116     6687    2         BACKUP_PAGES = GDDL_RESULTS.AVAIL_PGS# - %AUTO_STORAGE_PAGES;
+      117     6688    2       END;
+      118     6689    1     PREV_BLK$ = ADDR (NIL);
+      119     6690    1     BLKSIZE = (LENGTH + 7) / 8; /* # doublewords needed */
+      120     6691    1     BUCKETNUM = MOD (BLKSIZE, 128);
+      121     6692    1     BLKSIZE = BLKSIZE * 2;
+      122     6693    1     BLK$ = BUCKET$ (BUCKETNUM);
+      123     6694    1   SCAN_BUCKET:
+      124     6695    2     DO WHILE BLK$ ~= ADDR (NIL);
+      125     6696    2       IF BLK$ -> STORAGE_BLOCK.HEADER.SIZE > BLKSIZE THEN
+      126     6697    2         BLK$ = ADDR (NIL);
+      127     6698    3       ELSE DO;
+      128     6699    3         PREV_BLK$ = BLK$; /* PTR to last that is not too big, if any */
+      129     6700    3         IF BLK$ -> STORAGE_BLOCK.HEADER.SIZE = BLKSIZE THEN
+      130     6701    3           EXIT SCAN_BUCKET;
+      131     6702    3         BLK$ = BLK$ -> STORAGE_BLOCK.HEADER.ROP$;
+      132     6703    3       END;
+      133     6704    2     END; /* SCAN_BUCKET */
+      134     6705          /* If BLK$ ~= ADDR (NIL) then there is already at least one block of
+      135     6706             the desired size in the bucket. Question: is there at least one
+      136     6707             that is not currently allocated? */
+      137     6708    2     DO WHILE BLK$ ~= ADDR (NIL);
+      138     6709    2       IF BLK$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0 THEN EXIT;
+      139     6710    2       BLK$ = BLK$ -> STORAGE_BLOCK.HEADER.LOP$;
+      140     6711    2     END;
+      141     6712          /* If BLK$ ~= ADDR (NIL) now then it points to a block of the right
+      142     6713             size that is not allocated. Allocate it. */
+      143     6714    2     IF BLK$ = ADDR (NIL) THEN DO;
+      144     6715    2       HEAP$ = HEAP_HEAD$;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:6    
+      145     6716    2       HEAP1$ = ADDR (NIL);
+      146     6717    3       DO WHILE HEAP$ ~= ADDR (NIL);
+      147     6718    3         IF BLKSIZE <= HEAP$ -> STORAGE_BLOCK.HEADER.SIZE THEN EXIT;
+      148     6719    3         HEAP1$ = HEAP$;
+      149     6720    3         HEAP$ = HEAP$ -> STORAGE_BLOCK.HEADER.ROP$;
+      150     6721    3       END;
+      151     6722            /* If HEAP$ = ADDR (NIL) then there is no heap chunk that is big
+      152     6723               enough and so a 256K block needs to be added to the heap. */
+      153     6724    3       IF HEAP$ = ADDR (NIL) THEN DO;
+      154     6725    3         IF DYNAMIC_SEG# < 7 THEN
+      155     6726    3           DYNAMIC_SEG# = DYNAMIC_SEG# + 1;
+      156     6727    4         ELSE DO;
+      157     6728                /* In this case there are no 256K blocks left, either. Acquire
+      158     6729                   another 2048K super segment. */
+      159     6730    4           IF VIRTUAL_VLP.SEGNUM# > 2 THEN GOTO BAD_ERR;
+      160     6731    4           TEMP_SBIN = BACKUP_PAGES * 3 / 5; /* Use 60% of the space */
+      161     6732    4           VIRTUAL_VLP.PHYSICAL# = TEMP_SBIN;
+      162     6733    4           BACKUP_PAGES = BACKUP_PAGES - TEMP_SBIN;
+      163     6734    4           FPT_OPEN = FPT_OPEN_CONST;
+      164     6735    4           FPT_OPEN.V.DCB# = VIRTUAL_DCBNUMS (VIRTUAL_VLP.SEGNUM#);
+      165     6736    4           FPT_OPEN.V_ = VECTOR (FPT_OPEN.V);
+      166     6737    4           FPT_OPEN.VIRTUAL_ = VLPVEC;
+      167     6738    4           CALL M$OPEN (FPT_OPEN) ALTRET (BAD_ERR);
+      168     6739                /* Now split it into 8 regular segments. */
+      169     6740    4           CALL X9AS$SHRINK_PTR (DYNAMIC_SEG$, VIRTUAL_VLP.PTR$);
+      170     6741    4           DYNAMIC_SEG# = 0;
+      171     6742    4           VIRTUAL_VLP.SEGNUM# = VIRTUAL_VLP.SEGNUM# + 1;
+      172     6743    4         END;
+      173     6744    3         HEAP$ = DYNAMIC_SEG$ (DYNAMIC_SEG#);
+      174     6745    3         IF HEAP1$ = ADDR (NIL)
+      175     6746    3           THEN HEAP_HEAD$ = HEAP$;
+      176     6747    3           ELSE HEAP1$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP$;
+      177     6748    3         HEAP$ -> STORAGE_BLOCK.HEADER.IDENT = %MANAGED_BLOCK;
+      178     6749    3         HEAP$ -> STORAGE_BLOCK.HEADER.SIZE = %(MAX_SIZE-4);
+      179     6750              /* All 256K is available, except for 4 words for a header. */
+      180     6751    3         HEAP$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0;
+      181     6752    3         HEAP$ -> STORAGE_BLOCK.HEADER.LOP$ = ADDR (NIL);
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:7    
+      182     6753    3         HEAP$ -> STORAGE_BLOCK.HEADER.ROP$ = ADDR (NIL);
+      183     6754    3       END;
+      184     6755    3       IF BLKSIZE + 4 >= HEAP$ -> STORAGE_BLOCK.HEADER.SIZE THEN DO;
+      185     6756              /* There is at most 4 words left of this heap block, not enough
+      186     6757                 to be useable. */
+      187     6758    3         IF HEAP1$ = ADDR (NIL)
+      188     6759    3           THEN HEAP_HEAD$ = HEAP$ -> STORAGE_BLOCK.HEADER.ROP$;
+      189     6760    3           ELSE HEAP1$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP$ -> STORAGE_BLOCK.HEADER.
+              6760                    ROP$;
+      190     6761    3         HEAP$ -> STORAGE_BLOCK.HEADER.SIZE = BLKSIZE;
+      191     6762              /* Throw away the excess. */
+      192     6763    3       END;
+      193     6764    3       ELSE DO;
+      194     6765    3         HEAP2$ = PINCRW (HEAP$, BLKSIZE + 4);
+      195     6766              /* Only the part of the block starting here will still be in heap. */
+      196     6767    4         IF BLKSIZE + 132 <= HEAP$ -> STORAGE_BLOCK.HEADER.SIZE THEN DO;
+      197     6768                /* 128 or more words - yes, OK for balance to stay on heap */
+      198     6769    4           IF HEAP1$ = ADDR (NIL)
+      199     6770    4             THEN HEAP_HEAD$ = HEAP2$;
+      200     6771    4             ELSE HEAP1$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP2$;
+      201     6772    4           HEAP2$ -> STORAGE_BLOCK.HEADER.ROP$ =
+      202     6773    4               HEAP$ -> STORAGE_BLOCK.HEADER.ROP$;
+      203     6774    4           HEAP2$ -> STORAGE_BLOCK.HEADER.SIZE =
+      204     6775    4               HEAP$ -> STORAGE_BLOCK.HEADER.SIZE - BLKSIZE - 4;
+      205     6776    4           HEAP2$ -> STORAGE_BLOCK.HEADER.IDENT = %MANAGED_BLOCK;
+      206     6777    4         END;
+      207     6778    4         ELSE DO; /* No, move under bucket */
+      208     6779    4           HEAP2$ -> STORAGE_BLOCK.HEADER.LOP$ = ADDR (NIL);
+      209     6780    4           HEAP2$ -> STORAGE_BLOCK.HEADER.ROP$ = ADDR (NIL);
+      210     6781    4           IF HEAP1$ = ADDR (NIL)
+      211     6782    4             THEN HEAP_HEAD$ = HEAP$ -> STORAGE_BLOCK.HEADER.ROP$;
+      212     6783    4             ELSE HEAP1$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP$ -> STORAGE_BLOCK.HEADER.
+              6783                      ROP$;
+      213     6784                /* The heap block is now delinked. */
+      214     6785    4           SIZE1 = HEAP$ -> STORAGE_BLOCK.HEADER.SIZE - BLKSIZE - 4;
+      215     6786                /* SIZE1 is guaranteed to be not more than 128; therefore,
+      216     6787                   1) there is no need for a MOD operation in calculating the
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:8    
+      217     6788                   bucket number the remaining piece goes into; 2) this
+      218     6789                   remaining piece cannot be bigger than a block already under
+      219     6790                   its bucket; if there is already at least one of the same
+      220     6791                   size then the new one should be inserted at the new LOP of
+      221     6792                   the item pointed to by BUCKET$ (TEMP_SBIN); otherwise, it
+      222     6793                   should be inserted as the new head of the chain. */
+      223     6794    4           TEMP_SBIN = SIZE1 / 2;
+      224     6795    4           TEMP$ = BUCKET$ (TEMP_SBIN);
+      225     6796    5           IF TEMP$ = ADDR (NIL) THEN DO;
+      226     6797                  /* The unused part of the heap block goes into a previously
+      227     6798                     empty bucket. */
+      228     6799    5             BUCKET$ (TEMP_SBIN) = HEAP2$;
+      229     6800    5           END;
+      230     6801    5           ELSE DO;
+      231     6802    6             IF TEMP$ -> STORAGE_BLOCK.HEADER.SIZE = SIZE1 THEN DO;
+      232     6803                    /* New LOP of item at head of chain */
+      233     6804    6               HEAP2$ -> STORAGE_BLOCK.HEADER.LOP$ =
+      234     6805    6                   TEMP$ -> STORAGE_BLOCK.HEADER.LOP$;
+      235     6806    6               TEMP$ -> STORAGE_BLOCK.HEADER.LOP$ = HEAP2$;
+      236     6807    6             END;
+      237     6808    6             ELSE DO; /* New head of chain */
+      238     6809    6               HEAP2$ -> STORAGE_BLOCK.HEADER.ROP$ = TEMP$;
+      239     6810    6               BUCKET$ (TEMP_SBIN) = HEAP2$;
+      240     6811    6             END;
+      241     6812    5           END;
+      242     6813    4           HEAP2$ -> STORAGE_BLOCK.HEADER.IDENT = %MANAGED_BLOCK;
+      243     6814    4           HEAP2$ -> STORAGE_BLOCK.HEADER.SIZE = SIZE1;
+      244     6815    4           HEAP2$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0;
+      245     6816    4         END;
+      246     6817    3         HEAP$ -> STORAGE_BLOCK.HEADER.SIZE = BLKSIZE;
+      247     6818    3       END;
+      248     6819    2       ADDR$ = HEAP$;
+      249     6820    2       HEAP$ -> STORAGE_BLOCK.HEADER.ROP$ = ADDR (NIL);
+      250     6821    2       HEAP$ -> STORAGE_BLOCK.HEADER.LOP$ = ADDR (NIL);
+      251     6822    2       IF BUCKET$ (BUCKETNUM) = ADDR (NIL) THEN
+      252     6823    2         BUCKET$ (BUCKETNUM) = HEAP$; /* Bucket was empty */
+      253     6824    3       ELSE IF PREV_BLK$ = ADDR (NIL) THEN DO;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:9    
+      254     6825              /* Block smaller than any already under this bucket; insert at
+      255     6826                 head of chain. */
+      256     6827    3         HEAP$ -> STORAGE_BLOCK.HEADER.ROP$ = BUCKET$ (BUCKETNUM);
+      257     6828    3         BUCKET$ (BUCKETNUM) = HEAP$;
+      258     6829    3       END;
+      259     6830    3       ELSE IF PREV_BLK$ -> STORAGE_BLOCK.HEADER.SIZE < BLKSIZE THEN DO;
+      260     6831              /* There is at least one smaller block under this bucket. Insert
+      261     6832                 as the new ROP of PREV_BLK$. */
+      262     6833    3         HEAP$ -> STORAGE_BLOCK.HEADER.ROP$ =
+      263     6834    3             PREV_BLK$ -> STORAGE_BLOCK.HEADER.ROP$;
+      264     6835    3         PREV_BLK$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP$;
+      265     6836    3       END;
+      266     6837    3       ELSE DO;
+      267     6838              /* There is at least one block of the same size already there.
+      268     6839                 Insert as the new LOP of the (first such) item. */
+      269     6840    3         HEAP$ -> STORAGE_BLOCK.HEADER.LOP$ =
+      270     6841    3             PREV_BLK$ -> STORAGE_BLOCK.HEADER.LOP$;
+      271     6842    3         PREV_BLK$ -> STORAGE_BLOCK.HEADER.LOP$ = HEAP$;
+      272     6843    3       END;
+      273     6844    2     END;
+      274     6845    1     ELSE ADDR$ = BLK$;
+      275     6846    1     ADDR$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 1;
+      276     6847    1     ADDR$ = ADDR (ADDR$ -> STORAGE_BLOCK.BODY);
+      277     6848    1     RETURN;
+      278     6849    1   BAD_ERR:
+      279     6850    1     CALL M$ERR;
+      280     6851        %EJECT;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:10   
+      281     6852        /*---------*/
+      282     6853    1     X9MA$FREE:           ENTRY (ADDR$);
+      283     6854        /*---------*/
+      284     6855
+      285     6856        /*P*
+      286     6857               NAME:  X9MA$FREE
+      287     6858             AUTHOR:  Albert H. Wigchert
+      288     6859            PURPOSE:  Allocate/free memory as needed for USAGE IS POINTER.
+      289     6860        */
+      290     6861        /*D*
+      291     6862               NAME:  X9MA$FREE
+      292     6863               CALL:  CALL "X9MA$FREE" USING [BY REFERENCE] [ADDRESS OF]
+      293     6864                      identifier-1.
+      294     6865          INTERFACE:  X9AS$SHRINK_PTR -- Take a 2048K super segment and by
+      295     6866                                         shrinks split it into 8 regular
+      296     6867                                         segments, returning pointers to them.
+      297     6868              INPUT:  identifier-1 -- Must be USAGE IS POINTER; the allocated
+      298     6869                          block it points to gets freed and the identifier is
+      299     6870                          set to ADDR (NIL).
+      300     6871                      ADDRESS OF identifier-1 -- In this case it can be any
+      301     6872                          USAGE, including POINTER, as long as it is a level 01
+      302     6873                          or 77 item in the LINKAGE SECTION. The variable gets
+      303     6874                          freed and its pointer in the pseudostack is set to
+      304     6875                          ADDR (NIL).
+      305     6876             OUTPUT:  The pointer is set to ADDR (NIL).
+      306     6877        DESCRIPTION:  Check to make sure that this is a legitimate block of
+      307     6878                      allocated storage (IDENT has the right value) and that it
+      308     6879                      is indeed currently allocated (ALLOCATED = 1); if not
+      309     6880                      then an error message is in order. If the conditions hold,
+      310     6881                      then set the block to free (ALLOCATED = 0) and set its
+      311     6882                      pointer to a null pointer.
+      312     6883        */
+      313     6884        %eject;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:11   
+      314     6885    1     ADDR$ = PINCRW (ADDR$, -4); /* ADDR (header) */
+      315     6886    2     IF ADDR$ -> STORAGE_BLOCK.HEADER.IDENT ~= %MANAGED_BLOCK THEN DO;
+      316     6887            /* Issue error message */
+      317     6888    2       CALL M$ERR;
+      318     6889    2     END;
+      319     6890    2     IF ADDR$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0 THEN DO;
+      320     6891            /* Issue error message */
+      321     6892    2       CALL M$ERR;
+      322     6893    2     END;
+      323     6894    1     ADDR$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0; /* Free it */
+      324     6895    1     ADDR$ = ADDR (NIL);
+      325     6896    1     RETURN;
+      326     6897    1   END X9MA$ALLOCATE;
+      327     6898        %eject;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:12   
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:13   
+--  Include file information  --
+
+   CP_6_SUBS.:LIB_E04  is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+   Z9A_FLAGS.:Z8A6TOU  is referenced.
+   X8A_SYS_FILE.:X8A6TOU  is referenced.
+      No diagnostics issued in procedure X9MA$ALLOCATE.
+
+   Procedure X9MA$ALLOCATE requires 330 words for executable code.
+   Procedure X9MA$ALLOCATE requires 82 words of local(AUTO) storage.
+
+    No errors detected in file X9MA.:X8A6TSI    .
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:14   
+
+ Object Unit name= X9MA$ALLOCATE                              File name= X9MA.:X8A6TOU
+ UTS= AUG 09 '97 10:57:11.52 SAT                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   DCB   even  none     0      0  M$UC
+    1  RoData even  UTS     60     74  X9MA$ALLOCATE
+    2   Data  even  none   179    263  X9MA$ALLOCATE
+    3   Proc  even  none   330    512  X9MA$ALLOCATE
+    4  RoData even  none     7      7  X9MA$ALLOCATE
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     3      0   yes            yes      Std        2  X9MA$ALLOCATE
+     3    461                  yes      Std        1  X9MA$FREE
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       2 X9AS$SHRINK_PTR
+                       nStd      0 X66_AUTO_2
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     M$UC
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:15   
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID                                 NULLSID
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:16   
+
+
+        1        1        /*M* X9MA$ALLOCATE -- ALLOCATE/FREE FOR USAGE IS POINTER */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*P*
+        8        8               NAME:  X9MA$ALLOCATE
+        9        9             AUTHOR:  Albert H. Wigchert
+       10       10            Revised:  Charles F LaCasse III (for inclusion in shared library)
+       11       11            PURPOSE:  Allocate/free memory as needed for USAGE IS POINTER.
+       12       12        */
+       13       13        /*D*
+       14       14               NAME:  X9MA$ALLOCATE
+       15       15               CALL:  CALL "X9MA$ALLOCATE" USING [BY REFERENCE] [ADDRESS OF]
+       16       16                      identifier-1 {BY CONTENT LENGTH OF identifier-2 |
+       17       17                                    [BY CONTENT] identifier-3}.
+       18       18          INTERFACE:  X9AS$SHRINK_PTR -- Take a 2048K super segment and by
+       19       19                                         shrinks split it into 8 regular
+       20       20                                         segments, returning pointers to them.
+       21       21              INPUT:  LENGTH OF identifier-2 -- Set up an allocated block the
+       22       22                          same size as this identifier.
+       23       23                      identifier-3 -- Set up an allocated block where this
+       24       24                          variable = the number of bytes of storage needed.
+       25       25             OUTPUT:  identifier-1 -- Must be USAGE IS POINTER; it gets set to
+       26       26                          the address of the allocated block's body.
+       27       27                      ADDRESS OF identifier-1 -- In this case it can be any
+       28       28                          USAGE, including POINTER, as long as it is a level 01
+       29       29                          or 77 item in the LINKAGE SECTION. The variable gets
+       30       30                          allocated and its pointer in the pseudostack is set.
+       31       31        DESCRIPTION:  Find out which bucket this block is to be in; bucket
+       32       32                      number is the number of doublewords needed to hold it and
+       33       33                      its 4-word header, mod 128. Check if there are any
+       34       34                      currently non-allocated blocks of exactly the right size.
+       35       35                      If so, allocate one. Otherwise search the heap chain.
+       36       36                      Take the first that is big enough. If it is big enough
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:17   
+       37       37                      with at most 4 words to spare, use the whole thing. If
+       38       38                      there are at least 128 words to spare then remove the
+       39       39                      number of words needed from the low end of the heap item
+       40       40                      and leave the balance of it linked where it already was in
+       41       41                      the chain. (Generally they are linked in increasing order
+       42       42                      of size but this will not always be the case.) If the
+       43       43                      number of spare words is at least 6 but less than 128 (it
+       44       44                      will always be an even number) the remove the whole thing
+       45       45                      from the heap chain and place the remainder in whichever
+       46       46                      bucket is appropriate for a block of its size. Then again
+       47       47                      consider what was found about blocks already in the desired
+       48       48                      bucket. If none, just place it in the bucket. If everything
+       49       49                      in the bucket is bigger than the new item then insert the
+       50       50                      new item at the head of the chain. If at least one item
+       51       51                      is smaller but none are the same size then insert the new
+       52       52                      item as the ROP of the largest one not bigger than the new
+       53       53                      item, and make that one's old ROP the ROP of the new item.
+       54       54                      If there is exactly one of the right size already then
+       55       55                      attach the new one as its LOP; if more than one then
+       56       56                      make the new one the LOP of the first one in the chain,
+       57       57                      and make its old LOP the LOP of the new item.
+       58       58        */
+       59       59        %eject;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:18   
+       60       60        /*-------------*/
+       61       61          X9MA$ALLOCATE:       PROC (ADDR$, LENGTH);
+
+     61  3 000000   000000 700200 xent  X9MA$ALLOCA* TSX0  ! X66_AUTO_2
+         3 000001   000122 000002                    ZERO    82,2
+
+       62       62        /*-------------*/
+       63       63
+       64       64        %INCLUDE X8A_SYS_FILE;
+       65     6334        %EQU AUTO_STORAGE_PAGES = 12;
+       66     6335        %EQU MAX_SIZE = 262144;
+       67     6336        %EQU MANAGED_BLOCK = 390625;
+       68     6337        %FPT_GDDL (FPTN=GDDL_FPT, STCLASS=AUTO);
+       69     6350        %VLP_GDDL (FPTN=GDDL_RESULTS, STCLASS=AUTO);
+       70     6364        %FPT_OPEN (FPTN=FPT_OPEN, STCLASS=AUTO);
+       71     6473        %FPT_OPEN (FPTN=FPT_OPEN_CONST, STCLASS=CONSTANT, ORG=KEYED, ASN=FILE,
+       72     6474                   DISP=SCRATCH, FUN=CREATE);
+       73     6583        %FPT_GETDCB (FPTN=M$VIRTUAL1, DCBNUM="VIRTUAL_DCBNUMS(0)");
+       74     6598        %FPT_GETDCB (FPTN=M$VIRTUAL2, DCBNUM="VIRTUAL_DCBNUMS(1)");
+       75     6613        %FPT_GETDCB (FPTN=M$VIRTUAL3, DCBNUM="VIRTUAL_DCBNUMS(2)");
+       76     6628    1   DCL ADDR$ PTR;
+       77     6629    1   DCL LENGTH SBIN;
+       78     6630    1   DCL DYNAMIC_SEG$ (0:7) PTR STATIC INIT (ADDR (NIL) * 8);
+       79     6631    1   DCL DYNAMIC_SEG# SBIN STATIC INIT (7);
+       80     6632        %VLP_VIRTUAL (FPTN=VIRTUAL_VLP, INITIALIZE=YES, INITVALUE=0,
+       81     6633            PHYSICAL=10, SEGNUM=VS1, SEGSIZE=2097152);
+       82     6653    1   DCL VIRTUAL_DCBNUMS (0:2) UBIN STATIC;
+       83     6654    1   DCL 1 STORAGE_BLOCK BASED ALIGNED,
+       84     6655    1         2 HEADER,
+       85     6656    1           3 IDENT SBIN,
+       86     6657    1           3 SIZE UBIN HALF HALIGNED,
+       87     6658    1           3 ALLOCATED UBIN HALF HALIGNED,
+       88     6659    1           3 LOP$ PTR,
+       89     6660    1           3 ROP$ PTR,
+       90     6661    1         2 BODY (0:%(MAX_SIZE-2)) UBIN;
+       91     6662    1   DCL BACKUP_PAGES SBIN STATIC;
+       92     6663    1   DCL FIRST_TIME_FLAG BIT (1) STATIC INIT ('1'B);
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:19   
+       93     6664    1   DCL HEAP_HEAD$ PTR STATIC INIT (ADDR (NIL));
+       94     6665    1   DCL BUCKET$ (0:127) PTR STATIC INIT (ADDR (NIL) * 128);
+       95     6666    1   DCL BUCKETNUM SBIN;
+       96     6667    1   DCL BLKSIZE SBIN;
+       97     6668    1   DCL BLK$ PTR;
+       98     6669    1   DCL PREV_BLK$ PTR;
+       99     6670    1   DCL HEAP$ PTR;
+      100     6671    1   DCL HEAP1$ PTR;
+      101     6672    1   DCL HEAP2$ PTR;
+      102     6673    1   DCL VLPVEC VECTOR CONSTANT INIT (VECTOR (VIRTUAL_VLP));
+      103     6674    1   DCL SIZE1 UBIN;
+      104     6675    1   DCL TEMP_SBIN SBIN;
+      105     6676    1   DCL TEMP$ PTR;
+      106     6677    1   DCL X9AS$SHRINK_PTR ENTRY (2);
+      107     6678        %EJECT;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:20   
+      108     6679    1     IF FIRST_TIME_FLAG THEN
+
+   6679  3 000002   000061 234000 2                  SZN     FIRST_TIME_FLAG
+         3 000003   000031 605000 3                  TPL     s:6689
+
+      109     6680    2       DO;
+
+      110     6681    2         FIRST_TIME_FLAG = '0'B;
+
+   6681  3 000004   000061 450000 2                  STZ     FIRST_TIME_FLAG
+
+      111     6682    2         CALL M$GETDCB (M$VIRTUAL1);
+
+   6682  3 000005   000000 630400 2                  EPPR0   M$VIRTUAL1
+         3 000006   060002 713400                    CLIMB   24578
+         3 000007   401000 401760                    pmme    nvectors=3
+
+      112     6683    2         CALL M$GETDCB (M$VIRTUAL2);
+
+   6683  3 000010   000010 630400 2                  EPPR0   M$VIRTUAL2
+         3 000011   060002 713400                    CLIMB   24578
+         3 000012   401000 401760                    pmme    nvectors=3
+
+      113     6684    2         CALL M$GETDCB (M$VIRTUAL3);
+
+   6684  3 000013   000020 630400 2                  EPPR0   M$VIRTUAL3
+         3 000014   060002 713400                    CLIMB   24578
+         3 000015   401000 401760                    pmme    nvectors=3
+
+      114     6685    2         GDDL_FPT.RESULTS_ = VECTOR (GDDL_RESULTS);
+
+   6685  3 000016   000000 235000 4                  LDA     0
+         3 000017   200120 452500                    STP2    TEMP$+1,,AUTO
+         3 000020   200120 236100                    LDQ     TEMP$+1,,AUTO
+         3 000021   000010 036003                    ADLQ    8,DU
+         3 000022   200006 757100                    STAQ    GDDL_FPT,,AUTO
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:21   
+      115     6686    2         CALL M$GDDL (GDDL_FPT);
+
+   6686  3 000023   200006 630500                    EPPR0   GDDL_FPT,,AUTO
+         3 000024   030014 713400                    CLIMB   12300
+         3 000025   400000 401760                    pmme    nvectors=1
+
+      116     6687    2         BACKUP_PAGES = GDDL_RESULTS.AVAIL_PGS# - %AUTO_STORAGE_PAGES;
+
+   6687  3 000026   200012 235100                    LDA     GDDL_RESULTS+2,,AUTO
+         3 000027   000014 135007                    SBLA    12,DL
+         3 000030   000060 755000 2                  STA     BACKUP_PAGES
+
+      117     6688    2       END;
+
+      118     6689    1     PREV_BLK$ = ADDR (NIL);
+
+   6689  3 000031   000001 236000 4                  LDQ     1
+         3 000032   200111 756100                    STQ     PREV_BLK$,,AUTO
+
+      119     6690    1     BLKSIZE = (LENGTH + 7) / 8; /* # doublewords needed */
+
+   6690  3 000033   200004 470500                    LDP0    @LENGTH,,AUTO
+         3 000034   000000 236100                    LDQ     0,,PR0
+         3 000035   000007 036007                    ADLQ    7,DL
+         3 000036   000010 506007                    DIV     8,DL
+         3 000037   200107 756100                    STQ     BLKSIZE,,AUTO
+
+      120     6691    1     BUCKETNUM = MOD (BLKSIZE, 128);
+
+   6691  3 000040   000200 506007                    DIV     128,DL
+         3 000041   200106 755100                    STA     BUCKETNUM,,AUTO
+
+      121     6692    1     BLKSIZE = BLKSIZE * 2;
+
+   6692  3 000042   200107 236100                    LDQ     BLKSIZE,,AUTO
+         3 000043   200107 056100                    ASQ     BLKSIZE,,AUTO
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:22   
+      122     6693    1     BLK$ = BUCKET$ (BUCKETNUM);
+
+   6693  3 000044   000063 236005 2                  LDQ     BUCKET$,AL
+         3 000045   200110 756100                    STQ     BLK$,,AUTO
+
+      123     6694    1   SCAN_BUCKET:
+      124     6695    2     DO WHILE BLK$ ~= ADDR (NIL);
+
+   6695  3 000046   000067 710000 3     SCAN_BUCKET  TRA     s:6704
+
+      125     6696    2       IF BLK$ -> STORAGE_BLOCK.HEADER.SIZE > BLKSIZE THEN
+
+   6696  3 000047   200110 470500                    LDP0    BLK$,,AUTO
+         3 000050   000001 236100                    LDQ     1,,PR0
+         3 000051   000022 772000                    QRL     18
+         3 000052   200107 116100                    CMPQ    BLKSIZE,,AUTO
+         3 000053   000057 604400 3                  TMOZ    s:6699
+
+      126     6697    2         BLK$ = ADDR (NIL);
+
+   6697  3 000054   000001 236000 4                  LDQ     1
+         3 000055   200110 756100                    STQ     BLK$,,AUTO
+         3 000056   000067 710000 3                  TRA     s:6704
+
+      127     6698    3       ELSE DO;
+
+      128     6699    3         PREV_BLK$ = BLK$; /* PTR to last that is not too big, if any */
+
+   6699  3 000057   200110 236100                    LDQ     BLK$,,AUTO
+         3 000060   200111 756100                    STQ     PREV_BLK$,,AUTO
+
+      129     6700    3         IF BLK$ -> STORAGE_BLOCK.HEADER.SIZE = BLKSIZE THEN
+
+   6700  3 000061   000001 236100                    LDQ     1,,PR0
+         3 000062   000022 772000                    QRL     18
+         3 000063   200107 116100                    CMPQ    BLKSIZE,,AUTO
+         3 000064   000071 600000 3                  TZE     s:6708
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:23   
+
+      130     6701    3           EXIT SCAN_BUCKET;
+      131     6702    3         BLK$ = BLK$ -> STORAGE_BLOCK.HEADER.ROP$;
+
+   6702  3 000065   000003 236100                    LDQ     3,,PR0
+         3 000066   200110 756100                    STQ     BLK$,,AUTO
+
+      132     6703    3       END;
+
+      133     6704    2     END; /* SCAN_BUCKET */
+
+   6704  3 000067   000001 116000 4                  CMPQ    1
+         3 000070   000047 601000 3                  TNZ     s:6696
+
+      134     6705          /* If BLK$ ~= ADDR (NIL) then there is already at least one block of
+      135     6706             the desired size in the bucket. Question: is there at least one
+      136     6707             that is not currently allocated? */
+      137     6708    2     DO WHILE BLK$ ~= ADDR (NIL);
+
+   6708  3 000071   000077 710000 3                  TRA     s:6711
+
+      138     6709    2       IF BLK$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0 THEN EXIT;
+
+   6709  3 000072   200110 470500                    LDP0    BLK$,,AUTO
+         3 000073   000001 720100                    LXL0    1,,PR0
+         3 000074   000102 600000 3                  TZE     s:6714
+
+      139     6710    2       BLK$ = BLK$ -> STORAGE_BLOCK.HEADER.LOP$;
+
+   6710  3 000075   000002 236100                    LDQ     2,,PR0
+         3 000076   200110 756100                    STQ     BLK$,,AUTO
+
+      140     6711    2     END;
+
+   6711  3 000077   200110 236100                    LDQ     BLK$,,AUTO
+         3 000100   000001 116000 4                  CMPQ    1
+         3 000101   000072 601000 3                  TNZ     s:6709
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:24   
+
+      141     6712          /* If BLK$ ~= ADDR (NIL) now then it points to a block of the right
+      142     6713             size that is not allocated. Allocate it. */
+      143     6714    2     IF BLK$ = ADDR (NIL) THEN DO;
+
+   6714  3 000102   200110 236100                    LDQ     BLK$,,AUTO
+         3 000103   000001 116000 4                  CMPQ    1
+         3 000104   000444 601000 3                  TNZ     s:6845
+
+      144     6715    2       HEAP$ = HEAP_HEAD$;
+
+   6715  3 000105   000062 236000 2                  LDQ     HEAP_HEAD$
+         3 000106   200112 756100                    STQ     HEAP$,,AUTO
+
+      145     6716    2       HEAP1$ = ADDR (NIL);
+
+   6716  3 000107   000001 236000 4                  LDQ     1
+         3 000110   200113 756100                    STQ     HEAP1$,,AUTO
+
+      146     6717    3       DO WHILE HEAP$ ~= ADDR (NIL);
+
+   6717  3 000111   000123 710000 3                  TRA     s:6721
+
+      147     6718    3         IF BLKSIZE <= HEAP$ -> STORAGE_BLOCK.HEADER.SIZE THEN EXIT;
+
+   6718  3 000112   200112 470500                    LDP0    HEAP$,,AUTO
+         3 000113   000001 236100                    LDQ     1,,PR0
+         3 000114   000022 772000                    QRL     18
+         3 000115   200107 116100                    CMPQ    BLKSIZE,,AUTO
+         3 000116   000126 605000 3                  TPL     s:6724
+
+      148     6719    3         HEAP1$ = HEAP$;
+
+   6719  3 000117   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000120   200113 756100                    STQ     HEAP1$,,AUTO
+
+      149     6720    3         HEAP$ = HEAP$ -> STORAGE_BLOCK.HEADER.ROP$;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:25   
+
+   6720  3 000121   000003 236100                    LDQ     3,,PR0
+         3 000122   200112 756100                    STQ     HEAP$,,AUTO
+
+      150     6721    3       END;
+
+   6721  3 000123   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000124   000001 116000 4                  CMPQ    1
+         3 000125   000112 601000 3                  TNZ     s:6718
+
+      151     6722            /* If HEAP$ = ADDR (NIL) then there is no heap chunk that is big
+      152     6723               enough and so a 256K block needs to be added to the heap. */
+      153     6724    3       IF HEAP$ = ADDR (NIL) THEN DO;
+
+   6724  3 000126   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000127   000001 116000 4                  CMPQ    1
+         3 000130   000233 601000 3                  TNZ     s:6755
+
+      154     6725    3         IF DYNAMIC_SEG# < 7 THEN
+
+   6725  3 000131   000040 235000 2                  LDA     DYNAMIC_SEG#
+         3 000132   000007 115007                    CMPA    7,DL
+         3 000133   000136 605000 3                  TPL     s:6730
+
+      155     6726    3           DYNAMIC_SEG# = DYNAMIC_SEG# + 1;
+
+   6726  3 000134   000040 054000 2                  AOS     DYNAMIC_SEG#
+         3 000135   000205 710000 3                  TRA     s:6744
+
+      156     6727    4         ELSE DO;
+
+      157     6728                /* In this case there are no 256K blocks left, either. Acquire
+      158     6729                   another 2048K super segment. */
+      159     6730    4           IF VIRTUAL_VLP.SEGNUM# > 2 THEN GOTO BAD_ERR;
+
+   6730  3 000136   000041 236000 2                  LDQ     VIRTUAL_VLP
+         3 000137   000777 376007                    ANQ     511,DL
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:26   
+         3 000140   000003 116007                    CMPQ    3,DL
+         3 000141   000456 603000 3                  TRC     BAD_ERR
+
+      160     6731    4           TEMP_SBIN = BACKUP_PAGES * 3 / 5; /* Use 60% of the space */
+
+   6731  3 000142   000060 236000 2                  LDQ     BACKUP_PAGES
+         3 000143   000003 402007                    MPY     3,DL
+         3 000144   000005 506007                    DIV     5,DL
+         3 000145   200116 756100                    STQ     TEMP_SBIN,,AUTO
+
+      161     6732    4           VIRTUAL_VLP.PHYSICAL# = TEMP_SBIN;
+
+   6732  3 000146   000000 620006                    EAX0    0,QL
+         3 000147   000044 740000 2                  STX0    VIRTUAL_VLP+3
+
+      162     6733    4           BACKUP_PAGES = BACKUP_PAGES - TEMP_SBIN;
+
+   6733  3 000150   000060 236000 2                  LDQ     BACKUP_PAGES
+         3 000151   200116 136100                    SBLQ    TEMP_SBIN,,AUTO
+         3 000152   000060 756000 2                  STQ     BACKUP_PAGES
+
+      163     6734    4           FPT_OPEN = FPT_OPEN_CONST;
+
+   6734  3 000153   000100 100400                    MLR     fill='000'O
+         3 000154   000000 000350 1                  ADSC9   FPT_OPEN_CONST           cn=0,n=232
+         3 000155   200014 000350                    ADSC9   FPT_OPEN,,AUTO           cn=0,n=232
+
+      164     6735    4           FPT_OPEN.V.DCB# = VIRTUAL_DCBNUMS (VIRTUAL_VLP.SEGNUM#);
+
+   6735  3 000156   000041 721000 2                  LXL1    VIRTUAL_VLP
+         3 000157   000777 361003                    ANX1    511,DU
+         3 000160   000055 722011 2                  LXL2    VIRTUAL_DCBNUMS,X1
+         3 000161   200060 742100                    STX2    FPT_OPEN+36,,AUTO
+
+      165     6736    4           FPT_OPEN.V_ = VECTOR (FPT_OPEN.V);
+
+   6736  3 000162   000002 235000 4                  LDA     2
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:27   
+         3 000163   200120 452500                    STP2    TEMP$+1,,AUTO
+         3 000164   200120 236100                    LDQ     TEMP$+1,,AUTO
+         3 000165   000060 036003                    ADLQ    48,DU
+         3 000166   200014 757100                    STAQ    FPT_OPEN,,AUTO
+
+      166     6737    4           FPT_OPEN.VIRTUAL_ = VLPVEC;
+
+   6737  3 000167   000072 237000 1                  LDAQ    VLPVEC
+         3 000170   200020 757100                    STAQ    FPT_OPEN+4,,AUTO
+
+      167     6738    4           CALL M$OPEN (FPT_OPEN) ALTRET (BAD_ERR);
+
+   6738  3 000171   200014 630500                    EPPR0   FPT_OPEN,,AUTO
+         3 000172   450000 713400                    CLIMB   alt,open
+         3 000173   410400 401760                    pmme    nvectors=18
+         3 000174   000456 702000 3                  TSX2    BAD_ERR
+
+      168     6739                /* Now split it into 8 regular segments. */
+      169     6740    4           CALL X9AS$SHRINK_PTR (DYNAMIC_SEG$, VIRTUAL_VLP.PTR$);
+
+   6740  3 000175   000004 630400 4                  EPPR0   4
+         3 000176   000003 631400 4                  EPPR1   3
+         3 000177   000000 701000 xent               TSX1    X9AS$SHRINK_PTR
+         3 000200   000000 011000                    NOP     0
+
+      170     6741    4           DYNAMIC_SEG# = 0;
+
+   6741  3 000201   000040 450000 2                  STZ     DYNAMIC_SEG#
+
+      171     6742    4           VIRTUAL_VLP.SEGNUM# = VIRTUAL_VLP.SEGNUM# + 1;
+
+   6742  3 000202   000041 236000 2                  LDQ     VIRTUAL_VLP
+         3 000203   000001 036007                    ADLQ    1,DL
+         3 000204   000041 552004 2                  STBQ    VIRTUAL_VLP,'04'O
+
+      172     6743    4         END;
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:28   
+      173     6744    3         HEAP$ = DYNAMIC_SEG$ (DYNAMIC_SEG#);
+
+   6744  3 000205   000040 720000 2                  LXL0    DYNAMIC_SEG#
+         3 000206   000030 236010 2                  LDQ     DYNAMIC_SEG$,X0
+         3 000207   200112 756100                    STQ     HEAP$,,AUTO
+
+      174     6745    3         IF HEAP1$ = ADDR (NIL)
+
+   6745  3 000210   200113 236100                    LDQ     HEAP1$,,AUTO
+         3 000211   000001 116000 4                  CMPQ    1
+         3 000212   000216 601000 3                  TNZ     s:6747
+
+      175     6746    3           THEN HEAP_HEAD$ = HEAP$;
+
+   6746  3 000213   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000214   000062 756000 2                  STQ     HEAP_HEAD$
+         3 000215   000221 710000 3                  TRA     s:6748
+
+      176     6747    3           ELSE HEAP1$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP$;
+
+   6747  3 000216   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000217   200113 470500                    LDP0    HEAP1$,,AUTO
+         3 000220   000003 756100                    STQ     3,,PR0
+
+      177     6748    3         HEAP$ -> STORAGE_BLOCK.HEADER.IDENT = %MANAGED_BLOCK;
+
+   6748  3 000221   000006 235000 4                  LDA     6
+         3 000222   200112 470500                    LDP0    HEAP$,,AUTO
+         3 000223   000000 755100                    STA     0,,PR0
+
+      178     6749    3         HEAP$ -> STORAGE_BLOCK.HEADER.SIZE = %(MAX_SIZE-4);
+
+   6749  3 000224   777774 221003                    LDX1    -4,DU
+         3 000225   000001 741100                    STX1    1,,PR0
+
+      179     6750              /* All 256K is available, except for 4 words for a header. */
+      180     6751    3         HEAP$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:29   
+
+   6751  3 000226   000000 222003                    LDX2    0,DU
+         3 000227   000001 442100                    SXL2    1,,PR0
+
+      181     6752    3         HEAP$ -> STORAGE_BLOCK.HEADER.LOP$ = ADDR (NIL);
+
+   6752  3 000230   000001 236000 4                  LDQ     1
+         3 000231   000002 756100                    STQ     2,,PR0
+
+      182     6753    3         HEAP$ -> STORAGE_BLOCK.HEADER.ROP$ = ADDR (NIL);
+
+   6753  3 000232   000003 756100                    STQ     3,,PR0
+
+      183     6754    3       END;
+
+      184     6755    3       IF BLKSIZE + 4 >= HEAP$ -> STORAGE_BLOCK.HEADER.SIZE THEN DO;
+
+   6755  3 000233   200112 470500                    LDP0    HEAP$,,AUTO
+         3 000234   000001 236100                    LDQ     1,,PR0
+         3 000235   000022 772000                    QRL     18
+         3 000236   200120 756100                    STQ     TEMP$+1,,AUTO
+         3 000237   200107 236100                    LDQ     BLKSIZE,,AUTO
+         3 000240   000004 036007                    ADLQ    4,DL
+         3 000241   200120 116100                    CMPQ    TEMP$+1,,AUTO
+         3 000242   000257 604000 3                  TMI     s:6765
+
+      185     6756              /* There is at most 4 words left of this heap block, not enough
+      186     6757                 to be useable. */
+      187     6758    3         IF HEAP1$ = ADDR (NIL)
+
+   6758  3 000243   200113 236100                    LDQ     HEAP1$,,AUTO
+         3 000244   000001 116000 4                  CMPQ    1
+         3 000245   000251 601000 3                  TNZ     s:6760
+
+      188     6759    3           THEN HEAP_HEAD$ = HEAP$ -> STORAGE_BLOCK.HEADER.ROP$;
+
+   6759  3 000246   000003 236100                    LDQ     3,,PR0
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:30   
+         3 000247   000062 756000 2                  STQ     HEAP_HEAD$
+         3 000250   000254 710000 3                  TRA     s:6761
+
+      189     6760    3           ELSE HEAP1$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP$ -> STORAGE_BLOCK.HEADER.
+              6760                    ROP$;
+
+   6760  3 000251   000003 236100                    LDQ     3,,PR0
+         3 000252   200113 471500                    LDP1    HEAP1$,,AUTO
+         3 000253   100003 756100                    STQ     3,,PR1
+
+      190     6761    3         HEAP$ -> STORAGE_BLOCK.HEADER.SIZE = BLKSIZE;
+
+   6761  3 000254   200107 720100                    LXL0    BLKSIZE,,AUTO
+         3 000255   000001 740100                    STX0    1,,PR0
+
+      191     6762              /* Throw away the excess. */
+      192     6763    3       END;
+
+   6763  3 000256   000400 710000 3                  TRA     s:6819
+
+      193     6764    3       ELSE DO;
+
+      194     6765    3         HEAP2$ = PINCRW (HEAP$, BLKSIZE + 4);
+
+   6765  3 000257   000022 736000                    QLS     18
+         3 000260   200112 036100                    ADLQ    HEAP$,,AUTO
+         3 000261   200114 756100                    STQ     HEAP2$,,AUTO
+
+      195     6766              /* Only the part of the block starting here will still be in heap. */
+      196     6767    4         IF BLKSIZE + 132 <= HEAP$ -> STORAGE_BLOCK.HEADER.SIZE THEN DO;
+
+   6767  3 000262   200107 235100                    LDA     BLKSIZE,,AUTO
+         3 000263   000204 035007                    ADLA    132,DL
+         3 000264   200120 755100                    STA     TEMP$+1,,AUTO
+         3 000265   000001 236100                    LDQ     1,,PR0
+         3 000266   000022 772000                    QRL     18
+         3 000267   200120 116100                    CMPQ    TEMP$+1,,AUTO
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:31   
+         3 000270   000315 604000 3                  TMI     s:6779
+
+      197     6768                /* 128 or more words - yes, OK for balance to stay on heap */
+      198     6769    4           IF HEAP1$ = ADDR (NIL)
+
+   6769  3 000271   200113 236100                    LDQ     HEAP1$,,AUTO
+         3 000272   000001 116000 4                  CMPQ    1
+         3 000273   000277 601000 3                  TNZ     s:6771
+
+      199     6770    4             THEN HEAP_HEAD$ = HEAP2$;
+
+   6770  3 000274   200114 236100                    LDQ     HEAP2$,,AUTO
+         3 000275   000062 756000 2                  STQ     HEAP_HEAD$
+         3 000276   000302 710000 3                  TRA     s:6772
+
+      200     6771    4             ELSE HEAP1$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP2$;
+
+   6771  3 000277   200114 236100                    LDQ     HEAP2$,,AUTO
+         3 000300   200113 471500                    LDP1    HEAP1$,,AUTO
+         3 000301   100003 756100                    STQ     3,,PR1
+
+      201     6772    4           HEAP2$ -> STORAGE_BLOCK.HEADER.ROP$ =
+
+   6772  3 000302   000003 236100                    LDQ     3,,PR0
+         3 000303   200114 471500                    LDP1    HEAP2$,,AUTO
+         3 000304   100003 756100                    STQ     3,,PR1
+
+      202     6773    4               HEAP$ -> STORAGE_BLOCK.HEADER.ROP$;
+      203     6774    4           HEAP2$ -> STORAGE_BLOCK.HEADER.SIZE =
+
+   6774  3 000305   000001 236100                    LDQ     1,,PR0
+         3 000306   000022 772000                    QRL     18
+         3 000307   200107 136100                    SBLQ    BLKSIZE,,AUTO
+         3 000310   777774 620006                    EAX0    -4,QL
+         3 000311   100001 740100                    STX0    1,,PR1
+
+      204     6775    4               HEAP$ -> STORAGE_BLOCK.HEADER.SIZE - BLKSIZE - 4;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:32   
+      205     6776    4           HEAP2$ -> STORAGE_BLOCK.HEADER.IDENT = %MANAGED_BLOCK;
+
+   6776  3 000312   000006 236000 4                  LDQ     6
+         3 000313   100000 756100                    STQ     0,,PR1
+
+      206     6777    4         END;
+
+   6777  3 000314   000376 710000 3                  TRA     s:6817
+
+      207     6778    4         ELSE DO; /* No, move under bucket */
+
+      208     6779    4           HEAP2$ -> STORAGE_BLOCK.HEADER.LOP$ = ADDR (NIL);
+
+   6779  3 000315   000001 236000 4                  LDQ     1
+         3 000316   200114 471500                    LDP1    HEAP2$,,AUTO
+         3 000317   100002 756100                    STQ     2,,PR1
+
+      209     6780    4           HEAP2$ -> STORAGE_BLOCK.HEADER.ROP$ = ADDR (NIL);
+
+   6780  3 000320   100003 756100                    STQ     3,,PR1
+
+      210     6781    4           IF HEAP1$ = ADDR (NIL)
+
+   6781  3 000321   200113 236100                    LDQ     HEAP1$,,AUTO
+         3 000322   000001 116000 4                  CMPQ    1
+         3 000323   000327 601000 3                  TNZ     s:6783
+
+      211     6782    4             THEN HEAP_HEAD$ = HEAP$ -> STORAGE_BLOCK.HEADER.ROP$;
+
+   6782  3 000324   000003 236100                    LDQ     3,,PR0
+         3 000325   000062 756000 2                  STQ     HEAP_HEAD$
+         3 000326   000332 710000 3                  TRA     s:6785
+
+      212     6783    4             ELSE HEAP1$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP$ -> STORAGE_BLOCK.HEADER.
+              6783                      ROP$;
+
+   6783  3 000327   000003 236100                    LDQ     3,,PR0
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:33   
+         3 000330   200113 473500                    LDP3    HEAP1$,,AUTO
+         3 000331   300003 756100                    STQ     3,,PR3
+
+      213     6784                /* The heap block is now delinked. */
+      214     6785    4           SIZE1 = HEAP$ -> STORAGE_BLOCK.HEADER.SIZE - BLKSIZE - 4;
+
+   6785  3 000332   000001 236100                    LDQ     1,,PR0
+         3 000333   000022 772000                    QRL     18
+         3 000334   200107 136100                    SBLQ    BLKSIZE,,AUTO
+         3 000335   000004 136007                    SBLQ    4,DL
+         3 000336   200115 756100                    STQ     SIZE1,,AUTO
+
+      215     6786                /* SIZE1 is guaranteed to be not more than 128; therefore,
+      216     6787                   1) there is no need for a MOD operation in calculating the
+      217     6788                   bucket number the remaining piece goes into; 2) this
+      218     6789                   remaining piece cannot be bigger than a block already under
+      219     6790                   its bucket; if there is already at least one of the same
+      220     6791                   size then the new one should be inserted at the new LOP of
+      221     6792                   the item pointed to by BUCKET$ (TEMP_SBIN); otherwise, it
+      222     6793                   should be inserted as the new head of the chain. */
+      223     6794    4           TEMP_SBIN = SIZE1 / 2;
+
+   6794  3 000337   000001 772000                    QRL     1
+         3 000340   200116 756100                    STQ     TEMP_SBIN,,AUTO
+
+      224     6795    4           TEMP$ = BUCKET$ (TEMP_SBIN);
+
+   6795  3 000341   000063 236006 2                  LDQ     BUCKET$,QL
+         3 000342   200117 756100                    STQ     TEMP$,,AUTO
+
+      225     6796    5           IF TEMP$ = ADDR (NIL) THEN DO;
+
+   6796  3 000343   000001 116000 4                  CMPQ    1
+         3 000344   000351 601000 3                  TNZ     s:6802
+
+      226     6797                  /* The unused part of the heap block goes into a previously
+      227     6798                     empty bucket. */
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:34   
+      228     6799    5             BUCKET$ (TEMP_SBIN) = HEAP2$;
+
+   6799  3 000345   200114 236100                    LDQ     HEAP2$,,AUTO
+         3 000346   200116 720100                    LXL0    TEMP_SBIN,,AUTO
+         3 000347   000063 756010 2                  STQ     BUCKET$,X0
+
+      229     6800    5           END;
+
+   6800  3 000350   000370 710000 3                  TRA     s:6813
+
+      230     6801    5           ELSE DO;
+
+      231     6802    6             IF TEMP$ -> STORAGE_BLOCK.HEADER.SIZE = SIZE1 THEN DO;
+
+   6802  3 000351   200117 473500                    LDP3    TEMP$,,AUTO
+         3 000352   300001 236100                    LDQ     1,,PR3
+         3 000353   000022 772000                    QRL     18
+         3 000354   200115 116100                    CMPQ    SIZE1,,AUTO
+         3 000355   000363 601000 3                  TNZ     s:6809
+
+      232     6803                    /* New LOP of item at head of chain */
+      233     6804    6               HEAP2$ -> STORAGE_BLOCK.HEADER.LOP$ =
+
+   6804  3 000356   300002 236100                    LDQ     2,,PR3
+         3 000357   100002 756100                    STQ     2,,PR1
+
+      234     6805    6                   TEMP$ -> STORAGE_BLOCK.HEADER.LOP$;
+      235     6806    6               TEMP$ -> STORAGE_BLOCK.HEADER.LOP$ = HEAP2$;
+
+   6806  3 000360   200114 236100                    LDQ     HEAP2$,,AUTO
+         3 000361   300002 756100                    STQ     2,,PR3
+
+      236     6807    6             END;
+
+   6807  3 000362   000370 710000 3                  TRA     s:6813
+
+      237     6808    6             ELSE DO; /* New head of chain */
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:35   
+
+      238     6809    6               HEAP2$ -> STORAGE_BLOCK.HEADER.ROP$ = TEMP$;
+
+   6809  3 000363   200117 236100                    LDQ     TEMP$,,AUTO
+         3 000364   100003 756100                    STQ     3,,PR1
+
+      239     6810    6               BUCKET$ (TEMP_SBIN) = HEAP2$;
+
+   6810  3 000365   200114 236100                    LDQ     HEAP2$,,AUTO
+         3 000366   200116 720100                    LXL0    TEMP_SBIN,,AUTO
+         3 000367   000063 756010 2                  STQ     BUCKET$,X0
+
+      240     6811    6             END;
+
+      241     6812    5           END;
+
+      242     6813    4           HEAP2$ -> STORAGE_BLOCK.HEADER.IDENT = %MANAGED_BLOCK;
+
+   6813  3 000370   000006 235000 4                  LDA     6
+         3 000371   100000 755100                    STA     0,,PR1
+
+      243     6814    4           HEAP2$ -> STORAGE_BLOCK.HEADER.SIZE = SIZE1;
+
+   6814  3 000372   200115 720100                    LXL0    SIZE1,,AUTO
+         3 000373   100001 740100                    STX0    1,,PR1
+
+      244     6815    4           HEAP2$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0;
+
+   6815  3 000374   000000 221003                    LDX1    0,DU
+         3 000375   100001 441100                    SXL1    1,,PR1
+
+      245     6816    4         END;
+
+      246     6817    3         HEAP$ -> STORAGE_BLOCK.HEADER.SIZE = BLKSIZE;
+
+   6817  3 000376   200107 721100                    LXL1    BLKSIZE,,AUTO
+         3 000377   000001 741100                    STX1    1,,PR0
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:36   
+
+      247     6818    3       END;
+
+      248     6819    2       ADDR$ = HEAP$;
+
+   6819  3 000400   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000401   200003 471500                    LDP1    @ADDR$,,AUTO
+         3 000402   100000 756100                    STQ     0,,PR1
+
+      249     6820    2       HEAP$ -> STORAGE_BLOCK.HEADER.ROP$ = ADDR (NIL);
+
+   6820  3 000403   000001 236000 4                  LDQ     1
+         3 000404   000003 756100                    STQ     3,,PR0
+
+      250     6821    2       HEAP$ -> STORAGE_BLOCK.HEADER.LOP$ = ADDR (NIL);
+
+   6821  3 000405   000002 756100                    STQ     2,,PR0
+
+      251     6822    2       IF BUCKET$ (BUCKETNUM) = ADDR (NIL) THEN
+
+   6822  3 000406   200106 720100                    LXL0    BUCKETNUM,,AUTO
+         3 000407   000063 236010 2                  LDQ     BUCKET$,X0
+         3 000410   000001 116000 4                  CMPQ    1
+         3 000411   000415 601000 3                  TNZ     s:6824
+
+      252     6823    2         BUCKET$ (BUCKETNUM) = HEAP$; /* Bucket was empty */
+
+   6823  3 000412   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000413   000063 756010 2                  STQ     BUCKET$,X0
+         3 000414   000446 710000 3                  TRA     s:6846
+
+      253     6824    3       ELSE IF PREV_BLK$ = ADDR (NIL) THEN DO;
+
+   6824  3 000415   200111 236100                    LDQ     PREV_BLK$,,AUTO
+         3 000416   000001 116000 4                  CMPQ    1
+         3 000417   000425 601000 3                  TNZ     s:6830
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:37   
+      254     6825              /* Block smaller than any already under this bucket; insert at
+      255     6826                 head of chain. */
+      256     6827    3         HEAP$ -> STORAGE_BLOCK.HEADER.ROP$ = BUCKET$ (BUCKETNUM);
+
+   6827  3 000420   000063 236010 2                  LDQ     BUCKET$,X0
+         3 000421   000003 756100                    STQ     3,,PR0
+
+      257     6828    3         BUCKET$ (BUCKETNUM) = HEAP$;
+
+   6828  3 000422   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000423   000063 756010 2                  STQ     BUCKET$,X0
+
+      258     6829    3       END;
+
+   6829  3 000424   000446 710000 3                  TRA     s:6846
+
+      259     6830    3       ELSE IF PREV_BLK$ -> STORAGE_BLOCK.HEADER.SIZE < BLKSIZE THEN DO;
+
+   6830  3 000425   200111 473500                    LDP3    PREV_BLK$,,AUTO
+         3 000426   300001 236100                    LDQ     1,,PR3
+         3 000427   000022 772000                    QRL     18
+         3 000430   200107 116100                    CMPQ    BLKSIZE,,AUTO
+         3 000431   000437 605000 3                  TPL     s:6840
+
+      260     6831              /* There is at least one smaller block under this bucket. Insert
+      261     6832                 as the new ROP of PREV_BLK$. */
+      262     6833    3         HEAP$ -> STORAGE_BLOCK.HEADER.ROP$ =
+
+   6833  3 000432   300003 236100                    LDQ     3,,PR3
+         3 000433   000003 756100                    STQ     3,,PR0
+
+      263     6834    3             PREV_BLK$ -> STORAGE_BLOCK.HEADER.ROP$;
+      264     6835    3         PREV_BLK$ -> STORAGE_BLOCK.HEADER.ROP$ = HEAP$;
+
+   6835  3 000434   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000435   300003 756100                    STQ     3,,PR3
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:38   
+      265     6836    3       END;
+
+   6836  3 000436   000446 710000 3                  TRA     s:6846
+
+      266     6837    3       ELSE DO;
+
+      267     6838              /* There is at least one block of the same size already there.
+      268     6839                 Insert as the new LOP of the (first such) item. */
+      269     6840    3         HEAP$ -> STORAGE_BLOCK.HEADER.LOP$ =
+
+   6840  3 000437   300002 236100                    LDQ     2,,PR3
+         3 000440   000002 756100                    STQ     2,,PR0
+
+      270     6841    3             PREV_BLK$ -> STORAGE_BLOCK.HEADER.LOP$;
+      271     6842    3         PREV_BLK$ -> STORAGE_BLOCK.HEADER.LOP$ = HEAP$;
+
+   6842  3 000441   200112 236100                    LDQ     HEAP$,,AUTO
+         3 000442   300002 756100                    STQ     2,,PR3
+
+      272     6843    3       END;
+
+      273     6844    2     END;
+
+   6844  3 000443   000446 710000 3                  TRA     s:6846
+
+      274     6845    1     ELSE ADDR$ = BLK$;
+
+   6845  3 000444   200003 470500                    LDP0    @ADDR$,,AUTO
+         3 000445   000000 756100                    STQ     0,,PR0
+
+      275     6846    1     ADDR$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 1;
+
+   6846  3 000446   200003 470500                    LDP0    @ADDR$,,AUTO
+         3 000447   000000 471500                    LDP1    0,,PR0
+         3 000450   000001 220003                    LDX0    1,DU
+         3 000451   100001 440100                    SXL0    1,,PR1
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:39   
+      276     6847    1     ADDR$ = ADDR (ADDR$ -> STORAGE_BLOCK.BODY);
+
+   6847  3 000452   000000 471500                    LDP1    0,,PR0
+         3 000453   100004 633500                    EPPR3   4,,PR1
+         3 000454   000000 453500                    STP3    0,,PR0
+
+      277     6848    1     RETURN;
+
+   6848  3 000455   000000 702200 xent               TSX2  ! X66_ARET
+
+      278     6849    1   BAD_ERR:
+      279     6850    1     CALL M$ERR;
+
+   6850  3 000456   000002 713400       BAD_ERR      CLIMB   err
+         3 000457   000000 401760                    pmme    nvectors=0
+         3 000460   000463 710000 3                  TRA     s:6885
+
+      280     6851        %EJECT;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:40   
+      281     6852        /*---------*/
+      282     6853    1     X9MA$FREE:           ENTRY (ADDR$);
+
+   6853  3 000461   000000 700200 xent  X9MA$FREE    TSX0  ! X66_AUTO_2
+         3 000462   000122 000002                    ZERO    82,2
+
+      283     6854        /*---------*/
+      284     6855
+      285     6856        /*P*
+      286     6857               NAME:  X9MA$FREE
+      287     6858             AUTHOR:  Albert H. Wigchert
+      288     6859            PURPOSE:  Allocate/free memory as needed for USAGE IS POINTER.
+      289     6860        */
+      290     6861        /*D*
+      291     6862               NAME:  X9MA$FREE
+      292     6863               CALL:  CALL "X9MA$FREE" USING [BY REFERENCE] [ADDRESS OF]
+      293     6864                      identifier-1.
+      294     6865          INTERFACE:  X9AS$SHRINK_PTR -- Take a 2048K super segment and by
+      295     6866                                         shrinks split it into 8 regular
+      296     6867                                         segments, returning pointers to them.
+      297     6868              INPUT:  identifier-1 -- Must be USAGE IS POINTER; the allocated
+      298     6869                          block it points to gets freed and the identifier is
+      299     6870                          set to ADDR (NIL).
+      300     6871                      ADDRESS OF identifier-1 -- In this case it can be any
+      301     6872                          USAGE, including POINTER, as long as it is a level 01
+      302     6873                          or 77 item in the LINKAGE SECTION. The variable gets
+      303     6874                          freed and its pointer in the pseudostack is set to
+      304     6875                          ADDR (NIL).
+      305     6876             OUTPUT:  The pointer is set to ADDR (NIL).
+      306     6877        DESCRIPTION:  Check to make sure that this is a legitimate block of
+      307     6878                      allocated storage (IDENT has the right value) and that it
+      308     6879                      is indeed currently allocated (ALLOCATED = 1); if not
+      309     6880                      then an error message is in order. If the conditions hold,
+      310     6881                      then set the block to free (ALLOCATED = 0) and set its
+      311     6882                      pointer to a null pointer.
+      312     6883        */
+      313     6884        %eject;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:41   
+      314     6885    1     ADDR$ = PINCRW (ADDR$, -4); /* ADDR (header) */
+
+   6885  3 000463   200003 470500                    LDP0    @ADDR$,,AUTO
+         3 000464   000000 236100                    LDQ     0,,PR0
+         3 000465   777774 036003                    ADLQ    -4,DU
+         3 000466   000000 756100                    STQ     0,,PR0
+
+      315     6886    2     IF ADDR$ -> STORAGE_BLOCK.HEADER.IDENT ~= %MANAGED_BLOCK THEN DO;
+
+   6886  3 000467   000000 471500                    LDP1    0,,PR0
+         3 000470   100000 235100                    LDA     0,,PR1
+         3 000471   000006 115000 4                  CMPA    6
+         3 000472   000475 600000 3                  TZE     s:6890
+
+      316     6887            /* Issue error message */
+      317     6888    2       CALL M$ERR;
+
+   6888  3 000473   000002 713400                    CLIMB   err
+         3 000474   000000 401760                    pmme    nvectors=0
+
+      318     6889    2     END;
+
+      319     6890    2     IF ADDR$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0 THEN DO;
+
+   6890  3 000475   200003 470500                    LDP0    @ADDR$,,AUTO
+         3 000476   000000 471500                    LDP1    0,,PR0
+         3 000477   100001 720100                    LXL0    1,,PR1
+         3 000500   000503 601000 3                  TNZ     s:6894
+
+      320     6891            /* Issue error message */
+      321     6892    2       CALL M$ERR;
+
+   6892  3 000501   000002 713400                    CLIMB   err
+         3 000502   000000 401760                    pmme    nvectors=0
+
+      322     6893    2     END;
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:42   
+      323     6894    1     ADDR$ -> STORAGE_BLOCK.HEADER.ALLOCATED = 0; /* Free it */
+
+   6894  3 000503   200003 470500                    LDP0    @ADDR$,,AUTO
+         3 000504   000000 471500                    LDP1    0,,PR0
+         3 000505   000000 220003                    LDX0    0,DU
+         3 000506   100001 440100                    SXL0    1,,PR1
+
+      324     6895    1     ADDR$ = ADDR (NIL);
+
+   6895  3 000507   000001 236000 4                  LDQ     1
+         3 000510   000000 756100                    STQ     0,,PR0
+
+      325     6896    1     RETURN;
+
+   6896  3 000511   000000 702200 xent               TSX2  ! X66_ARET
+      326     6897    1   END X9MA$ALLOCATE;
+      327     6898        %eject;
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:43   
+
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:44   
+--  Include file information  --
+
+   CP_6_SUBS.:LIB_E04  is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+   Z9A_FLAGS.:Z8A6TOU  is referenced.
+   X8A_SYS_FILE.:X8A6TOU  is referenced.
+      No diagnostics issued in procedure X9MA$ALLOCATE.
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:45   
+
+ **** Variables and constants ****
+
+  ****  Section 001 RoData X9MA$ALLOCATE
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(2088)  r     1 FPT_OPEN_CONST            72-0-0/d VECT        r     1 VLPVEC
+
+  ****  Section 002  Data  X9MA$ALLOCATE
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    60-0-0/w SBIN        r     1 BACKUP_PAGES              63-0-0/w PTR         r     1 BUCKET$(0:127)
+    40-0-0/w SBIN        r     1 DYNAMIC_SEG#
+    30-0-0/w PTR         r     1 DYNAMIC_SEG$(0:7)
+    61-0-0/b BIT         r     1 FIRST_TIME_FLAG           62-0-0/w PTR         r     1 HEAP_HEAD$
+     0-0-0/d STRC(288)   r     1 M$VIRTUAL1                10-0-0/d STRC(288)   r     1 M$VIRTUAL2
+    20-0-0/d STRC(288)   r     1 M$VIRTUAL3
+    55-0-0/w UBIN        r     1 VIRTUAL_DCBNUMS(0:2)
+    41-0-0/w STRC(432)   r     1 VIRTUAL_VLP
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @ADDR$                     4-0-0/w PTR         r     1 @LENGTH
+    *0-0-0/w PTR         r     1 ADDR$                    110-0-0/w PTR         r     1 BLK$
+   107-0-0/w SBIN        r     1 BLKSIZE                  106-0-0/w SBIN        r     1 BUCKETNUM
+    14-0-0/d STRC(2088)  r     1 FPT_OPEN                   6-0-0/d STRC(72)    r     1 GDDL_FPT
+    10-0-0/d STRC(108)   r     1 GDDL_RESULTS             112-0-0/w PTR         r     1 HEAP$
+   113-0-0/w PTR         r     1 HEAP1$                   114-0-0/w PTR         r     1 HEAP2$
+    *0-0-0/w SBIN        r     1 LENGTH                   111-0-0/w PTR         r     1 PREV_BLK$
+   115-0-0/w UBIN        r     1 SIZE1                    117-0-0/w PTR         r     1 TEMP$
+   116-0-0/w SBIN        r     1 TEMP_SBIN
+PL6.E3A0      #001=X9MA$ALLOCATE File=X9MA.:X8A6TSI                              SAT 08/09/97 10:57 Page:46   
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0N  NULL        r     1 M$UC                       0-0-0/w STRC(108)   r     1 STORAGE_BLOCK
+
+
+   Procedure X9MA$ALLOCATE requires 330 words for executable code.
+   Procedure X9MA$ALLOCATE requires 82 words of local(AUTO) storage.
+
+    No errors detected in file X9MA.:X8A6TSI    .

@@ -1,0 +1,2630 @@
+VERSION E05
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:1    
+        1        1        /*M* QCM$MESS:  Write-to/erase-from/read-from the MESSAGE LINE.  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMC,PLM=4,IND=0,DCI=4,CSI=2,IAD=2,DTI=2,AND,ECI=0,DIN=2,STI=2 */
+        8        8
+        9        9        /*P*  NAME:         QCM$MESS
+       10       10              PURPOSE:      Write-to/erase-from/read-from the MESSAGE LINE.
+       11       11              DESCRIPTION:  Does stuff to the MESSAGE LINE (which isn't really
+       12       12                            a VDH-type field).
+       13       13        */
+       14       14
+       15       15        QCM$MESS: PROC ( QCM@MESS );
+       16       16
+       17       17        /*D*  NAME:         QCM$MESS
+       18       18              CALL:         CALL QCM$MESS ( QCM@MESS );
+       19       19              PARAMETERS:   QCM@MESS is a structure which contains information
+       20       20                            concerning the text to be written to the MESSAGE LINE
+       21       21                            and the DCB# of the MESSAGE LINE to write through.
+       22       22              INTERFACE:    Called by QBA$ABORT, QBA$ACCEPT, QBS$STOP_PAUSE,
+       23       23                            and QCG$GET_FIELD.
+       24       24                            Calls M$WRITE.
+       25       25              ENVIRONMENT:  Nothing unusual.
+       26       26              INPUT:        Pokes around in QI$GZ_FIELDs a little.
+       27       27              OUTPUT:       MESSAGE LINE message.
+       28       28              SCRATCH:      Various otter stuff.
+       29       29              DESCRIPTION:  Well, now, what's all this DCB# bullshit?
+       30       30                            Turns out there's a MESSAGE LINE clause which was
+       31       31                            (supposedly) deleted from the FPL language, which
+       32       32                            was to allow the specification of a MESSAGE LINE
+       33       33                            for any FD ASSIGNed to TERMINAL-IO.  Let's assume
+       34       34                            that clause is exhumed, and further assume that
+       35       35                            more than one screen FD can be open at once, and
+       36       36                            we're running a program that's got two screen FDs
+       37       37                            open, each with a different MESSAGE LINE.
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:2    
+       38       38                            QBA$ABORTs and QBS$STOP_PAUSEs ought to use the
+       39       39                            "default" MESSAGE LINE, defined during startup in
+       40       40                            QAT$TALLYHO (since no certain FD is associated with
+       41       41                            the arguments of those statements).  But QBV$VERIFYs
+       42       42                            and QCG$GET_FIELDs should direct their MESSAGE LINE output
+       43       43                            to the MESSAGE LINE associated with whichever FD
+       44       44                            the field they're (re-)reading is in.  The DCBs associated
+       45       45                            with the special FD MESSAGE LINEs should be M$OPENed,
+       46       46                            and the MESSAGE LINEs M$DCLFLDed when the FD is opened.
+       47       47                            Anyway, that's the "worst case" that this code spins
+       48       48                            around.
+       49       49                            More down-to-earthly, the IS_MESSAGE_A_DAD bit indicates
+       50       50                            whether the caller is putting up the text of a DAD,
+       51       51                            or just some interpreter-defined error message.  If
+       52       52                            it's a DAD with a strange type, conversion is in order.
+       53       53        */
+       54       54
+       55       55          %INCLUDE B_ERRORS_C;
+       56     1182          %INCLUDE LCP_6;
+       57     1373          %FPT_DEVICE ( FPTN = FPT@DEVICE,
+       58     1374                        STCLASS = AUTO );
+       59     1401          %FPT_READ ( FPTN = FPT@READ,
+       60     1402                      STCLASS = AUTO );
+       61     1428          %FPT_WRITE ( FPTN = FPT@WRITE,
+       62     1429                       STCLASS = AUTO );
+       63     1453
+       64     1454          %INCLUDE QG_MACRO_M;
+       65     1591          %QGB_ENTRIES;
+       66     1604          %INCLUDE QI_EQUATES_E;
+       67     1963          %INCLUDE QI_PERR_C;
+       68     2131          %INCLUDE QI_MACROS_M;
+       69     7189          %QI$ALL;
+       70    18302          %QI_FPTS;
+       71    20347
+       72    20348    1     DCL GZ_FIELD$ PTR;
+       73    20349    1     DCL MESSAGE_DATA$ CPTR;
+       74    20350    1     DCL MESSAGE_DATA_PLAIN_PTR$ REDEF MESSAGE_DATA$ PTR;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:3    
+       75    20351    1     DCL MESSAGE_LENGTH UBIN;
+       76    20352    1     DCL VISUAL_ATTRIBUTE UBIN;
+       77    20353    1     DCL WERE_A_MESS_ERASE BIT(1) ALIGNED;
+       78    20354    1     DCL WERE_A_MESS_PAUSE BIT(1) ALIGNED;
+       79    20355    1     DCL WERE_A_MESS_WRITE BIT(1) ALIGNED;
+       80    20356
+       81    20357          %QI@TYPE_DISPLAY_TARGET;
+       82    21022          %QI@OTTER_SPACE ( BYTE_SIZE = 32 );
+       83    21050
+       84    21051    1     DCL QCC$CBD ENTRY (1) ALTRET;
+       85    21052    1     DCL QCC$DMC ENTRY (1) ALTRET;
+       86    21053    1     DCL QCE$ERROR_INTERNAL ENTRY (4);
+       87    21054    1     DCL QCE$ERROR_M$INTERNAL ENTRY (4);
+       88    21055    1     DCL QCU$UPDATE_SCREEN ENTRY;
+       89    21056    1     DCL QCU$USE_INVALID_IO ENTRY (1);
+       90    21057
+       91    21058          %SET LISTMAC = '1'B;
+       92    21059
+       93    21060          %INCLUDE QCM_MESS_M;
+       94    21102          %QCM@MESS;
+             21103            %BEGIN_MACRO;
+             21104            %SET LISTDIR = '0'B;
+             21117    1     DCL 1 QCM@MESS ALIGNED,
+             21118    1           2 MESSAGE_LINE_GZ_HEADER$ PTR,
+             21119                           /* Pointer to QI$GZ_HEADER for the
+             21120                              MESSAGE LINE to use.  */
+             21121    1           2 IS_MESSAGE_A_DAD BIT(1) ALIGNED,
+             21122                           /* Set if MESSAGE$ points to a DAD,
+             21123                              reset if MESSAGE$ points to text
+             21124                              (in which case MESSAGE_LENGTH is valid).  */
+             21125    1           2 MESSAGE_LENGTH UBIN,
+             21126                           /* Length, in bytes, of the error message.  */
+             21127    1           2 MESSAGE$ PTR,
+             21128                           /* See IS_MESSAGE_A_DAD.  */
+             21129    1           2 FRAME_INDEX UBIN,
+             21130                           /* Index of the current frame.  */
+             21131    1           2 FIELD_INDEX UBIN,
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:4    
+             21132                           /* Index of the field to re-get (if any).  */
+             21133    1           2 STATUS UBIN,
+             21134                           /* Returned status code:  0 -> Immediate return to level 0;
+             21135                                                    >0 -> Status is ok.  */
+             21136    1           2 FIELD_ERROR_STOP_INDEX UBIN,
+             21137                           /* Passed index for QCG$GET_FIELD processing.  */
+             21138    1           2 VISUAL_ATTRIBUTE UBIN;
+             21139                           /* Matches %EQUs for QI#xxx_VISUAL_ATTR
+             21140                              (currently, blinking or non-blinking message line).  */
+             21147            %ENDIF;
+       95    21150
+       96    21151          %INCLUDE QCU_USE_M;
+       97    21205          %QCU@USE;
+             21206            %BEGIN_MACRO;
+             21207            %SET LISTDIR = '0'B;
+             21220    1     DCL 1 QCU@USE AUTO ALIGNED,
+             21221    1           2 CURR_FRAME$ PTR,
+             21222                          /* Pointer to DAD of current frame or ADDR (NIL).  */
+             21223    1           2 CURR_NODE$ PTR,
+             21224                          /* Pointer to current node or ADDR (NIL).  */
+             21225    1           2 USE_DEFAULT_IO UBIN,
+             21226                          /* For USE procedures which default applies
+             21227                             (see corresponding EQUs).  */
+             21228    1           2 IS_TIME_TO_SAVE_AWAY_FIELDS BIT(1) ALIGNED,
+             21229                          /* If IS_TIME_TO_SAVE_AWAY_FIELDS, then
+             21230                             save the fields within the bounds of
+             21231                             FRAME_START_INDEX, FRAME_STOP_INDEX,
+             21232                             FIELD_START_INDEX, and FIELD_STOP_INDEX
+             21233                             before calling the USE procedure.  */
+             21234    1           2 FRAME_START_INDEX UBIN,
+             21235                          /* Foist frame of the CURRENT.FORM$
+             21236                             involved with the I-O error.  */
+             21237    1           2 FRAME_STOP_INDEX UBIN,
+             21238                          /* Larst frame of the CURRENT.FORM$
+             21239                             involved with the I-O error.  */
+             21240    1           2 IS_FIELD_INDEXES_VALID BIT(1) ALIGNED,
+             21241                          /* If IS_FIELD_INDEXES_VALID, use them;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:5    
+             21242                             else use all the fields in the frame.  */
+             21243    1           2 FIELD_START_INDEX UBIN,
+             21244                          /* Starting index into QI$GZ_FIELD
+             21245                             which may have values "pushed".  */
+             21246    1           2 FIELD_STOP_INDEX UBIN,
+             21247                          /* Stopping index into QI$GZ_FIELD
+             21248                             which may have values "pushed".  */
+             21249    1           2 IS_CURSOR_POSITION_VALID BIT(1) ALIGNED,
+             21250                          /* If IS_CURSOR_POSITION_VALID, use it;
+             21251                             else allow cursor to default to upper-left-most field.  */
+             21252    1           2 CURSOR_POSITION BIT(16) ALIGNED,
+             21253                          /* POSition of the field on which to place the cursor.  */
+             21254    1           2 STATUS UBIN;
+             21255                          /* Returned action code; see corresponding EQUs.  */
+             21262            %ENDIF;
+       98    21265
+       99    21266          %SET LISTMAC = '0'B;
+      100    21267        %EJECT;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:6    
+      101    21268    1       WERE_A_MESS_WRITE = %YES;
+      102    21269    1       WERE_A_MESS_ERASE = %NO;
+      103    21270    1       WERE_A_MESS_PAUSE = %NO;
+      104    21271
+      105    21272    1   RETRY_MESS_WRITE:
+      106    21273    1       IF QCM@MESS.IS_MESSAGE_A_DAD
+      107    21274    1       THEN
+      108    21275    2         DO;
+      109    21276
+      110    21277                /*  This is kind of a mess.  Hence the module name.
+      111    21278                    What's happening is that lots of different routines are calling
+      112    21279                    this one to put something out on the MESSAGE LINE.  That something
+      113    21280                    might be either a QI$DAD or an explicit text message.  If it's
+      114    21281                    the latter, no problem....
+      115    21282                    If the message is held up in a QI$DAD, we may need to do some
+      116    21283                    conversion on it to make it readable (e.g., a BINARY value.)
+      117    21284                    (Note that all callers have resolved QCM@MESS.MESSAGE$ to the
+      118    21285                    last - not INDIRECT - DAD.)
+      119    21286                    But, since we may have come from just about anywhere, we can't
+      120    21287                    just stomp on QI_1.OP.S or QI_1.OP.T with QCS$SETUP.  So, we use
+      121    21288                    an AUTO QI@CIP_OPERATION, and duplicate some of SETUP's code.
+      122    21289                    Maybe, someday, it'll be possible to pass SETUP an entire AUTO
+      123    21290                    version of QI_1.OP?  */
+      124    21291    2           IF QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.WORD0_FLAGS.IS_CONSTANT
+      125    21292    2           THEN
+      126    21293                  %PROC_ADDRESS ( THING@P =
+             21293                      "QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.DATA@",
+      127    21294                    CHECK_FOR_INDIRECTION = NO,
+      128    21295                    RESULT$ = MESSAGE_DATA$ );
+      129    21332    2           ELSE
+      130    21333                  %DATA_ADDRESS ( THING@D =
+             21333                      "QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.DATA@",
+      131    21334                    CHECK_FOR_INDIRECTION = NO,
+      132    21335                    RESULT$ = MESSAGE_DATA$ );
+      133    21372
+      134    21373    2           IF QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.WORD0_FLAGS.IS_LINKAGE_ARGUMENT
+      135    21374    2           THEN
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:7    
+      136    21375                  %LINKAGE_ARGUMENT_ADDRESS ( THING$ = MESSAGE_DATA$,
+      137    21376                    RESULT$ = MESSAGE_DATA$ );
+      138    21412
+      139    21413    3           DO CASE ( QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.WORD0_FLAGS.TYPE );
+      140    21414
+      141    21415    3             CASE ( %QI#TYPE_BINARY );
+      142    21416    3               QI@TYPE_DISPLAY_TARGET = QI_TYPE_DISPLAY_TARGET;
+      143    21417    3               QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN = %QI#CD_SIGN_LEADING_SEPARATE;
+      144    21418    3               IF QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.LEN = %
+             21418                        QI#MIN_BINARY_LENGTH
+      145    21419    3               THEN
+      146    21420    4                 DO;
+      147    21421    4                   QI@TYPE_DISPLAY_TARGET.CIP.S_A (0) = QI_16_BIT_BINARY_A (0);
+      148    21422    4                   QI@TYPE_DISPLAY_TARGET.CIP.T.LEN = %QI#MIN_BINARY_DIGIT_COUNT + 1;
+      149    21423    4                 END;
+      150    21424    3               ELSE
+      151    21425    4                 DO;
+      152    21426    4                   QI@TYPE_DISPLAY_TARGET.CIP.S_A (0) = QI_32_BIT_BINARY_A (0);
+      153    21427    4                   QI@TYPE_DISPLAY_TARGET.CIP.T.LEN = %QI#MAX_BINARY_DIGIT_COUNT + 1;
+      154    21428    4                 END;
+      155    21429    3               QI@TYPE_DISPLAY_TARGET.CIP.S.CB = QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.
+             21429                        PSEUDO_CIP.NUMERIC.CB;
+      156    21430    3               QI@TYPE_DISPLAY_TARGET.DATA.S$ = MESSAGE_DATA_PLAIN_PTR$;
+      157    21431    3               QI@TYPE_DISPLAY_TARGET.DATA.T$ = ADDR ( QI@OTTER_SPACE );
+      158    21432
+      159    21433    3               CALL QCC$CBD ( QI@TYPE_DISPLAY_TARGET )
+      160    21434    3               WHENALTRETURN
+      161    21435    4                 DO;
+      162    21436    4                   CALL QCE$ERROR_INTERNAL ( %E$UNEXPECTED_QCC_ALTRET );
+      163    21437    4                 END;
+      164    21438
+      165    21439    3               MESSAGE_DATA$ = ADDR ( QI@OTTER_SPACE );
+      166    21440    3               MESSAGE_LENGTH = QI@TYPE_DISPLAY_TARGET.CIP.T.LEN;
+      167    21441
+      168    21442    3             CASE ( %QI#TYPE_PACKED );
+      169    21443    3               QI@TYPE_DISPLAY_TARGET = QI_TYPE_DISPLAY_TARGET;
+      170    21444    3               QI@TYPE_DISPLAY_TARGET.CIP.S_A (0) = QI_31_DIGIT_ST_PACKED_A (0);
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:8    
+      171    21445    3               QI@TYPE_DISPLAY_TARGET.CIP.S.CP = QCM@MESS.MESSAGE$ ->
+      172    21446    3                 QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CP;
+      173    21447    3               IF QI@TYPE_DISPLAY_TARGET.CIP.S.CP.SIGN = %QI#CP_UNSIGNED
+      174    21448    3               THEN
+      175    21449    3                 QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN = %QI#CD_UNSIGNED;
+      176    21450    3               ELSE
+      177    21451    3                 QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN = %QI#CD_SIGN_TRAILING_SEPARATE;
+      178    21452    3               QI@TYPE_DISPLAY_TARGET.CIP.S.LEN = QCM@MESS.MESSAGE$ ->
+      179    21453    3                 QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.LEN;
+      180    21454    3               QI@TYPE_DISPLAY_TARGET.CIP.T.LEN = QI@TYPE_DISPLAY_TARGET.CIP.S.LEN;
+      181    21455    3               QI@TYPE_DISPLAY_TARGET.DATA.S$ = MESSAGE_DATA_PLAIN_PTR$;
+      182    21456    3               QI@TYPE_DISPLAY_TARGET.DATA.T$ = ADDR ( QI@OTTER_SPACE );
+      183    21457
+      184    21458    3               CALL QCC$DMC ( QI@TYPE_DISPLAY_TARGET )
+      185    21459    3               WHENALTRETURN
+      186    21460    4                 DO;
+      187    21461    4                   CALL QCE$ERROR_INTERNAL ( %E$UNEXPECTED_QCC_ALTRET );
+      188    21462    4                 END;
+      189    21463
+      190    21464    3               MESSAGE_DATA$ = ADDR ( QI@OTTER_SPACE );
+      191    21465    3               MESSAGE_LENGTH = QI@TYPE_DISPLAY_TARGET.CIP.T.LEN;
+      192    21466
+      193    21467    3             CASE ( %QI#TYPE_DISPLAY );
+      194    21468    4               DO CASE ( QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD.SIGN )
+             21468                        ;
+      195    21469
+      196    21470    4                 CASE ( %QI#CD_SIGN_TRAILING_OVER );
+      197    21471    4                   QI@TYPE_DISPLAY_TARGET = QI_TYPE_DISPLAY_TARGET;
+      198    21472    4                   QI@TYPE_DISPLAY_TARGET.CIP.S_A (0) = QI_31_DIGIT_SLS_DISPLAY_A (0);
+      199    21473    4                   QI@TYPE_DISPLAY_TARGET.CIP.S.CD = QCM@MESS.MESSAGE$ ->
+      200    21474    4                     QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD;
+      201    21475    4                   QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN = %QI#CD_SIGN_TRAILING_SEPARATE
+             21475                            ;
+      202    21476    4                   QI@TYPE_DISPLAY_TARGET.CIP.S.LEN = QCM@MESS.MESSAGE$ ->
+      203    21477    4                     QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.LEN;
+      204    21478    4                   QI@TYPE_DISPLAY_TARGET.CIP.T.LEN = QI@TYPE_DISPLAY_TARGET.CIP.S.LEN;
+      205    21479    4                   QI@TYPE_DISPLAY_TARGET.DATA.S$ = MESSAGE_DATA_PLAIN_PTR$;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:9    
+      206    21480    4                   QI@TYPE_DISPLAY_TARGET.DATA.T$ = ADDR ( QI@OTTER_SPACE );
+      207    21481
+      208    21482    4                   CALL QCC$DMC ( QI@TYPE_DISPLAY_TARGET )
+      209    21483    4                   WHENALTRETURN
+      210    21484    5                     DO;
+      211    21485    5                       CALL QCE$ERROR_INTERNAL ( %E$UNEXPECTED_ALTRET );
+      212    21486    5                     END;
+      213    21487
+      214    21488    4                   MESSAGE_DATA$ = ADDR ( QI@OTTER_SPACE );
+      215    21489    4                   MESSAGE_LENGTH = QI@TYPE_DISPLAY_TARGET.CIP.T.LEN;
+      216    21490
+      217    21491    4                 CASE ( ELSE );
+      218    21492                        /*  SIGN is LEADING or TRAILING SEPARATE.
+      219    21493                            Just leave it as is.  */
+      220    21494    4                   MESSAGE_DATA$ = PINCRC ( MESSAGE_DATA$,
+      221    21495    4                     QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD.OFFSET );
+      222    21496    4                   MESSAGE_LENGTH = QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.
+             21496                            NUMERIC.LEN;
+      223    21497
+      224    21498    4               END;
+      225    21499
+      226    21500    3             CASE ( ELSE );
+      227    21501    3               MESSAGE_DATA$ = PINCRC ( MESSAGE_DATA$,
+      228    21502    3                 QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.ALPHANUMERIC.CA.OFFSET );
+      229    21503    3               MESSAGE_LENGTH = QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.
+             21503                        ALPHANUMERIC.LEN;
+      230    21504
+      231    21505    3           END;
+      232    21506
+      233    21507    2         END;
+      234    21508    1       ELSE
+      235    21509    2         DO;
+      236    21510    2           MESSAGE_DATA$ = QCM@MESS.MESSAGE$;
+      237    21511    2           MESSAGE_LENGTH = QCM@MESS.MESSAGE_LENGTH;
+      238    21512    2         END;
+      239    21513
+      240    21514    1       IF QI_1.SCREEN_UPDATE_FLAGS
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:10   
+      241    21515    1       THEN
+      242    21516    1         CALL QCU$UPDATE_SCREEN;
+      243    21517
+      244    21518    1       FPT@WRITE = QI_FPT_WRITE;
+      245    21519    1       VBASE ( FPT@WRITE.V_ ) = ADDR ( FPT@WRITE.V );
+      246    21520    1       FPT@WRITE.V.DCB# = QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB#;
+      247    21521    1       VBASE ( FPT@WRITE.BUF_ ) = MESSAGE_DATA$;
+      248    21522    1       VBOUND ( FPT@WRITE.BUF_ ) = MESSAGE_LENGTH - 1;
+      249    21523
+      250    21524    1       IF QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB# ~=
+      251    21525    1         QI_1.MESSAGE_LINE_GZ.HEADER$ -> QI$GZ_HEADER.DCB#
+      252    21526    1       THEN
+      253    21527    2         DO;
+      254    21528    2           GZ_FIELD$ = PINCRW ( QCM@MESS.MESSAGE_LINE_GZ_HEADER$,
+      255    21529    2             SIZEW (QI$GZ_HEADER) );
+      256    21530    2           FPT@WRITE.KEY_ = VECTOR ( GZ_FIELD$ -> QI$GZ_FIELD.DESCRIPTION.POSITION );
+      257    21531    2         END;
+      258    21532    1       ELSE
+      259    21533    1         GZ_FIELD$ = ADDR (NIL);
+      260    21534
+      261    21535    1       CALL QGB$WRITE ( FPT@WRITE, QGB_PARAM )
+      262    21536    1         ALTRET ( CHECK_USE_PROCEDURE_OR_INVALID );
+      263    21537
+      264    21538    1       QCM@MESS.STATUS = %QI#USE_INVALID_OK;
+      265    21539
+      266    21540    1       RETURN;
+      267    21541
+      268    21542    1   QCM$MESS_PAUSE: ENTRY ( QCM@MESS );
+      269    21543
+      270    21544        /*D*  NAME:         QCM$MESS_PAUSE
+      271    21545              CALL:         CALL QCM$MESS_PAUSE ( QCM@MESS );
+      272    21546              PARAMETERS:   QCM@MESS is a structure which contains information
+      273    21547                            concerning the DCB# of the MESSAGE LINE to read through.
+      274    21548              INTERFACE:    Called by QBA$ABORT and QBS$STOP_PAUSE.
+      275    21549                            Calls M$READ.
+      276    21550              ENVIRONMENT:  Nothing unusual.
+      277    21551              INPUT:        Pokes around in QI$GZ_FIELDs a little,
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:11   
+      278    21552                            reads from the MESSAGE LINE, and chucks the data.
+      279    21553              OUTPUT:       Cursor moved to the MESSAGE LINE.
+      280    21554              SCRATCH:      Various otter stuff.
+      281    21555              DESCRIPTION:  Lousy way to PAUSE, huh?
+      282    21556        */
+      283    21557
+      284    21558    1       WERE_A_MESS_PAUSE = %YES;
+      285    21559    1       WERE_A_MESS_ERASE = %NO;
+      286    21560    1       WERE_A_MESS_WRITE = %NO;
+      287    21561
+      288    21562    1   RETRY_MESS_PAUSE:
+      289    21563    1       FPT@READ = QI_FPT_READ;
+      290    21564    1       VBASE ( FPT@READ.V_ ) = ADDR ( FPT@READ.V );
+      291    21565    1       FPT@READ.V.DCB# = QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB#;
+      292    21566    1       FPT@READ.BUF_ = VECTOR ( QI@OTTER_SPACE_CA (0) );
+      293    21567
+      294    21568    1       IF QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB# ~=
+      295    21569    1         QI_1.MESSAGE_LINE_GZ.HEADER$ -> QI$GZ_HEADER.DCB#
+      296    21570    1       THEN
+      297    21571    2         DO;
+      298    21572    2           FPT@READ.V.KEYS = %YES;
+      299    21573
+      300    21574    2           GZ_FIELD$ = PINCRW ( QCM@MESS.MESSAGE_LINE_GZ_HEADER$,
+      301    21575    2             SIZEW (QI$GZ_HEADER) );
+      302    21576    2           FPT@READ.KEY_ = VECTOR ( GZ_FIELD$ -> QI$GZ_FIELD.DESCRIPTION.POSITION );
+      303    21577    2         END;
+      304    21578    1       ELSE
+      305    21579    1         GZ_FIELD$ = ADDR (NIL);
+      306    21580
+      307    21581    1       CALL QGB$READ ( FPT@READ, QGB_PARAM )
+      308    21582    1       WHENALTRETURN
+      309    21583    2         DO;
+      310    21584
+      311    21585    2           IF QGB_PARAM.ERR.ERR# ~= %E$EOF
+      312    21586    2           THEN
+      313    21587    2             GOTO CHECK_USE_PROCEDURE_OR_INVALID;
+      314    21588
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:12   
+      315    21589    2         END;
+      316    21590
+      317    21591    1       QCM@MESS.STATUS = %QI#USE_INVALID_OK;
+      318    21592
+      319    21593    1       RETURN;
+      320    21594
+      321    21595    1   QCM$MESS_ERASE: ENTRY ( QCM@MESS );
+      322    21596
+      323    21597        /*D*  NAME:         QCM$MESS_ERASE
+      324    21598              CALL:         CALL QCM$MESS_ERASE ( QCM@MESS );
+      325    21599              PARAMETERS:   QCM@MESS is a structure which contains information
+      326    21600                            concerning the DCB# of the MESSAGE LINE to erase through.
+      327    21601              INTERFACE:    Called by QBA$ABORT, QBA$ACCEPT, QBS$STOP_PAUSE, and
+      328    21602                            QCG$GET_FIELD.
+      329    21603                            Calls M$DEVICE.
+      330    21604              ENVIRONMENT:  Nothing unusual.
+      331    21605              INPUT:        Pokes around in QI$GZ_FIELDs a little.
+      332    21606              OUTPUT:       The MESSAGE LINE is erased.
+      333    21607              SCRATCH:      Various otter stuff.
+      334    21608              DESCRIPTION:  After a MESSAGE LINE message gets old (the ABORT or
+      335    21609                            STOP statement has paused, or a field has been (re-)read)
+      336    21610                            somebody has to erase it.
+      337    21611        */
+      338    21612
+      339    21613    1       WERE_A_MESS_ERASE = %YES;
+      340    21614    1       WERE_A_MESS_PAUSE = %NO;
+      341    21615    1       WERE_A_MESS_WRITE = %NO;
+      342    21616
+      343    21617    1   RETRY_MESS_ERASE:
+      344    21618    1       FPT@WRITE = QI_FPT_WRITE;
+      345    21619    1       VBASE ( FPT@WRITE.V_ ) = ADDR ( FPT@WRITE.V );
+      346    21620    1       FPT@WRITE.V.DCB# = QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB#;
+      347    21621            /*  TEMPORARY???  */
+      348    21622    1       FPT@WRITE.BUF_ = VECTOR ( QI_BLANK );
+      349    21623
+      350    21624    1       IF QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB# ~=
+      351    21625    1         QI_1.MESSAGE_LINE_GZ.HEADER$ -> QI$GZ_HEADER.DCB#
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:13   
+      352    21626    1       THEN
+      353    21627    2         DO;
+      354    21628    2           GZ_FIELD$ = PINCRW ( QCM@MESS.MESSAGE_LINE_GZ_HEADER$,
+      355    21629    2             SIZEW (QI$GZ_HEADER) );
+      356    21630    2           FPT@WRITE.KEY_ = VECTOR ( GZ_FIELD$ -> QI$GZ_FIELD.DESCRIPTION.POSITION );
+      357    21631    2         END;
+      358    21632    1       ELSE
+      359    21633    1         GZ_FIELD$ = ADDR (NIL);
+      360    21634
+      361    21635    1       CALL QGB$WRITE ( FPT@WRITE, QGB_PARAM )
+      362    21636    1         ALTRET ( CHECK_USE_PROCEDURE_OR_INVALID );
+      363    21637
+      364    21638    1       QCM@MESS.STATUS = %QI#USE_INVALID_OK;
+      365    21639
+      366    21640    1       RETURN;
+      367    21641
+      368    21642        %EJECT;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:14   
+      369    21643    1   CHECK_USE_PROCEDURE_OR_INVALID:
+      370    21644    1       QCU@USE.USE_DEFAULT_IO = %QI#USE_DEFAULT_NONE;
+      371    21645    1       QCU@USE.IS_TIME_TO_SAVE_AWAY_FIELDS = %NO;
+      372    21646    1       QCU@USE.CURR_FRAME$ = ADDR (NIL);
+      373    21647    1       IF GZ_FIELD$ = ADDR (NIL)
+      374    21648    1       THEN
+      375    21649    1         QCU@USE.CURR_NODE$ = ADDR (NIL);
+      376    21650    1       ELSE
+      377    21651    1         QCU@USE.CURR_NODE$ = GZ_FIELD$ -> QI$GZ_FIELD.DESCRIPTION.FIELD_DAD$;
+      378    21652
+      379    21653    1       CALL QCU$USE_INVALID_IO ( QCU@USE );
+      380    21654
+      381    21655    2       DO CASE ( QCU@USE.STATUS );
+      382    21656
+      383    21657    2         CASE ( %QI#USE_INVALID_RETURN );
+      384    21658    2           QCM@MESS.STATUS = %QI#USE_INVALID_RETURN;
+      385    21659
+      386    21660    2           RETURN;
+      387    21661
+      388    21662    2         CASE ( %QI#USE_INVALID_RETRY );
+      389    21663    2           IF WERE_A_MESS_ERASE
+      390    21664    2           THEN
+      391    21665    2             GOTO RETRY_MESS_ERASE;
+      392    21666    2           IF WERE_A_MESS_PAUSE
+      393    21667    2           THEN
+      394    21668    2             GOTO RETRY_MESS_PAUSE;
+      395    21669    2           IF WERE_A_MESS_WRITE
+      396    21670    2           THEN
+      397    21671    2             GOTO RETRY_MESS_WRITE;
+      398    21672
+      399    21673    2           CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_INTERPRETER_ERROR );
+      400    21674
+      401    21675    2         CASE ( %QI#USE_INVALID_SKIP_TO_NEXT );
+      402    21676    2           QCM@MESS.STATUS = %QI#USE_INVALID_SKIP_TO_NEXT;
+      403    21677
+      404    21678    2           RETURN;
+      405    21679
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:15   
+      406    21680    2         CASE ( ELSE );
+      407    21681    2           CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_INTERPRETER_ERROR );
+      408    21682
+      409    21683    2       END;
+      410    21684
+      411    21685    1   END QCM$MESS;
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:16   
+--  Include file information  --
+
+   QCU_USE_M.:E05TOU  is referenced.
+   QCM_MESS_M.:E05TOU  is referenced.
+   QI_MACROS_M.:E05TOU  is referenced.
+   QI_PERR_C.:E05TOU  is referenced.
+   QI_EQUATES_E.:E05TOU  is referenced.
+   QG_MACRO_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure QCM$MESS.
+
+   Procedure QCM$MESS requires 838 words for executable code.
+   Procedure QCM$MESS requires 124 words of local(AUTO) storage.
+
+    No errors detected in file QCM$MESS.:E05TSI    .
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:17   
+
+ Object Unit name= QCM$MESS                                   File name= QCM$MESS.:E05TOU
+ UTS= JUL 30 '97 05:11:57.80 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none   838    346  QCM$MESS
+    1  RoData even  none    12      C  QCM$MESS
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  QCM$MESS
+     0    208                  yes      Std        1  QCM$MESS_PAUSE
+     0    27D                  yes      Std        1  QCM$MESS_ERASE
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 QCC$CBD
+         yes           Std       4 QCE$ERROR_INTERNAL
+ yes     yes           Std       1 QCC$DMC
+         yes           Std       0 QCU$UPDATE_SCREEN
+ yes     yes           Std       2 QGB$WRITE
+ yes     yes           Std       2 QGB$READ
+         yes           Std       1 QCU$USE_INVALID_IO
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6A_ARET
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:18   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     QI_1                                  QI_BLANK                              QGB_PARAM
+     QI_TYPE_DISPLAY_TARGET                QI_4_CHAR_ALPHANUMERIC                QI_31_DIGIT_SLS_DISPLAY
+     QI_16_BIT_BINARY                      QI_32_BIT_BINARY                      QI_31_DIGIT_ST_PACKED
+     QI_PICTURE_STRING                     QI_FPT_READ                           QI_FPT_WRITE
+r    G$ROS$
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:19   
+
+
+        1        1        /*M* QCM$MESS:  Write-to/erase-from/read-from the MESSAGE LINE.  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMC,PLM=4,IND=0,DCI=4,CSI=2,IAD=2,DTI=2,AND,ECI=0,DIN=2,STI=2 */
+        8        8
+        9        9        /*P*  NAME:         QCM$MESS
+       10       10              PURPOSE:      Write-to/erase-from/read-from the MESSAGE LINE.
+       11       11              DESCRIPTION:  Does stuff to the MESSAGE LINE (which isn't really
+       12       12                            a VDH-type field).
+       13       13        */
+       14       14
+       15       15        QCM$MESS: PROC ( QCM@MESS );
+
+     15   0 000000  D380 0000 0000  xent QCM$MESS        LNJ,B5   X6A_AUTO_1
+          0 000003       007C 0001                       DC       124,1
+
+       16       16
+       17       17        /*D*  NAME:         QCM$MESS
+       18       18              CALL:         CALL QCM$MESS ( QCM@MESS );
+       19       19              PARAMETERS:   QCM@MESS is a structure which contains information
+       20       20                            concerning the text to be written to the MESSAGE LINE
+       21       21                            and the DCB# of the MESSAGE LINE to write through.
+       22       22              INTERFACE:    Called by QBA$ABORT, QBA$ACCEPT, QBS$STOP_PAUSE,
+       23       23                            and QCG$GET_FIELD.
+       24       24                            Calls M$WRITE.
+       25       25              ENVIRONMENT:  Nothing unusual.
+       26       26              INPUT:        Pokes around in QI$GZ_FIELDs a little.
+       27       27              OUTPUT:       MESSAGE LINE message.
+       28       28              SCRATCH:      Various otter stuff.
+       29       29              DESCRIPTION:  Well, now, what's all this DCB# bullshit?
+       30       30                            Turns out there's a MESSAGE LINE clause which was
+       31       31                            (supposedly) deleted from the FPL language, which
+       32       32                            was to allow the specification of a MESSAGE LINE
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:20   
+       33       33                            for any FD ASSIGNed to TERMINAL-IO.  Let's assume
+       34       34                            that clause is exhumed, and further assume that
+       35       35                            more than one screen FD can be open at once, and
+       36       36                            we're running a program that's got two screen FDs
+       37       37                            open, each with a different MESSAGE LINE.
+       38       38                            QBA$ABORTs and QBS$STOP_PAUSEs ought to use the
+       39       39                            "default" MESSAGE LINE, defined during startup in
+       40       40                            QAT$TALLYHO (since no certain FD is associated with
+       41       41                            the arguments of those statements).  But QBV$VERIFYs
+       42       42                            and QCG$GET_FIELDs should direct their MESSAGE LINE output
+       43       43                            to the MESSAGE LINE associated with whichever FD
+       44       44                            the field they're (re-)reading is in.  The DCBs associated
+       45       45                            with the special FD MESSAGE LINEs should be M$OPENed,
+       46       46                            and the MESSAGE LINEs M$DCLFLDed when the FD is opened.
+       47       47                            Anyway, that's the "worst case" that this code spins
+       48       48                            around.
+       49       49                            More down-to-earthly, the IS_MESSAGE_A_DAD bit indicates
+       50       50                            whether the caller is putting up the text of a DAD,
+       51       51                            or just some interpreter-defined error message.  If
+       52       52                            it's a DAD with a strange type, conversion is in order.
+       53       53        */
+       54       54
+       55       55          %INCLUDE B_ERRORS_C;
+       56     1182          %INCLUDE LCP_6;
+       57     1373          %FPT_DEVICE ( FPTN = FPT@DEVICE,
+       58     1374                        STCLASS = AUTO );
+       59     1401          %FPT_READ ( FPTN = FPT@READ,
+       60     1402                      STCLASS = AUTO );
+       61     1428          %FPT_WRITE ( FPTN = FPT@WRITE,
+       62     1429                       STCLASS = AUTO );
+       63     1453
+       64     1454          %INCLUDE QG_MACRO_M;
+       65     1591          %QGB_ENTRIES;
+       66     1604          %INCLUDE QI_EQUATES_E;
+       67     1963          %INCLUDE QI_PERR_C;
+       68     2131          %INCLUDE QI_MACROS_M;
+       69     7189          %QI$ALL;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:21   
+       70    18302          %QI_FPTS;
+       71    20347
+       72    20348    1     DCL GZ_FIELD$ PTR;
+       73    20349    1     DCL MESSAGE_DATA$ CPTR;
+       74    20350    1     DCL MESSAGE_DATA_PLAIN_PTR$ REDEF MESSAGE_DATA$ PTR;
+       75    20351    1     DCL MESSAGE_LENGTH UBIN;
+       76    20352    1     DCL VISUAL_ATTRIBUTE UBIN;
+       77    20353    1     DCL WERE_A_MESS_ERASE BIT(1) ALIGNED;
+       78    20354    1     DCL WERE_A_MESS_PAUSE BIT(1) ALIGNED;
+       79    20355    1     DCL WERE_A_MESS_WRITE BIT(1) ALIGNED;
+       80    20356
+       81    20357          %QI@TYPE_DISPLAY_TARGET;
+       82    21022          %QI@OTTER_SPACE ( BYTE_SIZE = 32 );
+       83    21050
+       84    21051    1     DCL QCC$CBD ENTRY (1) ALTRET;
+       85    21052    1     DCL QCC$DMC ENTRY (1) ALTRET;
+       86    21053    1     DCL QCE$ERROR_INTERNAL ENTRY (4);
+       87    21054    1     DCL QCE$ERROR_M$INTERNAL ENTRY (4);
+       88    21055    1     DCL QCU$UPDATE_SCREEN ENTRY;
+       89    21056    1     DCL QCU$USE_INVALID_IO ENTRY (1);
+       90    21057
+       91    21058          %SET LISTMAC = '1'B;
+       92    21059
+       93    21060          %INCLUDE QCM_MESS_M;
+       94    21102          %QCM@MESS;
+             21103            %BEGIN_MACRO;
+             21104            %SET LISTDIR = '0'B;
+             21117    1     DCL 1 QCM@MESS ALIGNED,
+             21118    1           2 MESSAGE_LINE_GZ_HEADER$ PTR,
+             21119                           /* Pointer to QI$GZ_HEADER for the
+             21120                              MESSAGE LINE to use.  */
+             21121    1           2 IS_MESSAGE_A_DAD BIT(1) ALIGNED,
+             21122                           /* Set if MESSAGE$ points to a DAD,
+             21123                              reset if MESSAGE$ points to text
+             21124                              (in which case MESSAGE_LENGTH is valid).  */
+             21125    1           2 MESSAGE_LENGTH UBIN,
+             21126                           /* Length, in bytes, of the error message.  */
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:22   
+             21127    1           2 MESSAGE$ PTR,
+             21128                           /* See IS_MESSAGE_A_DAD.  */
+             21129    1           2 FRAME_INDEX UBIN,
+             21130                           /* Index of the current frame.  */
+             21131    1           2 FIELD_INDEX UBIN,
+             21132                           /* Index of the field to re-get (if any).  */
+             21133    1           2 STATUS UBIN,
+             21134                           /* Returned status code:  0 -> Immediate return to level 0;
+             21135                                                    >0 -> Status is ok.  */
+             21136    1           2 FIELD_ERROR_STOP_INDEX UBIN,
+             21137                           /* Passed index for QCG$GET_FIELD processing.  */
+             21138    1           2 VISUAL_ATTRIBUTE UBIN;
+             21139                           /* Matches %EQUs for QI#xxx_VISUAL_ATTR
+             21140                              (currently, blinking or non-blinking message line).  */
+             21147            %ENDIF;
+       95    21150
+       96    21151          %INCLUDE QCU_USE_M;
+       97    21205          %QCU@USE;
+             21206            %BEGIN_MACRO;
+             21207            %SET LISTDIR = '0'B;
+             21220    1     DCL 1 QCU@USE AUTO ALIGNED,
+             21221    1           2 CURR_FRAME$ PTR,
+             21222                          /* Pointer to DAD of current frame or ADDR (NIL).  */
+             21223    1           2 CURR_NODE$ PTR,
+             21224                          /* Pointer to current node or ADDR (NIL).  */
+             21225    1           2 USE_DEFAULT_IO UBIN,
+             21226                          /* For USE procedures which default applies
+             21227                             (see corresponding EQUs).  */
+             21228    1           2 IS_TIME_TO_SAVE_AWAY_FIELDS BIT(1) ALIGNED,
+             21229                          /* If IS_TIME_TO_SAVE_AWAY_FIELDS, then
+             21230                             save the fields within the bounds of
+             21231                             FRAME_START_INDEX, FRAME_STOP_INDEX,
+             21232                             FIELD_START_INDEX, and FIELD_STOP_INDEX
+             21233                             before calling the USE procedure.  */
+             21234    1           2 FRAME_START_INDEX UBIN,
+             21235                          /* Foist frame of the CURRENT.FORM$
+             21236                             involved with the I-O error.  */
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:23   
+             21237    1           2 FRAME_STOP_INDEX UBIN,
+             21238                          /* Larst frame of the CURRENT.FORM$
+             21239                             involved with the I-O error.  */
+             21240    1           2 IS_FIELD_INDEXES_VALID BIT(1) ALIGNED,
+             21241                          /* If IS_FIELD_INDEXES_VALID, use them;
+             21242                             else use all the fields in the frame.  */
+             21243    1           2 FIELD_START_INDEX UBIN,
+             21244                          /* Starting index into QI$GZ_FIELD
+             21245                             which may have values "pushed".  */
+             21246    1           2 FIELD_STOP_INDEX UBIN,
+             21247                          /* Stopping index into QI$GZ_FIELD
+             21248                             which may have values "pushed".  */
+             21249    1           2 IS_CURSOR_POSITION_VALID BIT(1) ALIGNED,
+             21250                          /* If IS_CURSOR_POSITION_VALID, use it;
+             21251                             else allow cursor to default to upper-left-most field.  */
+             21252    1           2 CURSOR_POSITION BIT(16) ALIGNED,
+             21253                          /* POSition of the field on which to place the cursor.  */
+             21254    1           2 STATUS UBIN;
+             21255                          /* Returned action code; see corresponding EQUs.  */
+             21262            %ENDIF;
+       98    21265
+       99    21266          %SET LISTMAC = '0'B;
+      100    21267        %EJECT;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:24   
+      101    21268    1       WERE_A_MESS_WRITE = %YES;
+
+  21268   0 000005  8947 0041                            LBT,'8000'X       WERE_A_MESS_WRITE,AUTO
+  21268   0 000007       8000
+
+      102    21269    1       WERE_A_MESS_ERASE = %NO;
+
+  21269   0 000008  8747 003F                            CL       WERE_A_MESS_ERASE,AUTO
+
+      103    21270    1       WERE_A_MESS_PAUSE = %NO;
+
+  21270   0 00000A  8747 0040                            CL       WERE_A_MESS_PAUSE,AUTO
+
+      104    21271
+      105    21272    1   RETRY_MESS_WRITE:
+      106    21273    1       IF QCM@MESS.IS_MESSAGE_A_DAD
+
+  21273   0 00000C  ECC7 0004            RETRY_MESS_WRITELDB,B6   @QCM@MESS,AUTO
+          0 00000E  89C6 0002                            CMZ      2,B6
+          0 000010  0881 018B                            BAGE     s:21510,PREL
+
+      107    21274    1       THEN
+      108    21275    2         DO;
+
+      109    21276
+      110    21277                /*  This is kind of a mess.  Hence the module name.
+      111    21278                    What's happening is that lots of different routines are calling
+      112    21279                    this one to put something out on the MESSAGE LINE.  That something
+      113    21280                    might be either a QI$DAD or an explicit text message.  If it's
+      114    21281                    the latter, no problem....
+      115    21282                    If the message is held up in a QI$DAD, we may need to do some
+      116    21283                    conversion on it to make it readable (e.g., a BINARY value.)
+      117    21284                    (Note that all callers have resolved QCM@MESS.MESSAGE$ to the
+      118    21285                    last - not INDIRECT - DAD.)
+      119    21286                    But, since we may have come from just about anywhere, we can't
+      120    21287                    just stomp on QI_1.OP.S or QI_1.OP.T with QCS$SETUP.  So, we use
+      121    21288                    an AUTO QI@CIP_OPERATION, and duplicate some of SETUP's code.
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:25   
+      122    21289                    Maybe, someday, it'll be possible to pass SETUP an entire AUTO
+      123    21290                    version of QI_1.OP?  */
+      124    21291    2           IF QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.WORD0_FLAGS.IS_CONSTANT
+
+  21291   0 000012  DCC6 0004                            LDB,B5   4,B6
+          0 000014  8285                                 LB,'0040'X        ,B5
+          0 000015       0040
+          0 000016  0581 000C                            BBF      s:21353,PREL
+
+      125    21292    2           THEN
+      126    21293                  %PROC_ADDRESS ( THING@P =
+             21293                      "QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.DATA@",
+      127    21294                    CHECK_FOR_INDIRECTION = NO,
+      128    21295                    RESULT$ = MESSAGE_DATA$ );
+
+  21313   0 000018  B845 0002                            LDR,R3   2,B5
+          0 00001A  F853                                 LDR,R7   R3
+          0 00001B  6C00                                 LDV,R6   0
+          0 00001C  8400 0000 0002  xsym                 AID      QI_1+2
+          0 00001F  8D47 003B                            SDI      MESSAGE_DATA$,AUTO
+
+  21322   0 000021  0F81 000A                            B        s:21373,PREL
+
+      129    21332    2           ELSE
+      130    21333                  %DATA_ADDRESS ( THING@D =
+             21333                      "QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.DATA@",
+      131    21334                    CHECK_FOR_INDIRECTION = NO,
+      132    21335                    RESULT$ = MESSAGE_DATA$ );
+
+  21353   0 000023  B845 0002                            LDR,R3   2,B5
+          0 000025  F853                                 LDR,R7   R3
+          0 000026  6C00                                 LDV,R6   0
+          0 000027  8400 0000 0000  xsym                 AID      QI_1
+          0 00002A  8D47 003B                            SDI      MESSAGE_DATA$,AUTO
+
+      133    21372
+      134    21373    2           IF QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.WORD0_FLAGS.IS_LINKAGE_ARGUMENT
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:26   
+
+  21373   0 00002C  8285                                 LB,'0800'X        ,B5
+  21373   0 00002D       0800
+          0 00002E  0581 0012                            BBF      s:21413,PREL
+
+      135    21374    2           THEN
+      136    21375                  %LINKAGE_ARGUMENT_ADDRESS ( THING$ = MESSAGE_DATA$,
+      137    21376                    RESULT$ = MESSAGE_DATA$ );
+
+  21394   0 000030  CCC7 003B                            LDB,B4   MESSAGE_DATA$,AUTO
+          0 000032  A804                                 LDR,R2   ,B4
+          0 000033  9844 0001                            LDR,R1   1,B4
+          0 000035  BC80 0000 000C  xsym                 LDB,B3   QI_1+12
+          0 000038  ACA3                                 LDB,B2   ,B3,R2
+          0 000039  AFC7 0078                            STB,B2   QCU@USE+14,AUTO
+          0 00003B  F851                                 LDR,R7   R1
+          0 00003C  6C00                                 LDV,R6   0
+          0 00003D  8447 0078                            AID      QCU@USE+14,AUTO
+          0 00003F  8D47 003B                            SDI      MESSAGE_DATA$,AUTO
+
+      138    21412
+      139    21413    3           DO CASE ( QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.WORD0_FLAGS.TYPE );
+
+  21413   0 000041  DCC6 0004                            LDB,B5   4,B6
+          0 000043  A805                                 LDR,R2   ,B5
+          0 000044  A570 000F                            AND,R2   15,IMO
+          0 000046  2D03                                 CMV,R2   3
+          0 000047  0281 013D                            BGE      s:21501,PREL
+          0 000049  9820 0000 004F  00                   LDR,R1   s:21413+14,R2
+          0 00004C  8390 0000 0052  00                   JMP      s:21416,R1
+          0 00004F       00BB                            DC       s:21468,PREL
+          0 000050       0061                            DC       s:21443,PREL
+          0 000051       0000                            DC       s:21416,PREL
+
+      140    21414
+      141    21415    3             CASE ( %QI#TYPE_BINARY );
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:27   
+      142    21416    3               QI@TYPE_DISPLAY_TARGET = QI_TYPE_DISPLAY_TARGET;
+
+  21416   0 000052  AB80 0000 0000  xsym                 LAB,B2   QI_TYPE_DISPLAY_TARGET
+          0 000055  2C00                                 LDV,R2   0
+          0 000056  6C30                                 LDV,R6   48
+          0 000057  BBC7 0042                            LAB,B3   QI@TYPE_DISPLAY_TARGET,AUTO
+          0 000059  3C00                                 LDV,R3   0
+          0 00005A  0008                                 MMM
+
+      143    21417    3               QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN = %QI#CD_SIGN_LEADING_SEPARATE;
+
+  21417   0 00005B  E870 4000                            LDR,R6   16384,IMO
+          0 00005D  EAC7 0044                            SRM,R6,'6000'X    QI@TYPE_DISPLAY_TARGET+2,AUTO
+          0 00005F       6000
+
+      144    21418    3               IF QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.LEN = %
+             21418                        QI#MIN_BINARY_LENGTH
+
+  21418   0 000060  DCC6 0004                            LDB,B5   4,B6
+          0 000062  D845 0001                            LDR,R5   1,B5
+          0 000064  5048                                 SOR,R5   8
+          0 000065  D570 001F                            AND,R5   31,IMO
+          0 000067  5D02                                 CMV,R5   2
+          0 000068  0981 000D                            BNE      s:21426,PREL
+
+      145    21419    3               THEN
+      146    21420    4                 DO;
+
+      147    21421    4                   QI@TYPE_DISPLAY_TARGET.CIP.S_A (0) = QI_16_BIT_BINARY_A (0);
+
+  21421   0 00006A  C800 0000 0000  xsym                 LDR,R4   QI_16_BIT_BINARY
+          0 00006D  CF47 0042                            STR,R4   QI@TYPE_DISPLAY_TARGET,AUTO
+
+      148    21422    4                   QI@TYPE_DISPLAY_TARGET.CIP.T.LEN = %QI#MIN_BINARY_DIGIT_COUNT + 1;
+
+  21422   0 00006F  D870 0600                            LDR,R5   1536,IMO
+          0 000071  DAC7 0044                            SRM,R5,'1F00'X    QI@TYPE_DISPLAY_TARGET+2,AUTO
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:28   
+          0 000073       1F00
+
+      149    21423    4                 END;
+
+  21423   0 000074  0F81 000B                            B        s:21429,PREL
+
+      150    21424    3               ELSE
+      151    21425    4                 DO;
+
+      152    21426    4                   QI@TYPE_DISPLAY_TARGET.CIP.S_A (0) = QI_32_BIT_BINARY_A (0);
+
+  21426   0 000076  C800 0000 0000  xsym                 LDR,R4   QI_32_BIT_BINARY
+          0 000079  CF47 0042                            STR,R4   QI@TYPE_DISPLAY_TARGET,AUTO
+
+      153    21427    4                   QI@TYPE_DISPLAY_TARGET.CIP.T.LEN = %QI#MAX_BINARY_DIGIT_COUNT + 1;
+
+  21427   0 00007B  D870 0B00                            LDR,R5   2816,IMO
+          0 00007D  DAC7 0044                            SRM,R5,'1F00'X    QI@TYPE_DISPLAY_TARGET+2,AUTO
+          0 00007F       1F00
+
+      154    21428    4                 END;
+
+      155    21429    3               QI@TYPE_DISPLAY_TARGET.CIP.S.CB = QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.
+             21429                        PSEUDO_CIP.NUMERIC.CB;
+
+  21429   0 000080  DCC6 0004                            LDB,B5   4,B6
+          0 000082  D845 0001                            LDR,R5   1,B5
+          0 000084  DAC7 0042                            SRM,R5,'E000'X    QI@TYPE_DISPLAY_TARGET,AUTO
+          0 000086       E000
+
+      156    21430    3               QI@TYPE_DISPLAY_TARGET.DATA.S$ = MESSAGE_DATA_PLAIN_PTR$;
+
+  21430   0 000087  DCC7 003B                            LDB,B5   MESSAGE_DATA$,AUTO
+          0 000089  DFC7 0048                            STB,B5   QI@TYPE_DISPLAY_TARGET+6,AUTO
+
+      157    21431    3               QI@TYPE_DISPLAY_TARGET.DATA.T$ = ADDR ( QI@OTTER_SPACE );
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:29   
+  21431   0 00008B  CBC7 005A                            LAB,B4   QI@OTTER_SPACE,AUTO
+          0 00008D  CFC7 004A                            STB,B4   QI@TYPE_DISPLAY_TARGET+8,AUTO
+
+      158    21432
+      159    21433    3               CALL QCC$CBD ( QI@TYPE_DISPLAY_TARGET )
+
+  21433   0 00008F  BBC7 0042                            LAB,B3   QI@TYPE_DISPLAY_TARGET,AUTO
+          0 000091  BFC7 0078                            STB,B3   QCU@USE+14,AUTO
+          0 000093  BBC7 0078                            LAB,B3   QCU@USE+14,AUTO
+          0 000095  CBF0 0100                            LAB,B4   256,IMO
+          0 000097  E380 0000 0000  xent                 LNJ,B6   QCC$CBD
+          0 00009A       0003                            DC       s:21436,PREL
+          0 00009B  0F81 000A                            B        s:21439,PREL
+
+      160    21434    3               WHENALTRETURN
+      161    21435    4                 DO;
+
+      162    21436    4                   CALL QCE$ERROR_INTERNAL ( %E$UNEXPECTED_QCC_ALTRET );
+
+  21436   0 00009D  BB80 0000 0001  01                   LAB,B3   +1
+          0 0000A0  CBF0 0100                            LAB,B4   256,IMO
+          0 0000A2  E380 0000 0000  xent                 LNJ,B6   QCE$ERROR_INTERNAL
+          0 0000A5       0001                            DC       s:21439,PREL
+
+      163    21437    4                 END;
+
+      164    21438
+      165    21439    3               MESSAGE_DATA$ = ADDR ( QI@OTTER_SPACE );
+
+  21439   0 0000A6  EBC7 005A                            LAB,B6   QI@OTTER_SPACE,AUTO
+          0 0000A8  EFC7 003B                            STB,B6   MESSAGE_DATA$,AUTO
+
+      166    21440    3               MESSAGE_LENGTH = QI@TYPE_DISPLAY_TARGET.CIP.T.LEN;
+
+  21440   0 0000AA  E847 0044                            LDR,R6   QI@TYPE_DISPLAY_TARGET+2,AUTO
+          0 0000AC  6048                                 SOR,R6   8
+          0 0000AD  E570 001F                            AND,R6   31,IMO
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:30   
+          0 0000AF  EF47 003D                            STR,R6   MESSAGE_LENGTH,AUTO
+          0 0000B1  0F81 00F2                            B        s:21514,PREL
+
+      167    21441
+      168    21442    3             CASE ( %QI#TYPE_PACKED );
+
+      169    21443    3               QI@TYPE_DISPLAY_TARGET = QI_TYPE_DISPLAY_TARGET;
+
+  21443   0 0000B3  AB80 0000 0000  xsym                 LAB,B2   QI_TYPE_DISPLAY_TARGET
+          0 0000B6  2C00                                 LDV,R2   0
+          0 0000B7  6C30                                 LDV,R6   48
+          0 0000B8  BBC7 0042                            LAB,B3   QI@TYPE_DISPLAY_TARGET,AUTO
+          0 0000BA  3C00                                 LDV,R3   0
+          0 0000BB  0008                                 MMM
+
+      170    21444    3               QI@TYPE_DISPLAY_TARGET.CIP.S_A (0) = QI_31_DIGIT_ST_PACKED_A (0);
+
+  21444   0 0000BC  E800 0000 0000  xsym                 LDR,R6   QI_31_DIGIT_ST_PACKED
+          0 0000BF  EF47 0042                            STR,R6   QI@TYPE_DISPLAY_TARGET,AUTO
+
+      171    21445    3               QI@TYPE_DISPLAY_TARGET.CIP.S.CP = QCM@MESS.MESSAGE$ ->
+
+  21445   0 0000C1  DCC6 0004                            LDB,B5   4,B6
+          0 0000C3  D845 0001                            LDR,R5   1,B5
+          0 0000C5  DAC7 0042                            SRM,R5,'E000'X    QI@TYPE_DISPLAY_TARGET,AUTO
+          0 0000C7       E000
+
+      172    21446    3                 QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CP;
+      173    21447    3               IF QI@TYPE_DISPLAY_TARGET.CIP.S.CP.SIGN = %QI#CP_UNSIGNED
+
+  21447   0 0000C8  82C7 0042                            LB,'2000'X        QI@TYPE_DISPLAY_TARGET,AUTO
+  21447   0 0000CA       2000
+          0 0000CB  0501 0006                            BBT      s:21451,PREL
+
+      174    21448    3               THEN
+      175    21449    3                 QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN = %QI#CD_UNSIGNED;
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:31   
+  21449   0 0000CD  8847 0044                            LBF,'6000'X       QI@TYPE_DISPLAY_TARGET+2,AUTO
+  21449   0 0000CF       6000
+          0 0000D0  0F81 0004                            B        s:21452,PREL
+
+      176    21450    3               ELSE
+      177    21451    3                 QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN = %QI#CD_SIGN_TRAILING_SEPARATE;
+
+  21451   0 0000D2  8947 0044                            LBT,'6000'X       QI@TYPE_DISPLAY_TARGET+2,AUTO
+  21451   0 0000D4       6000
+
+      178    21452    3               QI@TYPE_DISPLAY_TARGET.CIP.S.LEN = QCM@MESS.MESSAGE$ ->
+
+  21452   0 0000D5  DCC6 0004                            LDB,B5   4,B6
+          0 0000D7  D845 0001                            LDR,R5   1,B5
+          0 0000D9  DAC7 0042                            SRM,R5,'1F00'X    QI@TYPE_DISPLAY_TARGET,AUTO
+          0 0000DB       1F00
+
+      179    21453    3                 QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.LEN;
+      180    21454    3               QI@TYPE_DISPLAY_TARGET.CIP.T.LEN = QI@TYPE_DISPLAY_TARGET.CIP.S.LEN;
+
+  21454   0 0000DC  D847 0042                            LDR,R5   QI@TYPE_DISPLAY_TARGET,AUTO
+          0 0000DE  DAC7 0044                            SRM,R5,'1F00'X    QI@TYPE_DISPLAY_TARGET+2,AUTO
+          0 0000E0       1F00
+
+      181    21455    3               QI@TYPE_DISPLAY_TARGET.DATA.S$ = MESSAGE_DATA_PLAIN_PTR$;
+
+  21455   0 0000E1  DCC7 003B                            LDB,B5   MESSAGE_DATA$,AUTO
+          0 0000E3  DFC7 0048                            STB,B5   QI@TYPE_DISPLAY_TARGET+6,AUTO
+
+      182    21456    3               QI@TYPE_DISPLAY_TARGET.DATA.T$ = ADDR ( QI@OTTER_SPACE );
+
+  21456   0 0000E5  CBC7 005A                            LAB,B4   QI@OTTER_SPACE,AUTO
+          0 0000E7  CFC7 004A                            STB,B4   QI@TYPE_DISPLAY_TARGET+8,AUTO
+
+      183    21457
+      184    21458    3               CALL QCC$DMC ( QI@TYPE_DISPLAY_TARGET )
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:32   
+  21458   0 0000E9  BBC7 0042                            LAB,B3   QI@TYPE_DISPLAY_TARGET,AUTO
+          0 0000EB  BFC7 0078                            STB,B3   QCU@USE+14,AUTO
+          0 0000ED  BBC7 0078                            LAB,B3   QCU@USE+14,AUTO
+          0 0000EF  CBF0 0100                            LAB,B4   256,IMO
+          0 0000F1  E380 0000 0000  xent                 LNJ,B6   QCC$DMC
+          0 0000F4       0003                            DC       s:21461,PREL
+          0 0000F5  0F81 000A                            B        s:21464,PREL
+
+      185    21459    3               WHENALTRETURN
+      186    21460    4                 DO;
+
+      187    21461    4                   CALL QCE$ERROR_INTERNAL ( %E$UNEXPECTED_QCC_ALTRET );
+
+  21461   0 0000F7  BB80 0000 0001  01                   LAB,B3   +1
+          0 0000FA  CBF0 0100                            LAB,B4   256,IMO
+          0 0000FC  E380 0000 0000  xent                 LNJ,B6   QCE$ERROR_INTERNAL
+          0 0000FF       0001                            DC       s:21464,PREL
+
+      188    21462    4                 END;
+
+      189    21463
+      190    21464    3               MESSAGE_DATA$ = ADDR ( QI@OTTER_SPACE );
+
+  21464   0 000100  EBC7 005A                            LAB,B6   QI@OTTER_SPACE,AUTO
+          0 000102  EFC7 003B                            STB,B6   MESSAGE_DATA$,AUTO
+
+      191    21465    3               MESSAGE_LENGTH = QI@TYPE_DISPLAY_TARGET.CIP.T.LEN;
+
+  21465   0 000104  E847 0044                            LDR,R6   QI@TYPE_DISPLAY_TARGET+2,AUTO
+          0 000106  6048                                 SOR,R6   8
+          0 000107  E570 001F                            AND,R6   31,IMO
+          0 000109  EF47 003D                            STR,R6   MESSAGE_LENGTH,AUTO
+          0 00010B  0F81 0098                            B        s:21514,PREL
+
+      192    21466
+      193    21467    3             CASE ( %QI#TYPE_DISPLAY );
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:33   
+      194    21468    4              DO CASE ( QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD.SIGN )
+             21468                        ;
+
+  21468   0 00010D  B845 0001                            LDR,R3   1,B5
+          0 00010F  304D                                 SOR,R3   13
+          0 000110  B570 0003                            AND,R3   3,IMO
+          0 000112  3D02                                 CMV,R3   2
+          0 000113  0281 0059                            BGE      s:21494,PREL
+          0 000115  A830 0000 011B  00                   LDR,R2   s:21468+14,R3
+          0 000118  83A0 0000 011D  00                   JMP      s:21471,R2
+          0 00011B       0050                            DC       s:21494,PREL
+          0 00011C       0000                            DC       s:21471,PREL
+
+      195    21469
+      196    21470    4                 CASE ( %QI#CD_SIGN_TRAILING_OVER );
+
+      197    21471    4                   QI@TYPE_DISPLAY_TARGET = QI_TYPE_DISPLAY_TARGET;
+
+  21471   0 00011D  AB80 0000 0000  xsym                 LAB,B2   QI_TYPE_DISPLAY_TARGET
+          0 000120  2C00                                 LDV,R2   0
+          0 000121  6C30                                 LDV,R6   48
+          0 000122  BBC7 0042                            LAB,B3   QI@TYPE_DISPLAY_TARGET,AUTO
+          0 000124  3C00                                 LDV,R3   0
+          0 000125  0008                                 MMM
+
+      198    21472    4                   QI@TYPE_DISPLAY_TARGET.CIP.S_A (0) = QI_31_DIGIT_SLS_DISPLAY_A (0);
+
+  21472   0 000126  E800 0000 0000  xsym                 LDR,R6   QI_31_DIGIT_SLS_DISPLAY
+          0 000129  EF47 0042                            STR,R6   QI@TYPE_DISPLAY_TARGET,AUTO
+
+      199    21473    4                   QI@TYPE_DISPLAY_TARGET.CIP.S.CD = QCM@MESS.MESSAGE$ ->
+
+  21473   0 00012B  DCC6 0004                            LDB,B5   4,B6
+          0 00012D  D845 0001                            LDR,R5   1,B5
+          0 00012F  DAC7 0042                            SRM,R5,'E000'X    QI@TYPE_DISPLAY_TARGET,AUTO
+          0 000131       E000
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:34   
+      200    21474    4                     QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD;
+      201    21475    4                  QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN = %QI#CD_SIGN_TRAILING_SEPARATE
+             21475                            ;
+
+  21475   0 000132  8947 0044                            LBT,'6000'X       QI@TYPE_DISPLAY_TARGET+2,AUTO
+  21475   0 000134       6000
+
+      202    21476    4                   QI@TYPE_DISPLAY_TARGET.CIP.S.LEN = QCM@MESS.MESSAGE$ ->
+
+  21476   0 000135  DCC6 0004                            LDB,B5   4,B6
+          0 000137  D845 0001                            LDR,R5   1,B5
+          0 000139  DAC7 0042                            SRM,R5,'1F00'X    QI@TYPE_DISPLAY_TARGET,AUTO
+          0 00013B       1F00
+
+      203    21477    4                     QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.LEN;
+      204    21478    4                  QI@TYPE_DISPLAY_TARGET.CIP.T.LEN = QI@TYPE_DISPLAY_TARGET.CIP.S.LEN;
+
+  21478   0 00013C  D847 0042                            LDR,R5   QI@TYPE_DISPLAY_TARGET,AUTO
+          0 00013E  DAC7 0044                            SRM,R5,'1F00'X    QI@TYPE_DISPLAY_TARGET+2,AUTO
+          0 000140       1F00
+
+      205    21479    4                   QI@TYPE_DISPLAY_TARGET.DATA.S$ = MESSAGE_DATA_PLAIN_PTR$;
+
+  21479   0 000141  DCC7 003B                            LDB,B5   MESSAGE_DATA$,AUTO
+          0 000143  DFC7 0048                            STB,B5   QI@TYPE_DISPLAY_TARGET+6,AUTO
+
+      206    21480    4                   QI@TYPE_DISPLAY_TARGET.DATA.T$ = ADDR ( QI@OTTER_SPACE );
+
+  21480   0 000145  CBC7 005A                            LAB,B4   QI@OTTER_SPACE,AUTO
+          0 000147  CFC7 004A                            STB,B4   QI@TYPE_DISPLAY_TARGET+8,AUTO
+
+      207    21481
+      208    21482    4                   CALL QCC$DMC ( QI@TYPE_DISPLAY_TARGET )
+
+  21482   0 000149  BBC7 0042                            LAB,B3   QI@TYPE_DISPLAY_TARGET,AUTO
+          0 00014B  BFC7 0078                            STB,B3   QCU@USE+14,AUTO
+          0 00014D  BBC7 0078                            LAB,B3   QCU@USE+14,AUTO
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:35   
+          0 00014F  CBF0 0100                            LAB,B4   256,IMO
+          0 000151  E380 0000 0000  xent                 LNJ,B6   QCC$DMC
+          0 000154       0003                            DC       s:21485,PREL
+          0 000155  0F81 000A                            B        s:21488,PREL
+
+      209    21483    4                   WHENALTRETURN
+      210    21484    5                     DO;
+
+      211    21485    5                       CALL QCE$ERROR_INTERNAL ( %E$UNEXPECTED_ALTRET );
+
+  21485   0 000157  BB80 0000 0004  01                   LAB,B3   +4
+          0 00015A  CBF0 0100                            LAB,B4   256,IMO
+          0 00015C  E380 0000 0000  xent                 LNJ,B6   QCE$ERROR_INTERNAL
+          0 00015F       0001                            DC       s:21488,PREL
+
+      212    21486    5                     END;
+
+      213    21487
+      214    21488    4                   MESSAGE_DATA$ = ADDR ( QI@OTTER_SPACE );
+
+  21488   0 000160  EBC7 005A                            LAB,B6   QI@OTTER_SPACE,AUTO
+          0 000162  EFC7 003B                            STB,B6   MESSAGE_DATA$,AUTO
+
+      215    21489    4                   MESSAGE_LENGTH = QI@TYPE_DISPLAY_TARGET.CIP.T.LEN;
+
+  21489   0 000164  E847 0044                            LDR,R6   QI@TYPE_DISPLAY_TARGET+2,AUTO
+          0 000166  6048                                 SOR,R6   8
+          0 000167  E570 001F                            AND,R6   31,IMO
+          0 000169  EF47 003D                            STR,R6   MESSAGE_LENGTH,AUTO
+          0 00016B  0F81 0038                            B        s:21514,PREL
+
+      216    21490
+      217    21491    4                 CASE ( ELSE );
+
+      218    21492                        /*  SIGN is LEADING or TRAILING SEPARATE.
+      219    21493                            Just leave it as is.  */
+      220    21494    4                   MESSAGE_DATA$ = PINCRC ( MESSAGE_DATA$,
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:36   
+
+  21494   0 00016D  A845 0001                            LDR,R2   1,B5
+          0 00016F  204F                                 SOR,R2   15
+          0 000170  7031                                 DCL,R7   1
+          0 000171  8D47 0078                            SDI      QCU@USE+14,AUTO
+          0 000173  F852                                 LDR,R7   R2
+          0 000174  6C00                                 LDV,R6   0
+          0 000175  8447 0078                            AID      QCU@USE+14,AUTO
+          0 000177  7071                                 DCR,R7   1
+          0 000178  8D47 003B                            SDI      MESSAGE_DATA$,AUTO
+
+      221    21495    4                     QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD.OFFSET );
+      222    21496    4                   MESSAGE_LENGTH = QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.
+             21496                            NUMERIC.LEN;
+
+  21496   0 00017A  DCC6 0004                            LDB,B5   4,B6
+          0 00017C  D845 0001                            LDR,R5   1,B5
+          0 00017E  5048                                 SOR,R5   8
+          0 00017F  D570 001F                            AND,R5   31,IMO
+          0 000181  DF47 003D                            STR,R5   MESSAGE_LENGTH,AUTO
+
+      223    21497
+      224    21498    4               END;
+
+  21498   0 000183  0F81 0020                            B        s:21514,PREL
+
+      225    21499
+      226    21500    3             CASE ( ELSE );
+
+      227    21501    3               MESSAGE_DATA$ = PINCRC ( MESSAGE_DATA$,
+
+  21501   0 000185  9845 0001                            LDR,R1   1,B5
+          0 000187  104F                                 SOR,R1   15
+          0 000188  7031                                 DCL,R7   1
+          0 000189  8D47 0078                            SDI      QCU@USE+14,AUTO
+          0 00018B  F851                                 LDR,R7   R1
+          0 00018C  6C00                                 LDV,R6   0
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:37   
+          0 00018D  8447 0078                            AID      QCU@USE+14,AUTO
+          0 00018F  7071                                 DCR,R7   1
+          0 000190  8D47 003B                            SDI      MESSAGE_DATA$,AUTO
+
+      228    21502    3                QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.ALPHANUMERIC.CA.OFFSET );
+      229    21503    3               MESSAGE_LENGTH = QCM@MESS.MESSAGE$ -> QI$COBOL_DAD.PSEUDO_CIP.
+             21503                        ALPHANUMERIC.LEN;
+
+  21503   0 000192  DCC6 0004                            LDB,B5   4,B6
+          0 000194  D845 0001                            LDR,R5   1,B5
+          0 000196  D570 3FFF                            AND,R5   16383,IMO
+          0 000198  DF47 003D                            STR,R5   MESSAGE_LENGTH,AUTO
+
+      230    21504
+      231    21505    3           END;
+
+      232    21506
+      233    21507    2         END;
+
+  21507   0 00019A  0F81 0009                            B        s:21514,PREL
+
+      234    21508    1       ELSE
+      235    21509    2         DO;
+
+      236    21510    2           MESSAGE_DATA$ = QCM@MESS.MESSAGE$;
+
+  21510   0 00019C  DCC6 0004                            LDB,B5   4,B6
+          0 00019E  DFC7 003B                            STB,B5   MESSAGE_DATA$,AUTO
+
+      237    21511    2           MESSAGE_LENGTH = QCM@MESS.MESSAGE_LENGTH;
+
+  21511   0 0001A0  E846 0003                            LDR,R6   3,B6
+          0 0001A2  EF47 003D                            STR,R6   MESSAGE_LENGTH,AUTO
+
+      238    21512    2         END;
+
+      239    21513
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:38   
+      240    21514    1       IF QI_1.SCREEN_UPDATE_FLAGS
+
+  21514   0 0001A4  8280 0000 0016  xsym                 LB,'F000'X        QI_1+22
+  21514   0 0001A7       F000
+          0 0001A8  0581 0007                            BBF      s:21518,PREL
+
+      241    21515    1       THEN
+      242    21516    1         CALL QCU$UPDATE_SCREEN;
+
+  21516   0 0001AA  CBF0 0000                            LAB,B4   0,IMO
+          0 0001AC  E380 0000 0000  xent                 LNJ,B6   QCU$UPDATE_SCREEN
+          0 0001AF       0001                            DC       s:21518,PREL
+
+      243    21517
+      244    21518    1       FPT@WRITE = QI_FPT_WRITE;
+
+  21518   0 0001B0  AB80 0000 0000  xsym                 LAB,B2   QI_FPT_WRITE
+          0 0001B3  2C00                                 LDV,R2   0
+          0 0001B4  6C24                                 LDV,R6   36
+          0 0001B5  BB87                                 LAB,B3   ,AUTO
+          0 0001B6  3C4E                                 LDV,R3   78
+          0 0001B7  0008                                 MMM
+
+      245    21519    1       VBASE ( FPT@WRITE.V_ ) = ADDR ( FPT@WRITE.V );
+
+  21519   0 0001B8  EBC7 0036                            LAB,B6   FPT@WRITE+15,AUTO
+          0 0001BA  EFC7 0028                            STB,B6   FPT@WRITE+1,AUTO
+
+      246    21520    1       FPT@WRITE.V.DCB# = QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB#;
+
+  21520   0 0001BC  DCC7 0004                            LDB,B5   @QCM@MESS,AUTO
+          0 0001BE  CC85                                 LDB,B4   ,B5
+          0 0001BF  E844 0003                            LDR,R6   3,B4
+          0 0001C1  E7C7 0036                            STH,R6   FPT@WRITE+15,AUTO
+
+      247    21521    1       VBASE ( FPT@WRITE.BUF_ ) = MESSAGE_DATA$;
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:39   
+  21521   0 0001C3  8CC7 003B                            LDI      MESSAGE_DATA$,AUTO
+          0 0001C5  8D47 002E                            SDI      FPT@WRITE+7,AUTO
+
+      248    21522    1       VBOUND ( FPT@WRITE.BUF_ ) = MESSAGE_LENGTH - 1;
+
+  21522   0 0001C7  D847 003D                            LDR,R5   MESSAGE_LENGTH,AUTO
+          0 0001C9  5EFF                                 ADV,R5   -1
+          0 0001CA  DF47 002D                            STR,R5   FPT@WRITE+6,AUTO
+
+      249    21523
+      250    21524    1       IF QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB# ~=
+
+  21524   0 0001CC  CC85                                 LDB,B4   ,B5
+          0 0001CD  AC80 0000 0064  xsym                 LDB,B2   QI_1+100
+          0 0001D0  C844 0003                            LDR,R4   3,B4
+          0 0001D2  C942 0003                            CMR,R4   3,B2
+          0 0001D4  0901 0015                            BE       s:21533,PREL
+
+      251    21525    1         QI_1.MESSAGE_LINE_GZ.HEADER$ -> QI$GZ_HEADER.DCB#
+      252    21526    1       THEN
+      253    21527    2         DO;
+
+      254    21528    2           GZ_FIELD$ = PINCRW ( QCM@MESS.MESSAGE_LINE_GZ_HEADER$,
+
+  21528   0 0001D6  9BC4 000B                            LAB,B1   11,B4
+          0 0001D8  9FC7 0039                            STB,B1   GZ_FIELD$,AUTO
+
+      255    21529    2             SIZEW (QI$GZ_HEADER) );
+      256    21530    2           FPT@WRITE.KEY_ = VECTOR ( GZ_FIELD$ -> QI$GZ_FIELD.DESCRIPTION.POSITION );
+
+  21530   0 0001DA  EBC1 0003                            LAB,B6   3,B1
+          0 0001DC  EFC7 0079                            STB,B6   QCU@USE+15,AUTO
+          0 0001DE  4C01                                 LDV,R4   1
+          0 0001DF  CF47 0078                            STR,R4   QCU@USE+14,AUTO
+          0 0001E1  ABC7 0078                            LAB,B2   QCU@USE+14,AUTO
+          0 0001E3  2C00                                 LDV,R2   0
+          0 0001E4  6C06                                 LDV,R6   6
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:40   
+          0 0001E5  BB87                                 LAB,B3   ,AUTO
+          0 0001E6  3C54                                 LDV,R3   84
+          0 0001E7  0008                                 MMM
+
+      257    21531    2         END;
+
+  21531   0 0001E8  0F81 0006                            B        s:21535,PREL
+
+      258    21532    1       ELSE
+      259    21533    1         GZ_FIELD$ = ADDR (NIL);
+
+  21533   0 0001EA  9B80 0000 0000                       LAB,B1   0
+          0 0001ED  9FC7 0039                            STB,B1   GZ_FIELD$,AUTO
+
+      260    21534
+      261    21535    1       CALL QGB$WRITE ( FPT@WRITE, QGB_PARAM )
+
+  21535   0 0001EF  EB80 0000 0000  xsym                 LAB,B6   QGB_PARAM
+          0 0001F2  EFC7 007A                            STB,B6   QCU@USE+16,AUTO
+          0 0001F4  CBC7 0027                            LAB,B4   FPT@WRITE,AUTO
+          0 0001F6  CFC7 0078                            STB,B4   QCU@USE+14,AUTO
+          0 0001F8  BBC7 0078                            LAB,B3   QCU@USE+14,AUTO
+          0 0001FA  CBF0 0200                            LAB,B4   512,IMO
+          0 0001FC  E380 0000 0000  xent                 LNJ,B6   QGB$WRITE
+          0 0001FF       00E1                            DC       s:21644,PREL
+
+      262    21536    1         ALTRET ( CHECK_USE_PROCEDURE_OR_INVALID );
+      263    21537
+      264    21538    1       QCM@MESS.STATUS = %QI#USE_INVALID_OK;
+
+  21538   0 000200  ECC7 0004                            LDB,B6   @QCM@MESS,AUTO
+          0 000202  6C03                                 LDV,R6   3
+          0 000203  EF46 0008                            STR,R6   8,B6
+
+      265    21539
+      266    21540    1       RETURN;
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:41   
+  21540   0 000205  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      267    21541
+      268    21542    1   QCM$MESS_PAUSE: ENTRY ( QCM@MESS );
+
+  21542   0 000208  D380 0000 0000  xent QCM$MESS_PAUSE  LNJ,B5   X6A_AUTO_1
+          0 00020B       007C 0001                       DC       124,1
+
+      269    21543
+      270    21544        /*D*  NAME:         QCM$MESS_PAUSE
+      271    21545              CALL:         CALL QCM$MESS_PAUSE ( QCM@MESS );
+      272    21546              PARAMETERS:   QCM@MESS is a structure which contains information
+      273    21547                            concerning the DCB# of the MESSAGE LINE to read through.
+      274    21548              INTERFACE:    Called by QBA$ABORT and QBS$STOP_PAUSE.
+      275    21549                            Calls M$READ.
+      276    21550              ENVIRONMENT:  Nothing unusual.
+      277    21551              INPUT:        Pokes around in QI$GZ_FIELDs a little,
+      278    21552                            reads from the MESSAGE LINE, and chucks the data.
+      279    21553              OUTPUT:       Cursor moved to the MESSAGE LINE.
+      280    21554              SCRATCH:      Various otter stuff.
+      281    21555              DESCRIPTION:  Lousy way to PAUSE, huh?
+      282    21556        */
+      283    21557
+      284    21558    1       WERE_A_MESS_PAUSE = %YES;
+
+  21558   0 00020D  8947 0040                            LBT,'8000'X       WERE_A_MESS_PAUSE,AUTO
+  21558   0 00020F       8000
+
+      285    21559    1       WERE_A_MESS_ERASE = %NO;
+
+  21559   0 000210  8747 003F                            CL       WERE_A_MESS_ERASE,AUTO
+
+      286    21560    1       WERE_A_MESS_WRITE = %NO;
+
+  21560   0 000212  8747 0041                            CL       WERE_A_MESS_WRITE,AUTO
+
+      287    21561
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:42   
+      288    21562    1   RETRY_MESS_PAUSE:
+      289    21563    1       FPT@READ = QI_FPT_READ;
+
+  21563   0 000214  AB80 0000 0000  xsym RETRY_MESS_PAUSELAB,B2   QI_FPT_READ
+          0 000217  2C00                                 LDV,R2   0
+          0 000218  6C24                                 LDV,R6   36
+          0 000219  BB87                                 LAB,B3   ,AUTO
+          0 00021A  3C2A                                 LDV,R3   42
+          0 00021B  0008                                 MMM
+
+      290    21564    1       VBASE ( FPT@READ.V_ ) = ADDR ( FPT@READ.V );
+
+  21564   0 00021C  EBC7 0024                            LAB,B6   FPT@READ+15,AUTO
+          0 00021E  EFC7 0016                            STB,B6   FPT@READ+1,AUTO
+
+      291    21565    1       FPT@READ.V.DCB# = QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB#;
+
+  21565   0 000220  DCC7 0004                            LDB,B5   @QCM@MESS,AUTO
+          0 000222  CC85                                 LDB,B4   ,B5
+          0 000223  E844 0003                            LDR,R6   3,B4
+          0 000225  E7C7 0024                            STH,R6   FPT@READ+15,AUTO
+
+      292    21566    1       FPT@READ.BUF_ = VECTOR ( QI@OTTER_SPACE_CA (0) );
+
+  21566   0 000227  CBC7 005A                            LAB,B4   QI@OTTER_SPACE,AUTO
+          0 000229  CFC7 0079                            STB,B4   QCU@USE+15,AUTO
+          0 00022B  8747 0078                            CL       QCU@USE+14,AUTO
+          0 00022D  ABC7 0078                            LAB,B2   QCU@USE+14,AUTO
+          0 00022F  2C00                                 LDV,R2   0
+          0 000230  6C06                                 LDV,R6   6
+          0 000231  BB87                                 LAB,B3   ,AUTO
+          0 000232  3C36                                 LDV,R3   54
+          0 000233  0008                                 MMM
+
+      293    21567
+      294    21568    1       IF QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB# ~=
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:43   
+  21568   0 000234  EC85                                 LDB,B6   ,B5
+          0 000235  CC80 0000 0064  xsym                 LDB,B4   QI_1+100
+          0 000238  E846 0003                            LDR,R6   3,B6
+          0 00023A  E944 0003                            CMR,R6   3,B4
+          0 00023C  0901 0019                            BE       s:21579,PREL
+
+      295    21569    1         QI_1.MESSAGE_LINE_GZ.HEADER$ -> QI$GZ_HEADER.DCB#
+      296    21570    1       THEN
+      297    21571    2         DO;
+
+      298    21572    2           FPT@READ.V.KEYS = %YES;
+
+  21572   0 00023E  8947 0024                            LBT,'0080'X       FPT@READ+15,AUTO
+  21572   0 000240       0080
+
+      299    21573
+      300    21574    2           GZ_FIELD$ = PINCRW ( QCM@MESS.MESSAGE_LINE_GZ_HEADER$,
+
+  21574   0 000241  EC85                                 LDB,B6   ,B5
+          0 000242  ABC6 000B                            LAB,B2   11,B6
+          0 000244  AFC7 0039                            STB,B2   GZ_FIELD$,AUTO
+
+      301    21575    2             SIZEW (QI$GZ_HEADER) );
+      302    21576    2           FPT@READ.KEY_ = VECTOR ( GZ_FIELD$ -> QI$GZ_FIELD.DESCRIPTION.POSITION );
+
+  21576   0 000246  9BC2 0003                            LAB,B1   3,B2
+          0 000248  9FC7 0079                            STB,B1   QCU@USE+15,AUTO
+          0 00024A  6C01                                 LDV,R6   1
+          0 00024B  EF47 0078                            STR,R6   QCU@USE+14,AUTO
+          0 00024D  ABC7 0078                            LAB,B2   QCU@USE+14,AUTO
+          0 00024F  2C00                                 LDV,R2   0
+          0 000250  6C06                                 LDV,R6   6
+          0 000251  BB87                                 LAB,B3   ,AUTO
+          0 000252  3C30                                 LDV,R3   48
+          0 000253  0008                                 MMM
+
+      303    21577    2         END;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:44   
+
+  21577   0 000254  0F81 0006                            B        s:21581,PREL
+
+      304    21578    1       ELSE
+      305    21579    1         GZ_FIELD$ = ADDR (NIL);
+
+  21579   0 000256  AB80 0000 0000                       LAB,B2   0
+          0 000259  AFC7 0039                            STB,B2   GZ_FIELD$,AUTO
+
+      306    21580
+      307    21581    1       CALL QGB$READ ( FPT@READ, QGB_PARAM )
+
+  21581   0 00025B  EB80 0000 0000  xsym                 LAB,B6   QGB_PARAM
+          0 00025E  EFC7 007A                            STB,B6   QCU@USE+16,AUTO
+          0 000260  CBC7 0015                            LAB,B4   FPT@READ,AUTO
+          0 000262  CFC7 0078                            STB,B4   QCU@USE+14,AUTO
+          0 000264  BBC7 0078                            LAB,B3   QCU@USE+14,AUTO
+          0 000266  CBF0 0200                            LAB,B4   512,IMO
+          0 000268  E380 0000 0000  xent                 LNJ,B6   QGB$READ
+          0 00026B       0003                            DC       s:21585,PREL
+          0 00026C  0F81 0008                            B        s:21591,PREL
+
+      308    21582    1       WHENALTRETURN
+      309    21583    2         DO;
+
+      310    21584
+      311    21585    2           IF QGB_PARAM.ERR.ERR# ~= %E$EOF
+
+  21585   0 00026E  E800 0000 0006  xsym                 LDR,R6   QGB_PARAM+6
+          0 000271  6043                                 SOR,R6   3
+          0 000272  6D06                                 CMV,R6   6
+          0 000273  0981 006C                            BNE      s:21644,PREL
+
+      312    21586    2           THEN
+      313    21587    2             GOTO CHECK_USE_PROCEDURE_OR_INVALID;
+      314    21588
+      315    21589    2         END;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:45   
+
+      316    21590
+      317    21591    1       QCM@MESS.STATUS = %QI#USE_INVALID_OK;
+
+  21591   0 000275  ECC7 0004                            LDB,B6   @QCM@MESS,AUTO
+          0 000277  6C03                                 LDV,R6   3
+          0 000278  EF46 0008                            STR,R6   8,B6
+
+      318    21592
+      319    21593    1       RETURN;
+
+  21593   0 00027A  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      320    21594
+      321    21595    1   QCM$MESS_ERASE: ENTRY ( QCM@MESS );
+
+  21595   0 00027D  D380 0000 0000  xent QCM$MESS_ERASE  LNJ,B5   X6A_AUTO_1
+          0 000280       007C 0001                       DC       124,1
+
+      322    21596
+      323    21597        /*D*  NAME:         QCM$MESS_ERASE
+      324    21598              CALL:         CALL QCM$MESS_ERASE ( QCM@MESS );
+      325    21599              PARAMETERS:   QCM@MESS is a structure which contains information
+      326    21600                            concerning the DCB# of the MESSAGE LINE to erase through.
+      327    21601              INTERFACE:    Called by QBA$ABORT, QBA$ACCEPT, QBS$STOP_PAUSE, and
+      328    21602                            QCG$GET_FIELD.
+      329    21603                            Calls M$DEVICE.
+      330    21604              ENVIRONMENT:  Nothing unusual.
+      331    21605              INPUT:        Pokes around in QI$GZ_FIELDs a little.
+      332    21606              OUTPUT:       The MESSAGE LINE is erased.
+      333    21607              SCRATCH:      Various otter stuff.
+      334    21608              DESCRIPTION:  After a MESSAGE LINE message gets old (the ABORT or
+      335    21609                            STOP statement has paused, or a field has been (re-)read)
+      336    21610                            somebody has to erase it.
+      337    21611        */
+      338    21612
+      339    21613    1       WERE_A_MESS_ERASE = %YES;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:46   
+
+  21613   0 000282  8947 003F                            LBT,'8000'X       WERE_A_MESS_ERASE,AUTO
+  21613   0 000284       8000
+
+      340    21614    1       WERE_A_MESS_PAUSE = %NO;
+
+  21614   0 000285  8747 0040                            CL       WERE_A_MESS_PAUSE,AUTO
+
+      341    21615    1       WERE_A_MESS_WRITE = %NO;
+
+  21615   0 000287  8747 0041                            CL       WERE_A_MESS_WRITE,AUTO
+
+      342    21616
+      343    21617    1   RETRY_MESS_ERASE:
+      344    21618    1       FPT@WRITE = QI_FPT_WRITE;
+
+  21618   0 000289  AB80 0000 0000  xsym RETRY_MESS_ERASELAB,B2   QI_FPT_WRITE
+          0 00028C  2C00                                 LDV,R2   0
+          0 00028D  6C24                                 LDV,R6   36
+          0 00028E  BB87                                 LAB,B3   ,AUTO
+          0 00028F  3C4E                                 LDV,R3   78
+          0 000290  0008                                 MMM
+
+      345    21619    1       VBASE ( FPT@WRITE.V_ ) = ADDR ( FPT@WRITE.V );
+
+  21619   0 000291  EBC7 0036                            LAB,B6   FPT@WRITE+15,AUTO
+          0 000293  EFC7 0028                            STB,B6   FPT@WRITE+1,AUTO
+
+      346    21620    1       FPT@WRITE.V.DCB# = QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB#;
+
+  21620   0 000295  DCC7 0004                            LDB,B5   @QCM@MESS,AUTO
+          0 000297  CC85                                 LDB,B4   ,B5
+          0 000298  E844 0003                            LDR,R6   3,B4
+          0 00029A  E7C7 0036                            STH,R6   FPT@WRITE+15,AUTO
+
+      347    21621            /*  TEMPORARY???  */
+      348    21622    1       FPT@WRITE.BUF_ = VECTOR ( QI_BLANK );
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:47   
+
+  21622   0 00029C  AB80 0000 0000  01                   LAB,B2   0
+          0 00029F  2C0C                                 LDV,R2   12
+          0 0002A0  6C06                                 LDV,R6   6
+          0 0002A1  BB87                                 LAB,B3   ,AUTO
+          0 0002A2  3C5A                                 LDV,R3   90
+          0 0002A3  0008                                 MMM
+
+      349    21623
+      350    21624    1       IF QCM@MESS.MESSAGE_LINE_GZ_HEADER$ -> QI$GZ_HEADER.DCB# ~=
+
+  21624   0 0002A4  EC85                                 LDB,B6   ,B5
+          0 0002A5  CC80 0000 0064  xsym                 LDB,B4   QI_1+100
+          0 0002A8  E846 0003                            LDR,R6   3,B6
+          0 0002AA  E944 0003                            CMR,R6   3,B4
+          0 0002AC  0901 0015                            BE       s:21633,PREL
+
+      351    21625    1         QI_1.MESSAGE_LINE_GZ.HEADER$ -> QI$GZ_HEADER.DCB#
+      352    21626    1       THEN
+      353    21627    2         DO;
+
+      354    21628    2           GZ_FIELD$ = PINCRW ( QCM@MESS.MESSAGE_LINE_GZ_HEADER$,
+
+  21628   0 0002AE  ABC6 000B                            LAB,B2   11,B6
+          0 0002B0  AFC7 0039                            STB,B2   GZ_FIELD$,AUTO
+
+      355    21629    2             SIZEW (QI$GZ_HEADER) );
+      356    21630    2           FPT@WRITE.KEY_ = VECTOR ( GZ_FIELD$ -> QI$GZ_FIELD.DESCRIPTION.POSITION );
+
+  21630   0 0002B2  9BC2 0003                            LAB,B1   3,B2
+          0 0002B4  9FC7 0079                            STB,B1   QCU@USE+15,AUTO
+          0 0002B6  6C01                                 LDV,R6   1
+          0 0002B7  EF47 0078                            STR,R6   QCU@USE+14,AUTO
+          0 0002B9  ABC7 0078                            LAB,B2   QCU@USE+14,AUTO
+          0 0002BB  2C00                                 LDV,R2   0
+          0 0002BC  6C06                                 LDV,R6   6
+          0 0002BD  BB87                                 LAB,B3   ,AUTO
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:48   
+          0 0002BE  3C54                                 LDV,R3   84
+          0 0002BF  0008                                 MMM
+
+      357    21631    2         END;
+
+  21631   0 0002C0  0F81 0006                            B        s:21635,PREL
+
+      358    21632    1       ELSE
+      359    21633    1         GZ_FIELD$ = ADDR (NIL);
+
+  21633   0 0002C2  AB80 0000 0000                       LAB,B2   0
+          0 0002C5  AFC7 0039                            STB,B2   GZ_FIELD$,AUTO
+
+      360    21634
+      361    21635    1       CALL QGB$WRITE ( FPT@WRITE, QGB_PARAM )
+
+  21635   0 0002C7  EB80 0000 0000  xsym                 LAB,B6   QGB_PARAM
+          0 0002CA  EFC7 007A                            STB,B6   QCU@USE+16,AUTO
+          0 0002CC  CBC7 0027                            LAB,B4   FPT@WRITE,AUTO
+          0 0002CE  CFC7 0078                            STB,B4   QCU@USE+14,AUTO
+          0 0002D0  BBC7 0078                            LAB,B3   QCU@USE+14,AUTO
+          0 0002D2  CBF0 0200                            LAB,B4   512,IMO
+          0 0002D4  E380 0000 0000  xent                 LNJ,B6   QGB$WRITE
+          0 0002D7       0009                            DC       s:21644,PREL
+
+      362    21636    1         ALTRET ( CHECK_USE_PROCEDURE_OR_INVALID );
+      363    21637
+      364    21638    1       QCM@MESS.STATUS = %QI#USE_INVALID_OK;
+
+  21638   0 0002D8  ECC7 0004                            LDB,B6   @QCM@MESS,AUTO
+          0 0002DA  6C03                                 LDV,R6   3
+          0 0002DB  EF46 0008                            STR,R6   8,B6
+
+      365    21639
+      366    21640    1       RETURN;
+
+  21640   0 0002DD  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:49   
+
+      367    21641
+      368    21642        %EJECT;
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:50   
+      369    21643    1   CHECK_USE_PROCEDURE_OR_INVALID:
+      370    21644    1       QCU@USE.USE_DEFAULT_IO = %QI#USE_DEFAULT_NONE;
+
+  21644   0 0002E0  8747 006E            CHECK_USE_PROCE*CL       QCU@USE+4,AUTO
+
+      371    21645    1       QCU@USE.IS_TIME_TO_SAVE_AWAY_FIELDS = %NO;
+
+  21645   0 0002E2  8747 006F                            CL       QCU@USE+5,AUTO
+
+      372    21646    1       QCU@USE.CURR_FRAME$ = ADDR (NIL);
+
+  21646   0 0002E4  EB80 0000 0000                       LAB,B6   0
+          0 0002E7  EFC7 006A                            STB,B6   QCU@USE,AUTO
+
+      373    21647    1       IF GZ_FIELD$ = ADDR (NIL)
+
+  21647   0 0002E9  8DC7 0039                            CMN      GZ_FIELD$,AUTO
+          0 0002EB  0981 0008                            BNE      s:21651,PREL
+
+      374    21648    1       THEN
+      375    21649    1         QCU@USE.CURR_NODE$ = ADDR (NIL);
+
+  21649   0 0002ED  DB80 0000 0000                       LAB,B5   0
+          0 0002F0  DFC7 006C                            STB,B5   QCU@USE+2,AUTO
+          0 0002F2  0F81 0007                            B        s:21653,PREL
+
+      376    21650    1       ELSE
+      377    21651    1         QCU@USE.CURR_NODE$ = GZ_FIELD$ -> QI$GZ_FIELD.DESCRIPTION.FIELD_DAD$;
+
+  21651   0 0002F4  DCC7 0039                            LDB,B5   GZ_FIELD$,AUTO
+          0 0002F6  CCC5 0004                            LDB,B4   4,B5
+          0 0002F8  CFC7 006C                            STB,B4   QCU@USE+2,AUTO
+
+      378    21652
+      379    21653    1       CALL QCU$USE_INVALID_IO ( QCU@USE );
+
+  21653   0 0002FA  DBC7 006A                            LAB,B5   QCU@USE,AUTO
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:51   
+          0 0002FC  DFC7 0078                            STB,B5   QCU@USE+14,AUTO
+          0 0002FE  BBC7 0078                            LAB,B3   QCU@USE+14,AUTO
+          0 000300  CBF0 0100                            LAB,B4   256,IMO
+          0 000302  E380 0000 0000  xent                 LNJ,B6   QCU$USE_INVALID_IO
+          0 000305       0001                            DC       s:21655,PREL
+
+      380    21654
+      381    21655    2       DO CASE ( QCU@USE.STATUS );
+
+  21655   0 000306  B847 0077                            LDR,R3   QCU@USE+13,AUTO
+          0 000308  3D03                                 CMV,R3   3
+          0 000309  0281 0030                            BGE      s:21681,PREL
+          0 00030B  A830 0000 0311  00                   LDR,R2   s:21655+11,R3
+          0 00030E  83A0 0000 0314  00                   JMP      s:21658,R2
+          0 000311       0000                            DC       s:21658,PREL
+          0 000312       0007                            DC       s:21663,PREL
+          0 000313       001E                            DC       s:21676,PREL
+
+      382    21656
+      383    21657    2         CASE ( %QI#USE_INVALID_RETURN );
+
+      384    21658    2           QCM@MESS.STATUS = %QI#USE_INVALID_RETURN;
+
+  21658   0 000314  ECC7 0004                            LDB,B6   @QCM@MESS,AUTO
+          0 000316  8746 0008                            CL       8,B6
+
+      385    21659
+      386    21660    2           RETURN;
+
+  21660   0 000318  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      387    21661
+      388    21662    2         CASE ( %QI#USE_INVALID_RETRY );
+
+      389    21663    2           IF WERE_A_MESS_ERASE
+
+  21663   0 00031B  89C7 003F                            CMZ      WERE_A_MESS_ERASE,AUTO
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:52   
+          0 00031D  0801 FF6B                            BAL      s:21618,PREL
+
+      390    21664    2           THEN
+      391    21665    2             GOTO RETRY_MESS_ERASE;
+      392    21666    2           IF WERE_A_MESS_PAUSE
+
+  21666   0 00031F  89C7 0040                            CMZ      WERE_A_MESS_PAUSE,AUTO
+          0 000321  0801 FEF2                            BAL      s:21563,PREL
+
+      393    21667    2           THEN
+      394    21668    2             GOTO RETRY_MESS_PAUSE;
+      395    21669    2           IF WERE_A_MESS_WRITE
+
+  21669   0 000323  89C7 0041                            CMZ      WERE_A_MESS_WRITE,AUTO
+          0 000325  0801 FCE6                            BAL      s:21273,PREL
+
+      396    21670    2           THEN
+      397    21671    2             GOTO RETRY_MESS_WRITE;
+      398    21672
+      399    21673    2           CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_INTERPRETER_ERROR );
+
+  21673   0 000327  BB80 0000 000A  01                   LAB,B3   +10
+          0 00032A  CBF0 0100                            LAB,B4   256,IMO
+          0 00032C  E380 0000 0000  xent                 LNJ,B6   QCE$ERROR_INTERNAL
+          0 00032F       0001                            DC       s:21673+9,PREL
+          0 000330  0F81 0012                            B        s:21685,PREL
+
+      400    21674
+      401    21675    2         CASE ( %QI#USE_INVALID_SKIP_TO_NEXT );
+
+      402    21676    2           QCM@MESS.STATUS = %QI#USE_INVALID_SKIP_TO_NEXT;
+
+  21676   0 000332  ECC7 0004                            LDB,B6   @QCM@MESS,AUTO
+          0 000334  6C02                                 LDV,R6   2
+          0 000335  EF46 0008                            STR,R6   8,B6
+
+      403    21677
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:53   
+      404    21678    2           RETURN;
+
+  21678   0 000337  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      405    21679
+      406    21680    2         CASE ( ELSE );
+
+      407    21681    2           CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_INTERPRETER_ERROR );
+
+  21681   0 00033A  BB80 0000 000A  01                   LAB,B3   +10
+          0 00033D  CBF0 0100                            LAB,B4   256,IMO
+          0 00033F  E380 0000 0000  xent                 LNJ,B6   QCE$ERROR_INTERNAL
+          0 000342       0001                            DC       s:21685,PREL
+
+      408    21682
+      409    21683    2       END;
+
+      410    21684
+      411    21685    1   END QCM$MESS;
+
+  21685   0 000343  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:54   
+--  Include file information  --
+
+   QCU_USE_M.:E05TOU  is referenced.
+   QCM_MESS_M.:E05TOU  is referenced.
+   QI_MACROS_M.:E05TOU  is referenced.
+   QI_PERR_C.:E05TOU  is referenced.
+   QI_EQUATES_E.:E05TOU  is referenced.
+   QG_MACRO_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure QCM$MESS.
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:55   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @QCM@MESS                 15-0-0/w STRC(288)   r     1 FPT@READ
+    27-0-0/w STRC(288)   r     1 FPT@WRITE                 39-0-0/w PTR         r     1 GZ_FIELD$
+    3B-0-0/w PTR         r     1 MESSAGE_DATA$
+    3B-0-0/w PTR         r     1 MESSAGE_DATA_PLAIN_PTR$
+    3D-0-0/w UBIN(16)    r     1 MESSAGE_LENGTH            *0-0-0/w STRC(176)   r     1 QCM@MESS
+    6A-0-0/w STRC(224)   r     1 QCU@USE                   5A-0-0/w STRC(256)   r     1 QI@OTTER_SPACE
+    5A-0-0/w CHAR        r     1 QI@OTTER_SPACE_CA(0:31)
+    42-0-0/d STRC(384)   r     1 QI@TYPE_DISPLAY_TARGET
+    3F-0-0/w BIT         r     1 WERE_A_MESS_ERASE         40-0-0/w BIT         r     1 WERE_A_MESS_PAUSE
+    41-0-0/w BIT         r     1 WERE_A_MESS_WRITE
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(432)   r     1 QGB_PARAM                  0-0-0/d STRC(2576)  r     1 QI_1
+     0-0-0/d STRC(32)    r     1 QI_16_BIT_BINARY
+     0-0-0/d UBIN(16)    r     1 QI_16_BIT_BINARY_A(0:1)
+     0-0-0/d STRC(32)    r     1 QI_31_DIGIT_SLS_DISPLAY
+     0-0-0/d UBIN(16)    r     1 QI_31_DIGIT_SLS_DISPLAY_A(0:1)
+     0-0-0/d STRC(32)    r     1 QI_31_DIGIT_ST_PACKED
+     0-0-0/d UBIN(16)    r     1 QI_31_DIGIT_ST_PACKED_A(0:1)
+     0-0-0/d STRC(32)    r     1 QI_32_BIT_BINARY
+     0-0-0/d UBIN(16)    r     1 QI_32_BIT_BINARY_A(0:1)
+     0-0-0/w UBIN(8)     r     1 QI_BLANK                   0-0-0/w STRC(288)   r     1 QI_FPT_READ
+     0-0-0/w STRC(288)   r     1 QI_FPT_WRITE
+     0-0-0/d STRC(384)   r     1 QI_TYPE_DISPLAY_TARGET
+
+  ****  BASED and DCB variables  ****
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:56   
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(192)   r     1 QI$COBOL_DAD               0-0-0/w STRC(184)   r     1 QI$GZ_FIELD
+     0-0-0/w STRC(176)   r     1 QI$GZ_HEADER
+     0-0-0/w STRC(32)    r     1 QI$LINKAGE_ARGUMENT_DESCRIPTOR
+     0-0-0/w PTR         r     1 QI$PTR_A$(0:0)
+     0-0-0/c ASTR(8)     r     1 QI$VARIABLE_IDENTIFIER
+
+
+   Procedure QCM$MESS requires 838 words for executable code.
+   Procedure QCM$MESS requires 124 words of local(AUTO) storage.
+
+    No errors detected in file QCM$MESS.:E05TSI    .
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:57   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:58   
+          MINI XREF LISTING
+
+CHECK_USE_PROCEDURE_OR_INVALID
+     21644**LABEL   21535--CALLALT 21587--GOTO    21635--CALLALT
+FPT@READ
+      1415**DCL     21563<<ASSIGN  21581<>CALL
+FPT@READ.BUF_
+      1417**DCL     21566<<ASSIGN
+FPT@READ.KEY_
+      1417**DCL     21576<<ASSIGN
+FPT@READ.V
+      1420**DCL     21564--ASSIGN
+FPT@READ.V.DCB#
+      1420**DCL     21565<<ASSIGN
+FPT@READ.V.KEYS
+      1420**DCL     21572<<ASSIGN
+FPT@READ.V_
+      1417**DCL     21564<<ASSIGN
+FPT@WRITE
+      1442**DCL     21518<<ASSIGN  21535<>CALL    21618<<ASSIGN  21635<>CALL
+FPT@WRITE.BUF_
+      1444**DCL     21521<<ASSIGN  21522<<ASSIGN  21622<<ASSIGN
+FPT@WRITE.KEY_
+      1444**DCL     21530<<ASSIGN  21630<<ASSIGN
+FPT@WRITE.V
+      1447**DCL     21519--ASSIGN  21619--ASSIGN
+FPT@WRITE.V.DCB#
+      1447**DCL     21520<<ASSIGN  21620<<ASSIGN
+FPT@WRITE.V_
+      1444**DCL     21519<<ASSIGN  21619<<ASSIGN
+GZ_FIELD$
+     20348**DCL     21528<<ASSIGN  21530>>ASSIGN  21533<<ASSIGN  21574<<ASSIGN  21576>>ASSIGN  21579<<ASSIGN
+     21628<<ASSIGN  21630>>ASSIGN  21633<<ASSIGN  21647>>IF      21651>>ASSIGN
+MESSAGE_DATA$
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:59   
+     20349**DCL     20350--REDEF   21313<<ASSIGN  21353<<ASSIGN  21394<<ASSIGN  21394>>ASSIGN  21394>>ASSIGN
+     21439<<ASSIGN  21464<<ASSIGN  21488<<ASSIGN  21494<<ASSIGN  21494>>ASSIGN  21501<<ASSIGN  21501>>ASSIGN
+     21510<<ASSIGN  21521>>ASSIGN
+MESSAGE_DATA_PLAIN_PTR$
+     20350**DCL     21430>>ASSIGN  21455>>ASSIGN  21479>>ASSIGN
+MESSAGE_LENGTH
+     20351**DCL     21440<<ASSIGN  21465<<ASSIGN  21489<<ASSIGN  21496<<ASSIGN  21503<<ASSIGN  21511<<ASSIGN
+     21522>>ASSIGN
+QCC$CBD
+     21051**DCL-ENT 21433--CALL
+QCC$DMC
+     21052**DCL-ENT 21458--CALL    21482--CALL
+QCE$ERROR_INTERNAL
+     21053**DCL-ENT 21436--CALL    21461--CALL    21485--CALL    21673--CALL    21681--CALL
+QCM@MESS
+     21117**DCL        15--PROC    21542--ENTRY   21595--ENTRY
+QCM@MESS.IS_MESSAGE_A_DAD
+     21121**DCL     21273>>IF
+QCM@MESS.MESSAGE$
+     21127**DCL     21291>>IF      21313>>ASSIGN  21353>>ASSIGN  21373>>IF      21413>>DOCASE  21418>>IF
+     21429>>ASSIGN  21445>>ASSIGN  21452>>ASSIGN  21468>>DOCASE  21473>>ASSIGN  21476>>ASSIGN  21494>>ASSIGN
+     21496>>ASSIGN  21501>>ASSIGN  21503>>ASSIGN  21510>>ASSIGN
+QCM@MESS.MESSAGE_LENGTH
+     21125**DCL     21511>>ASSIGN
+QCM@MESS.MESSAGE_LINE_GZ_HEADER$
+     21118**DCL     21520>>ASSIGN  21524>>IF      21528>>ASSIGN  21565>>ASSIGN  21568>>IF      21574>>ASSIGN
+     21620>>ASSIGN  21624>>IF      21628>>ASSIGN
+QCM@MESS.STATUS
+     21133**DCL     21538<<ASSIGN  21591<<ASSIGN  21638<<ASSIGN  21658<<ASSIGN  21676<<ASSIGN
+QCU$UPDATE_SCREEN
+     21055**DCL-ENT 21516--CALL
+QCU$USE_INVALID_IO
+     21056**DCL-ENT 21653--CALL
+QCU@USE
+     21220**DCL     21653<>CALL
+QCU@USE.CURR_FRAME$
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:60   
+     21221**DCL     21646<<ASSIGN
+QCU@USE.CURR_NODE$
+     21223**DCL     21649<<ASSIGN  21651<<ASSIGN
+QCU@USE.IS_TIME_TO_SAVE_AWAY_FIELDS
+     21228**DCL     21645<<ASSIGN
+QCU@USE.STATUS
+     21254**DCL     21655>>DOCASE
+QCU@USE.USE_DEFAULT_IO
+     21225**DCL     21644<<ASSIGN
+QGB$READ
+      1600**DCL-ENT 21581--CALL
+QGB$WRITE
+      1599**DCL-ENT 21535--CALL    21635--CALL
+QGB_PARAM
+     12718**DCL     21535<>CALL    21581<>CALL    21635<>CALL
+QGB_PARAM.DVE.DVBYTE.VFC
+     12786**DCL     12787--REDEF
+QGB_PARAM.DVE.EOMCHAR
+     12798**DCL     12799--REDEF
+QGB_PARAM.ERR.ERR#
+     12777**DCL     21585>>IF
+QGB_PARAM.MSG$
+     12780**DCL     12781--REDEF
+QGB_PARAM.UHDR$
+     12805**DCL     12806--REDEF
+QI$ACTIVATION_STATUS
+     10544**DCL     10550--REDEF
+QI$CIP
+      9385**DCL      9455--REDEF
+QI$CIP.CA
+      9390**DCL      9394--REDEF    9397--REDEF    9400--REDEF
+QI$COBOL_DAD.PSEUDO_CIP
+      9629**DCL      9654--REDEF
+QI$COBOL_DAD.PSEUDO_CIP.ALPHANUMERIC
+      9631**DCL      9636--REDEF
+QI$COBOL_DAD.PSEUDO_CIP.ALPHANUMERIC.CA.OFFSET
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:61   
+      9633**DCL     21501>>ASSIGN
+QI$COBOL_DAD.PSEUDO_CIP.ALPHANUMERIC.LEN
+      9635**DCL     21503>>ASSIGN
+QI$COBOL_DAD.PSEUDO_CIP.DATA@
+      9653**DCL     21313>>ASSIGN  21353>>ASSIGN
+QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CB
+      9637**DCL      9640--REDEF    9643--REDEF   21429>>ASSIGN
+QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD
+      9640**DCL     21473>>ASSIGN
+QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD.OFFSET
+      9641**DCL     21494>>ASSIGN
+QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CD.SIGN
+      9642**DCL     21468>>DOCASE
+QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CP
+      9643**DCL     21445>>ASSIGN
+QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.LEN
+      9646**DCL     21418>>IF      21452>>ASSIGN  21476>>ASSIGN  21496>>ASSIGN
+QI$COBOL_DAD.VARIABLE_LENGTH_ITEMS
+      9665**DCL      9681--REDEF    9689--REDEF    9697--REDEF
+QI$COBOL_DAD.VARIABLE_LENGTH_ITEMS.LEVEL_MULTIPLIERS
+      9666**DCL      9676--REDEF    9679--REDEF
+QI$COBOL_DAD.WORD0
+      9593**DCL      9594--REDEF    9608--REDEF
+QI$COBOL_DAD.WORD0_FLAGS.IS_CONSTANT
+      9605**DCL     21291>>IF
+QI$COBOL_DAD.WORD0_FLAGS.IS_LINKAGE_ARGUMENT
+      9600**DCL     21373>>IF
+QI$COBOL_DAD.WORD0_FLAGS.TYPE
+      9607**DCL     21413>>DOCASE
+QI$COBOL_DAD_P_BITS.P
+      9733**DCL      9739--REDEF
+QI$CONDITION_CONTROL_BLOCK.LIST_A@P
+      9219**DCL      9220--REDEF
+QI$CONDITION_CONTROL_BLOCK.WORD0_FLAGS
+      9215**DCL      9218--REDEF
+QI$CONDITION_LEGAL_BLOCK.ARRAY@P
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:62   
+      9252**DCL      9253--REDEF    9254--REDEF
+QI$DAD.PSEUDO_CIP
+      9532**DCL      9557--REDEF
+QI$DAD.PSEUDO_CIP.ALPHANUMERIC
+      9534**DCL      9539--REDEF
+QI$DAD.PSEUDO_CIP.NUMERIC.CB
+      9540**DCL      9543--REDEF    9546--REDEF
+QI$DAD.WORD0
+      9501**DCL      9502--REDEF
+QI$ERROR_MESSAGE_LINE
+     12893**DCL     12895--REDEF
+QI$ERROR_STATUS
+     12890**DCL     12892--REDEF
+QI$FIELD_DAD.ELEMENTARY_ITEM.P
+      9947**DCL      9954--REDEF
+QI$FIELD_DAD.ONE_DIMENSIONAL_ITEM.P
+      9967**DCL      9974--REDEF
+QI$FIELD_DAD.PSEUDO_CIP
+      9874**DCL      9899--REDEF
+QI$FIELD_DAD.PSEUDO_CIP.ALPHANUMERIC
+      9876**DCL      9881--REDEF
+QI$FIELD_DAD.PSEUDO_CIP.NUMERIC.CB
+      9882**DCL      9885--REDEF    9888--REDEF
+QI$FIELD_DAD.TWO_DIMENSIONAL_ITEM.P
+      9987**DCL      9994--REDEF
+QI$FIELD_DAD.VARIABLE_LENGTH_ITEMS
+      9930**DCL      9946--REDEF    9964--REDEF    9982--REDEF
+QI$FIELD_DAD.VARIABLE_LENGTH_ITEMS.LEVEL_MULTIPLIERS
+      9931**DCL      9941--REDEF    9944--REDEF
+QI$FIELD_DAD.WORD0
+      9826**DCL      9827--REDEF
+QI$FIELD_DAD.WORD0_FLAGS.IO_FLAGS
+      9830**DCL      9835--REDEF
+QI$FIELD_DAD_P.P
+     10028**DCL     10035--REDEF
+QI$FIELD_STATUS.INDICATORS
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:63   
+     10694**DCL     10726--REDEF
+QI$FIELD_STATUS.INDICATORS.ENABLED_FLAGS
+     10698**DCL     10703--REDEF
+QI$FIELD_STATUS.INDICATORS.OPEN_FLAGS
+     10710**DCL     10717--REDEF
+QI$FIELD_STATUS.INDICATORS.STATE_FLAGS
+     10704**DCL     10709--REDEF
+QI$FILE.WORD0
+     10150**DCL     10151--REDEF
+QI$FILE_STATUS.INDICATORS
+     10987**DCL     11019--REDEF
+QI$FILE_STATUS.INDICATORS.ENABLED_FLAGS
+     10991**DCL     10996--REDEF
+QI$FILE_STATUS.INDICATORS.OPEN_FLAGS
+     11003**DCL     11010--REDEF
+QI$FILE_STATUS.INDICATORS.STATE_FLAGS
+     10997**DCL     11002--REDEF
+QI$FORM_FILE.USE_PROCEDURE
+     10250**DCL     10257--REDEF
+QI$FORM_FILE.WORD0
+     10204**DCL     10205--REDEF
+QI$FORM_STATUS.INDICATORS
+     11108**DCL     11140--REDEF
+QI$FORM_STATUS.INDICATORS.ENABLED_FLAGS
+     11112**DCL     11117--REDEF
+QI$FORM_STATUS.INDICATORS.OPEN_FLAGS
+     11124**DCL     11131--REDEF
+QI$FORM_STATUS.INDICATORS.STATE_FLAGS
+     11118**DCL     11123--REDEF
+QI$FRAME.WORD0
+     10365**DCL     10366--REDEF
+QI$FRAME_STATUS.INDICATORS
+     11337**DCL     11369--REDEF
+QI$FRAME_STATUS.INDICATORS.ENABLED_FLAGS
+     11341**DCL     11346--REDEF
+QI$FRAME_STATUS.INDICATORS.OPEN_FLAGS
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:64   
+     11353**DCL     11360--REDEF
+QI$FRAME_STATUS.INDICATORS.STATE_FLAGS
+     11347**DCL     11352--REDEF
+QI$GZ_FIELD.DESCRIPTION.FIELD_DAD$
+     18240**DCL     21651>>ASSIGN
+QI$GZ_FIELD.DESCRIPTION.IO_FLAGS
+     18219**DCL     18224--REDEF
+QI$GZ_FIELD.DESCRIPTION.POSITION
+     18235**DCL     21530--ASSIGN  21576--ASSIGN  21630--ASSIGN
+QI$GZ_HEADER
+     18167**DCL     21528--ASSIGN  21574--ASSIGN  21628--ASSIGN
+QI$GZ_HEADER.DCB#
+     18173**DCL     21520>>ASSIGN  21524>>IF      21524>>IF      21565>>ASSIGN  21568>>IF      21568>>IF
+     21620>>ASSIGN  21624>>IF      21624>>IF
+QI$IDENTIFIER
+     12896**DCL     12898--REDEF
+QI$INDICATORS
+     10608**DCL     10638--REDEF
+QI$INDICATORS.ENABLED_FLAGS
+     10614**DCL     10619--REDEF
+QI$INDICATORS.OPEN_FLAGS
+     10626**DCL     10633--REDEF
+QI$INDICATORS.STATE_FLAGS
+     10620**DCL     10625--REDEF
+QI$LINKAGE_ARGUMENT_DESCRIPTOR.ARGUMENT_NUMBER
+      9794**DCL     21394>>ASSIGN
+QI$LINKAGE_ARGUMENT_DESCRIPTOR.WORD_OFFSET_FROM_01_ITEM
+      9798**DCL     21394>>ASSIGN
+QI$MAJOR_NODE.WORD0
+     10064**DCL     10065--REDEF
+QI$MAJOR_STATUS.INDICATORS
+     10787**DCL     10819--REDEF
+QI$MAJOR_STATUS.INDICATORS.ENABLED_FLAGS
+     10791**DCL     10796--REDEF
+QI$MAJOR_STATUS.INDICATORS.OPEN_FLAGS
+     10803**DCL     10810--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:65   
+QI$MAJOR_STATUS.INDICATORS.STATE_FLAGS
+     10797**DCL     10802--REDEF
+QI$MESSAGE_TYPE
+     12887**DCL     12889--REDEF
+QI$MINOR_NODE.WORD0
+     10107**DCL     10108--REDEF
+QI$MINOR_STATUS.INDICATORS
+     10880**DCL     10912--REDEF
+QI$MINOR_STATUS.INDICATORS.ENABLED_FLAGS
+     10884**DCL     10889--REDEF
+QI$MINOR_STATUS.INDICATORS.OPEN_FLAGS
+     10896**DCL     10903--REDEF
+QI$MINOR_STATUS.INDICATORS.STATE_FLAGS
+     10890**DCL     10895--REDEF
+QI$OP_ACCEPT.DATANAME@P
+      7295**DCL      7296--REDEF
+QI$OP_CALL.EPTR$
+      7467**DCL      7468--REDEF
+QI$OP_CLEAR.IO_FLAGS
+      7500**DCL      7503--REDEF
+QI$OP_DISPLAY.FIELD_A@P
+      7767**DCL      7768--REDEF
+QI$OP_ENABLE.IO_FLAGS
+      7854**DCL      7857--REDEF
+QI$OP_IFCLS.ATTRIBUTE.TYPE
+      7947**DCL      7952--REDEF
+QI$OP_INSPECT.TALLYING_FOR_ITEM@P
+      8181**DCL      8182--REDEF
+QI$OP_INSPECT.TALLYING_INITIAL_ITEM@P
+      8183**DCL      8184--REDEF
+QI$OP_INSPECT.TALLYING_ITEM@P
+      8179**DCL      8180--REDEF
+QI$OP_OPEN.IO_FLAGS
+      8741**DCL      8744--REDEF
+QI$OP_PERFM.BINARY_ITERATION_COUNT@P
+      8779**DCL      8780--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:66   
+QI$PSEUDO_CIP
+      9280**DCL      9304--REDEF
+QI$PSEUDO_CIP.ALPHANUMERIC
+      9284**DCL      9289--REDEF
+QI$PSEUDO_CIP.NUMERIC.CB
+      9290**DCL      9293--REDEF    9296--REDEF
+QI$PTR_A$
+     12886**DCL     21394>>ASSIGN
+QI$TERMINAL_ATTRIBUTES
+     10501**DCL     10514--REDEF
+QI$TRAN_FILE.WORD0
+     10286**DCL     10287--REDEF
+QI$TRAN_STATUS.INDICATORS
+     11221**DCL     11253--REDEF
+QI$TRAN_STATUS.INDICATORS.ENABLED_FLAGS
+     11225**DCL     11230--REDEF
+QI$TRAN_STATUS.INDICATORS.OPEN_FLAGS
+     11237**DCL     11244--REDEF
+QI$TRAN_STATUS.INDICATORS.STATE_FLAGS
+     11231**DCL     11236--REDEF
+QI$VARIABLE_IDENTIFIER.LENGTH
+     12900**DCL     12901--IMP-SIZ
+QI@OTTER_SPACE
+     21037**DCL     21039--REDEF   21040--REDEF   21431--ASSIGN  21439--ASSIGN  21456--ASSIGN  21464--ASSIGN
+     21480--ASSIGN  21488--ASSIGN
+QI@OTTER_SPACE_CA
+     21039**DCL     21566--ASSIGN
+QI@TYPE_DISPLAY_TARGET
+     20394**DCL     21416<<ASSIGN  21433<>CALL    21443<<ASSIGN  21458<>CALL    21471<<ASSIGN  21482<>CALL
+QI@TYPE_DISPLAY_TARGET.CIP
+     20398**DCL     20849--REDEF
+QI@TYPE_DISPLAY_TARGET.CIP.AUX
+     20764**DCL     20835--REDEF
+QI@TYPE_DISPLAY_TARGET.CIP.AUX.CA
+     20767**DCL     20771--REDEF   20774--REDEF   20777--REDEF
+QI@TYPE_DISPLAY_TARGET.CIP.S
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:67   
+     20468**DCL     20539--REDEF
+QI@TYPE_DISPLAY_TARGET.CIP.S.CA
+     20471**DCL     20475--REDEF   20478--REDEF   20481--REDEF
+QI@TYPE_DISPLAY_TARGET.CIP.S.CB
+     20475**DCL     21429<<ASSIGN
+QI@TYPE_DISPLAY_TARGET.CIP.S.CD
+     20478**DCL     21473<<ASSIGN
+QI@TYPE_DISPLAY_TARGET.CIP.S.CP
+     20481**DCL     21445<<ASSIGN
+QI@TYPE_DISPLAY_TARGET.CIP.S.CP.SIGN
+     20483**DCL     21447>>IF
+QI@TYPE_DISPLAY_TARGET.CIP.S.LEN
+     20527**DCL     21452<<ASSIGN  21454>>ASSIGN  21476<<ASSIGN  21478>>ASSIGN
+QI@TYPE_DISPLAY_TARGET.CIP.S_A
+     20539**DCL     21421<<ASSIGN  21426<<ASSIGN  21444<<ASSIGN  21472<<ASSIGN
+QI@TYPE_DISPLAY_TARGET.CIP.T
+     20616**DCL     20687--REDEF
+QI@TYPE_DISPLAY_TARGET.CIP.T.CD
+     20661**DCL     20664--REDEF   20668--REDEF   20671--REDEF
+QI@TYPE_DISPLAY_TARGET.CIP.T.CD.SIGN
+     20663**DCL     21417<<ASSIGN  21449<<ASSIGN  21451<<ASSIGN  21475<<ASSIGN
+QI@TYPE_DISPLAY_TARGET.CIP.T.LEN
+     20675**DCL     21422<<ASSIGN  21427<<ASSIGN  21440>>ASSIGN  21454<<ASSIGN  21465>>ASSIGN  21478<<ASSIGN
+     21489>>ASSIGN
+QI@TYPE_DISPLAY_TARGET.DATA
+     20856**DCL     20860--REDEF
+QI@TYPE_DISPLAY_TARGET.DATA.S$
+     20857**DCL     21430<<ASSIGN  21455<<ASSIGN  21479<<ASSIGN
+QI@TYPE_DISPLAY_TARGET.DATA.T$
+     20858**DCL     21431<<ASSIGN  21456<<ASSIGN  21480<<ASSIGN
+QI@TYPE_DISPLAY_TARGET.DEC
+     20924**DCL     20928--REDEF   20929--REDEF   20933--REDEF
+QI@TYPE_DISPLAY_TARGET.LEN
+     20896**DCL     20900--REDEF   20901--REDEF   20905--REDEF   20906--REDEF   20910--REDEF
+QI@TYPE_DISPLAY_TARGET.PICTURE_STRING
+     20966**DCL     20969--REDEF   20970--REDEF   20973--REDEF   20974--REDEF   20977--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:68   
+QI@TYPE_DISPLAY_TARGET.ROUND
+     20999**DCL     21000--REDEF   21001--REDEF
+QI@TYPE_DISPLAY_TARGET.SIZE_ERROR
+     20985**DCL     20986--REDEF
+QI@TYPE_DISPLAY_TARGET.SRCH_VRFY_ELEMS
+     20935**DCL     20938--REDEF
+QI_1.ARGUMENTS_AND_OR_FREE_AUTO_A$$
+     11443**DCL     21394>>ASSIGN
+QI_1.BASE
+     11429**DCL     11436--REDEF
+QI_1.BASE.DATA$
+     11430**DCL     21353>>ASSIGN
+QI_1.BASE.PROC$
+     11432**DCL     21313>>ASSIGN
+QI_1.CURRENT.FILE$
+     12320**DCL     12322--REDEF   12324--REDEF
+QI_1.CURRENT.FILE_STATUS$
+     12326**DCL     12328--REDEF   12330--REDEF
+QI_1.DAD
+     12124**DCL     12129--REDEF
+QI_1.FILE_HEAD
+     12307**DCL     12314--REDEF
+QI_1.IS_ALL_LIT
+     12130**DCL     12135--REDEF
+QI_1.IS_FORM_VARIABLE
+     12136**DCL     12141--REDEF
+QI_1.IS_TEMP
+     12142**DCL     12147--REDEF
+QI_1.MESSAGE_LINE_DAD.PSEUDO_CIP
+     12240**DCL     12265--REDEF
+QI_1.MESSAGE_LINE_DAD.PSEUDO_CIP.ALPHANUMERIC
+     12242**DCL     12247--REDEF
+QI_1.MESSAGE_LINE_DAD.PSEUDO_CIP.NUMERIC.CB
+     12248**DCL     12251--REDEF   12254--REDEF
+QI_1.MESSAGE_LINE_DAD.WORD0
+     12209**DCL     12210--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:69   
+QI_1.MESSAGE_LINE_GZ.HEADER$
+     12286**DCL     21524>>IF      21568>>IF      21624>>IF
+QI_1.OFFSET
+     12148**DCL     12153--REDEF
+QI_1.OP.CIP
+     11509**DCL     11960--REDEF
+QI_1.OP.CIP.AUX
+     11875**DCL     11946--REDEF
+QI_1.OP.CIP.AUX.CD
+     11920**DCL     11923--REDEF   11927--REDEF   11930--REDEF
+QI_1.OP.CIP.S
+     11579**DCL     11650--REDEF
+QI_1.OP.CIP.S.CD
+     11624**DCL     11627--REDEF   11631--REDEF   11634--REDEF
+QI_1.OP.CIP.T
+     11727**DCL     11798--REDEF
+QI_1.OP.CIP.T.CD
+     11772**DCL     11775--REDEF   11779--REDEF   11782--REDEF
+QI_1.OP.DATA
+     11967**DCL     11971--REDEF
+QI_1.OP.FILL_CHAR
+     12091**DCL     12094--REDEF
+QI_1.OP.INX
+     12024**DCL     12028--REDEF   12029--REDEF   12033--REDEF
+QI_1.OP.LEN
+     12007**DCL     12011--REDEF   12012--REDEF   12016--REDEF   12017--REDEF   12021--REDEF
+QI_1.OP.LEN.AUX
+     12010**DCL     12911--IMP-SIZ
+QI_1.OP.LEN.S
+     12008**DCL     12907--IMP-SIZ
+QI_1.OP.LEN.T
+     12009**DCL     12909--IMP-SIZ
+QI_1.OP.PICTURE_STRING
+     12077**DCL     12080--REDEF   12081--REDEF   12084--REDEF   12085--REDEF   12088--REDEF
+QI_1.OP.ROUND
+     12110**DCL     12111--REDEF   12112--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:70   
+QI_1.OP.SRCH_VRFY_ELEMS
+     12046**DCL     12049--REDEF
+QI_1.OPENED_COUNT
+     12315**DCL     12318--REDEF
+QI_1.OTTER_SPACE
+     12154**DCL     12159--REDEF
+QI_1.PICTURE_STRING
+     12160**DCL     12165--REDEF
+QI_1.SCREEN_UPDATE_FLAGS
+     11468**DCL     21514>>IF
+QI_1.SPECIAL_NAMES
+     12343**DCL     12352--REDEF
+QI_1.TYPE
+     12166**DCL     12171--REDEF
+QI_16_BIT_BINARY
+     17356**DCL     17426--REDEF
+QI_16_BIT_BINARY.CB
+     17375**DCL     17378--REDEF   17382--REDEF   17385--REDEF
+QI_16_BIT_BINARY_A
+     17426**DCL     21421>>ASSIGN
+QI_31_DIGIT_SLS_DISPLAY
+     17189**DCL     17259--REDEF
+QI_31_DIGIT_SLS_DISPLAY.CD
+     17236**DCL     17239--REDEF   17243--REDEF   17246--REDEF
+QI_31_DIGIT_SLS_DISPLAY_A
+     17259**DCL     21472>>ASSIGN
+QI_31_DIGIT_ST_PACKED
+     17691**DCL     17761--REDEF
+QI_31_DIGIT_ST_PACKED.CP
+     17724**DCL     17727--REDEF   17731--REDEF   17734--REDEF
+QI_31_DIGIT_ST_PACKED_A
+     17761**DCL     21444>>ASSIGN
+QI_32_BIT_BINARY
+     17523**DCL     17593--REDEF
+QI_32_BIT_BINARY.CB
+     17542**DCL     17545--REDEF   17549--REDEF   17552--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:71   
+QI_32_BIT_BINARY_A
+     17593**DCL     21426>>ASSIGN
+QI_4_CHAR_ALPHANUMERIC
+     17021**DCL     17091--REDEF
+QI_4_CHAR_ALPHANUMERIC.CA
+     17026**DCL     17030--REDEF   17033--REDEF   17036--REDEF
+QI_ACCUMULATOR_DAD.CIP
+     18034**DCL     18105--REDEF
+QI_ACCUMULATOR_DAD.CIP.CP
+     18065**DCL     18068--REDEF   18072--REDEF   18075--REDEF
+QI_ALR.CIP
+     12986**DCL     13437--REDEF
+QI_ALR.CIP.AUX
+     13352**DCL     13423--REDEF
+QI_ALR.CIP.AUX.CA
+     13355**DCL     13359--REDEF   13362--REDEF   13365--REDEF
+QI_ALR.CIP.S
+     13056**DCL     13127--REDEF
+QI_ALR.CIP.S.CA
+     13059**DCL     13063--REDEF   13066--REDEF   13069--REDEF
+QI_ALR.CIP.T
+     13204**DCL     13275--REDEF
+QI_ALR.CIP.T.CA
+     13207**DCL     13211--REDEF   13214--REDEF   13217--REDEF
+QI_ALR.DATA
+     13444**DCL     13448--REDEF
+QI_ALR.FILL_CHAR
+     13568**DCL     13571--REDEF
+QI_ALR.INX
+     13501**DCL     13505--REDEF   13506--REDEF   13510--REDEF
+QI_ALR.LEN
+     13484**DCL     13488--REDEF   13489--REDEF   13493--REDEF   13494--REDEF   13498--REDEF
+QI_ALR.PICTURE_STRING
+     13554**DCL     13557--REDEF   13558--REDEF   13561--REDEF   13562--REDEF   13565--REDEF
+QI_ALR.ROUND
+     13587**DCL     13588--REDEF   13589--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:72   
+QI_ALR.SRCH_VRFY_ELEMS
+     13523**DCL     13526--REDEF
+QI_BLANK
+     12448**DCL     21622--ASSIGN
+QI_FPT_DBCONTROL.V_
+     18406**DCL     18406--REDEF
+QI_FPT_INT.V_
+     19244**DCL     19244--REDEF
+QI_FPT_READ
+     19518**DCL     21563>>ASSIGN
+QI_FPT_WRITE
+     20233**DCL     21518>>ASSIGN  21618>>ASSIGN
+QI_MAT.CIP
+     16325**DCL     16776--REDEF
+QI_MAT.CIP.AUX
+     16691**DCL     16762--REDEF
+QI_MAT.CIP.AUX.CA
+     16694**DCL     16698--REDEF   16701--REDEF   16704--REDEF
+QI_MAT.CIP.S
+     16395**DCL     16466--REDEF
+QI_MAT.CIP.S.CA
+     16398**DCL     16402--REDEF   16405--REDEF   16408--REDEF
+QI_MAT.CIP.T
+     16543**DCL     16614--REDEF
+QI_MAT.CIP.T.CA
+     16546**DCL     16550--REDEF   16553--REDEF   16556--REDEF
+QI_MAT.DATA
+     16783**DCL     16787--REDEF
+QI_MAT.DEC
+     16851**DCL     16855--REDEF   16856--REDEF   16860--REDEF
+QI_MAT.FILL_CHAR
+     16907**DCL     16910--REDEF
+QI_MAT.LEN
+     16823**DCL     16827--REDEF   16828--REDEF   16832--REDEF   16833--REDEF   16837--REDEF
+QI_MAT.PICTURE_STRING
+     16893**DCL     16896--REDEF   16897--REDEF   16900--REDEF   16901--REDEF   16904--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:73   
+QI_MAT.ROUND
+     16926**DCL     16927--REDEF   16928--REDEF
+QI_MAT.SRCH_VRFY_ELEMS
+     16862**DCL     16865--REDEF
+QI_PICTURE_STRING
+     17859**DCL     17929--REDEF
+QI_PICTURE_STRING.CA
+     17864**DCL     17868--REDEF   17871--REDEF   17874--REDEF
+QI_SRCH_VRFY.CIP
+     15656**DCL     16107--REDEF
+QI_SRCH_VRFY.CIP.AUX
+     16022**DCL     16093--REDEF
+QI_SRCH_VRFY.CIP.AUX.CA
+     16025**DCL     16029--REDEF   16032--REDEF   16035--REDEF
+QI_SRCH_VRFY.CIP.S
+     15726**DCL     15797--REDEF
+QI_SRCH_VRFY.CIP.S.CA
+     15729**DCL     15733--REDEF   15736--REDEF   15739--REDEF
+QI_SRCH_VRFY.CIP.T
+     15874**DCL     15945--REDEF
+QI_SRCH_VRFY.CIP.T.CA
+     15877**DCL     15881--REDEF   15884--REDEF   15887--REDEF
+QI_SRCH_VRFY.DATA
+     16114**DCL     16118--REDEF
+QI_SRCH_VRFY.DEC
+     16182**DCL     16186--REDEF   16187--REDEF   16191--REDEF
+QI_SRCH_VRFY.FILL_CHAR
+     16238**DCL     16241--REDEF
+QI_SRCH_VRFY.ROUND
+     16257**DCL     16258--REDEF   16259--REDEF
+QI_SRCH_VRFY.SRCH_RESULT
+     16198**DCL     16201--REDEF   16202--REDEF   16205--REDEF   16206--REDEF   16209--REDEF
+QI_SRCH_VRFY.SRCH_VRFY_ARGS
+     16122**DCL     16126--REDEF   16127--REDEF   16131--REDEF   16132--REDEF   16136--REDEF
+QI_SRCH_VRFY.SRCH_VRFY_ELEMS
+     16193**DCL     16196--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:74   
+QI_TYPE_BINARY_TARGET.CIP
+     14983**DCL     15434--REDEF
+QI_TYPE_BINARY_TARGET.CIP.AUX
+     15349**DCL     15420--REDEF
+QI_TYPE_BINARY_TARGET.CIP.AUX.CA
+     15352**DCL     15356--REDEF   15359--REDEF   15362--REDEF
+QI_TYPE_BINARY_TARGET.CIP.S
+     15053**DCL     15124--REDEF
+QI_TYPE_BINARY_TARGET.CIP.S.CA
+     15056**DCL     15060--REDEF   15063--REDEF   15066--REDEF
+QI_TYPE_BINARY_TARGET.CIP.T
+     15201**DCL     15272--REDEF
+QI_TYPE_BINARY_TARGET.CIP.T.CB
+     15218**DCL     15221--REDEF   15225--REDEF   15228--REDEF
+QI_TYPE_BINARY_TARGET.DATA
+     15441**DCL     15445--REDEF
+QI_TYPE_BINARY_TARGET.DEC
+     15509**DCL     15513--REDEF   15514--REDEF   15518--REDEF
+QI_TYPE_BINARY_TARGET.LEN
+     15481**DCL     15485--REDEF   15486--REDEF   15490--REDEF   15491--REDEF   15495--REDEF
+QI_TYPE_BINARY_TARGET.PICTURE_STRING
+     15551**DCL     15554--REDEF   15555--REDEF   15558--REDEF   15559--REDEF   15562--REDEF
+QI_TYPE_BINARY_TARGET.ROUND
+     15584**DCL     15585--REDEF   15586--REDEF
+QI_TYPE_BINARY_TARGET.SIZE_ERROR
+     15570**DCL     15571--REDEF
+QI_TYPE_BINARY_TARGET.SRCH_VRFY_ELEMS
+     15520**DCL     15523--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP
+     13651**DCL     14102--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.AUX
+     14017**DCL     14088--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.AUX.CA
+     14020**DCL     14024--REDEF   14027--REDEF   14030--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.S
+     13721**DCL     13792--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:75   
+QI_TYPE_DISPLAY_SOURCE.CIP.S.CD
+     13766**DCL     13769--REDEF   13773--REDEF   13776--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.T
+     13869**DCL     13940--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.T.CA
+     13872**DCL     13876--REDEF   13879--REDEF   13882--REDEF
+QI_TYPE_DISPLAY_SOURCE.DATA
+     14109**DCL     14113--REDEF
+QI_TYPE_DISPLAY_SOURCE.DEC
+     14177**DCL     14181--REDEF   14182--REDEF   14186--REDEF
+QI_TYPE_DISPLAY_SOURCE.LEN
+     14149**DCL     14153--REDEF   14154--REDEF   14158--REDEF   14159--REDEF   14163--REDEF
+QI_TYPE_DISPLAY_SOURCE.PICTURE_STRING
+     14219**DCL     14222--REDEF   14223--REDEF   14226--REDEF   14227--REDEF   14230--REDEF
+QI_TYPE_DISPLAY_SOURCE.ROUND
+     14252**DCL     14253--REDEF   14254--REDEF
+QI_TYPE_DISPLAY_SOURCE.SIZE_ERROR
+     14238**DCL     14239--REDEF
+QI_TYPE_DISPLAY_SOURCE.SRCH_VRFY_ELEMS
+     14188**DCL     14191--REDEF
+QI_TYPE_DISPLAY_TARGET
+     14313**DCL     21416>>ASSIGN  21443>>ASSIGN  21471>>ASSIGN
+QI_TYPE_DISPLAY_TARGET.CIP
+     14317**DCL     14768--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.AUX
+     14683**DCL     14754--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.AUX.CA
+     14686**DCL     14690--REDEF   14693--REDEF   14696--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.S
+     14387**DCL     14458--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.S.CA
+     14390**DCL     14394--REDEF   14397--REDEF   14400--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.T
+     14535**DCL     14606--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.T.CD
+     14580**DCL     14583--REDEF   14587--REDEF   14590--REDEF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:76   
+QI_TYPE_DISPLAY_TARGET.DATA
+     14775**DCL     14779--REDEF
+QI_TYPE_DISPLAY_TARGET.DEC
+     14843**DCL     14847--REDEF   14848--REDEF   14852--REDEF
+QI_TYPE_DISPLAY_TARGET.LEN
+     14815**DCL     14819--REDEF   14820--REDEF   14824--REDEF   14825--REDEF   14829--REDEF
+QI_TYPE_DISPLAY_TARGET.PICTURE_STRING
+     14885**DCL     14888--REDEF   14889--REDEF   14892--REDEF   14893--REDEF   14896--REDEF
+QI_TYPE_DISPLAY_TARGET.ROUND
+     14918**DCL     14919--REDEF   14920--REDEF
+QI_TYPE_DISPLAY_TARGET.SIZE_ERROR
+     14904**DCL     14905--REDEF
+QI_TYPE_DISPLAY_TARGET.SRCH_VRFY_ELEMS
+     14854**DCL     14857--REDEF
+QI_VLP_SEGMENT.BASE
+     18943**DCL     18943--REDEF
+QI_VLP_SEGMENT_BUFFER.BASE
+     19041**DCL     19041--REDEF
+QI_VLP_SEGMENT_LOAD.BASE
+     19139**DCL     19139--REDEF
+QI_VLP_TRMCTL.BREAKCOUNT
+     20133**DCL     20134--REDEF
+QI_VLP_XBREAK.IC
+     20323**DCL     20323--REDEF
+QI_VLP_XBREAK.OLDIC
+     20323**DCL     20324--REDEF   20324--REDEF
+RETRY_MESS_ERASE
+     21618**LABEL   21665--GOTO
+RETRY_MESS_PAUSE
+     21563**LABEL   21668--GOTO
+RETRY_MESS_WRITE
+     21273**LABEL   21671--GOTO
+WERE_A_MESS_ERASE
+     20353**DCL     21269<<ASSIGN  21559<<ASSIGN  21613<<ASSIGN  21663>>IF
+WERE_A_MESS_PAUSE
+     20354**DCL     21270<<ASSIGN  21558<<ASSIGN  21614<<ASSIGN  21666>>IF
+PL6.E3A0      #001=QCM$MESS File=QCM$MESS.:E05TSI                                WED 07/30/97 05:11 Page:77   
+WERE_A_MESS_WRITE
+     20355**DCL     21268<<ASSIGN  21560<<ASSIGN  21615<<ASSIGN  21669>>IF

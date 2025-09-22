@@ -1,0 +1,509 @@
+
+
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               1    
+    1      /* $Header: read_em.c,v 1.8 87/03/31 08:16:17 ceriel Exp $ */
+    2      /*
+    3       * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+    4       * See the copyright notice in the ACK home directory, in the file "Copyright".
+    5       */
+    6      /*  Read_em: a module to read either compact or human readable EM code.
+    7       Exported are the following routines:
+    8       EM_open() : has a parameter representing either a pointer to a
+    9             filename or a null pointer, indicating that input is
+   10             from standard input. This routine initializes for
+   11             reading.
+   12       EM_getinstr() :   Delivers the next EM instruction in a format
+   13             defined in <em_comp.h>.
+   14       Imported are:
+   15       The constants COMPACT (either defined or not defined) and
+   16       CHECKING (again either defined or not defined),
+   17       some routines from the system module. and the em_code module
+   18      */
+   19
+   20      #include <assert.h>
+   21      #include <system.h>
+   22      #include <em_label.h>
+   23      #include <em_arith.h>
+   24      #include <em_pseu.h>
+   25      #include <em_spec.h>
+   26      #include "em_ptyp.h"
+   27      #include "em_comp.h"
+   28      #include <em_flag.h>
+   29      #include <em_mes.h>
+   30
+   31      /* Buffered input */
+   32
+   33      #ifdef TM_L66
+   34      #define getbyte()  (*_ich ? (*_ich++ & 0777) : _fill())
+   35      #else
+   36      #define getbyte()  (*_ich ? (*_ich++ & 0377) : _fill())
+   37      #endif
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               2    
+   38      #define ungetbyte(uch)   ((uch) >= 0 && (*--_ich = (uch)))
+   39      #define init_input()  (_fill(), _ich--)
+   40
+   41      #define EOF  -1
+   42
+   43      static File *fd = 0;
+   44      static char *_ich = 0;
+   45
+   46      PRIVATE int
+   47      _fill()
+   48      {
+   49       static char text[BUFSIZ + 1];
+   50       static int sz;
+   51
+   52       if (_ich && _ich < &text[sz]) return _ich++, '\0';
+   53       _ich = text;
+   54       if (sys_read(fd, text, BUFSIZ, &sz) &&
+   55           sz > 0
+   56          ) {
+   57          text[sz] = '\0';
+   58      #ifdef TM_L66
+   59          return (*_ich++&0777);
+   60      #else
+   61          return (*_ich++&0377);
+   62      #endif
+   63       }
+   64       else {
+   65          sz = 0;
+   66          text[0] = 0;
+   67          return EOF;
+   68       }
+   69      }
+   70
+   71      #define NARGS   3     /* Maximum number of arguments */
+   72      #define STRSIZ  256      /* Maximum length of strings */
+   73
+   74      static struct e_instr emhead;  /* Where we put the head */
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               3    
+   75      static struct e_args emargs[NARGS+2];   /* Where we put the arguments.
+   76                      We need some more because some
+   77                      arguments are constructed
+   78                   */
+   79      static struct e_args *i_emargs = 0;
+   80      #define argentry() (i_emargs++)
+   81      static struct string {
+   82       int length;
+   83       char str[STRSIZ + 1];
+   84      } strings[NARGS];     /* Room for strings */
+   85      static struct string *i_strings = 0;    /* Index of last one used */
+   86      #define stringentry() (i_strings++)
+   87
+   88      static struct e_args *argp = 0;   /* Indicates arguments yet to be
+   89                   delivered
+   90                */
+   91      static arith strleft;    /* count # of chars left to read
+   92                   in a string
+   93                */
+   94
+   95      static int state;     /* What state are we in? */
+   96      #define CON  01    /* Reading a CON */
+   97      #define ROM  02    /* Reading a ROM */
+   98      #define MES  03    /* Reading a MES */
+   99      #define PSEUMASK 03
+  100      #define INSTRING 010     /* Reading a string */
+  101
+  102      static int EM_initialized;  /* EM_open called? */
+  103
+  104      static long wordmask[] = {  /* allowed bits in a word */
+  105      #ifdef  TM_L66
+  106        0000000000000,
+  107        0000000000777,
+  108        0000000777777,
+  109        0000000000000,
+  110        0777777777777
+  111      #else
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               4    
+  112       0x00000000,
+  113       0x000000FF,
+  114       0x0000FFFF,
+  115       0x00000000,
+  116       0xFFFFFFFF
+  117      #endif
+  118      };
+  119
+  120      static int wsize, psize; /* word size and pointer size */
+  121      int EM_wordsize, EM_pointersize;
+  122
+  123      #ifdef CHECKING
+  124      static char *argrange = "Argument range error";
+  125      #define check(expr) (expr || !EM_error || (EM_error = argrange))
+  126      #else not CHECKING
+  127      #define check(x)   /* nothing */
+  128      #endif CHECKING
+  129
+  130      /* Error handling
+  131      */
+  132
+  133      PRIVATE
+  134      xerror(s)
+  135       char *s;
+  136      {
+  137       if (emhead.em_type != EM_FATAL) emhead.em_type = EM_ERROR;
+  138       if (!EM_error) EM_error = s;
+  139      }
+  140
+  141      PRIVATE
+  142      xfatal(s)
+  143       char *s;
+  144      {
+  145       emhead.em_type = EM_FATAL;
+  146       if (!EM_error) EM_error = s;
+  147      }
+  148
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               5    
+  149      #ifdef COMPACT
+  150      #include "readk.c"
+  151      #else not COMPACT
+  152      #include "reade.c"
+  153      #endif COMPACT
+  154
+  155      /* EM_open: Open input file, get magic word if COMPACT.
+  156      */
+  157      EXPORT int
+  158      EM_open(filename)
+  159       char *filename;
+  160      {
+  161       if (EM_initialized) {
+  162          EM_error = "EM_open already called";
+  163          return 0;
+  164       }
+  165
+  166       if (filename) {
+  167      #ifdef COMPACT
+  168          if (!sys_open(filename, OP_READ+OP_BIN, &fd)) {
+  169      #else
+  170          if (!sys_open(filename, OP_READ, &fd)) {
+  171      #endif
+  172             EM_error = "Could not open input file";
+  173             return 0;
+  174          }
+  175       }
+  176       else  fd = STDIN;
+  177       EM_filename = filename;
+  178       init_input();
+  179
+  180      #ifdef COMPACT
+  181       if (get16() != sp_magic) {
+  182          EM_error = "Illegal magic word";
+  183          return 0;
+  184       }
+  185      #else not COMPACT
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               6    
+  186       inithash(); /* initialize hashtable */
+  187      #endif COMPACT
+  188
+  189       EM_initialized = 1;
+  190       return 1;
+  191      }
+  192
+  193      /* EM_close: Close input file
+  194      */
+  195      EXPORT
+  196      EM_close()
+  197      {
+  198
+  199       register struct string *pstr;
+  200
+  201       if (fd != STDIN) {
+  202          sys_close(fd);
+  203          fd = STDIN;
+  204       }
+  205       EM_initialized = 0;
+  206      }
+  207
+  208
+  209      /* startmes: handle the start of a message. The only important thing here
+  210       is to get the wordsize and pointer size, and remember that they
+  211       have already been read, not only to check that they are not specified
+  212       again, but also to deliver the arguments on next calls to EM_getinstr.
+  213       This is indicated by the variable "argp".
+  214      */
+  215      PRIVATE
+  216      startmes(p)
+  217       register struct e_instr *p;
+  218      {
+  219       register struct e_args *ap;
+  220
+  221       ap = getarg(cst_ptyp);
+  222       p->em_arg = ap;
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               7    
+  223       state = MES;
+  224
+  225       if (ap->em_cst == ms_emx) {
+  226          if (wsize || psize) {
+  227             if (!EM_error) EM_error = "Duplicate ms_emx";
+  228          }
+  229          argp = ap = getarg(cst_ptyp);
+  230          wsize = ap->em_cst;
+  231          EM_wordsize = ap->em_cst;
+  232          ap->em_next = getarg(cst_ptyp);
+  233          ap = ap->em_next;
+  234          psize = ap->em_cst;
+  235          EM_pointersize = ap->em_cst;
+  236       }
+  237      }
+  238
+  239
+  240      /* EM_getinstr: read an "EM_line"
+  241      */
+  242      EXPORT struct e_instr *
+  243      EM_getinstr()
+  244      {
+  245       register struct e_instr *p = &emhead;
+  246       register struct e_args *args;
+  247
+  248       i_emargs = emargs;
+  249       i_strings = strings;
+  250       EM_error = 0;
+  251      #ifdef CHECKING
+  252       if (!EM_initialized) {
+  253          EM_error = "Initialization not done";
+  254          p->em_type = EM_FATAL;
+  255          return p;
+  256       }
+  257      #endif CHECKING
+  258
+  259       if (argp) { /* We have some arguments left to deliver */
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               8    
+  260          args = argp;
+  261          argp = args->em_next;
+  262          p->em_type = EM_MESARG;
+  263          p->em_arg = args;
+  264          args->em_next = 0;
+  265          return p;
+  266       }
+  267
+  268       if (!state) {     /* All clear, get a new line */
+  269          p = gethead();
+  270          if (!p) {   /* End of file */
+  271             return p;
+  272          }
+  273          switch(p->em_type) {
+  274          case EM_MNEM: {
+  275             register int i,j;
+  276             register struct e_args *ap;
+  277             extern char em_flag[];
+  278             extern short em_ptyp[];
+  279
+  280             p->em_args = 0;
+  281             j = em_flag[p->em_opcode - sp_fmnem] & EM_PAR;
+  282             i = em_ptyp[j];
+  283             if (j == PAR_NO) {   /* No arguments */
+  284                break;
+  285             }
+  286      #ifndef COMPACT
+  287             if (j == PAR_B) i = ptyp(sp_ilb2);
+  288      #endif COMPACT
+  289             ap = getarg(i);
+  290      #ifndef COMPACT
+  291             if (j == PAR_B) {
+  292                ap->em_cst = ap->em_ilb;
+  293                ap->em_argtype = cst_ptyp;
+  294             }
+  295      #endif COMPACT
+  296             /* range checking
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               9    
+  297             */
+  298      #ifdef CHECKING
+  299             if (wsize <= 4 && psize <= 4) switch(j) {
+  300             case PAR_B:
+  301      #ifdef TM_L66
+  302                check(ap->em_cst <= 262143);
+  303      #else
+  304                check(ap->em_cst <= 32767);
+  305      #endif
+  306                /* Fall through */
+  307             case PAR_N:
+  308                check(ap->em_cst >= 0);
+  309                break;
+  310             case PAR_G:
+  311                if (ap->em_argtype == cst_ptyp) {
+  312                   check(ap->em_cst >= 0);
+  313                }
+  314                /* Fall through */
+  315             case PAR_F:
+  316                /* ??? not in original em_decode or em_encode */
+  317             case PAR_L:
+  318             {  arith m = ap->em_cst >= 0 ? ap->em_cst :
+  319                             - ap->em_cst;
+  320
+  321                /* Check that the number fits in a pointer */
+  322                check((m & ~wordmask[psize]) == 0);
+  323                break;
+  324             }
+  325             case PAR_W:
+  326                if (!ap) break;
+  327                check((ap->em_cst & ~wordmask[wsize]) == 0);
+  328                /* Fall through */
+  329             case PAR_S:
+  330                check(ap->em_cst > 0);
+  331                /* Fall through */
+  332             case PAR_Z:
+  333                check(ap->em_cst >= 0 &&
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               10   
+  334                      ap->em_cst % wsize == 0);
+  335                break;
+  336             case PAR_O:
+  337                check(ap->em_cst > 0 &&
+  338                            ( ap->em_cst % wsize == 0 ||
+  339                   wsize % ap->em_cst == 0));
+  340                break;
+  341             case PAR_R:
+  342                check(ap->em_cst >= 0 && ap->em_cst <= 2);
+  343                break;
+  344             }
+  345      #endif CHECKING
+  346             p->em_args = ap;
+  347      #ifndef COMPACT
+  348             checkeol();
+  349      #endif COMPACT
+  350             }
+  351             break;
+  352          case EM_PSEU:
+  353             /* handle a pseudo, read possible arguments. CON's and
+  354                ROM's are handled especially: Only one argument is
+  355                read, and a mark is set that an argument list of
+  356                type ROM or CON is in process
+  357             */
+  358             {
+  359             register struct e_args *ap = 0, *ap1;
+  360
+  361             switch(p->em_opcode) {
+  362             case ps_bss:
+  363             case ps_hol:
+  364                ap = getarg(cst_ptyp);
+  365                ap->em_next = ap1 = getarg(par_ptyp);
+  366                ap->em_next->em_next = ap1 = getarg(cst_ptyp);
+  367      #ifdef CHECKING
+  368                /* Check that the last value is 0 or 1
+  369                */
+  370                if (ap1->em_cst != 1 && ap1->em_cst != 0) {
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               11   
+  371                  if (! EM_error)
+  372                   EM_error="Third argument of hol/bss not 0/1";
+  373                }
+  374      #endif CHECKING
+  375                break;
+  376             case ps_exa:
+  377             case ps_ina:
+  378                ap = getarg(lab_ptyp);
+  379                break;
+  380             case ps_exp:
+  381             case ps_inp:
+  382                ap = getarg(pro_ptyp);
+  383                break;
+  384             case ps_exc:
+  385                ap = getarg(cst_ptyp);
+  386                ap->em_next = getarg(cst_ptyp);
+  387                break;
+  388             case ps_pro:
+  389                ap = getarg(pro_ptyp);
+  390                ap->em_next = getarg(cst_ptyp|ptyp(sp_cend));
+  391                break;
+  392             case ps_end:
+  393                ap = getarg(cst_ptyp|ptyp(sp_cend));
+  394                break;
+  395             case ps_con:
+  396                ap = getarg(val_ptyp);
+  397                state |= CON;
+  398                break;
+  399             case ps_rom:
+  400                ap = getarg(val_ptyp);
+  401                state |= ROM;
+  402                break;
+  403             default:
+  404                xerror("Bad pseudo");
+  405                break;
+  406             }
+  407             p->em_args = ap;
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               12   
+  408             }
+  409      #ifndef COMPACT
+  410             if (p->em_opcode != ps_con && p->em_opcode != ps_rom) {
+  411                checkeol();
+  412             }
+  413      #endif COMPACT
+  414             break;
+  415          case EM_STARTMES:
+  416             startmes(p);
+  417             break;
+  418          }
+  419          if (!wsize && !EM_error) {
+  420             wsize = 2;
+  421             psize = 2;
+  422             EM_error = "EM code should start with mes 2";
+  423          }
+  424          return p;
+  425       }
+  426
+  427       if (state & INSTRING) { /* We already delivered part of a string.
+  428                   Deliver the next part
+  429                */
+  430          register struct string *s;
+  431
+  432          s = getstring(0);
+  433          args = argentry();
+  434          args->em_next = 0;
+  435          args->em_argtype = str_ptyp;
+  436          args->em_str = s->str;
+  437          args->em_size = s->length;
+  438          switch(state & PSEUMASK) {
+  439          default:
+  440             assert(0);
+  441          case MES:
+  442             if (!EM_error)
+  443                EM_error = "String too long in message";
+  444             p->em_type = EM_MESARG;
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               13   
+  445             p->em_arg = args;
+  446             break;
+  447          case CON:
+  448             p->em_type = EM_PSEU;
+  449             p->em_opcode = ps_con;
+  450             p->em_args = args;
+  451             break;
+  452          case ROM:
+  453             p->em_type = EM_PSEU;
+  454             p->em_opcode = ps_rom;
+  455             p->em_args = args;
+  456             break;
+  457          }
+  458          return p;
+  459       }
+  460
+  461       /* Here, we are in a state reading arguments */
+  462       args=getarg(any_ptyp);
+  463       if (EM_error && p->em_type != EM_FATAL) {
+  464          return p;
+  465       }
+  466       if (!args) {   /* No more arguments */
+  467      #ifndef COMPACT
+  468          checkeol();
+  469      #endif
+  470          if (state == MES) {
+  471             state = 0;
+  472             p->em_type = EM_ENDMES;
+  473             return p;
+  474          }
+  475          /* Here, we have to get the next instruction */
+  476          state = 0;
+  477          return EM_getinstr();
+  478       }
+  479
+  480       /* Here, there was an argument */
+  481       if (state == MES) {
+10:54 AUG 20 '97 zbm$read$read_em:c.:ZBC3TSI                               14   
+  482          p->em_type = EM_MESARG;
+  483          p->em_arg = args;
+  484          return p;
+  485       }
+  486       p->em_type = EM_PSEU;
+  487       p->em_args = args;
+  488       if (state == CON) p->em_opcode = ps_con;
+  489       else  p->em_opcode = ps_rom;
+  490       return p;
+  491      }
+  492
+

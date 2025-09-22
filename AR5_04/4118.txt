@@ -1,0 +1,162 @@
+/*M*    ALARM_SI61      PL6 procs for asynchronous wait capability      */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMC,PLM=4,IND=4,DCI=8,DTI=0,ENI=4,ECI=4,CSI=4,DIN=4,SDI=0 */
+ALARM: PROC( PARM1, PARM2);
+%INCLUDE CP_6;
+    %B$EXCFR;
+    %B$TCB;
+    %M$DCB( DCBN=F$ALARM, ASN=COMGROUP, FUN=UPDATE,
+            ACCT=':SYS', NAME='ALARMCG');
+    %FPT_EVENT( UENTRY=ALARM$ASYNC, STCLASS=CONSTANT);
+    %FPT_READ( DCB=F$ALARM, BUF=WAKEUP, WAIT=NO);
+    %FPT_TIME( SOURCE=CLOCK, DEST=UTS, TSTAMP=WAKEUP, STCLASS=CONSTANT);
+    %FPT_WRITE( DCB=F$ALARM, BUF=WAKEUP, STATION=VLP_STATION, STCLASS=CONSTANT);
+    %VLP_STATION( STATION='SERVER', STCLASS=CONSTANT);
+%INCLUDE XUD_UTS_M;
+    %XUD$UTS_ENTRIES;
+    %XUD_UTS_EQU;
+ 
+    DCL ALARM$ASYNC ENTRY ASYNC;
+    DCL ALARM$SIGALRM ENTRY OPTIONAL;
+ 
+    DCL B$TCB$ PTR SYMREF READONLY;
+ 
+    DCL ALARM_EVID UBIN STATIC SYMDEF INIT( 8744117325);  /* =='ALRM' */
+    DCL ALARM_HANDLER$ EPTR STATIC SYMDEF INIT( ENTADDR( NIL));
+%EJECT;
+    DCL PARM1 UBIN;
+    DCL SECONDS REDEF PARM1 UBIN;  /* for ALARM$WAIT */
+    DCL UTS REDEF PARM1 UBIN;  /* for ALARM$CLOCK */
+    DCL HANDLER$ REDEF PARM1 EPTR;  /* for ALARM$INIT */
+    DCL PARM2 UBIN;
+    DCL PREVSECONDS REDEF PARM2 UBIN;  /* for ALARM$WAIT */
+    DCL PREVUTS REDEF PARM2 UBIN;  /* for ALARM$CLOCK */
+    DCL EVID REDEF PARM2 UBIN;  /* for ALARM$INIT */
+ 
+    DCL ENTRYFLAG UBIN;
+%EQU WAIT=0;
+%EQU CLOCK=1;
+    DCL MUSTREAD BIT(1) STATIC INIT( '1'B);
+    DCL PREVWAKEUP UBIN STATIC INIT( 0);
+    DCL CURRWAKEUP UBIN STATIC INIT( 0);
+    DCL INITIALIZED BIT(1) STATIC INIT( '0'B);
+    DCL WAKEUP UBIN STATIC;
+%EJECT;
+ALARM$WAIT: ENTRY( PARM1, PARM2);
+    /* PARM1 is SECONDS, PARM2 is optional PREVSECONDS */
+ 
+    ENTRYFLAG = %WAIT;
+COMMON:
+    IF NOT INITIALIZED THEN
+        CALL ALARM$INIT;
+    CALL M$TIME( FPT_TIME);  /* get current time */
+    IF CURRWAKEUP = 0 THEN
+        PREVWAKEUP = 0;
+    ELSE
+        PREVWAKEUP = CURRWAKEUP - WAKEUP;
+    /* compute wakeup time */
+    IF ENTRYFLAG = %WAIT THEN
+        CALL XUD$UTS_ADJUST( WAKEUP, WAKEUP, SECONDS*%UTS_CSEC_SEC#);
+    ELSE
+        WAKEUP = MAXIMUM( WAKEUP, UTS);
+    CURRWAKEUP = WAKEUP;
+    CALL M$WRITE( FPT_WRITE);  /* send wakeup request to server */
+    IF MUSTREAD THEN DO INHIBIT;
+        MUSTREAD = '0'B;
+        CALL M$READ( FPT_READ);  /* set up NoWait read for reply */
+        END;
+    IF ADDR( PARM2) ~= ADDR( NIL) THEN DO;
+        IF ENTRYFLAG = %WAIT THEN
+            PREVSECONDS = PREVWAKEUP/%UTS_CSEC_SEC#;
+        ELSE
+            PREVUTS = PREVWAKEUP;
+        END;
+    PREVWAKEUP = 0;
+    RETURN;
+%EJECT;
+ALARM$CLOCK: ENTRY( PARM1, PARM2);
+    /* PARM1 is UTS, PARM2 is optional PREVUTS */
+ 
+    ENTRYFLAG = %CLOCK;
+    GOTO COMMON;
+%EJECT;
+ALARM$INIT: ENTRY( PARM1, PARM2);
+    /* PARM1 is optional HANDLER$, PARM2 is optional EVID */
+ 
+    IF INITIALIZED THEN
+        RETURN;
+    /* if HANDLER$ specified and NIL, then appl will call us */
+    /* if HANDLER$ specified and non-NIL, then we will call appl */
+    /* if HANDLER$ not specified then we will handle all events */
+    IF ADDR( HANDLER$) ~= ADDR( NIL) THEN DO;
+        IF HANDLER$ = ENTADDR( NIL) THEN
+            HANDLER$ = ENTADDR( ALARM$EVENT);
+        ELSE
+            ALARM_HANDLER$ = HANDLER$;
+        END;
+    IF ADDR( HANDLER$) = ADDR( NIL) OR HANDLER$ ~= ENTADDR( NIL) THEN
+        CALL M$EVENT( FPT_EVENT);
+    /* if EVID specified and zero, tell appl our default evid */
+    /* if EVID specified and nonzero, use that evid */
+    /* if EVID not specified, use default evid */
+    IF ADDR( EVID) ~= ADDR( NIL) THEN DO;
+        IF EVID = 0 THEN
+            EVID = ALARM_EVID;
+        ELSE
+            ALARM_EVID = EVID;
+        END;
+    FPT_READ.V.EVENT# = ALARM_EVID;
+    INITIALIZED = '1'B;
+    RETURN;
+%EJECT;
+ALARM$EVENT: ENTRY;
+ 
+    MUSTREAD = '1'B;
+    IF WAKEUP ~= CURRWAKEUP THEN
+        RETURN;  /* forget this obsolete wakeup notification */
+    CURRWAKEUP = 0;
+    IF ALARM_HANDLER$ ~= ENTADDR( NIL) THEN
+        CALL ALARM_HANDLER$( B$TCB$->B$TCB.STK$->B$EXCFR);
+    ELSE
+        IF ENTADDR( ALARM$SIGALRM) ~= ENTADDR( NIL) THEN
+            CALL ALARM$SIGALRM;
+    RETURN;
+ 
+END ALARM;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMC,PLM=4,IND=4,DCI=8,DTI=0,ENI=4,ECI=4,CSI=4,DIN=4,SDI=0 */
+ALARM$ASYNC: PROC ASYNC;
+%INCLUDE CP_6;
+    %B$EXCFR;
+    %B$TCB;
+ 
+    DCL ALARM$EVENT ENTRY;
+ 
+    DCL ALARM_EVID UBIN SYMREF;
+    DCL ALARM_HANDLER$ EPTR SYMREF;
+    DCL B$TCB$ PTR SYMREF READONLY;
+ 
+    DCL EVID UBIN;
+ 
+    DO INHIBIT;
+        EVID = B$TCB$->B$TCB.STK$->B$EXCFR.EVID;
+        IF EVID = ALARM_EVID THEN
+            CALL ALARM$EVENT;
+        ELSE
+            IF ALARM_HANDLER$ = ENTADDR( NIL) THEN
+                CALL M$ERR;
+            ELSE
+                CALL ALARM_HANDLER$( B$TCB$->B$TCB.STK$->B$EXCFR);
+        RETURN;
+        END;
+ 
+END ALARM$ASYNC;

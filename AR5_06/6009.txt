@@ -1,0 +1,528 @@
+/*M* RUDD - eliminate duplicate lines in a file */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMR,PLM=5,IND=5,CTI=5,SDI=5,MCL=10,CSI=0,ECI=0 */
+                                   /*
+                                        Author: J.L.Joseph, LADC
+                                        Date: 12/85
+                                                                  */
+%SET LISTSUB='1'B;
+ 
+RUDD: PROC MAIN;
+ 
+                                   /*
+                                        Locally needed %SUBs
+                                                                  */
+%SUB TRUE#='1'B /*TRUE#*/;
+%SUB FALSE#='0'B /*FALSE#*/;
+%SUB P_TOOMANY#=0 /*P_TOOMANY*/;
+%SUB P_NOZEROS#=1 /*P_NOZEROS*/;
+%SUB P_MUSTFIL#=2 /*P_MUSTFIL#*/;
+%SUB P_ALTRETN#=3 /*P_ALTRETN#*/;
+%SUB P_MAKEEVN#=4 /*P_MAKEEVN#*/;
+%SUB P_BADHILO#=5 /*P_BADHILO#*/;
+%SUB P_TOOLARG#=6 /*P_TOOLARG#*/;
+%SUB BBUFSIZ#=8192 /*BBUFSIZ#*/;
+%SUB KBUFSIZ#=1024 /*KBUFSIZ#*/;
+%SUB TOTALSIZ#=10240 /*TOTALSIZ#*/;
+ 
+                                   /*
+                                        INCLUDEs here
+                                                                  */
+     %INCLUDE CP_6;
+     %INCLUDE CP_6_SUBS;
+ 
+     %INCLUDE XU_MACRO_C;
+     %INCLUDE XU_SUBS_C;
+     %INCLUDE XU_PERR_C;
+ 
+     %INCLUDE B$JIT_C;
+     %INCLUDE B_ERRORS_C;
+ 
+     %INCLUDE XS_MACRO_C;
+                                   /*
+                                        DCBs defined here
+                                                                  */
+DCL M$SI DCB;
+DCL M$OU DCB;
+DCL M$DO DCB;
+ 
+                                   /*
+                                        EXTERNALs
+                                                                  */
+DCL B$JIT$ PTR SYMREF;
+DCL B$TCB$ PTR SYMREF;
+DCL RUDD_NODES SBIN WORD SYMREF;
+DCL X$PARSE ENTRY(1) ALTRET;
+DCL XSA$OPEN ENTRY(2) ALTRET;
+DCL XSA$CLOSE ENTRY(2) ALTRET;
+DCL XSA$READ ENTRY(2) ALTRET;
+                                   /*
+                                        CONSTANT definitions here
+                                                                  */
+ 
+DCL WARN_MSG CHAR(80) STATIC INIT(' ');
+ 
+ 
+                                   /*
+                                        Local STATIC storage
+                                                                  */
+DCL BUF1 CHAR(257) STATIC CALIGNED INIT(' ');
+DCL COUNT SBIN WORD STATIC SYMDEF INIT(0);
+DCL NEW_KEY CHAR(257) STATIC INIT(' ');
+DCL CURRENT_KEY CHAR(257) STATIC INIT(' ');
+DCL BUF1ARS UBIN WORD STATIC INIT(0);
+DCL 1 BUF1_NUM STATIC CALIGNED,         /* NOTE: */
+         2 NUM CHAR(5) CALIGNED INIT(' '), /* THIS MUST STAY */
+         2 * CHAR(3) CALIGNED INIT(' * '); /* ADJACENT TO BUF1_SAVE */
+DCL BUF1_SAVE CHAR(257) STATIC CALIGNED INIT(' '); /* FOR COUNTING */
+DCL BUF1ARS_SAVE UBIN WORD STATIC INIT(0);
+ 
+ 
+DCL MY_ERROR_BUF CHAR(140) STATIC;
+ 
+                              /*
+                                   OPTIONS stuff
+                                                  */
+DCL RANGES(0:11) SBIN WORD;
+ 
+                              /*
+                                   internal status flags
+                                                                  */
+DCL END_OF_FILE BIT(1) ALIGNED STATIC INIT(FALSE#);
+DCL COUNT_FLAG BIT(1) ALIGNED STATIC SYMDEF INIT (FALSE#);
+ 
+ 
+ 
+                              /*
+                                   mysterious and misused temps
+                                                                  */
+DCL I SBIN WORD STATIC ALIGNED INIT(0);
+DCL K SBIN WORD STATIC ALIGNED INIT(0);
+DCL J SBIN WORD STATIC ALIGNED INIT(0);
+ 
+ 
+DCL RUDD_WORKSPACE(0:199) SBIN WORD STATIC SYMDEF;
+ 
+DCL FPARAM_BUF (0:1024) SBIN STATIC ALIGNED;
+ 
+DCL PARSE$ PTR;
+ 
+DCL 1 FILE_KEY STATIC CALIGNED,
+         2 COUNT_ UBIN BYTE CALIGNED INIT(3),
+         2 KEY_ UBIN(27) CALIGNED INIT(1000);
+ 
+DCL M$SI$ PTR STATIC;
+DCL M$OU$ PTR STATIC;
+ 
+%EJECT;
+                                   /*
+                                        I/O FPTs here
+                                                                  */
+     %FPT_OPEN      (FPTN=OPEN_SI_IN,
+                         FUN=IN,
+                         ACS=SEQUEN,
+                         DCB=M$SI);
+ 
+     %FPT_OPEN      (FPTN=OPEN_SI_TEST,
+                         TEST=YES,
+                         FPARAM=FPARAM_BUF,
+                         DCB=M$SI);
+ 
+     %FPT_READ      (FPTN=READ_BUF1,
+                         DCB=M$SI,
+                         BUF=BUF1,
+                         WAIT=YES);
+ 
+ 
+     %FPT_WRITE     (FPTN=WRITE_OU_BUF1,
+                         ONEWKEY=YES,
+                         KEY=FILE_KEY,
+                         DCB=M$OU,
+                         BUF=BUF1_SAVE,
+                         WAIT=YES);
+ 
+     %FPT_CLOSE     (FPTN=CLOSE_SI_REL,
+                         DISP=RELEASE,
+                         DCB=M$SI);
+ 
+     %FPT_CLOSE     (FPTN=CLOSE_OU_SAVE,
+                         RELG=YES,
+                         DISP=SAVE,
+                         DCB=M$OU);
+ 
+     %FPT_OPEN      (FPTN=OPEN_OU_OUT,
+                         EXIST=NEWFILE,
+                         FUN=CREATE,
+                         ACS=DIRECT,
+                         ORG=KEYED,
+                         IFPARAM=FPARAM_BUF,
+                         DCB=M$OU);
+ 
+     %VLP_SN        (FPTN=OPEN_OU_SN,
+                         N=1);
+     %FPT_WRITE     (FPTN=WRITE_DO_MSG,
+                         BUF=WARN_MSG,
+                         DCB=M$DO,
+                         WAIT=YES);
+ 
+     %FPT_ERRMSG    (FPTN=ERROR_PRINT,
+                         BUF=MY_ERROR_BUF,
+                         DCB=M$SI,
+                         OUTDCB1=M$DO,
+                         CODE=NIL);
+ 
+     %P_PCB         (NAME=RUDD_PCB,
+                         STCLASS="STATIC SYMDEF",
+                         R=NIL,
+                         W=RUDD_WORKSPACE,
+                         U$=NIL,
+                         WSZ=200,
+                         N#=0);
+ 
+     %XSA_PARAM     (FPTN=SI_PARAM,
+                         BBUF=NIL,
+                         KBUF=NIL);
+ 
+     %FPT_GDS       (FPTN=GET_DATA,
+                         RESULTS=DATA_VECTOR,
+                         SEGSIZE=TOTALSIZ#);
+ 
+          %VLP_VECTOR (FPTN=DATA_VECTOR);
+ 
+ 
+ 
+                                   /*
+                                        BASED definitions
+                                                                  */
+     %F$DCB;
+ 
+     %PARSE$SYM     (NAME=RUDD$SYM,
+                         STCLASS="BASED");
+ 
+     %PARSE$OUT     (NAME=RUDD$OUTBLK,
+                         STCLASS="BASED");
+ 
+     %B$JIT0;
+     %U$JIT1;
+     %A$JIT6X;
+ 
+     %B$TCB;
+ 
+     %B$ALT;
+ 
+%SUB B$ALT=B$TCB$->B$TCB.ALT$->B$ALT;
+ 
+%EJECT;
+ 
+/* ************************************************************
+   ***                                                      ***
+   ***  Begin   RUDD  main program                          ***
+   ***                                                      ***
+   ************************************************************ */
+ 
+     M$SI$ = DCBADDR(DCBNUM(M$SI));
+     M$OU$ = DCBADDR(DCBNUM(M$OU));
+ 
+     RUDD_PCB.ROOT$ = ADDR(RUDD_NODES);
+ 
+     DO I=0 TO 11;
+          RANGES(I)=0;
+        END;
+ 
+     IF B$JIT$->B$JIT.CCARS > B$JIT$->B$JIT.CCDISP
+     THEN
+     DO;                                /* MUST BE OPTIONS ON CMD LINE */
+ 
+          RUDD_PCB.TEXT$ = PINCRC(ADDR(B$JIT.CCBUF),B$JIT.CCDISP);
+          RUDD_PCB.NCHARS = B$JIT.CCARS - B$JIT.CCDISP ;
+ 
+          CALL X$PARSE (RUDD_PCB)
+          WHENALTRETURN
+          DO;
+               CALL PARSE_ERROR(P_ALTRETN#);
+               GOTO GET_GONE;
+             END;                       /* DO if parse error */
+ 
+ 
+          J = 0;
+          PARSE$ = RUDD_PCB.OUT$;
+          DO I = 0 TO PARSE$ -> RUDD$OUTBLK.NSUBLKS - 1;
+ 
+               DO CASE (PARSE$ ->RUDD$OUTBLK.SUBLK$(I)->
+                    RUDD$OUTBLK.CODE);
+ 
+               CASE (3);
+                  CALL CHARBIN (K, PARSE$->
+                       RUDD$OUTBLK.SUBLK$(I) -> RUDD$SYM.TEXT);
+ 
+                  IF K=0
+                  THEN
+                  DO;
+                       CALL PARSE_ERROR(P_NOZEROS#);
+                       GOTO GET_GONE;
+                     END;               /* DO IF 0 */
+ 
+                  IF J > 11
+                  THEN
+                  DO;
+                       CALL PARSE_ERROR(P_TOOMANY#);
+                       GOTO GET_GONE;
+                     END;               /* DO IF TOO MANY */
+ 
+                  RANGES(J) = K;
+                  J = J + 1;
+ 
+               CASE (4);
+ 
+                  COUNT_FLAG = '1'B;
+ 
+               END;                     /* DO CASE */
+ 
+ 
+             END;                       /* DO I = 0 TO NSUBLKS - 1 */
+ 
+          IF (J/2)*2 ~= J
+          THEN
+          DO;
+               CALL PARSE_ERROR(P_MAKEEVN#);
+               GOTO GET_GONE;
+             END;                       /* DO IF NUMBER PASSED NOT EVEN */
+ 
+          I = 0;
+ 
+          DO WHILE (I<11 AND RANGES(I)~=0);
+ 
+               IF RANGES(I)>RANGES(I+1)
+               THEN
+               DO;
+                    CALL PARSE_ERROR(P_BADHILO#);
+                    GOTO GET_GONE;
+                  END;
+ 
+               IF RANGES(I)>255 OR RANGES(I+1)>255
+               THEN
+               DO;
+                    CALL PARSE_ERROR(P_TOOLARG#);
+                    GOTO GET_GONE;
+                  END;                  /* DO IF OUT OF RANGE */
+ 
+ 
+               I=I+2;
+ 
+             END;                       /* DO WHILE SEARCHING LIST */
+ 
+ 
+        END;                            /* DO IF OPTIONS ON CMD LINE */
+ 
+ 
+%EJECT;
+/* ************************************************************
+   ***                                                      ***
+   ***    SETUP XSA$FSF information                         ***
+   ***                                                      ***
+   ************************************************************ */
+ 
+     CALL M$GDS (GET_DATA) ALTRET (MXXX);
+ 
+     SI_PARAM.BBUF_.BUF$ = DATA_VECTOR.PTR$;
+     SI_PARAM.BBUF_.BOUND = BBUFSIZ#*4 - 1;
+     SI_PARAM.KBUF_.BUF$ = PINCRW(SI_PARAM.BBUF_.BUF$,BBUFSIZ#);
+     SI_PARAM.KBUF_.BOUND = KBUFSIZ#*4-1;
+ 
+%EJECT;
+ 
+/* ************************************************************
+   ***                                                      ***
+   ***  Process the file  ... first record = first key      ***
+   ***                                                      ***
+   ************************************************************ */
+ 
+     CALL M$OPEN (OPEN_SI_TEST) ALTRET (MXXX);
+ 
+     CALL XSA$OPEN (OPEN_SI_IN,SI_PARAM) ALTRET (XSERR);
+ 
+     IF M$SI$->F$DCB.ASN# ~= %FILE#
+     THEN
+     DO;
+          CALL PARSE_ERROR (P_MUSTFIL#);
+          GOTO GET_GONE;
+        END;                            /* DO IF INPUT ~ FILE */
+ 
+     BUF1 = ' ';
+     CALL XSA$READ (READ_BUF1,SI_PARAM) ALTRET (XSERR);
+     BUF1ARS = SI_PARAM.ARS#;
+     IF BUF1ARS = 0
+     THEN
+          BUF1ARS = 1;
+     BUF1_SAVE = BUF1;
+     BUF1ARS_SAVE = BUF1ARS;
+ 
+     OPEN_OU_OUT.NAME_ = VECTOR(M$SI$->F$DCB.NAME#);
+     OPEN_OU_OUT.ACCT_ = VECTOR(M$SI$->F$DCB.ACCT#);
+     IF M$SI$->F$DCB.PSN# ~= '      '
+     THEN DO;
+          OPEN_OU_SN.SN#(0)=M$SI$->F$DCB.PSN#;
+          OPEN_OU_OUT.SN_ = VECTOR(OPEN_OU_SN);
+        END;
+     CALL M$OPEN (OPEN_OU_OUT) ALTRET (MXXX);
+ 
+     CALL BUILD_KEY;
+     CURRENT_KEY = NEW_KEY;
+ 
+     DO WHILE (~END_OF_FILE);
+ 
+          CALL BUILD_KEY;
+ 
+          IF NEW_KEY ~= CURRENT_KEY
+          THEN
+          DO;
+               CURRENT_KEY = NEW_KEY;
+               CALL WRITE_BUF1;
+               COUNT = 0;
+             END;
+ 
+          COUNT = COUNT + 1;
+          BUF1 = ' ';
+          CALL XSA$READ (READ_BUF1, SI_PARAM) ALTRET(MUST_BE_EOF);
+          BUF1ARS = SI_PARAM.ARS#;
+          IF BUF1ARS = 0
+          THEN
+               BUF1ARS = 1;
+ 
+        END;                            /* DO IF ~ EOF */
+ 
+MUST_BE_EOF: ;
+ 
+     IF SI_PARAM.ERR.CODE ~= %E$EOF
+     THEN
+          GOTO XSERR;
+ 
+     CALL WRITE_BUF1;
+ 
+     CALL M$CLOSE (CLOSE_OU_SAVE) ALTRET (MXXX);
+     CALL XSA$CLOSE (CLOSE_SI_REL,SI_PARAM) ALTRET (XSERR);
+ 
+     CALL M$EXIT;
+ 
+XSERR: ;
+     ERROR_PRINT.CODE_ = VECTOR(SI_PARAM.ERR);
+     GOTO PRINTERR;
+ 
+MXXX: ;
+ 
+     ERROR_PRINT.CODE_ = VECTOR(B$ALT.ERR);
+ 
+PRINTERR:
+     CALL M$ERRMSG (ERROR_PRINT)
+     WHENALTRETURN
+     DO;
+        END;
+GET_GONE: ;
+     CALL M$XXX;
+ 
+ 
+ 
+%EJECT;
+WRITE_BUF1: PROC ALTRET;
+ 
+ 
+     WRITE_OU_BUF1.BUF_.BOUND = BUF1ARS_SAVE - 1;
+ 
+     IF COUNT_FLAG
+     THEN
+     DO;
+          WRITE_OU_BUF1.BUF_.BUF$ = ADDR(BUF1_NUM);
+          WRITE_OU_BUF1.BUF_.BOUND = WRITE_OU_BUF1.BUF_.BOUND + 8;
+          CALL BINCHAR(BUF1_NUM.NUM,COUNT);
+          J=0;
+          DO WHILE (SUBSTR(BUF1_NUM.NUM,J,1)='0');
+               SUBSTR(BUF1_NUM.NUM,J,1)=' ';
+               J=J+1;
+             END;                       /* DO WHILE */
+        END;
+ 
+     CALL M$WRITE (WRITE_OU_BUF1)
+     WHENALTRETURN
+     DO;
+          ALTRETURN;
+        END;
+     FILE_KEY.KEY_ = FILE_KEY.KEY_ + 1000;
+     BUF1_SAVE = BUF1;
+     BUF1ARS_SAVE = BUF1ARS;
+ 
+     RETURN;
+ 
+END WRITE_BUF1;
+ 
+%EJECT;
+ 
+BUILD_KEY: PROC;
+ 
+ 
+DCL I SBIN;
+DCL J SBIN;
+DCL K SBIN;
+ 
+     IF RANGES(0)=0
+     THEN
+     DO;
+          NEW_KEY=BUF1;
+          RETURN;
+        END;
+ 
+     I=0;
+     J=0;
+     K=0;
+ 
+     DO WHILE(I<11 AND RANGES(I)~=0);
+ 
+          K = RANGES(I+1) - RANGES(I) + 1;
+          CALL INSERT(NEW_KEY, J, K, SUBSTR(BUF1,RANGES(I)-1,K));
+          J = J + K;                    /* Update insertion pointer */
+          I = I + 2;                    /* Update pair pointer */
+ 
+        END;                            /* DO WHILE ASSEMBLING KEY */
+ 
+ 
+     RETURN;
+ 
+END BUILD_KEY;
+ 
+%EJECT;
+PARSE_ERROR: PROC (XX);
+ 
+DCL XX SBIN;
+ 
+     DO CASE (XX);
+ 
+     CASE(P_TOOMANY#);
+        WARN_MSG = '*** Too many column specs on command line ';
+     CASE(P_NOZEROS#);
+        WARN_MSG = '*** Columns must be positive and non-zero';
+     CASE(P_MUSTFIL#);
+        WARN_MSG = '*** Input must be from managed disk file';
+     CASE(P_ALTRETN#);
+        WARN_MSG = '*** Totally barfo input on command line';
+     CASE(P_MAKEEVN#);
+        WARN_MSG = '*** Column specifiers come in pairs';
+     CASE(P_BADHILO#);
+        WARN_MSG = '*** Bad pair specification (1st>2nd)';
+     CASE(P_TOOLARG#);
+        WARN_MSG = '*** Value > 255';
+     CASE(ELSE);
+        WARN_MSG = '*** Undetermined internal error -- bailing out';
+     END;                               /* DO CASE SUBCODE */
+ 
+     CALL M$WRITE (WRITE_DO_MSG)
+     WHENALTRETURN
+     DO;
+        END;
+ 
+     RETURN;
+ 
+END PARSE_ERROR;
+END RUDD;

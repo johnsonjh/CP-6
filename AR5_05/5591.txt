@@ -1,0 +1,413 @@
+/*M*    make_macro:c      -- Routines to handle macros           */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+#include <stdlib.h>
+#include <xu_cp6_c.h>
+#include <xu_macro_c.h>
+#include <xu_subs_c.h>
+#define CP6_ESMALLWORK       5      /*  #include <xu_perr_c.h>  */
+#define CP6_EWKOVERFLOW      4
+#include "MAKE_Cc13"
+#include "MAKE_Cc14"
+#include <setjmp.h>
+#include <string.h>
+ 
+ 
+extern struct p_node PARSECOMMAND; /*Partrge node to parse macros   */
+ 
+char *ParseWork = 0;
+int   ParseWorkSize = 0;
+/*********************************************************
+char *ExpandMacros();
+int  UserParse();
+void ReportParseErr();
+int  ReportParseLexemes();
+int  DoMacSublk();
+*/
+extern struct p_pcb MacroPCB; /*{0, &PARSECOMMAND, 0, 0, UserParse, 0, 1,
+              0, 1, 0, 1, 0, 0, {0,0,0,0,0}, {0,0,0,0}, 0, 1, 0, 0,
+              0, 0, 0, ReportParseLexemes};       ********/
+ 
+ 
+jmp_buf ExpandParseRetry;
+ 
+ 
+ 
+/*D*    NAME:    ExpandMacros
+        PURPOSE: To replace macros within text with their correct
+                 replacement text.
+*/
+ 
+char *
+ExpandMacros(buf, bsize)
+  char *buf;
+  int   bsize;
+{
+  struct parse_out *p;
+  int   i;
+ 
+  MacroSubs = 0;
+  if (!ParseWorkSize)
+     if (!(ParseWork = (char *) malloc(ParseWorkSize = 4096)))
+        crash("Out of memory: ExpandMacros");
+ 
+  MacroPCB.text = buf;
+  MacroPCB.nchars = bsize;
+  setjmp(ExpandParseRetry);
+ 
+  MacroPCB.work = ParseWork;
+  MacroPCB.wksz = ParseWorkSize >> 2;
+ 
+  if (!X_PARSE(&MacroPCB)) {
+     UserParseAlt(&MacroPCB);
+     ReportParseErr(&MacroPCB);
+     MacRecLen = bsize;
+     return buf;
+     }
+ 
+  SpecMacroFlags = 0;
+  MacRecLen      = 0;
+ 
+  if (!MacRecBuf)
+     if (!(MacRecBuf = (char *) malloc(MacRecSize = 1024)))
+        crash("Out of Memory: ExpandMacros");
+ 
+  p = MacroPCB.out;
+ 
+  if (p->nsublks < 2)  {  /*  No macros present!  */
+     MacRecLen = bsize;
+     return buf;
+     }
+ 
+  if (buf == MacRecBuf)   {
+     if (AltRecSize < bsize) {
+        int i = (bsize + 1023)/1024 * 1024;
+        if (!(AltRecBuf = (char *)realloc(AltRecBuf,(AltRecSize=i))))
+           crash("Out of Memory: ExpandMacros");
+        }
+     memcpy(AltRecBuf, buf, bsize);
+     buf = AltRecBuf;
+     }
+ 
+  i = 0;
+  do {
+     i = DoMacSublk(p, i, buf, bsize);
+     } while (i > 0);
+ 
+  MacRecBuf[ MacRecLen ] = 0;
+  return MacRecBuf;
+}
+ 
+ 
+/*D*    NAME:       DoMacSublk
+        PURPOSE:    To cause expand a single macro sub-block entry.
+        DESCRIPTION:
+           This function takes as input a sublk associated with the
+           PARSECOMMAND parse.  It causes text to be added to the
+           output which is collected in MacRecBuf.
+*/
+int
+DoMacSublk(p, i, rec, reclen)
+  struct parse_out *p;
+  int               i;
+  char             *rec;
+  int               reclen;
+{
+  struct parse_sym *ps = (struct parse_sym *)p->sublk[i++];
+  char             *st = rec + ps->cpos;
+  struct sym_macro *macsym;
+  int               ep;
+  int               mr = (i<p->nsublks) ? (p->sublk[i]->code==50) : 0;
+ 
+     switch (ps->code) {
+ 
+     case 0:  /* non-macro part: textc isn't always big enuf! */
+        if ( i<p->nsublks && p->sublk[i]->ndtype != CP6_ALTERN) {
+           ep = p->sublk[i]->cpos;    /* Compute end of field */
+           while (ep >= 0 && rec[ep] != '$') ep--;
+           if (p->sublk[i]->code == 5) ep--;
+           }
+        else ep = reclen;
+        CatenateRec( st, ep - ps->cpos);
+        break;
+ 
+     case 1:  /* user-defined macro name    */
+        macsym = lookup_sym_macro(&(ps->text[1]), ps->text[0], 4);
+        MacroSubs++;
+        if (!macsym || !macsym->mc_def)
+           break;
+ 
+        macsym->mc_used++;
+        if (mr)
+           modified_reference(p, i, macsym), i+=2;
+        else CatenateRec(macsym->mc_def,macsym->mc_deflen);
+        break;
+ 
+     case 49: /*  re-construct this name    */
+        CatenateRec("$",1);
+        CatenateRec(&(ps->text[1]),ps->text[0]);
+        break;
+ 
+     case 50: /*  replace string in previous macro-name    */
+/*****  warning("### String replacement not implemented\n");  ****/
+     case 51:
+        break;
+ 
+     default: /*  Special symbols           */
+        macsym = sym_macro_specials[ ps->code ];
+        SpecMacroFlags  |=  1<<ps->code;
+        if (!macsym->mc_def) break;
+        if (mr)
+           modified_reference(p, i, macsym), i+= 2;
+        else CatenateRec(macsym->mc_def, macsym->mc_deflen);
+        break;
+     }
+  return (i < p->nsublks)? i : 0;
+}
+ 
+/*D*    NAME:          UserParse
+        PURPOSE:       A generic routine to handle entries from
+                 X$PARSE to expand the parser work area.
+        DESCRIPTION:
+           In order to use this function, the user must be using
+           ParseWork and ParseWorkSize.  If the workarea has moved
+           during expansion, this routine unwinds (longjumps)
+           through ExpandParseRetry which is expected to re-start
+           the parse of this command.
+*/
+ 
+int
+UserParse(p)
+  struct parse_param *p;
+{
+  char *q;
+ 
+  switch (p->type)  {
+ 
+  case CP6_ESMALLWORK:
+  case CP6_EWKOVERFLOW:
+ 
+     q = ParseWork;
+     if (!(ParseWork = (char *) realloc(ParseWork, (ParseWorkSize <<=1))))
+        crash("Out of Memory: UserParse");
+ 
+     if (q != ParseWork) longjmp(ExpandParseRetry, 1);
+     p->wksz = ParseWorkSize >> 2;
+     break;
+  }
+  return 0;
+}
+ 
+ 
+ 
+/*D*    NAME:    UserParseAlt(struct p_pcb *pcb)
+        PURPOSE: To expand the parse area if the reason for
+                 X$PARSE altreturning is work area size.
+*/
+ 
+UserParseAlt(pcb)
+  struct p_pcb *pcb;
+{
+  char *q;
+ 
+  if (pcb->error.err == CP6_ESMALLWORK)  {
+     q = ParseWork;
+     if (!(ParseWork = (char *) realloc(ParseWork, (ParseWorkSize <<= 1))))
+        crash("Out of Memory: UserParseAlt");
+     longjmp(ExpandParseRetry, 1);
+     }
+}
+ 
+ 
+/*D*    NAME:       CatenateRec
+        PURPOSE:    To add text to the output record.
+*/
+ 
+CatenateRec(b, s)
+  char  *b;
+  int    s;
+{
+  int    x;
+ 
+  if (MacRecSize < (MacRecLen + s))   {
+     x = (s > 1024) ? s+1024 : 1024;
+     if (!(MacRecBuf = (char *) realloc(MacRecBuf, (MacRecSize+=x))))
+        crash("Out of Memory: ExpandMacros");
+     }
+  memcpy(MacRecBuf+MacRecLen, b, s);
+  MacRecLen += s;
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:          modified_reference(p, i, macsym)
+        PURPOSE:       To expand a modified variable reference
+                       and add it to the output command.
+*/
+ 
+modified_reference(p, i, macsym)
+  struct parse_out *p;
+  int               i;
+  struct sym_macro *macsym;
+{
+  char             *old = ((struct parse_sym *)p->sublk[i])->text;
+  char             *new = ((struct parse_sym *)p->sublk[i+1])->text;
+  int               delta = *new - *old;
+  char             *def = macsym->mc_def;
+  char             *c   = def;
+  int               sz  = macsym->mc_deflen;
+  char             *str;
+  char             *rs;
+  int               l;
+  int               saved = *(old + *old + 1);
+ 
+  if (sz == 0) return;
+  *(old + *old + 1) = 0;   /*  Make "old" a C string  */
+/*  If oldsize != newsize then compute new size!  */
+  if (delta)  {
+     c = strstr( def, old+1 );
+     while (c)   {
+        sz = sz + delta;
+        c += *old;
+        c  = strstr(c, old+1 );
+        }
+     }
+ 
+/*  Allocate memory to hold the "modified reference" result   */
+  rs = str = (char *) malloc(sz);
+  c  = strstr( def, old+1 );
+  while (c)   {
+     l = c - def;
+     memcpy(str, def, l);
+     str += l;
+     memcpy(str, new+1, *new);
+     str += *new;
+     def += l + *old;
+     c    = strstr(def, old+1);
+  }
+ 
+  c = def + strlen(def);
+  l = c - def;
+  memcpy(str, def, l);
+  str += l;
+  *str = 0;
+  CatenateRec(rs, strlen(rs) );
+  free(rs);
+ 
+  *(old + *old + 1) = saved;
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       ReportParseErr(pcb)
+        PURPOSE:    To report an error detected by X$PARSE.
+*/
+ 
+int
+ReportParseErr(pcb)
+  struct p_pcb *pcb;
+{
+  char  preview[40];
+  static CONST char marker[] = " <-*-> ";
+  extern int MakeRecs;
+  unsigned ep = pcb->hi_char;
+  unsigned sc = (ep > 15) ? ep - 15 : 0;
+  unsigned lp = pcb->nchars;
+  unsigned ec = ((ep+12)>lp) ? lp : ep+12;
+  char *ins = preview;
+  char *src = pcb->text;
+  int   l;
+ 
+  if ((ec - sc)>0)  {
+     if ((l = ep - sc) > 0)
+        memcpy(ins, src+sc, l), ins += l;
+     memcpy(ins, marker, 7), ins += 7;
+     if ((l = ec - ep) > 0)
+        memcpy(ins, src+ep, l), ins += l;
+     *ins = 0;
+     if (MakeRecs > 0)
+        error("\"%s\" line %d: Error \"%s\"\n",
+              file_table[InputNo].fid, file_table[InputNo].recno,
+              preview);
+     else error("Error: \"%s\"\n",preview);
+     }
+  else Errors++;
+  pcb->nxt = 1;
+  X_PARSE(pcb);
+  pcb->nxt = 0;
+  return;
+}
+ 
+/*D*    NAME:       ReportParseLexemes(line)
+        PURPOSE:    To print the syntax alternatives indicated by
+                    X$PARSE.
+*/
+int
+ReportParseLexemes(line)
+  char *line;
+{
+  int i = 79;
+  char buf[84];
+ 
+  memcpy(buf, line, 80);
+  while (buf[i] == ' ') i--;
+  buf[++i] = 0;
+  printf("%s\n",buf);
+  return 0;
+}
+ 
+ 
+ 
+/*D*    NAME:       dump_macros(LS_width)
+        PURPOSE:    To print the entire list of macro definitions.
+*/
+ 
+void
+dump_macros(LS_width)
+  unsigned    LS_width;
+{
+  int         i;
+  printf("\n***  Macro Definitions  ***\n\n");
+ 
+  for ( i=0 ; i<macro_hash_table.hash_size ; i++ )   {
+     struct sym_macro *s = (struct sym_macro *) macro_hash_table.table[i];
+     while (s)   {
+        int   fw = (s->mc_len < 12)? 12 : 5 *((s->mc_len+5)/5);
+        char  *c = s->mc_def;
+        int   l = s->mc_deflen;
+        int   w_printed;
+        if (fw > 12)
+           printf("%-*s   = ",fw,s->mc_sym), w_printed = fw+5;
+        else printf("%-12s = ",s->mc_sym), w_printed = 15;
+        if (l == 0) c = "";
+ 
+        if ( w_printed+l > LS_width )    {
+           int room = LS_width-11;
+           int ps = PrintSegment(room-w_printed,c,0,"%-1.*s\\\n",0,c);
+           c += ps;
+           l -= ps;
+           while (l > room)  {
+              ps = PrintSegment(room,c,0,"         %-1.*s\\\n",0,c);
+              c += ps, l -= ps;
+              }
+           if ( strchr(c, 0200) )
+              PrintSegment(LS_width-11,c,0,"%-1.*s\n",0,c);
+           else printf("         %s\n",c);
+           }
+        else if ( strchr(c, 0200) )
+             PrintSegment(LS_width-11,c,0,"%-1.*s\n",0,c);
+        else printf("%s\n",c);
+ 
+        s = s->next;
+     }     /* end of while (s)  */
+  }        /* end of for (i=0...*/
+}
+ 

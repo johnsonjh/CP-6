@@ -1,0 +1,1728 @@
+VERSION E05
+
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:1    
+        1        1        /*M* XUD$UTS - library routines to manage UTS values.  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*F* These routines are designed to handle the two UTS formats described
+        8        8             in AF1267C.  The routines are described in AF1291B.  */
+        9        9        /*X* PLM=5, IND=5, CTI=5, DCI=5, ENI=0 */
+       10       10
+       11       11        XUD$UTS_DIFF: PROC (INTERVAL, UTS1, UTS2) ALTRET;
+       12       12
+       13       13        /*  Include Files   ****************** */
+       14       14
+       15       15        %INCLUDE XUD_UTS_M;
+       16       97
+       17       98        %XUD_UTS_EQU;                           /* UTS public EQUs                    */
+       18      109
+       19      110        /*  Internal EQUs   ****************** */
+       20      111        /*      These may be duplicated elsewhere in this module, and must match */
+       21      112
+       22      113        %EQU MAXINT# = 34359738367;             /* bitbin ('377777777777'o)           */
+       23      114        %EQU HALFMAXINT# = 17179869183;         /* bitbin ('177777777777'o)           */
+       24      115        %EQU NEW_TIC_RATE# = 25;                /* tics/second after cusp             */
+       25      116        %EQU OLD_TIC_RATE# = 100;               /* tics/second before cusp            */
+       26      117        %EQU TIC_FACTOR# = 4;                   /* %OLD_TIC_RATE# / %NEW_TIC_RATE#    */
+       27      118
+       28      119        /*  PARAMETERS      ****************** */
+       29      120
+       30      121    1   DCL INTERVAL        SBIN;               /* OUTPUT - UTS difference            */
+       31      122    1   DCL UTS1            UBIN;               /* INPUT  - first UTS value           */
+       32      123    1   DCL UTS2            UBIN;               /* INPUT  - second UTS value          */
+       33      124
+       34      125        /*  AUTOMATICS      ****************** */
+       35      126
+       36      127    1   DCL ABSDIFF         UBIN;               /* unsigned time interval             */
+       37      128    1   DCL ABSDIFF2        UBIN;               /* unsigned difference temporary      */
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:2    
+       38      129    1   DCL CONVERSION      SBIN;               /* conversion factor for diff units   */
+       39      130    1   DCL NEG             BIT(1);             /* should interval be negative?       */
+       40      131    1   DCL S1              BIT(1);             /* leftmost bit of first operand      */
+       41      132    1   DCL S2              BIT(1);             /* leftmost bit of second operand     */
+       42      133    1   DCL SR              BIT(1);             /* leftmost bit of result             */
+       43      134
+       44      135        %EJECT;
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:3    
+       45      136
+       46      137        /*F*  NAME: XUD$UTS_DIFF */
+       47      138        /*F*  PURPOSE: Compute difference between two UTS values, in centiseconds. */
+       48      139
+       49      140        /*    USAGE:  call XUD$UTS_DIFF (INTERVAL, UTS1, UTS2); */
+       50      141        /*    OUTPUT: INTERVAL */
+       51      142        /*    INPUT:  UTS1, UTS2 */
+       52      143
+       53      144        /*  This routine does not use UTS_DIFF_COMMON, as there are more overflow
+       54      145            tests required for calculating intervals in centiseconds (note that
+       55      146            the common code uses 1/25th second tics to avoid these tests).
+       56      147
+       57      148            The interval is calculated as an absolute difference initially, to
+       58      149            allow the use of a UBIN temporary, to extend the range and simplify
+       59      150            the overflow testing.  This requires a separate flag to track the
+       60      151            sign of the difference, to be set just before returning.  Additionally,
+       61      152            care must be taken with difference computations to ensure that a
+       62      153            positive value will result -- always subtract the lesser from the
+       63      154            greater.  Failure to do so will result in the negative result be
+       64      155            misinterpreted as a very large UBIN.
+       65      156
+       66      157            A further caveat is required with regard to UBIN differences.  Even
+       67      158            if the logic will guarantee that a difference expression between two
+       68      159            UBINs is positive, the compiler will assume an SBIN result, and emit
+       69      160            appropriate code.  This is *inappropriate* in the case of the expression
+       70      161            (UBIN - UBIN) / N.  PL6 will emit a DIV instruction, rather than a
+       71      162            DVF instruction, resulting in a signed division occuring.  For large
+       72      163            UBIN differences with the leftmost bit set, the quotient produced will
+       73      164            be wrong.  The solution is to assign the difference to a UBIN temporary,
+       74      165            and then divide the temporary.  This will result in a QLR shift
+       75      166            instruction being emitted, which will perform the unsigned division
+       76      167            correctly.  Again, a negative difference will cause an incorrect result.
+       77      168
+       78      169            In mixed-type calculations, the difference between the new-style UTS and
+       79      170            the cusp date is multiplied by the tic factor (4) to convert to centisecs.
+       80      171            This multiply will overflow if the two leftmost bits of the difference
+       81      172            (ABSDIFF2) are not zero.  When adding the pre- and post-cusp differences,
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:4    
+       82      173            overflow must also be tested.  If both differences have their leftmost
+       83      174            bit on, or if one is on and the leftmost bit of the result is not on,
+       84      175            then an overflow has occured.  An overflow results in an ALTRETURN.
+       85      176
+       86      177            The final overflow test occurs for all difference types, when the
+       87      178            UBIN is converted to an SBIN.  If the magnitude of the UBIN exceeds
+       88      179            the range of the SBIN, an overflow occurs, and the routine ALTRETURNS.
+       89      180            Note that the test does not allow for the fact that the negative range
+       90      181            of the SBIN exceeds in magnitude the positive range (by one).  Thus there
+       91      182            is a single valid negative interval result that will cause an ALTRET.
+       92      183            Specifically: -34359738368, although a valid SBIN, will ALTRETURN.
+       93      184        */
+       94      185
+       95      186    1        NEG = (UTS1 < UTS2);               /* should result be negative?         */
+       96      187
+       97      188        /*  If both UTSes are pre-cusp, things are easy.  */
+       98      189    2        IF (UTS1 <= %UTS_CUSP#) & (UTS2 <= %UTS_CUSP#) THEN DO;
+       99      190    2             IF NEG THEN ABSDIFF = UTS2 - UTS1;
+      100      191    2             ELSE ABSDIFF = UTS1 - UTS2;
+      101      192    2        END;
+      102      193
+      103      194        /*  If both UTSes are post-cusp, things are a bit more complicated, as
+      104      195            the difference must be checked for a possible overflow when multiplied
+      105      196            by the tic factor.  Since the multiplier is four, if the two leftmost
+      106      197            bits are zero, all is AOK, and the multiply will not overflow.  */
+      107      198
+      108      199    2        ELSE IF (UTS1 >= %UTS_CUSP#) & (UTS2 >= %UTS_CUSP#) THEN DO;
+      109      200    2                  IF NEG THEN ABSDIFF = UTS2 - UTS1;
+      110      201    2                  ELSE ABSDIFF = UTS1 - UTS2;
+      111      202    2                  IF (ABSDIFF > %HALFMAXINT#) THEN
+      112      203    2                       ALTRETURN;          /* will overflow on multiply          */
+      113      204    2                  ABSDIFF = ABSDIFF * %TIC_FACTOR#;
+      114      205    2             END;
+      115      206
+      116      207        /*  This is the difficult case, where one UTS is pre-cusp, and one post.
+      117      208            The difference between the pre-cusp UTS and the cusp is at the old tic
+      118      209            rate, and the difference between the cusp and the post-cusp UTS is at
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:5    
+      119      210            the new tic rate.  Thus the post-cusp difference must be multiplied by
+      120      211            the tic factor, with the above-mentioned test for overflow.  The code
+      121      212            below computes the difference in csecs in ABSDIFF, and the difference
+      122      213            in new 1/25 sec tics in ABSDIFF2.  Also note that which of the UTS
+      123      214            values is pre-cusp also determines the order of subtraction.  If UTS1
+      124      215            is pre-cusp, UTS2 must be post-cusp, and NEG must be '1'b, and the
+      125      216            converse true if UTS2 is pre-cusp.  */
+      126      217
+      127      218    2             ELSE DO;                      /* mixed type difference              */
+      128      219    3                  IF UTS1 <= %UTS_CUSP# THEN DO;/* UTS1 is pre-cusp              */
+      129      220    3                       ABSDIFF = %UTS_CUSP# - UTS1;
+      130      221    3                       ABSDIFF2 = UTS2 - %UTS_CUSP#;
+      131      222    3                  END;
+      132      223
+      133      224    3                  ELSE DO;                 /* UTS2 is old style                  */
+      134      225    3                       ABSDIFF = %UTS_CUSP# - UTS2;
+      135      226    3                       ABSDIFF2 = UTS1 - %UTS_CUSP#;
+      136      227    3                  END;
+      137      228
+      138      229        /*  Test post-cusp difference portion for overflow when converting to csecs.
+      139      230            Leftmost two bits must be zero to avoid overflow multiplying by 4.  */
+      140      231    2                  IF (ABSDIFF2 > %HALFMAXINT#) THEN
+      141      232    2                       ALTRETURN;
+      142      233    2                  ABSDIFF2 = ABSDIFF2 * %TIC_FACTOR#;
+      143      234
+      144      235        /*  Add ABSDIFF and ABSDIFF2 with overflow testing.  The result overflows
+      145      236            if both operands have their leftmost bit set, or one does and the
+      146      237            result does not.  If overflow occurs, altreturn.  */
+      147      238
+      148      239    2                  S1 = (ABSDIFF > %MAXINT#);
+      149      240    2                  S2 = (ABSDIFF2 > %MAXINT#);
+      150      241    2                  IF (S1 & S2) THEN ALTRETURN;
+      151      242
+      152      243    2                  ABSDIFF = ABSDIFF + ABSDIFF2;
+      153      244    2                  SR = (ABSDIFF > %MAXINT#);
+      154      245    2                  IF ((S1 | S2) & (~SR)) THEN ALTRETURN;
+      155      246    2             END;
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:6    
+      156      247
+      157      248    1        IF ABSDIFF > %MAXINT# THEN ALTRETURN; /* is valid as SBIN?               */
+      158      249
+      159      250    1        IF NEG THEN INTERVAL = -ABSDIFF;   /* convert to SBIN                    */
+      160      251    1        ELSE INTERVAL = ABSDIFF;
+      161      252
+      162      253    1        RETURN;
+      163      254
+      164      255
+      165      256        /*F*  NAME: XUD$UTS_DIFF_25TH */
+      166      257        /*F*  PURPOSE: Compute difference between two UTS values, in 1/25 seconds. */
+      167      258
+      168      259        /*    USAGE:  call XUD$UTS_DIFF_25TH (INTERVAL, UTS1, UTS2); */
+      169      260        /*    OUTPUT: INTERVAL */
+      170      261        /*    INPUT:  UTS1, UTS2 */
+      171      262
+      172      263    1   XUD$UTS_DIFF_25TH: ENTRY (INTERVAL, UTS1, UTS2) ALTRET;
+      173      264
+      174      265    1        CONVERSION = 1;
+      175      266    1        GOTO UTS_DIFF_COMMON;
+      176      267
+      177      268
+      178      269        /*F*  NAME: XUD$UTS_DIFF_SEC */
+      179      270        /*F*  PURPOSE: Compute difference between two UTS values, in seconds. */
+      180      271
+      181      272        /*    USAGE:  call XUD$UTS_DIFF_SEC (INTERVAL, UTS1, UTS2); */
+      182      273        /*    OUTPUT: INTERVAL */
+      183      274        /*    INPUT:  UTS1, UTS2 */
+      184      275
+      185      276    1   XUD$UTS_DIFF_SEC: ENTRY (INTERVAL, UTS1, UTS2) ALTRET;
+      186      277
+      187      278    1        CONVERSION = %NEW_TIC_RATE#;
+      188      279
+      189      280
+      190      281        /*  XUD$UTS_DIFF common code.  This section computes the interval in
+      191      282            new tics (1/25 sec), and uses a conversion factor (CONVERSION) to
+      192      283            convert to the required units.  This section is not used by the
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:7    
+      193      284            centisecond interval routine, as special overflow tests must be made.
+      194      285            The same caveats apply here as in XUD$UTS_DIFF regarding UBIN
+      195      286            differences, and division.
+      196      287        */
+      197      288
+      198      289    1   UTS_DIFF_COMMON:                        /* merge UTS_DIFF_SECS, UTS_DIFF_25TH */
+      199      290
+      200      291    1        NEG = (UTS1 < UTS2);               /* should result be negative?         */
+      201      292
+      202      293        /*  if both UTSes are pre-cusp, convert difference to 25ths from csecs.  */
+      203      294    2        IF (UTS1 <= %UTS_CUSP#) & (UTS2 <= %UTS_CUSP#) THEN DO;
+      204      295    2             IF NEG THEN ABSDIFF = UTS2 - UTS1;
+      205      296    2             ELSE ABSDIFF = UTS1 - UTS2;
+      206      297    2             ABSDIFF = ABSDIFF / %TIC_FACTOR#; /* force QLR                      */
+      207      298    2        END;
+      208      299
+      209      300        /*  if both UTSes are post-cusp, a simple difference is all we need.  */
+      210      301    2        ELSE IF (UTS1 >= %UTS_CUSP#) & (UTS2 >= %UTS_CUSP#) THEN DO;
+      211      302    2                  IF NEG THEN ABSDIFF = UTS2 - UTS1;
+      212      303    2                  ELSE ABSDIFF = UTS1 - UTS2;
+      213      304    2             END;
+      214      305
+      215      306        /*  if UTS1 is pre-cusp, the difference between it and the cusp is in csecs,
+      216      307            and must be converted to 25ths.  */
+      217      308    2             ELSE IF UTS1 <= %UTS_CUSP# THEN DO;
+      218      309    2                       ABSDIFF = %UTS_CUSP# - UTS1; /* abs difference            */
+      219      310    2                       ABSDIFF = ABSDIFF / %TIC_FACTOR#; /* force QLR            */
+      220      311    2                       ABSDIFF = ABSDIFF + (UTS2 - %UTS_CUSP#);
+      221      312    2                  END;
+      222      313
+      223      314        /*  otherwise UTS2 is precusp, and the diff between it and cusp is csecs.  */
+      224      315    2                  ELSE DO;
+      225      316    2                       ABSDIFF = %UTS_CUSP# - UTS2; /* abs diff                  */
+      226      317    2                       ABSDIFF = ABSDIFF / %TIC_FACTOR#; /* force QLR            */
+      227      318    2                       ABSDIFF = ABSDIFF + (UTS1 - %UTS_CUSP#);
+      228      319    2                  END;
+      229      320
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:8    
+      230      321    1        ABSDIFF = ABSDIFF / CONVERSION;    /* convert to final units             */
+      231      322    1        IF ABSDIFF > %MAXINT# THEN ALTRETURN; /* valid as an SBIN?               */
+      232      323    1        IF NEG THEN INTERVAL = -ABSDIFF;   /* convert to SBIN                    */
+      233      324    1        ELSE INTERVAL = ABSDIFF;
+      234      325
+      235      326    1        RETURN;
+      236      327
+      237      328    1   END XUD$UTS_DIFF;
+      238      329        %EOD;
+
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:9    
+--  Include file information  --
+
+   XUD_UTS_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure XUD$UTS_DIFF.
+
+   Procedure XUD$UTS_DIFF requires 260 words for executable code.
+   Procedure XUD$UTS_DIFF requires 16 words of local(AUTO) storage.
+
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:10   
+
+ Object Unit name= XUD$UTS_DIFF                               File name= XUD$UTS.:E05TOU
+ UTS= JUL 30 '97 09:11:47.48 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS      1      1  XUD$UTS_DIFF
+    1   Proc  even  none   260    404  XUD$UTS_DIFF
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes    yes     yes      Std        3  XUD$UTS_DIFF
+     1    223          yes     yes      Std        3  XUD$UTS_DIFF_25TH
+     1    230          yes     yes      Std        3  XUD$UTS_DIFF_SEC
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+                       nStd      0 X66_AUTO_3
+                       nStd      0 X66_AALT
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     B_VECTNIL
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:11   
+
+
+        1        1        /*M* XUD$UTS - library routines to manage UTS values.  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*F* These routines are designed to handle the two UTS formats described
+        8        8             in AF1267C.  The routines are described in AF1291B.  */
+        9        9        /*X* PLM=5, IND=5, CTI=5, DCI=5, ENI=0 */
+       10       10
+       11       11        XUD$UTS_DIFF: PROC (INTERVAL, UTS1, UTS2) ALTRET;
+
+     11  1 000000   000000 700200 xent  XUD$UTS_DIFF TSX0  ! X66_AUTO_3
+         1 000001   000020 000003                    ZERO    16,3
+
+       12       12
+       13       13        /*  Include Files   ****************** */
+       14       14
+       15       15        %INCLUDE XUD_UTS_M;
+       16       97
+       17       98        %XUD_UTS_EQU;                           /* UTS public EQUs                    */
+       18      109
+       19      110        /*  Internal EQUs   ****************** */
+       20      111        /*      These may be duplicated elsewhere in this module, and must match */
+       21      112
+       22      113        %EQU MAXINT# = 34359738367;             /* bitbin ('377777777777'o)           */
+       23      114        %EQU HALFMAXINT# = 17179869183;         /* bitbin ('177777777777'o)           */
+       24      115        %EQU NEW_TIC_RATE# = 25;                /* tics/second after cusp             */
+       25      116        %EQU OLD_TIC_RATE# = 100;               /* tics/second before cusp            */
+       26      117        %EQU TIC_FACTOR# = 4;                   /* %OLD_TIC_RATE# / %NEW_TIC_RATE#    */
+       27      118
+       28      119        /*  PARAMETERS      ****************** */
+       29      120
+       30      121    1   DCL INTERVAL        SBIN;               /* OUTPUT - UTS difference            */
+       31      122    1   DCL UTS1            UBIN;               /* INPUT  - first UTS value           */
+       32      123    1   DCL UTS2            UBIN;               /* INPUT  - second UTS value          */
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:12   
+       33      124
+       34      125        /*  AUTOMATICS      ****************** */
+       35      126
+       36      127    1   DCL ABSDIFF         UBIN;               /* unsigned time interval             */
+       37      128    1   DCL ABSDIFF2        UBIN;               /* unsigned difference temporary      */
+       38      129    1   DCL CONVERSION      SBIN;               /* conversion factor for diff units   */
+       39      130    1   DCL NEG             BIT(1);             /* should interval be negative?       */
+       40      131    1   DCL S1              BIT(1);             /* leftmost bit of first operand      */
+       41      132    1   DCL S2              BIT(1);             /* leftmost bit of second operand     */
+       42      133    1   DCL SR              BIT(1);             /* leftmost bit of result             */
+       43      134
+       44      135        %EJECT;
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:13   
+       45      136
+       46      137        /*F*  NAME: XUD$UTS_DIFF */
+       47      138        /*F*  PURPOSE: Compute difference between two UTS values, in centiseconds. */
+       48      139
+       49      140        /*    USAGE:  call XUD$UTS_DIFF (INTERVAL, UTS1, UTS2); */
+       50      141        /*    OUTPUT: INTERVAL */
+       51      142        /*    INPUT:  UTS1, UTS2 */
+       52      143
+       53      144        /*  This routine does not use UTS_DIFF_COMMON, as there are more overflow
+       54      145            tests required for calculating intervals in centiseconds (note that
+       55      146            the common code uses 1/25th second tics to avoid these tests).
+       56      147
+       57      148            The interval is calculated as an absolute difference initially, to
+       58      149            allow the use of a UBIN temporary, to extend the range and simplify
+       59      150            the overflow testing.  This requires a separate flag to track the
+       60      151            sign of the difference, to be set just before returning.  Additionally,
+       61      152            care must be taken with difference computations to ensure that a
+       62      153            positive value will result -- always subtract the lesser from the
+       63      154            greater.  Failure to do so will result in the negative result be
+       64      155            misinterpreted as a very large UBIN.
+       65      156
+       66      157            A further caveat is required with regard to UBIN differences.  Even
+       67      158            if the logic will guarantee that a difference expression between two
+       68      159            UBINs is positive, the compiler will assume an SBIN result, and emit
+       69      160            appropriate code.  This is *inappropriate* in the case of the expression
+       70      161            (UBIN - UBIN) / N.  PL6 will emit a DIV instruction, rather than a
+       71      162            DVF instruction, resulting in a signed division occuring.  For large
+       72      163            UBIN differences with the leftmost bit set, the quotient produced will
+       73      164            be wrong.  The solution is to assign the difference to a UBIN temporary,
+       74      165            and then divide the temporary.  This will result in a QLR shift
+       75      166            instruction being emitted, which will perform the unsigned division
+       76      167            correctly.  Again, a negative difference will cause an incorrect result.
+       77      168
+       78      169            In mixed-type calculations, the difference between the new-style UTS and
+       79      170            the cusp date is multiplied by the tic factor (4) to convert to centisecs.
+       80      171            This multiply will overflow if the two leftmost bits of the difference
+       81      172            (ABSDIFF2) are not zero.  When adding the pre- and post-cusp differences,
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:14   
+       82      173            overflow must also be tested.  If both differences have their leftmost
+       83      174            bit on, or if one is on and the leftmost bit of the result is not on,
+       84      175            then an overflow has occured.  An overflow results in an ALTRETURN.
+       85      176
+       86      177            The final overflow test occurs for all difference types, when the
+       87      178            UBIN is converted to an SBIN.  If the magnitude of the UBIN exceeds
+       88      179            the range of the SBIN, an overflow occurs, and the routine ALTRETURNS.
+       89      180            Note that the test does not allow for the fact that the negative range
+       90      181            of the SBIN exceeds in magnitude the positive range (by one).  Thus there
+       91      182            is a single valid negative interval result that will cause an ALTRET.
+       92      183            Specifically: -34359738368, although a valid SBIN, will ALTRETURN.
+       93      184        */
+       94      185
+       95      186    1        NEG = (UTS1 < UTS2);               /* should result be negative?         */
+
+    186  1 000002   400000 220003                    LDX0    -131072,DU
+         1 000003   200004 470500                    LDP0    @UTS1,,AUTO
+         1 000004   200005 471500                    LDP1    @UTS2,,AUTO
+         1 000005   000000 236100                    LDQ     0,,PR0
+         1 000006   100000 116100                    CMPQ    0,,PR1
+         1 000007   000011 602000 1                  TNC     s:186+7
+         1 000010   000000 220003                    LDX0    0,DU
+         1 000011   000000 636010                    EAQ     0,X0
+         1 000012   200011 756100                    STQ     NEG,,AUTO
+
+       96      187
+       97      188        /*  If both UTSes are pre-cusp, things are easy.  */
+       98      189    2        IF (UTS1 <= %UTS_CUSP#) & (UTS2 <= %UTS_CUSP#) THEN DO;
+
+    189  1 000013   400000 220003                    LDX0    -131072,DU
+         1 000014   000000 236000 0                  LDQ     0
+         1 000015   000000 116100                    CMPQ    0,,PR0
+         1 000016   000020 603000 1                  TRC     s:189+5
+         1 000017   000000 220003                    LDX0    0,DU
+         1 000020   400000 221003                    LDX1    -131072,DU
+         1 000021   100000 116100                    CMPQ    0,,PR1
+         1 000022   000024 603000 1                  TRC     s:189+9
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:15   
+         1 000023   000000 221003                    LDX1    0,DU
+         1 000024   000000 636011                    EAQ     0,X1
+         1 000025   200016 756100                    STQ     SR+2,,AUTO
+         1 000026   000000 636010                    EAQ     0,X0
+         1 000027   200016 376100                    ANQ     SR+2,,AUTO
+         1 000030   000043 600000 1                  TZE     s:199
+
+       99      190    2             IF NEG THEN ABSDIFF = UTS2 - UTS1;
+
+    190  1 000031   200011 234100                    SZN     NEG,,AUTO
+         1 000032   000037 605000 1                  TPL     s:191
+
+    190  1 000033   100000 236100                    LDQ     0,,PR1
+         1 000034   000000 136100                    SBLQ    0,,PR0
+         1 000035   200006 756100                    STQ     ABSDIFF,,AUTO
+         1 000036   000204 710000 1                  TRA     s:248
+
+      100      191    2             ELSE ABSDIFF = UTS1 - UTS2;
+
+    191  1 000037   000000 236100                    LDQ     0,,PR0
+         1 000040   100000 136100                    SBLQ    0,,PR1
+         1 000041   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      101      192    2        END;
+
+    192  1 000042   000204 710000 1                  TRA     s:248
+
+      102      193
+      103      194        /*  If both UTSes are post-cusp, things are a bit more complicated, as
+      104      195            the difference must be checked for a possible overflow when multiplied
+      105      196            by the tic factor.  Since the multiplier is four, if the two leftmost
+      106      197            bits are zero, all is AOK, and the multiply will not overflow.  */
+      107      198
+      108      199    2        ELSE IF (UTS1 >= %UTS_CUSP#) & (UTS2 >= %UTS_CUSP#) THEN DO;
+
+    199  1 000043   400000 220003                    LDX0    -131072,DU
+         1 000044   000000 236100                    LDQ     0,,PR0
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:16   
+         1 000045   000000 116000 0                  CMPQ    0
+         1 000046   000050 603000 1                  TRC     s:199+5
+         1 000047   000000 220003                    LDX0    0,DU
+         1 000050   400000 221003                    LDX1    -131072,DU
+         1 000051   100000 236100                    LDQ     0,,PR1
+         1 000052   000000 116000 0                  CMPQ    0
+         1 000053   000055 603000 1                  TRC     s:199+10
+         1 000054   000000 221003                    LDX1    0,DU
+         1 000055   000000 636011                    EAQ     0,X1
+         1 000056   200016 756100                    STQ     SR+2,,AUTO
+         1 000057   000000 636010                    EAQ     0,X0
+         1 000060   200016 376100                    ANQ     SR+2,,AUTO
+         1 000061   000102 600000 1                  TZE     s:219
+
+      109      200    2                  IF NEG THEN ABSDIFF = UTS2 - UTS1;
+
+    200  1 000062   200011 234100                    SZN     NEG,,AUTO
+         1 000063   000070 605000 1                  TPL     s:201
+
+    200  1 000064   100000 236100                    LDQ     0,,PR1
+         1 000065   000000 136100                    SBLQ    0,,PR0
+         1 000066   200006 756100                    STQ     ABSDIFF,,AUTO
+         1 000067   000073 710000 1                  TRA     s:202
+
+      110      201    2                  ELSE ABSDIFF = UTS1 - UTS2;
+
+    201  1 000070   000000 236100                    LDQ     0,,PR0
+         1 000071   100000 136100                    SBLQ    0,,PR1
+         1 000072   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      111      202    2                  IF (ABSDIFF > %HALFMAXINT#) THEN
+
+    202  1 000073   200000 116003                    CMPQ    65536,DU
+         1 000074   000076 602000 1                  TNC     s:204
+
+      112      203    2                       ALTRETURN;          /* will overflow on multiply          */
+
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:17   
+    203  1 000075   000000 702200 xent               TSX2  ! X66_AALT
+
+      113      204    2                  ABSDIFF = ABSDIFF * %TIC_FACTOR#;
+
+    204  1 000076   200006 235100                    LDA     ABSDIFF,,AUTO
+         1 000077   000002 735000                    ALS     2
+         1 000100   200006 755100                    STA     ABSDIFF,,AUTO
+
+      114      205    2             END;
+
+    205  1 000101   000204 710000 1                  TRA     s:248
+
+      115      206
+      116      207        /*  This is the difficult case, where one UTS is pre-cusp, and one post.
+      117      208            The difference between the pre-cusp UTS and the cusp is at the old tic
+      118      209            rate, and the difference between the cusp and the post-cusp UTS is at
+      119      210            the new tic rate.  Thus the post-cusp difference must be multiplied by
+      120      211            the tic factor, with the above-mentioned test for overflow.  The code
+      121      212            below computes the difference in csecs in ABSDIFF, and the difference
+      122      213            in new 1/25 sec tics in ABSDIFF2.  Also note that which of the UTS
+      123      214            values is pre-cusp also determines the order of subtraction.  If UTS1
+      124      215            is pre-cusp, UTS2 must be post-cusp, and NEG must be '1'b, and the
+      125      216            converse true if UTS2 is pre-cusp.  */
+      126      217
+      127      218    2             ELSE DO;                      /* mixed type difference              */
+
+      128      219    3                  IF UTS1 <= %UTS_CUSP# THEN DO;/* UTS1 is pre-cusp              */
+
+    219  1 000102   000000 236000 0                  LDQ     0
+         1 000103   000000 116100                    CMPQ    0,,PR0
+         1 000104   000113 602000 1                  TNC     s:225
+
+      129      220    3                       ABSDIFF = %UTS_CUSP# - UTS1;
+
+    220  1 000105   000000 136100                    SBLQ    0,,PR0
+         1 000106   200006 756100                    STQ     ABSDIFF,,AUTO
+
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:18   
+      130      221    3                       ABSDIFF2 = UTS2 - %UTS_CUSP#;
+
+    221  1 000107   100000 236100                    LDQ     0,,PR1
+         1 000110   000000 136000 0                  SBLQ    0
+         1 000111   200007 756100                    STQ     ABSDIFF2,,AUTO
+
+      131      222    3                  END;
+
+    222  1 000112   000120 710000 1                  TRA     s:231
+
+      132      223
+      133      224    3                  ELSE DO;                 /* UTS2 is old style                  */
+
+      134      225    3                       ABSDIFF = %UTS_CUSP# - UTS2;
+
+    225  1 000113   100000 136100                    SBLQ    0,,PR1
+         1 000114   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      135      226    3                       ABSDIFF2 = UTS1 - %UTS_CUSP#;
+
+    226  1 000115   000000 236100                    LDQ     0,,PR0
+         1 000116   000000 136000 0                  SBLQ    0
+         1 000117   200007 756100                    STQ     ABSDIFF2,,AUTO
+
+      136      227    3                  END;
+
+      137      228
+      138      229        /*  Test post-cusp difference portion for overflow when converting to csecs.
+      139      230            Leftmost two bits must be zero to avoid overflow multiplying by 4.  */
+      140      231    2                  IF (ABSDIFF2 > %HALFMAXINT#) THEN
+
+    231  1 000120   200000 116003                    CMPQ    65536,DU
+         1 000121   000123 602000 1                  TNC     s:233
+
+      141      232    2                       ALTRETURN;
+
+    232  1 000122   000000 702200 xent               TSX2  ! X66_AALT
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:19   
+
+      142      233    2                  ABSDIFF2 = ABSDIFF2 * %TIC_FACTOR#;
+
+    233  1 000123   200007 235100                    LDA     ABSDIFF2,,AUTO
+         1 000124   000002 735000                    ALS     2
+         1 000125   200007 755100                    STA     ABSDIFF2,,AUTO
+
+      143      234
+      144      235        /*  Add ABSDIFF and ABSDIFF2 with overflow testing.  The result overflows
+      145      236            if both operands have their leftmost bit set, or one does and the
+      146      237            result does not.  If overflow occurs, altreturn.  */
+      147      238
+      148      239    2                  S1 = (ABSDIFF > %MAXINT#);
+
+    239  1 000126   400000 220003                    LDX0    -131072,DU
+         1 000127   200006 236100                    LDQ     ABSDIFF,,AUTO
+         1 000130   000031 116000 xsym               CMPQ    B_VECTNIL+25
+         1 000131   000133 600000 1                  TZE     s:239+5
+         1 000132   000134 603000 1                  TRC     s:239+6
+         1 000133   000000 220003                    LDX0    0,DU
+         1 000134   000000 636010                    EAQ     0,X0
+         1 000135   200012 756100                    STQ     S1,,AUTO
+
+      149      240    2                  S2 = (ABSDIFF2 > %MAXINT#);
+
+    240  1 000136   400000 220003                    LDX0    -131072,DU
+         1 000137   000031 115000 xsym               CMPA    B_VECTNIL+25
+         1 000140   000142 600000 1                  TZE     s:240+4
+         1 000141   000143 603000 1                  TRC     s:240+5
+         1 000142   000000 220003                    LDX0    0,DU
+         1 000143   000000 636010                    EAQ     0,X0
+         1 000144   200013 756100                    STQ     S2,,AUTO
+
+      150      241    2                  IF (S1 & S2) THEN ALTRETURN;
+
+    241  1 000145   200013 236100                    LDQ     S2,,AUTO
+         1 000146   400000 376003                    ANQ     -131072,DU
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:20   
+         1 000147   200016 756100                    STQ     SR+2,,AUTO
+         1 000150   200012 236100                    LDQ     S1,,AUTO
+         1 000151   400000 376003                    ANQ     -131072,DU
+         1 000152   200016 376100                    ANQ     SR+2,,AUTO
+         1 000153   000155 600000 1                  TZE     s:243
+
+    241  1 000154   000000 702200 xent               TSX2  ! X66_AALT
+
+      151      242
+      152      243    2                  ABSDIFF = ABSDIFF + ABSDIFF2;
+
+    243  1 000155   200006 236100                    LDQ     ABSDIFF,,AUTO
+         1 000156   200007 036100                    ADLQ    ABSDIFF2,,AUTO
+         1 000157   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      153      244    2                  SR = (ABSDIFF > %MAXINT#);
+
+    244  1 000160   400000 220003                    LDX0    -131072,DU
+         1 000161   000031 116000 xsym               CMPQ    B_VECTNIL+25
+         1 000162   000164 600000 1                  TZE     s:244+4
+         1 000163   000165 603000 1                  TRC     s:244+5
+         1 000164   000000 220003                    LDX0    0,DU
+         1 000165   000000 636010                    EAQ     0,X0
+         1 000166   200014 756100                    STQ     SR,,AUTO
+
+      154      245    2                  IF ((S1 | S2) & (~SR)) THEN ALTRETURN;
+
+    245  1 000167   200013 236100                    LDQ     S2,,AUTO
+         1 000170   400000 376003                    ANQ     -131072,DU
+         1 000171   200016 756100                    STQ     SR+2,,AUTO
+         1 000172   200012 236100                    LDQ     S1,,AUTO
+         1 000173   400000 376003                    ANQ     -131072,DU
+         1 000174   200016 276100                    ORQ     SR+2,,AUTO
+         1 000175   200017 756100                    STQ     SR+3,,AUTO
+         1 000176   200014 236100                    LDQ     SR,,AUTO
+         1 000177   400000 376003                    ANQ     -131072,DU
+         1 000200   400000 676003                    ERQ     -131072,DU
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:21   
+         1 000201   200017 376100                    ANQ     SR+3,,AUTO
+         1 000202   000204 600000 1                  TZE     s:248
+
+    245  1 000203   000000 702200 xent               TSX2  ! X66_AALT
+
+      155      246    2             END;
+      156      247
+      157      248    1        IF ABSDIFF > %MAXINT# THEN ALTRETURN; /* is valid as SBIN?               */
+
+    248  1 000204   200006 235100                    LDA     ABSDIFF,,AUTO
+         1 000205   000031 115000 xsym               CMPA    B_VECTNIL+25
+         1 000206   000211 602000 1                  TNC     s:250
+         1 000207   000211 600000 1                  TZE     s:250
+
+    248  1 000210   000000 702200 xent               TSX2  ! X66_AALT
+
+      158      249
+      159      250    1        IF NEG THEN INTERVAL = -ABSDIFF;   /* convert to SBIN                    */
+
+    250  1 000211   200011 234100                    SZN     NEG,,AUTO
+         1 000212   000220 605000 1                  TPL     s:251
+
+    250  1 000213   000027 675000 xsym               ERA     B_VECTNIL+23
+         1 000214   000001 035007                    ADLA    1,DL
+         1 000215   200003 473500                    LDP3    @INTERVAL,,AUTO
+         1 000216   300000 755100                    STA     0,,PR3
+         1 000217   000222 710000 1                  TRA     s:253
+
+      160      251    1        ELSE INTERVAL = ABSDIFF;
+
+    251  1 000220   200003 473500                    LDP3    @INTERVAL,,AUTO
+         1 000221   300000 755100                    STA     0,,PR3
+
+      161      252
+      162      253    1        RETURN;
+
+    253  1 000222   000000 702200 xent               TSX2  ! X66_ARET
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:22   
+
+      163      254
+      164      255
+      165      256        /*F*  NAME: XUD$UTS_DIFF_25TH */
+      166      257        /*F*  PURPOSE: Compute difference between two UTS values, in 1/25 seconds. */
+      167      258
+      168      259        /*    USAGE:  call XUD$UTS_DIFF_25TH (INTERVAL, UTS1, UTS2); */
+      169      260        /*    OUTPUT: INTERVAL */
+      170      261        /*    INPUT:  UTS1, UTS2 */
+      171      262
+      172      263    1   XUD$UTS_DIFF_25TH: ENTRY (INTERVAL, UTS1, UTS2) ALTRET;
+
+    263  1 000223   000000 700200 xent  XUD$UTS_DIF* TSX0  ! X66_AUTO_3
+         1 000224   000020 000003                    ZERO    16,3
+
+      173      264
+      174      265    1        CONVERSION = 1;
+
+    265  1 000225   000001 235007                    LDA     1,DL
+         1 000226   200010 755100                    STA     CONVERSION,,AUTO
+
+      175      266    1        GOTO UTS_DIFF_COMMON;
+
+    266  1 000227   000234 710000 1                  TRA     UTS_DIFF_COMMON
+
+      176      267
+      177      268
+      178      269        /*F*  NAME: XUD$UTS_DIFF_SEC */
+      179      270        /*F*  PURPOSE: Compute difference between two UTS values, in seconds. */
+      180      271
+      181      272        /*    USAGE:  call XUD$UTS_DIFF_SEC (INTERVAL, UTS1, UTS2); */
+      182      273        /*    OUTPUT: INTERVAL */
+      183      274        /*    INPUT:  UTS1, UTS2 */
+      184      275
+      185      276    1   XUD$UTS_DIFF_SEC: ENTRY (INTERVAL, UTS1, UTS2) ALTRET;
+
+    276  1 000230   000000 700200 xent  XUD$UTS_DIF* TSX0  ! X66_AUTO_3
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:23   
+         1 000231   000020 000003                    ZERO    16,3
+
+      186      277
+      187      278    1        CONVERSION = %NEW_TIC_RATE#;
+
+    278  1 000232   000031 235007                    LDA     25,DL
+         1 000233   200010 755100                    STA     CONVERSION,,AUTO
+
+      188      279
+      189      280
+      190      281        /*  XUD$UTS_DIFF common code.  This section computes the interval in
+      191      282            new tics (1/25 sec), and uses a conversion factor (CONVERSION) to
+      192      283            convert to the required units.  This section is not used by the
+      193      284            centisecond interval routine, as special overflow tests must be made.
+      194      285            The same caveats apply here as in XUD$UTS_DIFF regarding UBIN
+      195      286            differences, and division.
+      196      287        */
+      197      288
+      198      289    1   UTS_DIFF_COMMON:                        /* merge UTS_DIFF_SECS, UTS_DIFF_25TH */
+      199      290
+      200      291    1        NEG = (UTS1 < UTS2);               /* should result be negative?         */
+
+    291  1 000234   400000 220003       UTS_DIFF_CO* LDX0    -131072,DU
+         1 000235   200004 470500                    LDP0    @UTS1,,AUTO
+         1 000236   200005 471500                    LDP1    @UTS2,,AUTO
+         1 000237   000000 236100                    LDQ     0,,PR0
+         1 000240   100000 116100                    CMPQ    0,,PR1
+         1 000241   000243 602000 1                  TNC     UTS_DIFF_COMMON+7
+         1 000242   000000 220003                    LDX0    0,DU
+         1 000243   000000 636010                    EAQ     0,X0
+         1 000244   200011 756100                    STQ     NEG,,AUTO
+
+      201      292
+      202      293        /*  if both UTSes are pre-cusp, convert difference to 25ths from csecs.  */
+      203      294    2        IF (UTS1 <= %UTS_CUSP#) & (UTS2 <= %UTS_CUSP#) THEN DO;
+
+    294  1 000245   400000 220003                    LDX0    -131072,DU
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:24   
+         1 000246   000000 236000 0                  LDQ     0
+         1 000247   000000 116100                    CMPQ    0,,PR0
+         1 000250   000252 603000 1                  TRC     s:294+5
+         1 000251   000000 220003                    LDX0    0,DU
+         1 000252   400000 221003                    LDX1    -131072,DU
+         1 000253   100000 116100                    CMPQ    0,,PR1
+         1 000254   000256 603000 1                  TRC     s:294+9
+         1 000255   000000 221003                    LDX1    0,DU
+         1 000256   000000 636011                    EAQ     0,X1
+         1 000257   200016 756100                    STQ     SR+2,,AUTO
+         1 000260   000000 636010                    EAQ     0,X0
+         1 000261   200016 376100                    ANQ     SR+2,,AUTO
+         1 000262   000277 600000 1                  TZE     s:301
+
+      204      295    2             IF NEG THEN ABSDIFF = UTS2 - UTS1;
+
+    295  1 000263   200011 234100                    SZN     NEG,,AUTO
+         1 000264   000271 605000 1                  TPL     s:296
+
+    295  1 000265   100000 236100                    LDQ     0,,PR1
+         1 000266   000000 136100                    SBLQ    0,,PR0
+         1 000267   200006 756100                    STQ     ABSDIFF,,AUTO
+         1 000270   000274 710000 1                  TRA     s:297
+
+      205      296    2             ELSE ABSDIFF = UTS1 - UTS2;
+
+    296  1 000271   000000 236100                    LDQ     0,,PR0
+         1 000272   100000 136100                    SBLQ    0,,PR1
+         1 000273   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      206      297    2             ABSDIFF = ABSDIFF / %TIC_FACTOR#; /* force QLR                      */
+
+    297  1 000274   000002 772000                    QRL     2
+         1 000275   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      207      298    2        END;
+
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:25   
+    298  1 000276   000354 710000 1                  TRA     s:321
+
+      208      299
+      209      300        /*  if both UTSes are post-cusp, a simple difference is all we need.  */
+      210      301    2        ELSE IF (UTS1 >= %UTS_CUSP#) & (UTS2 >= %UTS_CUSP#) THEN DO;
+
+    301  1 000277   400000 220003                    LDX0    -131072,DU
+         1 000300   000000 236100                    LDQ     0,,PR0
+         1 000301   000000 116000 0                  CMPQ    0
+         1 000302   000304 603000 1                  TRC     s:301+5
+         1 000303   000000 220003                    LDX0    0,DU
+         1 000304   400000 221003                    LDX1    -131072,DU
+         1 000305   100000 236100                    LDQ     0,,PR1
+         1 000306   000000 116000 0                  CMPQ    0
+         1 000307   000311 603000 1                  TRC     s:301+10
+         1 000310   000000 221003                    LDX1    0,DU
+         1 000311   000000 636011                    EAQ     0,X1
+         1 000312   200016 756100                    STQ     SR+2,,AUTO
+         1 000313   000000 636010                    EAQ     0,X0
+         1 000314   200016 376100                    ANQ     SR+2,,AUTO
+         1 000315   000330 600000 1                  TZE     s:308
+
+      211      302    2                  IF NEG THEN ABSDIFF = UTS2 - UTS1;
+
+    302  1 000316   200011 234100                    SZN     NEG,,AUTO
+         1 000317   000324 605000 1                  TPL     s:303
+
+    302  1 000320   100000 236100                    LDQ     0,,PR1
+         1 000321   000000 136100                    SBLQ    0,,PR0
+         1 000322   200006 756100                    STQ     ABSDIFF,,AUTO
+         1 000323   000354 710000 1                  TRA     s:321
+
+      212      303    2                  ELSE ABSDIFF = UTS1 - UTS2;
+
+    303  1 000324   000000 236100                    LDQ     0,,PR0
+         1 000325   100000 136100                    SBLQ    0,,PR1
+         1 000326   200006 756100                    STQ     ABSDIFF,,AUTO
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:26   
+
+      213      304    2             END;
+
+    304  1 000327   000354 710000 1                  TRA     s:321
+
+      214      305
+      215      306        /*  if UTS1 is pre-cusp, the difference between it and the cusp is in csecs,
+      216      307            and must be converted to 25ths.  */
+      217      308    2             ELSE IF UTS1 <= %UTS_CUSP# THEN DO;
+
+    308  1 000330   000000 236000 0                  LDQ     0
+         1 000331   000000 116100                    CMPQ    0,,PR0
+         1 000332   000344 602000 1                  TNC     s:316
+
+      218      309    2                       ABSDIFF = %UTS_CUSP# - UTS1; /* abs difference            */
+
+    309  1 000333   000000 136100                    SBLQ    0,,PR0
+         1 000334   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      219      310    2                       ABSDIFF = ABSDIFF / %TIC_FACTOR#; /* force QLR            */
+
+    310  1 000335   000002 772000                    QRL     2
+         1 000336   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      220      311    2                       ABSDIFF = ABSDIFF + (UTS2 - %UTS_CUSP#);
+
+    311  1 000337   100000 236100                    LDQ     0,,PR1
+         1 000340   000000 136000 0                  SBLQ    0
+         1 000341   200006 036100                    ADLQ    ABSDIFF,,AUTO
+         1 000342   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      221      312    2                  END;
+
+    312  1 000343   000354 710000 1                  TRA     s:321
+
+      222      313
+      223      314        /*  otherwise UTS2 is precusp, and the diff between it and cusp is csecs.  */
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:27   
+      224      315    2                  ELSE DO;
+
+      225      316    2                       ABSDIFF = %UTS_CUSP# - UTS2; /* abs diff                  */
+
+    316  1 000344   100000 136100                    SBLQ    0,,PR1
+         1 000345   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      226      317    2                       ABSDIFF = ABSDIFF / %TIC_FACTOR#; /* force QLR            */
+
+    317  1 000346   000002 772000                    QRL     2
+         1 000347   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      227      318    2                       ABSDIFF = ABSDIFF + (UTS1 - %UTS_CUSP#);
+
+    318  1 000350   000000 236100                    LDQ     0,,PR0
+         1 000351   000000 136000 0                  SBLQ    0
+         1 000352   200006 036100                    ADLQ    ABSDIFF,,AUTO
+         1 000353   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      228      319    2                  END;
+
+      229      320
+      230      321    1        ABSDIFF = ABSDIFF / CONVERSION;    /* convert to final units             */
+
+    321  1 000354   000364 605000 1                  TPL     s:321+8
+         1 000355   000001 405007                    CMG     1,DL
+         1 000356   000365 600000 1                  TZE     s:321+9
+         1 000357   000000 235003                    LDA     0,DU
+         1 000360   000001 737000                    LLS     1
+         1 000361   200010 507100                    DVF     CONVERSION,,AUTO
+         1 000362   000044 733000                    LRS     36
+         1 000363   000365 710000 1                  TRA     s:321+9
+         1 000364   200010 506100                    DIV     CONVERSION,,AUTO
+         1 000365   200006 756100                    STQ     ABSDIFF,,AUTO
+
+      231      322    1        IF ABSDIFF > %MAXINT# THEN ALTRETURN; /* valid as an SBIN?               */
+
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:28   
+    322  1 000366   000031 116000 xsym               CMPQ    B_VECTNIL+25
+         1 000367   000372 602000 1                  TNC     s:323
+         1 000370   000372 600000 1                  TZE     s:323
+
+    322  1 000371   000000 702200 xent               TSX2  ! X66_AALT
+
+      232      323    1        IF NEG THEN INTERVAL = -ABSDIFF;   /* convert to SBIN                    */
+
+    323  1 000372   200011 234100                    SZN     NEG,,AUTO
+         1 000373   000401 605000 1                  TPL     s:324
+
+    323  1 000374   000000 235003                    LDA     0,DU
+         1 000375   200006 135100                    SBLA    ABSDIFF,,AUTO
+         1 000376   200003 473500                    LDP3    @INTERVAL,,AUTO
+         1 000377   300000 755100                    STA     0,,PR3
+         1 000400   000403 710000 1                  TRA     s:326
+
+      233      324    1        ELSE INTERVAL = ABSDIFF;
+
+    324  1 000401   200003 473500                    LDP3    @INTERVAL,,AUTO
+         1 000402   300000 756100                    STQ     0,,PR3
+
+      234      325
+      235      326    1        RETURN;
+
+    326  1 000403   000000 702200 xent               TSX2  ! X66_ARET
+
+(unnamed)
+ Sect OctLoc
+   0     000   540546 215000                                                    ....
+      236      327
+      237      328    1   END XUD$UTS_DIFF;
+      238      329        %EOD;
+
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:29   
+--  Include file information  --
+
+   XUD_UTS_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure XUD$UTS_DIFF.
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:30   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @INTERVAL                  4-0-0/w PTR         r     1 @UTS1
+     5-0-0/w PTR         r     1 @UTS2                      6-0-0/w UBIN        r     1 ABSDIFF
+     7-0-0/w UBIN        r     1 ABSDIFF2                  10-0-0/w SBIN        r     1 CONVERSION
+    *0-0-0/w SBIN        r     1 INTERVAL                  11-0-0/b BIT         r     1 NEG
+    12-0-0/b BIT         r     1 S1                        13-0-0/b BIT         r     1 S2
+    14-0-0/b BIT         r     1 SR                        *0-0-0/w UBIN        r     1 UTS1
+    *0-0-0/w UBIN        r     1 UTS2
+
+
+   Procedure XUD$UTS_DIFF requires 260 words for executable code.
+   Procedure XUD$UTS_DIFF requires 16 words of local(AUTO) storage.
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:31   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:32   
+          MINI XREF LISTING
+
+ABSDIFF
+       127**DCL       190<<ASSIGN    191<<ASSIGN    200<<ASSIGN    201<<ASSIGN    202>>IF        204<<ASSIGN
+       204>>ASSIGN    220<<ASSIGN    225<<ASSIGN    239>>ASSIGN    243<<ASSIGN    243>>ASSIGN    244>>ASSIGN
+       248>>IF        250>>ASSIGN    251>>ASSIGN    295<<ASSIGN    296<<ASSIGN    297<<ASSIGN    297>>ASSIGN
+       302<<ASSIGN    303<<ASSIGN    309<<ASSIGN    310<<ASSIGN    310>>ASSIGN    311<<ASSIGN    311>>ASSIGN
+       316<<ASSIGN    317<<ASSIGN    317>>ASSIGN    318<<ASSIGN    318>>ASSIGN    321<<ASSIGN    321>>ASSIGN
+       322>>IF        323>>ASSIGN    324>>ASSIGN
+ABSDIFF2
+       128**DCL       221<<ASSIGN    226<<ASSIGN    231>>IF        233<<ASSIGN    233>>ASSIGN    240>>ASSIGN
+       243>>ASSIGN
+CONVERSION
+       129**DCL       265<<ASSIGN    278<<ASSIGN    321>>ASSIGN
+INTERVAL
+       121**DCL        11--PROC      250<<ASSIGN    251<<ASSIGN    263--ENTRY     276--ENTRY     323<<ASSIGN
+       324<<ASSIGN
+NEG
+       130**DCL       186<<ASSIGN    190>>IF        200>>IF        250>>IF        291<<ASSIGN    295>>IF
+       302>>IF        323>>IF
+S1
+       131**DCL       239<<ASSIGN    241>>IF        245>>IF
+S2
+       132**DCL       240<<ASSIGN    241>>IF        245>>IF
+SR
+       133**DCL       244<<ASSIGN    245>>IF
+UTS1
+       122**DCL        11--PROC      186>>ASSIGN    189>>IF        190>>ASSIGN    191>>ASSIGN    199>>IF
+       200>>ASSIGN    201>>ASSIGN    219>>IF        220>>ASSIGN    226>>ASSIGN    263--ENTRY     276--ENTRY
+       291>>ASSIGN    294>>IF        295>>ASSIGN    296>>ASSIGN    301>>IF        302>>ASSIGN    303>>ASSIGN
+       308>>IF        309>>ASSIGN    318>>ASSIGN
+UTS2
+       123**DCL        11--PROC      186>>ASSIGN    189>>IF        190>>ASSIGN    191>>ASSIGN    199>>IF
+       200>>ASSIGN    201>>ASSIGN    221>>ASSIGN    225>>ASSIGN    263--ENTRY     276--ENTRY     291>>ASSIGN
+PL6.E3A0      #001=XUD$UTS_DIFF File=XUD$UTS.:E05TSI                             WED 07/30/97 09:11 Page:33   
+       294>>IF        295>>ASSIGN    296>>ASSIGN    301>>IF        302>>ASSIGN    303>>ASSIGN    311>>ASSIGN
+       316>>ASSIGN
+UTS_DIFF_COMMON
+       291**LABEL     266--GOTO
+
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:34   
+      239        1        /*T***********************************************************/
+      240        2        /*T*                                                         */
+      241        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      242        4        /*T*                                                         */
+      243        5        /*T***********************************************************/
+      244        6
+      245        7        XUD$UTS_ADJUST: PROC (UTS1, UTS2, INTERVAL) ALTRET;
+      246        8
+      247        9        /*  Include Files   ****************** */
+      248       10
+      249       11        %INCLUDE XUD_UTS_M;
+      250       93
+      251       94        %XUD_UTS_EQU;                           /* UTS public EQUs                    */
+      252      105
+      253      106        /*  Internal EQUs   ****************** */
+      254      107        /*      These may be duplicated elsewhere in this module, and must match */
+      255      108
+      256      109        %EQU MAXINT# = 34359738367;             /* bitbin ('377777777777'o)           */
+      257      110        %EQU HALFMAXINT# = 17179869183;         /* bitbin ('177777777777'o)           */
+      258      111        %EQU TIC_FACTOR# = 4;                   /* %OLD_TIC_RATE# / %NEW_TIC_RATE#    */
+      259      112
+      260      113        /*  PARAMETERS      ****************** */
+      261      114
+      262      115    1   DCL UTS1            UBIN;               /* OUTPUT - UTS result value          */
+      263      116    1   DCL UTS2            UBIN;               /* INPUT  - source UTS value          */
+      264      117    1   DCL INTERVAL        SBIN;               /* INPUT  - UTS interval              */
+      265      118
+      266      119        /*  AUTOMATICS      ****************** */
+      267      120
+      268      121    1   DCL TICS            SBIN;               /* interval in 1/25th second tics     */
+      269      122    1   DCL CSECS           SBIN;               /* residual centisecs after TICS      */
+      270      123    1   DCL TO_CUSP         UBIN;               /* interval from UTS2 to cusp         */
+      271      124    1   DCL TEMP            UBIN;               /* unsigned temporary                 */
+      272      125    1   DCL S1              BIT(1);             /* leftmost bit for overflow testing  */
+      273      126    1   DCL SR              BIT(1);             /* leftmost bit of result             */
+      274      127
+      275      128        %EJECT;
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:35   
+      276      129
+      277      130        /*F*  NAME: XUD$UTS_ADJUST */
+      278      131        /*F*  PURPOSE: Compute a new UTS value from a UTS and an interval in csecs */
+      279      132
+      280      133        /*    USAGE:  call XUD$UTS_ADJUST (UTS1, UTS2, INTERVAL); */
+      281      134        /*    OUTPUT: UTS1 */
+      282      135        /*    INPUT:  UTS2, INTERVAL */
+      283      136
+      284      137    1        TICS = INTERVAL / %TIC_FACTOR#;    /* cSEC to tics                       */
+      285      138    1        CSECS = INTERVAL - (TICS * %TIC_FACTOR#); /* remainder                   */
+      286      139    1        GOTO UTS_ADJ_COMMON;
+      287      140
+      288      141
+      289      142        /*F*  NAME: XUD$UTS_ADJ_25TH */
+      290      143        /*F*  PURPOSE: Compute a new UTS value from a UTS and an interval in 1/25 secs */
+      291      144
+      292      145        /*    USAGE:  call XUD$UTS_ADJ_25TH (UTS1, UTS2, INTERVAL); */
+      293      146        /*    OUTPUT: UTS1 */
+      294      147        /*    INPUT:  UTS2, INTERVAL */
+      295      148
+      296      149    1   XUD$UTS_ADJ_25TH: entry (UTS1, UTS2, INTERVAL) altret;
+      297      150
+      298      151    1        TICS = INTERVAL;
+      299      152    1        CSECS = 0;
+      300      153
+      301      154
+      302      155        /*  Common UTS adjustment code.  This section adds an interval to the UTS2
+      303      156            value.  The interval is expressed in 1/25th second tics, with a
+      304      157            residual component expressed in centiseconds.  This avoids the
+      305      158            possibility of a tic interval overflowing when converted to csecs.
+      306      159
+      307      160            There are four cases to consider:  pre-cusp UTS and a positive
+      308      161            interval, pre-cusp UTS and a negative interval, post-cusp UTS and
+      309      162            positive interval, post-cusp UTS and negative interval.
+      310      163
+      311      164            The pre-cusp & positive case must check for crossing the cusp, in
+      312      165            which case the time to the cusp (converted from centiseconds) is
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:36   
+      313      166            subtracted from the interval before being added to the cusp.  It
+      314      167            must also test cusp-crossing intervals for overflow (exceeding the
+      315      168            new end-of-time in 2020).  An overflow occurs if the base UTS has
+      316      169            its leftmost bit set, and the resulting UTS does not.  The interval,
+      317      170            being an SBIN, cannot have its leftmost bit set in a positive interval.
+      318      171
+      319      172            The pre-cusp & negative case must check for a negative result, and
+      320      173            convert the interval in 25ths to centiseconds (with overflow check).
+      321      174
+      322      175            The post-cusp & positive case must check for overflow.  For overflow
+      323      176            checking the base UTS value will always have its leftmost bit set.
+      324      177
+      325      178            The post-cusp & negative case must check for a cusp crossing, and
+      326      179            for a negative result.  Also, if the interval in tics will overflow
+      327      180            when converting to centiseconds, then the result would be negative
+      328      181            (conversion occurs on cusp crossings only).
+      329      182        */
+      330      183
+      331      184    1   UTS_ADJ_COMMON:
+      332      185
+      333      186        /* fix for star #41098, won't work for XUD$UTS_ADJ_25TH (UTS,0,0) */
+      334      187    2        IF (INTERVAL = 0) THEN DO;
+      335      188    2             UTS1 = UTS2;
+      336      189    2        END;
+      337      190    2        ELSE IF (UTS2 >= %UTS_CUSP#) THEN DO; /* base is post-cusp UTS           */
+      338      191    2                  UTS1 = UTS2 + TICS;      /* add interval to base               */
+      339      192    3                  IF (INTERVAL > 0) THEN DO; /* if fwd, check overflow           */
+      340      193    3                       IF (UTS1 <= %MAXINT#) THEN ALTRETURN;
+      341      194    3                  END;
+      342      195
+      343      196        /*  UTS1 cannot be made negative just by adding the negative tics in, as the
+      344      197            cusp value exceeds the maximum SBIN that could be subtracted.  The UTS
+      345      198            must be converted if it is less than the cusp, and this could generate
+      346      199            a negative value, or even overflow when converted to centiseconds.
+      347      200            The conversion computes the difference between the UTS and the cusp, and
+      348      201            multiplies this by the tic conversion factor (4).  The csec remainder
+      349      202            (also negative) is added to the positive temporary value by subtraction.
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:37   
+      350      203            This temporary is subtracted from the cusp to produce the correct UTS.  */
+      351      204
+      352      205    3                  ELSE DO;                 /* reverse, check underflow           */
+      353      206    4                       IF (UTS1 < %UTS_CUSP#) THEN DO;
+      354      207    4                            TEMP = %UTS_CUSP#-UTS1;
+      355      208    4                            IF (TEMP > %HALFMAXINT#) THEN ALTRETURN;
+      356      209    4                            TEMP = TEMP * %TIC_FACTOR# - CSECS;
+      357      210    4                            IF (TEMP > %UTS_CUSP#) THEN ALTRETURN;
+      358      211    4                            UTS1 = %UTS_CUSP# - TEMP;
+      359      212    4                       END;
+      360      213    3                  END;
+      361      214    2             END;
+      362      215
+      363      216    2             ELSE DO;                      /* is pre-cusp UTS                    */
+      364      217    3                  IF (INTERVAL > 0) THEN DO; /* fwd interval                     */
+      365      218    3                       TO_CUSP = %UTS_CUSP# - UTS2; /* csecs to cusp             */
+      366      219    3                       TEMP = TO_CUSP / %TIC_FACTOR#;/* ... in tics              */
+      367      220
+      368      221        /*  Test for crossing the cusp (by at least one tic).  The interval (in tics)
+      369      222            is adjusted for the time to the cusp, and this new interval is added to
+      370      223            the cusp UTS value.  The time to the cusp is measured in centiseconds,
+      371      224            so a remainder could be left after adjusting in tics.  If this remainder
+      372      225            is larger than the centisecond component of the interval, 4 csecs are
+      373      226            "borrowed" from TICs (which is decremented by one) to cover them.  */
+      374      227
+      375      228    4                       IF TEMP < TICS THEN DO; /* crosses cusp?                  */
+      376      229    4                            TICS = TICS - TEMP;
+      377      230    4                            TEMP = TO_CUSP - TEMP * %TIC_FACTOR#;
+      378      231    4                            IF TEMP > CSECS THEN TICS = TICS - 1;
+      379      232    4                            UTS1 = %UTS_CUSP# + TICS;
+      380      233    4                            IF (UTS1 <= %MAXINT#) THEN ALTRETURN;
+      381      234    4                       END;
+      382      235
+      383      236        /*  This case either does not cross the cusp, or crosses by less than a tic
+      384      237            (4 csecs).  No fancy math needed, as no overflow can occur.  Just add the
+      385      238            centiseconds to the old UTS.  We must still check for crossing the cusp
+      386      239            by those 1 to 3 centisecs, and adjust the result if required.  */
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:38   
+      387      240
+      388      241    4                       ELSE DO;
+      389      242    4                            UTS1 = UTS2 + TICS*%TIC_FACTOR# + CSECS;
+      390      243    5                            IF UTS1 > %UTS_CUSP# THEN DO;
+      391      244    5                                 TEMP = UTS1 - %UTS_CUSP#;
+      392      245    5                                 UTS1 = %UTS_CUSP# +
+      393      246    5                                      TEMP / %TIC_FACTOR#;
+      394      247    5                            END;
+      395      248    4                       END;
+      396      249    3                  END;
+      397      250
+      398      251        /*  The pre-cusp UTS, negative interval case only needs to check the csec
+      399      252            conversion for overflow, and the magnitude of the interval for exceeding
+      400      253            the base UTS.  */
+      401      254
+      402      255    3                  ELSE DO;                 /* negative interval                  */
+      403      256    3                       IF UTS2 / %TIC_FACTOR# < -TICS THEN ALTRETURN;
+      404      257    3                       TEMP = -TICS * %TIC_FACTOR# - CSECS;
+      405      258    3                       IF TEMP >= UTS2 THEN ALTRETURN;
+      406      259    3                       UTS1 = UTS2 - TEMP;
+      407      260    3                  END;
+      408      261    2             END;
+      409      262
+      410      263    1        RETURN;
+      411      264
+      412      265    1   END XUD$UTS_ADJUST;
+
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:39   
+--  Include file information  --
+
+   XUD_UTS_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure XUD$UTS_ADJUST.
+
+   Procedure XUD$UTS_ADJUST requires 129 words for executable code.
+   Procedure XUD$UTS_ADJUST requires 14 words of local(AUTO) storage.
+
+    No errors detected in file XUD$UTS.:E05TSI    .
+
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:40   
+
+ Object Unit name= XUD$UTS_ADJUST                             File name= XUD$UTS.:E05TOU
+ UTS= JUL 30 '97 09:11:58.44 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS      1      1  XUD$UTS_ADJUST
+    1   Proc  even  none   129    201  XUD$UTS_ADJUST
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes    yes     yes      Std        3  XUD$UTS_ADJUST
+     1     14          yes     yes      Std        3  XUD$UTS_ADJ_25TH
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+                       nStd      0 X66_AUTO_3
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_AALT
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     B_VECTNIL
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:41   
+
+
+      239        1        /*T***********************************************************/
+      240        2        /*T*                                                         */
+      241        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      242        4        /*T*                                                         */
+      243        5        /*T***********************************************************/
+      244        6
+      245        7        XUD$UTS_ADJUST: PROC (UTS1, UTS2, INTERVAL) ALTRET;
+
+      7  1 000000   000000 700200 xent  XUD$UTS_ADJ* TSX0  ! X66_AUTO_3
+         1 000001   000016 000003                    ZERO    14,3
+
+      246        8
+      247        9        /*  Include Files   ****************** */
+      248       10
+      249       11        %INCLUDE XUD_UTS_M;
+      250       93
+      251       94        %XUD_UTS_EQU;                           /* UTS public EQUs                    */
+      252      105
+      253      106        /*  Internal EQUs   ****************** */
+      254      107        /*      These may be duplicated elsewhere in this module, and must match */
+      255      108
+      256      109        %EQU MAXINT# = 34359738367;             /* bitbin ('377777777777'o)           */
+      257      110        %EQU HALFMAXINT# = 17179869183;         /* bitbin ('177777777777'o)           */
+      258      111        %EQU TIC_FACTOR# = 4;                   /* %OLD_TIC_RATE# / %NEW_TIC_RATE#    */
+      259      112
+      260      113        /*  PARAMETERS      ****************** */
+      261      114
+      262      115    1   DCL UTS1            UBIN;               /* OUTPUT - UTS result value          */
+      263      116    1   DCL UTS2            UBIN;               /* INPUT  - source UTS value          */
+      264      117    1   DCL INTERVAL        SBIN;               /* INPUT  - UTS interval              */
+      265      118
+      266      119        /*  AUTOMATICS      ****************** */
+      267      120
+      268      121    1   DCL TICS            SBIN;               /* interval in 1/25th second tics     */
+      269      122    1   DCL CSECS           SBIN;               /* residual centisecs after TICS      */
+      270      123    1   DCL TO_CUSP         UBIN;               /* interval from UTS2 to cusp         */
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:42   
+      271      124    1   DCL TEMP            UBIN;               /* unsigned temporary                 */
+      272      125    1   DCL S1              BIT(1);             /* leftmost bit for overflow testing  */
+      273      126    1   DCL SR              BIT(1);             /* leftmost bit of result             */
+      274      127
+      275      128        %EJECT;
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:43   
+      276      129
+      277      130        /*F*  NAME: XUD$UTS_ADJUST */
+      278      131        /*F*  PURPOSE: Compute a new UTS value from a UTS and an interval in csecs */
+      279      132
+      280      133        /*    USAGE:  call XUD$UTS_ADJUST (UTS1, UTS2, INTERVAL); */
+      281      134        /*    OUTPUT: UTS1 */
+      282      135        /*    INPUT:  UTS2, INTERVAL */
+      283      136
+      284      137    1        TICS = INTERVAL / %TIC_FACTOR#;    /* cSEC to tics                       */
+
+    137  1 000002   200005 470500                    LDP0    @INTERVAL,,AUTO
+         1 000003   000000 236100                    LDQ     0,,PR0
+         1 000004   000004 506007                    DIV     4,DL
+         1 000005   200006 756100                    STQ     TICS,,AUTO
+
+      285      138    1        CSECS = INTERVAL - (TICS * %TIC_FACTOR#); /* remainder                   */
+
+    138  1 000006   000002 736000                    QLS     2
+         1 000007   000027 676000 xsym               ERQ     B_VECTNIL+23
+         1 000010   000001 036007                    ADLQ    1,DL
+         1 000011   000000 036100                    ADLQ    0,,PR0
+         1 000012   200007 756100                    STQ     CSECS,,AUTO
+
+      286      139    1        GOTO UTS_ADJ_COMMON;
+
+    139  1 000013   000022 710000 1                  TRA     UTS_ADJ_COMMON
+
+      287      140
+      288      141
+      289      142        /*F*  NAME: XUD$UTS_ADJ_25TH */
+      290      143        /*F*  PURPOSE: Compute a new UTS value from a UTS and an interval in 1/25 secs */
+      291      144
+      292      145        /*    USAGE:  call XUD$UTS_ADJ_25TH (UTS1, UTS2, INTERVAL); */
+      293      146        /*    OUTPUT: UTS1 */
+      294      147        /*    INPUT:  UTS2, INTERVAL */
+      295      148
+      296      149    1   XUD$UTS_ADJ_25TH: entry (UTS1, UTS2, INTERVAL) altret;
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:44   
+
+    149  1 000014   000000 700200 xent  XUD$UTS_ADJ* TSX0  ! X66_AUTO_3
+         1 000015   000016 000003                    ZERO    14,3
+
+      297      150
+      298      151    1        TICS = INTERVAL;
+
+    151  1 000016   200005 470500                    LDP0    @INTERVAL,,AUTO
+         1 000017   000000 235100                    LDA     0,,PR0
+         1 000020   200006 755100                    STA     TICS,,AUTO
+
+      299      152    1        CSECS = 0;
+
+    152  1 000021   200007 450100                    STZ     CSECS,,AUTO
+
+      300      153
+      301      154
+      302      155        /*  Common UTS adjustment code.  This section adds an interval to the UTS2
+      303      156            value.  The interval is expressed in 1/25th second tics, with a
+      304      157            residual component expressed in centiseconds.  This avoids the
+      305      158            possibility of a tic interval overflowing when converted to csecs.
+      306      159
+      307      160            There are four cases to consider:  pre-cusp UTS and a positive
+      308      161            interval, pre-cusp UTS and a negative interval, post-cusp UTS and
+      309      162            positive interval, post-cusp UTS and negative interval.
+      310      163
+      311      164            The pre-cusp & positive case must check for crossing the cusp, in
+      312      165            which case the time to the cusp (converted from centiseconds) is
+      313      166            subtracted from the interval before being added to the cusp.  It
+      314      167            must also test cusp-crossing intervals for overflow (exceeding the
+      315      168            new end-of-time in 2020).  An overflow occurs if the base UTS has
+      316      169            its leftmost bit set, and the resulting UTS does not.  The interval,
+      317      170            being an SBIN, cannot have its leftmost bit set in a positive interval.
+      318      171
+      319      172            The pre-cusp & negative case must check for a negative result, and
+      320      173            convert the interval in 25ths to centiseconds (with overflow check).
+      321      174
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:45   
+      322      175            The post-cusp & positive case must check for overflow.  For overflow
+      323      176            checking the base UTS value will always have its leftmost bit set.
+      324      177
+      325      178            The post-cusp & negative case must check for a cusp crossing, and
+      326      179            for a negative result.  Also, if the interval in tics will overflow
+      327      180            when converting to centiseconds, then the result would be negative
+      328      181            (conversion occurs on cusp crossings only).
+      329      182        */
+      330      183
+      331      184    1   UTS_ADJ_COMMON:
+      332      185
+      333      186        /* fix for star #41098, won't work for XUD$UTS_ADJ_25TH (UTS,0,0) */
+      334      187    2        IF (INTERVAL = 0) THEN DO;
+
+    187  1 000022   000000 235100       UTS_ADJ_COM* LDA     0,,PR0
+         1 000023   000031 601000 1                  TNZ     s:190
+
+      335      188    2             UTS1 = UTS2;
+
+    188  1 000024   200004 471500                    LDP1    @UTS2,,AUTO
+         1 000025   200003 473500                    LDP3    @UTS1,,AUTO
+         1 000026   100000 235100                    LDA     0,,PR1
+         1 000027   300000 755100                    STA     0,,PR3
+
+      336      189    2        END;
+
+    189  1 000030   000200 710000 1                  TRA     s:263
+
+      337      190    2        ELSE IF (UTS2 >= %UTS_CUSP#) THEN DO; /* base is post-cusp UTS           */
+
+    190  1 000031   200004 471500                    LDP1    @UTS2,,AUTO
+         1 000032   100000 236100                    LDQ     0,,PR1
+         1 000033   000000 116000 0                  CMPQ    0
+         1 000034   000075 602000 1                  TNC     s:217
+
+      338      191    2                  UTS1 = UTS2 + TICS;      /* add interval to base               */
+
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:46   
+    191  1 000035   200006 036100                    ADLQ    TICS,,AUTO
+         1 000036   200003 473500                    LDP3    @UTS1,,AUTO
+         1 000037   300000 756100                    STQ     0,,PR3
+
+      339      192    3                  IF (INTERVAL > 0) THEN DO; /* if fwd, check overflow           */
+
+    192  1 000040   000000 235100                    LDA     0,,PR0
+         1 000041   000046 604400 1                  TMOZ    s:206
+
+      340      193    3                       IF (UTS1 <= %MAXINT#) THEN ALTRETURN;
+
+    193  1 000042   000031 116000 xsym               CMPQ    B_VECTNIL+25
+         1 000043   000045 600000 1                  TZE     s:193+3
+         1 000044   000200 603000 1                  TRC     s:263
+
+    193  1 000045   000000 702200 xent               TSX2  ! X66_AALT
+
+      341      194    3                  END;
+      342      195
+      343      196        /*  UTS1 cannot be made negative just by adding the negative tics in, as the
+      344      197            cusp value exceeds the maximum SBIN that could be subtracted.  The UTS
+      345      198            must be converted if it is less than the cusp, and this could generate
+      346      199            a negative value, or even overflow when converted to centiseconds.
+      347      200            The conversion computes the difference between the UTS and the cusp, and
+      348      201            multiplies this by the tic conversion factor (4).  The csec remainder
+      349      202            (also negative) is added to the positive temporary value by subtraction.
+      350      203            This temporary is subtracted from the cusp to produce the correct UTS.  */
+      351      204
+      352      205    3                  ELSE DO;                 /* reverse, check underflow           */
+
+      353      206    4                       IF (UTS1 < %UTS_CUSP#) THEN DO;
+
+    206  1 000046   000000 116000 0                  CMPQ    0
+         1 000047   000200 603000 1                  TRC     s:263
+
+      354      207    4                            TEMP = %UTS_CUSP#-UTS1;
+
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:47   
+    207  1 000050   000000 236000 0                  LDQ     0
+         1 000051   300000 136100                    SBLQ    0,,PR3
+         1 000052   200011 756100                    STQ     TEMP,,AUTO
+
+      355      208    4                            IF (TEMP > %HALFMAXINT#) THEN ALTRETURN;
+
+    208  1 000053   200000 116003                    CMPQ    65536,DU
+         1 000054   000056 602000 1                  TNC     s:209
+
+    208  1 000055   000000 702200 xent               TSX2  ! X66_AALT
+
+      356      209    4                            TEMP = TEMP * %TIC_FACTOR# - CSECS;
+
+    209  1 000056   000002 736000                    QLS     2
+         1 000057   000027 676000 xsym               ERQ     B_VECTNIL+23
+         1 000060   000001 036007                    ADLQ    1,DL
+         1 000061   200007 036100                    ADLQ    CSECS,,AUTO
+         1 000062   000027 676000 xsym               ERQ     B_VECTNIL+23
+         1 000063   000001 036007                    ADLQ    1,DL
+         1 000064   200011 756100                    STQ     TEMP,,AUTO
+
+      357      210    4                            IF (TEMP > %UTS_CUSP#) THEN ALTRETURN;
+
+    210  1 000065   000000 116000 0                  CMPQ    0
+         1 000066   000071 602000 1                  TNC     s:211
+         1 000067   000071 600000 1                  TZE     s:211
+
+    210  1 000070   000000 702200 xent               TSX2  ! X66_AALT
+
+      358      211    4                            UTS1 = %UTS_CUSP# - TEMP;
+
+    211  1 000071   000000 236000 0                  LDQ     0
+         1 000072   200011 136100                    SBLQ    TEMP,,AUTO
+         1 000073   300000 756100                    STQ     0,,PR3
+
+      359      212    4                       END;
+
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:48   
+      360      213    3                  END;
+
+      361      214    2             END;
+
+    214  1 000074   000200 710000 1                  TRA     s:263
+
+      362      215
+      363      216    2             ELSE DO;                      /* is pre-cusp UTS                    */
+
+      364      217    3                  IF (INTERVAL > 0) THEN DO; /* fwd interval                     */
+
+    217  1 000075   000000 115003                    CMPA    0,DU
+         1 000076   000153 604400 1                  TMOZ    s:256
+
+      365      218    3                       TO_CUSP = %UTS_CUSP# - UTS2; /* csecs to cusp             */
+
+    218  1 000077   000000 236000 0                  LDQ     0
+         1 000100   100000 136100                    SBLQ    0,,PR1
+         1 000101   200010 756100                    STQ     TO_CUSP,,AUTO
+
+      366      219    3                       TEMP = TO_CUSP / %TIC_FACTOR#;/* ... in tics              */
+
+    219  1 000102   000002 772000                    QRL     2
+         1 000103   200011 756100                    STQ     TEMP,,AUTO
+
+      367      220
+      368      221        /*  Test for crossing the cusp (by at least one tic).  The interval (in tics)
+      369      222            is adjusted for the time to the cusp, and this new interval is added to
+      370      223            the cusp UTS value.  The time to the cusp is measured in centiseconds,
+      371      224            so a remainder could be left after adjusting in tics.  If this remainder
+      372      225            is larger than the centisecond component of the interval, 4 csecs are
+      373      226            "borrowed" from TICs (which is decremented by one) to cover them.  */
+      374      227
+      375      228    4                       IF TEMP < TICS THEN DO; /* crosses cusp?                  */
+
+    228  1 000104   000134 604000 1                  TMI     s:242
+         1 000105   200006 116100                    CMPQ    TICS,,AUTO
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:49   
+         1 000106   000134 605000 1                  TPL     s:242
+
+      376      229    4                            TICS = TICS - TEMP;
+
+    229  1 000107   200006 236100                    LDQ     TICS,,AUTO
+         1 000110   200011 136100                    SBLQ    TEMP,,AUTO
+         1 000111   200006 756100                    STQ     TICS,,AUTO
+
+      377      230    4                            TEMP = TO_CUSP - TEMP * %TIC_FACTOR#;
+
+    230  1 000112   000000 236003                    LDQ     0,DU
+         1 000113   200011 136100                    SBLQ    TEMP,,AUTO
+         1 000114   000002 736000                    QLS     2
+         1 000115   200010 036100                    ADLQ    TO_CUSP,,AUTO
+         1 000116   200011 756100                    STQ     TEMP,,AUTO
+
+      378      231    4                            IF TEMP > CSECS THEN TICS = TICS - 1;
+
+    231  1 000117   000122 604000 1                  TMI     s:231+3
+         1 000120   200007 116100                    CMPQ    CSECS,,AUTO
+         1 000121   000124 604400 1                  TMOZ    s:232
+
+    231  1 000122   000001 336007                    LCQ     1,DL
+         1 000123   200006 056100                    ASQ     TICS,,AUTO
+
+      379      232    4                            UTS1 = %UTS_CUSP# + TICS;
+
+    232  1 000124   200006 236100                    LDQ     TICS,,AUTO
+         1 000125   000000 036000 0                  ADLQ    0
+         1 000126   200003 473500                    LDP3    @UTS1,,AUTO
+         1 000127   300000 756100                    STQ     0,,PR3
+
+      380      233    4                            IF (UTS1 <= %MAXINT#) THEN ALTRETURN;
+
+    233  1 000130   000031 116000 xsym               CMPQ    B_VECTNIL+25
+         1 000131   000133 600000 1                  TZE     s:233+3
+         1 000132   000200 603000 1                  TRC     s:263
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:50   
+
+    233  1 000133   000000 702200 xent               TSX2  ! X66_AALT
+
+      381      234    4                       END;
+      382      235
+      383      236        /*  This case either does not cross the cusp, or crosses by less than a tic
+      384      237            (4 csecs).  No fancy math needed, as no overflow can occur.  Just add the
+      385      238            centiseconds to the old UTS.  We must still check for crossing the cusp
+      386      239            by those 1 to 3 centisecs, and adjust the result if required.  */
+      387      240
+      388      241    4                       ELSE DO;
+
+      389      242    4                            UTS1 = UTS2 + TICS*%TIC_FACTOR# + CSECS;
+
+    242  1 000134   200006 236100                    LDQ     TICS,,AUTO
+         1 000135   000002 736000                    QLS     2
+         1 000136   100000 036100                    ADLQ    0,,PR1
+         1 000137   200007 036100                    ADLQ    CSECS,,AUTO
+         1 000140   200003 473500                    LDP3    @UTS1,,AUTO
+         1 000141   300000 756100                    STQ     0,,PR3
+
+      390      243    5                            IF UTS1 > %UTS_CUSP# THEN DO;
+
+    243  1 000142   000000 116000 0                  CMPQ    0
+         1 000143   000200 602000 1                  TNC     s:263
+         1 000144   000200 600000 1                  TZE     s:263
+
+      391      244    5                                 TEMP = UTS1 - %UTS_CUSP#;
+
+    244  1 000145   000000 136000 0                  SBLQ    0
+         1 000146   200011 756100                    STQ     TEMP,,AUTO
+
+      392      245    5                                 UTS1 = %UTS_CUSP# +
+
+    245  1 000147   000002 772000                    QRL     2
+         1 000150   000000 036000 0                  ADLQ    0
+         1 000151   300000 756100                    STQ     0,,PR3
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:51   
+
+      393      246    5                                      TEMP / %TIC_FACTOR#;
+      394      247    5                            END;
+
+      395      248    4                       END;
+
+      396      249    3                  END;
+
+    249  1 000152   000200 710000 1                  TRA     s:263
+
+      397      250
+      398      251        /*  The pre-cusp UTS, negative interval case only needs to check the csec
+      399      252            conversion for overflow, and the magnitude of the interval for exceeding
+      400      253            the base UTS.  */
+      401      254
+      402      255    3                  ELSE DO;                 /* negative interval                  */
+
+      403      256    3                       IF UTS2 / %TIC_FACTOR# < -TICS THEN ALTRETURN;
+
+    256  1 000153   000002 772000                    QRL     2
+         1 000154   200006 335100                    LCA     TICS,,AUTO
+         1 000155   200014 755100                    STA     TEMP+3,,AUTO
+         1 000156   000000 116003                    CMPQ    0,DU
+         1 000157   000163 604000 1                  TMI     s:257
+         1 000160   200014 116100                    CMPQ    TEMP+3,,AUTO
+         1 000161   000163 605000 1                  TPL     s:257
+
+    256  1 000162   000000 702200 xent               TSX2  ! X66_AALT
+
+      404      257    3                       TEMP = -TICS * %TIC_FACTOR# - CSECS;
+
+    257  1 000163   200006 236100                    LDQ     TICS,,AUTO
+         1 000164   000002 736000                    QLS     2
+         1 000165   200007 036100                    ADLQ    CSECS,,AUTO
+         1 000166   000027 676000 xsym               ERQ     B_VECTNIL+23
+         1 000167   000001 036007                    ADLQ    1,DL
+         1 000170   200011 756100                    STQ     TEMP,,AUTO
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:52   
+
+      405      258    3                       IF TEMP >= UTS2 THEN ALTRETURN;
+
+    258  1 000171   100000 116100                    CMPQ    0,,PR1
+         1 000172   000174 602000 1                  TNC     s:259
+
+    258  1 000173   000000 702200 xent               TSX2  ! X66_AALT
+
+      406      259    3                       UTS1 = UTS2 - TEMP;
+
+    259  1 000174   100000 236100                    LDQ     0,,PR1
+         1 000175   200011 136100                    SBLQ    TEMP,,AUTO
+         1 000176   200003 473500                    LDP3    @UTS1,,AUTO
+         1 000177   300000 756100                    STQ     0,,PR3
+
+      407      260    3                  END;
+
+      408      261    2             END;
+
+      409      262
+      410      263    1        RETURN;
+
+    263  1 000200   000000 702200 xent               TSX2  ! X66_ARET
+
+(unnamed)
+ Sect OctLoc
+   0     000   540546 215000                                                    ....
+      411      264
+      412      265    1   END XUD$UTS_ADJUST;
+
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:53   
+--  Include file information  --
+
+   XUD_UTS_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure XUD$UTS_ADJUST.
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:54   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     5-0-0/w PTR         r     1 @INTERVAL                  3-0-0/w PTR         r     1 @UTS1
+     4-0-0/w PTR         r     1 @UTS2                      7-0-0/w SBIN        r     1 CSECS
+    *0-0-0/w SBIN        r     1 INTERVAL                  11-0-0/w UBIN        r     1 TEMP
+     6-0-0/w SBIN        r     1 TICS                      10-0-0/w UBIN        r     1 TO_CUSP
+    *0-0-0/w UBIN        r     1 UTS1                      *0-0-0/w UBIN        r     1 UTS2
+
+
+   Procedure XUD$UTS_ADJUST requires 129 words for executable code.
+   Procedure XUD$UTS_ADJUST requires 14 words of local(AUTO) storage.
+
+    No errors detected in file XUD$UTS.:E05TSI    .
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:55   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=XUD$UTS_ADJUST File=XUD$UTS.:E05TSI                           WED 07/30/97 09:11 Page:56   
+          MINI XREF LISTING
+
+CSECS
+       122**DCL       138<<ASSIGN    152<<ASSIGN    209>>ASSIGN    231>>IF        242>>ASSIGN    257>>ASSIGN
+INTERVAL
+       117**DCL         7--PROC      137>>ASSIGN    138>>ASSIGN    149--ENTRY     151>>ASSIGN    187>>IF
+       192>>IF        217>>IF
+TEMP
+       124**DCL       207<<ASSIGN    208>>IF        209<<ASSIGN    209>>ASSIGN    210>>IF        211>>ASSIGN
+       219<<ASSIGN    228>>IF        229>>ASSIGN    230<<ASSIGN    230>>ASSIGN    231>>IF        244<<ASSIGN
+       245>>ASSIGN    257<<ASSIGN    258>>IF        259>>ASSIGN
+TICS
+       121**DCL       137<<ASSIGN    138>>ASSIGN    151<<ASSIGN    191>>ASSIGN    228>>IF        229<<ASSIGN
+       229>>ASSIGN    231<<ASSIGN    231>>ASSIGN    232>>ASSIGN    242>>ASSIGN    256>>IF        257>>ASSIGN
+TO_CUSP
+       123**DCL       218<<ASSIGN    219>>ASSIGN    230>>ASSIGN
+UTS1
+       115**DCL         7--PROC      149--ENTRY     188<<ASSIGN    191<<ASSIGN    193>>IF        206>>IF
+       207>>ASSIGN    211<<ASSIGN    232<<ASSIGN    233>>IF        242<<ASSIGN    243>>IF        244>>ASSIGN
+       245<<ASSIGN    259<<ASSIGN
+UTS2
+       116**DCL         7--PROC      149--ENTRY     188>>ASSIGN    190>>IF        191>>ASSIGN    218>>ASSIGN
+       242>>ASSIGN    256>>IF        258>>IF        259>>ASSIGN
+UTS_ADJ_COMMON
+       187**LABEL     139--GOTO

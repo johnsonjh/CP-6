@@ -1,0 +1,3235 @@
+/*M* FILER_SI0 */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* THI=1,PLM=3,IND=3 */
+/*********************************************************************/
+ 
+/**
+***   FILER   14 SEP 77   (PRY)   MAIN PROCEDURE OF FILER PROGRAM.
+**/
+ 
+FILER: PROC MAIN;
+%LIST;
+%INCLUDE FILER_II0;
+%INCLUDE FILER_II1;
+%INCLUDE FILER_II2;
+%INCLUDE FILER_II3;
+%INCLUDE FILER_II4;
+%INCLUDE FILER_II5;
+%PLIST;
+%INCLUDE CP_6;
+   %B$TCB;
+   %B$ALT;
+   %F$DCB(DCBN=F$DCB);
+%INCLUDE B_ERRORS_C;
+%INCLUDE U$JIT_C;
+DCL   B$JIT$            PTR       SYMREF;
+DCL B$TCB$ PTR SYMREF;
+DCL THEERRCODE SBIN AUTO  ;
+/********************
+***   USER DCBS:
+**/
+DCL   M$SI              DCB;
+DCL   M$FI              DCB;
+DCL   M$F1              DCB;
+DCL   M$F2              DCB;
+DCL   M$F3              DCB;
+DCL M$LO DCB;
+%M$DCB( DCBN=F$HELP,ASN=FILE,FUN=IN,ORG=KEYED,ACS=DIRECT,NAME='FILER',
+        ACCT='X       ' );
+ 
+/********************
+***   LOCALS:
+**/
+%FPT_OPEN( FPTN=HELPOPEN,FUN=IN,DCB=F$HELP,ACCT=HELPBUF );
+%FPT_CLOSE( FPTN=HELPCLOSE,DCB=F$HELP,DISP=SAVE );
+%FPT_READ( FPTN=HELPREAD,DCB=F$HELP,BUF=HELPBUF,KEY=HELPKEY,KEYS=YES,KEYR=YES );
+%FPT_CLOSE ( FPTN=CLS_FI_FPT, DCB=M$FI, DISP=SAVE );
+%FPT_CLOSE(FPTN=CLS_LO,DISP=SAVE,DCB=M$LO);
+DCL 1 HELPKEY STATIC,
+      2 L UBIN BYTE UNAL,
+      2 U27 UBIN(27) UNAL,
+      2 C28 CHAR(28) UNAL;
+DCL HELPBUF CHAR(140) STATIC;
+DCL PMME_IX SBIN WORD ALIGNED AUTO  ;   /* Index of PMME                      */
+DCL   NEW_CMND_BUF$     PTR       ALIGNED   AUTO  ;
+                                   /* SAVES PTR TO NEWEST COMMAND BUFFER DESC */
+DCL   EXECUTING_CMND    SBIN WORD ALIGNED   STATIC   SYMDEF;
+                                        /* CONTROLS COMMAND EXECUTION LOOP    */
+DCL   CMND_LEN          SBIN WORD ALIGNED   AUTO  ;
+                                        /* LENGTH OF CURRENT COMMAND          */
+DCL   BID               SBIN WORD ALIGNED   AUTO  ;
+                                        /* BUFFER ID                          */
+DCL   FPTPTR_TBL$       PTR       ALIGNED   AUTO  ;
+                                        /* CURRENT FPT POINTER                */
+DCL 1 EXEC_STACK(0:50) ALIGNED AUTO  ,
+                                        /* EXECUTION CONTROL STACK            */
+      2 CHARX SBIN WORD ALIGNED,        /* SAVED CHARX                        */
+      2 CR_CHARX SBIN WORD ALIGNED,
+                                        /* SAVED POSITION OF LAST CR          */
+      2 CR_COUNT SBIN WORD ALIGNED,     /* SAVED COUNT OF CR'S                */
+      2 CHARX_MAX SBIN WORD ALIGNED,    /* SAVED MAXIMUM CHARX                */
+      2 STRING$ PTR ALIGNED;            /* SAVED STRING$                      */
+DCL   EXEC_STACK_IX     SBIN WORD ALIGNED   AUTO  ;
+                                        /* INDEX INTO EXEC STACK              */
+DCL   EXEC_STACK_IX_MAX SBIN WORD ALIGNED   CONSTANT  INIT(50);
+                                        /* MAX INDEX                          */
+DCL   UBIN6#       UBIN(6)        UNAL      BASED;
+                                        /* FOR SIX-BIT ERROR CODE             */
+DCL   DFLT_DCB_NUM      SBIN WORD ALIGNED   AUTO  ;
+                                        /* TO BE USED WHEN NONE IS SPECIFIED  */
+DCL ERRBUFFER CHAR(140) STATIC;         /* For M$ERRMSG                       */
+DCL 1 ERRCODE STATIC,
+      2 FCG BIT(12) UNAL,
+      2 MID BIT(6) UNAL,
+      2 MON BIT(1) UNAL,
+      2 CODE UBIN(14) UNAL,
+      2 SEV UBIN(3) UNAL;
+%FPT_ERRMSG(FPTN=ERRMSGFPT,OUTDCB1=M$LO,BUF=ERRBUFFER,CODE=ERRCODE);
+ 
+/********************
+***   INITIALIZATION:
+**/
+   VAL_FAULT = 0;                       /* NO ERRORS DETECTED                 */
+   CALL UT_INIT_ALL;                    /* INITIALIZE BLOCK SPACE, ETC.       */
+   IF VAL_FAULT ~= 0                    /* PROBLEMS?                          */
+    THEN DO;
+      CHARX = -1;
+      CALL UT_REPORT_VAL_FAULT;         /* TELL ERROR TO USER                 */
+      RETURN;
+      END;
+/**
+***   ALLOCATE BUFFER J AS THE JIT.  DEFAULT DCB IS 1.
+**/
+   BRK_FLAG = 0;                        /* ALLOW OUTPUT                       */
+   TPTR1$ = PINCRW( STRT_BUF_DESC$, (CT_J-CT_A)*BUF_DESC_SIZE );
+                                        /* CALC POINTER TO J                  */
+   TPTR1$ -> BUF.TYPE  = BT_MAPPED;     /* POINT IT TO THE JIT                */
+   TPTR1$ -> BUF.BLK$  = B$JIT$;
+   TPTR1$ -> BUF.WIDTH = LENGTHB( B$JIT$ -> B$JIT );
+   OUT_CHARX           = 0;             /* INITIALIZE OUTPUT CHAR COUNT       */
+   DFLT_DCB_NUM       = DCBNUM( M$F1 ); /* SET DEFAULT DCB NUMBER             */
+/**
+***   ALLOCATE BUFFER E AS ERASE, N AS NIL.
+**/
+   TPTR1$ = PINCRW( STRT_BUF_DESC$, (CT_E-CT_A)*BUF_DESC_SIZE );
+                                        /* CALC POINTER TO E                  */
+   FPT_RESULTSV      = VECTOR( ERASE ); /* GET AN ERASE VECTOR                */
+   TPTR1$ -> BUF.TYPE    = BT_MAPPED;   /* ERASE IS MAPPED                    */
+   TPTR1$ -> BUF.WIDTH   = (FPT_RESULTS.BOUND + 1) * 9;
+                                        /* CALC SIZE IN BITS FROM BOUND       */
+   TPTR1$ -> BUF.BLK$    = FPT_RESULTS.DATA$;
+                                        /* SET DATA POINTER                   */
+   TPTR1$ = PINCRW( STRT_BUF_DESC$, (CT_N-CT_A)*BUF_DESC_SIZE );
+                                        /* CALC POINTER TO N                  */
+   FPT_RESULTSV        = VECTOR( NIL ); /* GET A NIL VECTOR                   */
+   TPTR1$ -> BUF.TYPE    = BT_MAPPED;   /* NIL IS MAPPED                      */
+   TPTR1$ -> BUF.WIDTH   = (FPT_RESULTS.BOUND + 1) * 9;
+                                        /* CALC SIZE IN BITS FROM BOUND       */
+   TPTR1$ -> BUF.BLK$    = FPT_RESULTS.DATA$;
+                                        /* SET DATA POINTER                   */
+   USER_WANTS_FILER_TO_RUN = 1;
+   FILE_STK_IX = -1;                    /* RESET FILE STACK POINTER - EMPTY   */
+ 
+/********************
+***   MAIN EXECUTION LOOP.
+**/
+   DO WHILE (USER_WANTS_FILER_TO_RUN = 1);
+      VAL_FAULT = 0;                    /* ASSUME NO ERRORS                   */
+      CHARX     = -1;                   /* NO COMMAND ERRORS                  */
+      CMND_LEN  = 0;                    /* NO COMMAND                         */
+         /**
+         *** GET THE NEXT COMMAND STRING.
+         **/
+      DO WHILE (CMND_LEN <= 0);         /* MAKE SURE WE GET SOMETHING         */
+         CALL UT_GET_CMND( NEW_CMND_BUF$, CMND_LEN, 0 );
+                                        /* GET A COMMAND                      */
+         IF VAL_FAULT ~= 0              /* PROBLEMS?                          */
+          THEN DO;
+            CALL UT_REPORT_VAL_FAULT;   /* TELL USER                          */
+            RETURN;
+            END;
+         CHARX     = 0;
+                                   /* START COMMAND DECODING WITH FIRST BYTE  */
+         CHARX_MAX = CMND_LEN - 1;
+         CR_COUNT  = 0;                 /* INITIALIZE CR COUNT                */
+         CR_CHARX  = 0;                 /* INITIALIZE POSITION OF LAST CR     */
+         STRING$   = NEW_CMND_BUF$;
+                                   /* MAKE THE NEW COMMAND BUFFER CURRENT     */
+         CALL UT_IGNORE_BLANKS;
+                                        /* FIND THE FIRST "REAL" CHAR         */
+         IF CHARX > CHARX_MAX THEN CMND_LEN = 0;
+                                   /* CHECK IF ALL BLANKS OR NOTHING INPUT    */
+         IF CMND_LEN <= 0 THEN CALL UT_DEALLOC_BUF( NEW_CMND_BUF$ );
+                                        /* GET RID OF DESCRIPTOR AND BUFFER   */
+         END;
+         /**
+         ***   INITIALIZE FOR COMMAND EXECUTION.
+         **/
+      BRK_FLAG  = 0;                    /* RESET BREAK FLAG                   */
+      NOT_X_ONLY    = 0;                /* ASSUME ONLY X MODIFIED             */
+      EXEC_STACK_IX = -1;               /* INITIALIZE STACK INDEX             */
+      CALL UT_PUSH_EXEC_STACK( STRING$, CHARX, CHARX_MAX, CR_CHARX, CR_COUNT );
+                                        /* PUSH INITIAL COMMAND ON STACK      */
+         /**
+         ***   EXECUTE COMMANDS WHILE: (1) NO ERRORS OCCURRED,
+         ***   (2) THE USER WANTS FILER TO RUN, AND (3) THE
+         ***   EXECUTION STACK HAS SOMETHING TO EXECUTE.
+         **/
+      DO WHILE (EXEC_STACK_IX >= 0  AND  VAL_FAULT = 0
+        AND  USER_WANTS_FILER_TO_RUN = 1);
+              /**
+              ***   POP THE EXECUTION STACK FOR THE NEXT COMMAND TO EXECUTE.
+              **/
+         STRING$       = EXEC_STACK.STRING$(EXEC_STACK_IX);
+                                        /* POP EXEC STACK                     */
+         CHARX         = EXEC_STACK.CHARX(EXEC_STACK_IX);
+         CHARX_MAX     = EXEC_STACK.CHARX_MAX(EXEC_STACK_IX);
+         CR_COUNT      = EXEC_STACK.CR_COUNT(EXEC_STACK_IX);
+         CR_CHARX      = EXEC_STACK.CR_CHARX(EXEC_STACK_IX);
+         EXEC_STACK_IX = EXEC_STACK_IX - 1;
+         PREV_C         = 0;            /* INITIALIZE PREVIOUS CHAR           */
+         CALL UT_IGNORE_BLANKS;
+ 
+              /**
+              ***   EXECUTE THE COMMAND STRING.
+              **/
+         EXECUTING_CMND = 1;
+         DO WHILE (EXECUTING_CMND = 1  AND  CHARX <= CHARX_MAX);
+            CALL UT_FLUSH_BUF;          /* FLUSH THE OUTPUT BUFFER            */
+            PSBL_ERR_IX   = 0;
+                                        /* GET READY TO SAVE POSSIBLE ERRORS  */
+            NBR_PSBL_ERRS = 0;
+            IF C = CT_B                 /* B - BASE CMND                      */
+             THEN CALL XQC_BASE;
+             ELSE
+               IF C = CT_M              /* M - MONITOR CALL CMND              */
+                THEN CALL XQC_MON_CALL;
+                ELSE
+                  IF C = CT_Z           /* Z - Z-REGISTER CMND                */
+                   THEN CALL XQC_Z_REGISTER;
+                   ELSE
+                     IF C = CT_A        /* A - ALLOCATE CMND                  */
+                      THEN CALL XQC_ALLOCATE;
+                      ELSE
+                        IF C = CT_S     /* S - SET BUFFER CMND                */
+                         THEN CALL XQC_BUF_MODIFICATION;
+                         ELSE
+                           IF C = CT_D  /* D - DISPLAY CMND                   */
+                            THEN CALL XQC_DISPLAY;
+                            ELSE
+                              IF C = CT_E /* E - EDIT CMND                    */
+                               THEN CALL XQC_EDIT;
+                               ELSE
+                                 IF C = CT_U /* U - UNDERTAKE CMND            */
+                                  THEN CALL XQC_UNDERTAKE;
+                                  ELSE
+                                    IF C = CT_G /* G - GOTO MND               */
+                                     THEN CALL XQC_GOTO;
+                                     ELSE
+                                       IF C = CT_L /* L - SET LINE WIDTH      */
+                                        THEN CALL XQC_LINE_WIDTH;
+                                        ELSE
+                                          IF C = CT_F /* F - IF CMND          */
+                                           THEN CALL XQC_IF;
+                                           ELSE
+                                             IF C = CT_R /* R - READ FILE CMND */
+                                              THEN CALL XQC_READ_FILE;
+                                              ELSE
+                                                IF C = CT_SLASH /*  / - COMMENT CMND */
+                                                 THEN CALL XQC_COMMENT;
+                                                 ELSE
+                                                   IF C = CT_EXCLAMATION /* ! - SPECIAL COMMANDS */
+                                                    THEN CALL XQC_SPECIAL_COMMANDS;
+                                                    ELSE
+                                                      IF C = CT_SEMI_COLON /* IGNORE DOUBLE SEMICOLON */
+                                                       THEN C = C; /* DO NOTHING */
+                                                       ELSE
+                                                         IF C = CT_QUESTION OR C = CT_H /* H - HELP CMND */
+                                                          THEN CALL XQC_HELP;
+                                                          ELSE
+                                                            IF C = CT_X /* X - EXIT CMND */
+                                                              OR C = CT_Q /* Q - QUIT CMND */
+                                                             THEN DO;
+                                                               CALL UT_INC_CHARX; /* SKIP OVER X */
+                                                               CALL UT_JUNK_CHK;
+                                        /* MAKE SURE COMMAND IS LEGAL         */
+                                                               IF VAL_FAULT = 0 /* LEGAL? */
+                                                                THEN DO; /* YES: STOP EXECUTION */
+                                                                  USER_WANTS_FILER_TO_RUN = 0;
+                                                                  EXECUTING_CMND          = 0;
+                                        /* BYE                                */
+                                                                  END;
+                                                               END;
+                                                             ELSE CALL XQC_HEADS_OR_TAILS;
+                   /**
+                   ***   IF USER SET THE ABORT SWITCH BIT, FAULT.
+                   **/
+            IF ZY$ -> BT36# & '000000000004'O
+                                        /* ABORT SWITCH IN ZY SET?            */
+             THEN DO;                   /* YES                                */
+               ZY$ -> BT36# = ZY$ -> BT36# & '777777777773'O;
+                                        /* CLEAR THE BIT                      */
+               VAL_FAULT = 82;
+                              /*E* 82V FILER: USER ASKED TO ABORT EXECUTION   */
+               END;
+                   /**
+                   ***   IF USER HIT BREAK, FAULT.
+                   **/
+            IF BRK_FLAG ~= 0            /* BREAK KEY HIT?                     */
+             THEN DO;
+               BRK_FLAG = 0;            /* RESET TO PERMIT OUTPUT             */
+               VAL_FAULT = 81;
+                             /*E* 81V FILER: USER HIT THE BREAK KEY           */
+               END;
+                   /**
+                   ***   IF A FAULT OCCURRED, DISCONTINUE EXECUTION.
+                   ***   OTHERWISE, SKIP OVER THE SEMI-COLON.
+                   **/
+ 
+            IF VAL_FAULT ~= 0           /* PROBLEMS?                          */
+             THEN EXECUTING_CMND = 0;
+                                        /* YES: QUIT EXECUTION                */
+             ELSE DO;                   /* NO: FIND THE NEXT COMMAND          */
+               CALL UT_IGNORE_BLANKS;
+               IF CHARX <= CHARX_MAX  AND  C = CT_SEMI_COLON
+                                        /* IF SEMI COLON,                     */
+                THEN DO;
+                  CALL UT_INC_CHARX;
+                                        /* SKIP OVER IT                       */
+                  CALL UT_IGNORE_BLANKS;
+                  END;
+               END;
+            END;
+         STRING$ -> BUF.LOCK = STRING$ -> BUF.LOCK - 1;
+                                        /* UNLOCK CURRENTLY EXECUTING BUFFER  */
+         END;
+      CALL UT_FLUSH_BUF;                /* FLUSH THE OUTPUT BUFFER            */
+         /**
+         ***   IF EXECUTION STOPPED, GIVE ERROR MESSAGE IF
+         ***   CAUSED BY A VALUE FAULT.
+         **/
+      IF VAL_FAULT ~= 0 THEN CALL UT_REPORT_VAL_FAULT;
+      IF (VAL_FAULT ~= 0  OR  USER_WANTS_FILER_TO_RUN = 0)
+        AND  READ_FILE = 1              /* NEED TO CLOSE FILE?                */
+       THEN DO;                         /* YES                                */
+         READ_FILE = 0;                 /* READ NEXT COMMAND FROM UC          */
+         FILE_STK_IX = -1;              /* RESET FILE STACK POINTER - EMPTY   */
+         CALL M$CLOSE( CLS_FI_FPT ) ALTRET ( F_CLS_FI_ALTRET );
+         END;
+F_CLS_FI_ALTRET:
+      CALL UT_REPORT_PSBL_ERR;          /* REPORT ANY POSSIBLE ERRORS         */
+      IF VAL_FAULT ~= 0 AND ECHO = 1
+       THEN CALL M$XXX;
+                                        /* No more execution if batch or XEQ  */
+         /**
+         ***   UNLOCK ALL STACKED BUFFERS.
+         **/
+         DO WHILE (EXEC_STACK_IX >= 0);
+            TPTR1$ = EXEC_STACK.STRING$(EXEC_STACK_IX);
+                                        /* GET POINTER TO BUFFER DESCRIPTOR   */
+            TPTR1$ -> BUF.LOCK = 0;
+            EXEC_STACK_IX = EXEC_STACK_IX - 1;
+            END;
+         /**
+         ***   SAVE THE LAST COMMAND STRING TYPED IF NECESSARY.
+         **/
+      IF NOT_X_ONLY = 1
+                         /* MAKE NEW COMMAND CURRENT IF ONLY X BUF MODIFIED   */
+       THEN DO;
+         IF X_CMND_BUF$ -> BUF.TYPE ~= BT_UNUSED
+          THEN CALL UT_DEALLOC_BUF( X_CMND_BUF$ );
+                                   /* DEALLOCATE DESCRIPTOR AND FREE BLOCK    */
+         TEMP1                     = NEW_CMND_BUF$ -> BUF.IX;
+                                        /* GET BLOCK IX                       */
+         X_CMND_BUF$ -> BUF.IX     = TEMP1;
+                                        /* SET BLOCK IX                       */
+         X_CMND_BUF$   -> BUF.BLK$ = NEW_CMND_BUF$ -> BUF.BLK$;
+                                        /* SET DATA POINTER                   */
+         X_CMND_BUF$ -> BUF.WIDTH  = NEW_CMND_BUF$ -> BUF.WIDTH;
+                                        /* TRANSFER BUFFER WIDTH              */
+         X_CMND_BUF$   -> BUF.TYPE = BT_CMND_BUF;
+                                        /* TYPE IS COMMAND BUFFER             */
+         BID                       = X_CMND_BUF$ -> BUF.ID;
+                                        /* GET ITS ID                         */
+         TPTR1$            = PINCRW( DATA_BASE$, TEMP1 );
+                                   /* POINT TO NEW COMMAND BUFFER'S HEADER    */
+         TPTR1$ -> BLK.ID          = BID;
+                                        /* SET ID IN HEADER                   */
+         TPTR1$                    = PINCRW( TPTR1$, TPTR1$ -> BLK.SIZE - 2 );
+                                        /* POINT TO FOOTER                    */
+         TPTR1$ -> BLK_FTR.ID      = BID;
+                                        /* SET ID IN FOOTER                   */
+         NEW_CMND_BUF$ -> BUF.TYPE = BT_UNUSED;
+                                        /* RELEASE DESCRIPTOR                 */
+         END;
+       ELSE CALL UT_DEALLOC_BUF( NEW_CMND_BUF$ );
+                                        /* GET RID OF NEW COMMAND BUFFER      */
+      END;
+ 
+   IF DCBADDR(DCBNUM(M$LO))->F$DCB.FCD#
+    THEN CALL M$CLOSE(CLS_LO);
+   CALL M$EXIT;
+ 
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**
+***   XQC_BASE   14 SEP 77   (PRY)   EXECUTE THE BASE COMMAND.
+**/
+ 
+XQC_BASE: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   NEW_BASE  SBIN WORD ALIGNED AUTO; /* SPECIFIED BASE                     */
+DCL   VAL$              PTR       ALIGNED   AUTO;
+                                        /* POINTER TO VALUE TO DISPLAY        */
+ 
+/********************
+***   WE'VE ALREADY SEEN THE 'B'.  SKIP OVER IT AND GET THE VALUE.
+***   IF NO VALUE IS SPECIFIED, DISPLAY THE CURRENT BASE.
+**/
+   CALL UT_INC_IGNORE;                  /* SKIP OVER THE 'B'                  */
+   IF (C = CT_SEMI_COLON  AND  CHARX <= CHARX_MAX)
+                                        /* END OF COMMAND?                    */
+     OR  CHARX > CHARX_MAX
+    THEN DO;                            /* DISPLAY THE CURRENT BASE           */
+      CALL UT_OUTPUT_CHARS( 'B', 1 );
+      VAL$ = ADDR(DFLT_BASE);
+                                   /* POINT TO WORD TO CONVERT TO DECIMAL     */
+      CALL UT_DISPLAY( VAL$, 36, -DT_DECIMAL );
+      RETURN;
+      END;
+   CALL UT_SBIN_VALUE( NEW_BASE );      /* GET THE NEW BASE                   */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERRORS                   */
+   CALL UT_JUNK_CHK;                    /* CHECK FOR ILLEGAL JUNK             */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF JUNK                     */
+/********************
+***   FIND THE SPECIFIED VALUE IN THE
+***   LEGAL BASE TABLE.
+**/
+   DO TIX1=0 TO MAX_BASE_IX;
+      IF BASE(TIX1) = NEW_BASE          /* BASE IN THE TABLE?                 */
+       THEN DO;                         /* YES                                */
+         DFLT_BASE       = NEW_BASE;    /* SET THE NEW BASE                   */
+         DFLT_BASE_WIDTH = BASE_WIDTH(TIX1);
+                                        /* AND THE NEW BASE WIDTH             */
+         RETURN;
+         END;
+      END;
+/**
+***   COULDN'T FIND THE SPECIFIED VALUE IN THE BASE TABLE.
+**/
+   VAL_FAULT = 32;      /*E* 32V XQC_BASE: THAT'S NOT A VALID BASE      */
+   RETURN;
+ 
+END XQC_BASE;
+ 
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**
+***   XQC_LINE_WIDTH   16 NOV 77   (PRY)   SET THE LINE WIDTH
+***   AND MODE.
+**/
+ 
+XQC_LINE_WIDTH: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL NEW_LINE_WID SBIN WORD ALIGNED AUTO; /* POSSIBLE NEW LINE WIDTH           */
+DCL   LINE_WID$       PTR ALIGNED AUTO; /* POINTER TO LINE WIDTH              */
+ 
+/********************
+***   SKIP OVER THE 'L'.  IF A VALUE IS PRESENT, MAKE IT THE
+***   NEW LINE WIDTH.  IF NOT, PRINT THE OLD LINE WIDTH.
+**/
+   CALL UT_INC_IGNORE;                  /* SKIP OVER THE 'L'                  */
+   IF C = CT_SEMI_COLON  OR  CHARX > CHARX_MAX
+                              /* IF NO VALUE, PRINT THE CURRENT LINE WIDTH    */
+    THEN DO;
+      LINE_WID$ = ADDR( LINE_WID );     /* DISPLAY THE LINE WIDTH             */
+      CALL UT_OUTPUT_CHARS( 'L', 1 );
+      CALL UT_DISPLAY( LINE_WID$, 36, -DT_DECIMAL );
+      IF UPSHIFT_FLAG ~= 0              /* DISPLAY SHIFT STATUS               */
+       THEN CALL UT_OUTPUT_CHARS( ';LU', 3 );
+       ELSE CALL UT_OUTPUT_CHARS( ';LN', 3 );
+      IF ECHO_XEQ_FLAG ~= 0
+       THEN CALL UT_OUTPUT_CHARS( ';LE', 3 );
+       ELSE CALL UT_OUTPUT_CHARS( ';LX', 3 );
+      RETURN;
+      END;
+ 
+/********************
+***   IF 'U' OR 'N' FOLLOWS, CHANGE SHIFT STATUS.
+**/
+   IF C >= CT_A  AND  C <= CT_Z         /* ALPHA CHAR--LINE MODIFIER          */
+    THEN DO;                            /* YES--CHANGE SOME MODE              */
+      NEW_LINE_WID = C;                 /* SAVE THE CURRENT CHAR              */
+      CALL UT_INC_CHARX;                /* SKIP OVER MODE CHAR                */
+      CALL UT_JUNK_CHK;                 /* CHECK IF ILLEGAL JUNK FOLLOWS      */
+      IF VAL_FAULT ~= 0 THEN RETURN;    /* RETURN IF ERROR                    */
+      IF NEW_LINE_WID = CT_U THEN UPSHIFT_FLAG = 1;
+       ELSE IF NEW_LINE_WID = CT_N THEN UPSHIFT_FLAG = 0;
+          ELSE IF NEW_LINE_WID = CT_X THEN ECHO_XEQ_FLAG = 0;
+             ELSE IF NEW_LINE_WID = CT_E THEN ECHO_XEQ_FLAG = 1;
+                ELSE VAL_FAULT = 83;
+   /*E* 83V XQC_LINE_WIDTH: ILLEGAL LINE MODE */
+      RETURN;
+      END;
+/************************
+***   GET THE NEW WIDTH.
+**/
+   CALL UT_SBIN_VALUE( NEW_LINE_WID );  /* GET THE NEW LINE WIDTH             */
+   IF VAL_FAULT ~= 0 THEN RETURN;
+   IF NEW_LINE_WID < 40  OR  NEW_LINE_WID > 132
+    THEN DO;
+      VAL_FAULT = 73; /*E* 73V XQC_LINE_WIDTH: ILLEGAL LINE WIDTH     */
+      RETURN;
+      END;
+ 
+   LINE_WID = NEW_LINE_WID;             /* SET THE NEW LINE WIDTH             */
+ 
+   RETURN;
+ 
+END XQC_LINE_WIDTH;
+ 
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**
+***   XQC_Z_REGISTER   14 SEP 77   (PRY)   EXECUTES Z-REGISTER COMMAND.
+**/
+ 
+XQC_Z_REGISTER: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   OP        SBIN WORD ALIGNED AUTO; /* VARIOUS TEMP USES                  */
+DCL   Z_REG_PTR$        PTR       ALIGNED   AUTO;
+                                        /* POINTER TO SPECIFIED Z REGISTER    */
+DCL   VALUE     SBIN WORD ALIGNED AUTO; /* VALUE                              */
+DCL   VALUEB REDEF VALUE BIT(36);
+DCL   Z_REG_VAL SBIN WORD ALIGNED AUTO; /* CURRENT Z REGISTER VALUE           */
+DCL   Z_REG_VALU REDEF Z_REG_VAL UBIN;
+DCL   Z_REG_VALB REDEF Z_REG_VAL BIT(36);
+ 
+/********************
+***   SKIP OVER 'Z' AND MAKE SURE Z-REGISTER NAME FOLLOWS.
+**/
+   CALL UT_INC_CHARX;
+   IF CHARX > CHARX_MAX  OR  C < CT_A  OR  C > CT_Z
+                                        /* Z-REG NAME THERE?                  */
+    THEN DO;                            /* NO                                 */
+      VAL_FAULT = 3;
+                    /*E* 3V XQC_Z_REGISTER: EXPECTED Z-REG NAME MISSING       */
+      RETURN;
+      END;
+ 
+/********************
+***   CONVERT Z-REG NAME TO POINTER; IF NOTHING ELSE FOLLOWS,
+***   DISPLAY THE Z-REG IN THE DEFAULT FORMAT.
+**/
+   Z_REG_PTR$ = PINCRW( Z_REG$, C-CT_A ); /* CONVERT NAME TO POINTER          */
+   CALL UT_INC_IGNORE;
+   IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* END OF COMMAND?                    */
+    THEN DO;                            /* YES                                */
+      CALL UT_DISPLAY( Z_REG_PTR$, 36, DT_DECIMAL );
+                                        /* DISPLAY Z-REGISTER IN DECIMAL      */
+      RETURN;
+      END;
+ 
+/********************
+***   CHECK IF NEXT CHAR IS AN OPERATOR.
+**/
+   Z_REG_VAL  = Z_REG_PTR$ -> WRD#;     /* GET THE Z-REGISTER VALUE           */
+   OP = -100;                           /* ASSUME NO OPERATOR FOLLOWS         */
+   IF C=CT_EQUAL                        /* ASSIGNMENT?                        */
+    THEN DO;
+      CALL UT_INC_CHARX;                /* SKIP OVER =                        */
+      CALL UT_SBIN_VALUE( Z_REG_VAL );  /* GET THE VALUE                      */
+      IF VAL_FAULT ~= 0 THEN RETURN;    /* RETURN IF ERROR                    */
+      CALL UT_IGNORE_BLANKS;            /* CHECK IF OP MIGHT FOLLOW           */
+      IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* POSSIBLE?                          */
+       THEN DO;                         /* NO: JUST MAKE ASSIGNMENT           */
+         Z_REG_PTR$ -> WRD# = Z_REG_VAL;
+         RETURN;
+         END;
+      END;
+   IF C = CT_PLUS THEN OP = -1;         /* ADDITION?                          */
+    ELSE IF C = CT_MINUS THEN OP = -2;  /* SUBTRACTION?                       */
+       ELSE IF C = CT_AMPERSAND THEN OP = -3; /* AND?                         */
+          ELSE IF C = CT_EXCLAMATION THEN OP = -4; /* OR?                     */
+             ELSE IF C = CT_LCARAT THEN OP = -5; /* LEFT SHIFT?               */
+                ELSE IF C = CT_RCARAT THEN OP = -6; /* RIGHT SHIFT?           */
+                   ELSE IF C = CT_SLASH THEN OP = -7; /* DIVISION?            */
+                      ELSE IF C = CT_ASTERISK /* SHIFT?                       */
+                         THEN DO;       /* CHECK WHAT TYPE OF SHIFT           */
+                           CALL UT_INC_CHARX; /* SKIP STAR                    */
+                           IF (C ~= CT_ASTERISK  AND  CHARX <= CHARX_MAX)
+                                        /* STAR THERE?                        */
+                            THEN OP = 8; /* NO: MULTIPLICATION                */
+                            ELSE DO;
+                              IF C = CT_ASTERISK  AND  CHARX <= CHARX_MAX
+                               THEN DO; /* HAVE **                            */
+                                 CALL UT_INC_CHARX;
+                                        /*CHECK IF LEFT OR RIGHT SHIFT        */
+                                 IF CHARX <= CHARX_MAX  AND  C = CT_MINUS
+                                        /* RIGHT SHIFT?                       */
+                                  THEN DO; /* YES                             */
+                                    OP = 6;
+                                    CALL UT_INC_CHARX; /* SKIP OVER -         */
+                                    END;
+                                  ELSE OP = 5; /* LEFT SHIFT                  */
+                                 END;
+                              END;
+                           END;
+ 
+/********************
+***   IF WE FOUND AN OPERATOR, EXECUTE IT.
+**/
+   IF OP > -100                         /* FOUND AN OPERATOR?                 */
+    THEN DO;                            /* YES                                */
+      IF OP <= 0                        /* CHECK SKIP FLAG                    */
+       THEN DO;                         /* SKIP                               */
+         OP = - OP;
+         CALL UT_INC_CHARX;
+         END;
+      CALL UT_SBIN_VALUE( VALUE );      /* GET THE VALUE                      */
+      IF VAL_FAULT ~= 0 THEN RETURN;    /* RETURN IF ERROR                    */
+      CALL UT_JUNK_CHK;                 /* CHECK FOR ILLEGAL JUNK             */
+      IF VAL_FAULT ~= 0 THEN RETURN;    /* RETURN IF SOME FOUND               */
+         /**
+         ***   EXECUTE OPERATOR.
+         **/
+      DO CASE (OP);
+       CASE(0);                         /* ASSIGNMENT                         */
+         Z_REG_VAL = VALUE;
+       CASE(1);                         /* ADDITION                           */
+         Z_REG_VAL = Z_REG_VAL + VALUE;
+       CASE(2);                         /* SUBTRACTION                        */
+         Z_REG_VAL = Z_REG_VAL - VALUE;
+       CASE(3);                         /* LOGICAL AND                        */
+         Z_REG_VALB = Z_REG_VALB & VALUEB;
+       CASE(4);                         /* LOGICAL OR                         */
+         Z_REG_VALB = Z_REG_VALB | VALUEB;
+       CASE(5);                         /* LEFT SHIFT                         */
+         GOTO SHIFT_IT;
+       CASE(6);                         /* RIGHT SHIFT                        */
+         VALUE = -VALUE;
+SHIFT_IT: ;
+         IF VALUE > 35 OR VALUE < -35 THEN Z_REG_VAL = 0;
+          ELSE IF VALUE > 0
+             THEN Z_REG_VAL = Z_REG_VAL * TWO_POWER (VALUE);
+             ELSE IF Z_REG_VAL > 0
+                THEN Z_REG_VAL = Z_REG_VAL / TWO_POWER (-VALUE);
+                ELSE DO;
+                  Z_REG_VALU = Z_REG_VALU/2;
+                  Z_REG_VAL = Z_REG_VAL / TWO_POWER (-VALUE-1);
+                  END;
+       CASE(7);                         /* DIVISION                           */
+         IF VALUE = 0                   /* CHECK FOR DIVIDE BY 0              */
+          THEN VAL_FAULT = 62;
+                              /*E* 62V XQC_Z_REGISTER: ATTEMPTED DIVIDE BY 0  */
+          ELSE Z_REG_VAL = Z_REG_VAL
+              / VALUE;
+       CASE(8);                         /* MULTIPLICATION                     */
+         Z_REG_VAL = Z_REG_VAL * VALUE;
+       END;
+      Z_REG_PTR$ -> WRD# = Z_REG_VAL;   /* SET THE Z-REGISTER VALUE           */
+      RETURN;
+      END;
+ 
+/********************
+***   WE DIDN'T HAVE AN OPERATOR.  IT MUST BE A DISPLAY FORMAT.
+**/
+   IF C = FT_MACHINE THEN OP = DT_MACHINE;
+    ELSE IF C = FT_TEXT THEN OP = DT_TEXT;
+       ELSE IF C = FT_DECIMAL THEN OP = -DT_DECIMAL;
+          ELSE IF C = FT_TEXTC THEN OP = DT_TEXTC;
+             ELSE IF C = FT_NOTHING THEN OP = DT_NOTHING;
+                ELSE IF C = FT_BASED THEN OP = DT_BASED;
+                   ELSE IF C = FT_MIXED THEN OP = DT_MIXED;
+                      ELSE IF C = FT_WIDTH THEN OP = DT_WIDTH;
+                         ELSE IF C = FT_NTEXT THEN OP = DT_NTEXT;
+                            ELSE IF C = FT_DUMP THEN OP = DT_DUMP;
+ 
+/**
+***   IF WE GOT A FORMAT, DISPLAY THE Z-REGISTER.
+**/
+   IF OP >= 0 OR OP =-3                 /* GET A FORMAT?                      */
+    THEN DO;                            /* YES                                */
+      CALL UT_INC_CHARX;                /* SKIP OVER FORMAT                   */
+      CALL UT_JUNK_CHK;                 /* CHECK FOR ILLEGAL JUNK             */
+      IF VAL_FAULT ~= 0 THEN RETURN;
+      CALL UT_DISPLAY( Z_REG_PTR$, 36, OP );
+                              /* DISPLAY THE Z-REGISTER IN SPECIFIED FORMAT   */
+      RETURN;
+      END;
+ 
+/********************
+***   CHARACTER MUST BE ILLEGAL.
+**/
+   VAL_FAULT = 34;
+                    /*E* 34V XQC_Z_REGISTER: INVALID FORMAT OR OPERATOR       */
+   RETURN;
+ 
+END XQC_Z_REGISTER;
+ 
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**
+***   XQC_ALLOCATE   14 SEP 77   (PRY)   EXECUTE THE ALLOCATE COMMAND.
+**/
+ 
+XQC_ALLOCATE: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   BUF$              PTR       ALIGNED   AUTO;
+                                        /* POINT TO BUFFER DESCRIPTOR         */
+DCL   BIX       SBIN WORD ALIGNED AUTO; /* BUFFER DESCRIPTOR INDEX            */
+DCL   DIX       SBIN WORD ALIGNED AUTO; /* DESCRIPTOR INDEX                   */
+DCL   BTYPE     SBIN WORD ALIGNED AUTO; /* TYPE OF BUFFER                     */
+DCL   CHR       SBIN WORD ALIGNED AUTO; /* SAVES CHARACTER                    */
+DCL   WSIZE     SBIN WORD ALIGNED AUTO; /* SIZE IN WORDS                      */
+DCL   BLK_IX    SBIN WORD ALIGNED AUTO; /* INDEX OF BUFFER BLOCK              */
+DCL   SIZE      SBIN WORD ALIGNED AUTO; /* DESIRED SIZE IN BITS               */
+DCL   VAL$              PTR       ALIGNED   AUTO;
+                                   /* PTR TO DESCRIPTOR USED TO GET BLOCK     */
+DCL   GOT_SIZE          SBIN WORD ALIGNED   AUTO;
+                                        /* FLAG SET IF SIZE SPECIFIED         */
+DCL   DCB_NBR           SBIN WORD ALIGNED   AUTO;
+                                        /* USER SPECIFIED DCB NUMBER          */
+DCL LGL_DCB_NBR SBIN WORD ALIGNED AUTO; /* LOGICAL DCB NUMBER                 */
+ 
+/********************
+***   SKIP OVER 'A'.  IF NOTHING FOLLOWS, PRINT BUFFER STATS.
+**/
+   CALL UT_INC_IGNORE;
+   IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* END OF COMMAND HIT?                */
+    THEN DO;                            /* YES                                */
+      CALL XQC_BUF_STATS;               /* REPORT BUFFER STATISTICS           */
+      RETURN;
+      END;
+ 
+/********************
+***   SOMETHING FOLLOWS THE A...IT MUST BE A BUFFER NAME.
+**/
+   CALL UT_IDENTIFY_BUFFER( BUF$, BIX );
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERROR                    */
+   BTYPE = BUF$ -> BUF.TYPE;            /* GET THE BUFFER TYPE                */
+   IF BTYPE ~= BT_UNUSED  AND  BUF$ -> BUF.LOCK > 0
+                                        /* CHECK IF LOCKED                    */
+    THEN DO;                            /* IT IS                              */
+      VAL_FAULT = 70; /*E* 70V XQC_ALLOCATE: THIS BUFFER IS LOCKED    */
+      RETURN;
+      END;
+   BIX   = BIX + CT_A;                  /* CONVERT BUFFER ID TO NAME          */
+ 
+/********************
+***   CHECK IF DEALLOCATE COMMAND (NOTHING FOLLOWS A<A>).
+**/
+   CALL UT_IGNORE_BLANKS;
+   IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* ANYTHING FOLLOW?                   */
+    THEN DO;                            /* NO: DEALLOCATE BUFFER              */
+      IF BTYPE = BT_UNUSED              /* IS BUFFER UNUSED?                  */
+       THEN DO;                         /* YES                                */
+         VAL_FAULT = 25;
+                    /*E* 25V XQC_ALLOCATE: THAT BUFFER IS ALREADY UNALLOCATED */
+         RETURN;
+         END;
+         /**
+         ***   ANY BUFFER EXCEPT THE COMMAND
+         ***   BUFFER CAN BE DEALLOCATED.
+         **/
+      IF BTYPE = BT_CMND_BUF            /* CAN'T DEALLOCATE COMMAND BUFFER    */
+       THEN DO;
+         VAL_FAULT = 31;
+          /*E* 31V XQC_ALLOCATE: COMMAND BUFFERS CAN'T BE DEALLOCATED         */
+         RETURN;
+         END;
+      CALL UT_DEALLOC_BUF( BUF$ );      /* DEALLOCATE THE BUFFER              */
+      IF NOT (ZY$ -> BT36# & ZYF_DONT_GOSSIP)
+                                        /* SHOULD WE TELL USER                */
+       THEN DO;                         /* YES                                */
+         CALL UT_OUTPUT_CHAR( BIX );    /* PRINT NAME                         */
+         CALL UT_OUTPUT_CHARS( ' gone', 5 );
+         END;
+      RETURN;
+      END;
+ 
+/********************
+***   CHECK IF SIZE MODIFICATION.
+**/
+   IF C = CT_PLUS  OR  C = CT_MINUS     /* + OR - ?                           */
+    THEN DO;                            /* YES                                */
+      IF BTYPE = BT_UNUSED              /* CAN'T MODIFY UNUSED BUFFER         */
+       THEN DO;
+         VAL_FAULT = 27;
+                    /*E* 27V XQC_ALLCATE: THAT BUFFER IS UNALLOCATED          */
+         RETURN;
+         END;
+      IF BTYPE ~= BT_FIX_BUF  AND  BTYPE ~= BT_VAR_BUF
+                              /* CAN ONLY MODIFY FIXED OR VARIABLE BUFFERS    */
+       THEN DO;
+         VAL_FAULT = 28;
+          /*E* 28V XQC_ALLOCATE: THAT TYPE OF BUFFER CAN'T BE MODIFIED        */
+         RETURN;
+         END;
+      CHR = C;                          /* SAVE + OR -                        */
+      CALL UT_INC_CHARX;                /* SKIP OVER IT                       */
+      CALL EV_EVAL_SIZE( SIZE, GOT_SIZE );
+                                        /* GET SIZE SPECIFICATION             */
+      IF VAL_FAULT ~= 0 THEN RETURN;    /* RETURN IF PROBLEMS                 */
+      IF GOT_SIZE = 0                   /* GET ANYTHING?                      */
+       THEN DO;                         /* NO                                 */
+         VAL_FAULT = 15;
+                              /*E* 15V XQC_ALLOCATE: EXPECTED SIZE IS MISSING */
+         RETURN;
+         END;
+      TEMP1 = BUF$ -> BUF.WIDTH;
+                                        /* GET CURRENT SIZE OF BUFFER         */
+      IF CHR = CT_PLUS                  /* CHECK TYPE OF MODIFICATION         */
+       THEN SIZE = TEMP1 + SIZE;        /* EXPAND BUFFER                      */
+       ELSE SIZE = TEMP1 - SIZE;        /* CONTRACT BUFFER                    */
+      IF SIZE < 0                       /* MUST HAVE AT LEAST ONE GOOD WORD   */
+       THEN DO;                         /* WE DON'T                           */
+         VAL_FAULT = 35;
+                    /*E* 35V XQC_ALLOCATE: ATTEMPT TO CONTRACT PAST 0         */
+         RETURN;
+         END;
+      CALL UT_JUNK_CHK;                 /* CHECK FOR ILLEGAL JUNK             */
+      IF VAL_FAULT ~= 0 THEN RETURN;
+      CALL UT_NEW_SIZE( BUF$, SIZE );   /* ADJUST SIZE OF BUFFER              */
+      IF VAL_FAULT ~= 0 THEN RETURN;    /* RETURN IF PROBLEM                  */
+      IF NOT (ZY$ -> BT36# & ZYF_DONT_GOSSIP)
+                                        /* SHOULD WE TELL USER                */
+       THEN DO;                         /* YES                                */
+         CALL UT_OUTPUT_CHAR( BIX );    /* NAME OF BUFFER                     */
+         CALL UT_OUTPUT_CHAR( CT_SPACE );
+         CALL UT_PRINT_SIZE( SIZE );    /* TELL USER NEW SIZE                 */
+         END;
+      RETURN;
+      END;
+ 
+/********************
+***   CHECK IF BUFFER ALLOCATION.
+**/
+   IF C = CT_QUESTION                   /* QUESTIONING ALLOCATION?            */
+    THEN DO;
+      IF BTYPE ~= BT_UNUSED             /* IF USED, SAY SO                    */
+       THEN DO;
+         VAL_FAULT = 26;
+                    /*E* 26V XQC_ALLOCATE: THAT BUFFER IS ALREADY ALLOCATED   */
+         RETURN;
+         END;
+      CALL UT_INC_IGNORE;               /* SKIP OVER ?                        */
+      END;
+ 
+/**
+***   CAN ONLY ALLOCATE FIXED, VARIABLE OR UNUSED BUFFER.
+**/
+   IF BTYPE ~= BT_FIX_BUF  AND  BTYPE ~= BT_VAR_BUF
+     AND  BTYPE ~= BT_UNUSED            /* PROPER TYPE OF BUFFER?             */
+    THEN DO;                            /* NOPE                               */
+      VAL_FAULT = 29;
+ /*E* 29V XQC_ALLOCATE: THAT TYPE OF BUFFER MUST BE EXPLICITLY DEALLOCATED    */
+      RETURN;
+      END;
+/*******************
+***   CHECK IF DCB OR MAPPED ALLOCATION.
+**/
+   IF CHARX <= CHARX_MAX AND C = CT_EQUAL /* =?                               */
+    THEN DO;                            /* YES                                */
+      CALL UT_INC_IGNORE;               /* SKIP OVER =                        */
+      IF CHARX <= CHARX_MAX  AND  C = CT_P
+                                        /* CHECK IF MAPPED ALLOC              */
+       THEN DO;                         /* IT IS                              */
+              /**
+              ***   MAPPED ALLOCATION.
+              **/
+         CALL UT_INC_CHARX;             /* SKIP OVER THE 'P'                  */
+         CALL UT_SBIN_VALUE( DCB_NBR ); /* GET THE FOLLOWING VALUE            */
+         IF VAL_FAULT = 0 THEN CALL UT_JUNK_CHK;
+                                        /* CHECK FOR ILLEGAL JUNK             */
+         IF VAL_FAULT ~= 0 THEN RETURN;
+                                        /* RETURN IF ERRORS                   */
+         IF BTYPE ~= BT_UNUSED THEN CALL UT_DEALLOC_BUF( BUF$ );
+                                        /* GET RID OF PREVIOUS ASSOCIATIONS   */
+         BUF$ -> BUF.TYPE = BT_MAPPED;
+                                        /* SET BUFFER TYPE                    */
+         TPTR1$           = ADDR( BUF$ -> BUF.BLK$ );
+                                        /* GET POINTER TO POINTER WORD        */
+         TPTR1$ -> WRD#   = DCB_NBR;
+                                        /* SET POINTER                        */
+         BUF$ -> BUF.WIDTH = MAX_BLK_SIZE * 36;
+                                        /* UNLIMITED RANGE                    */
+         IF NOT (ZY$ -> BT36# & ZYF_DONT_GOSSIP)
+                                        /* SHOULD WE TELL USER                */
+          THEN DO;                      /* YES                                */
+            CALL UT_OUTPUT_CHAR( BIX );
+                                        /* TELL USER ALLOCATION OK            */
+            CALL UT_OUTPUT_CHARS( ' allocated as ', 14 );
+            BUF$ = ADDR( DCB_NBR );
+            CALL UT_DISPLAY( BUF$, 36, DT_MACHINE );
+                                        /* DISPLAY POINTER                    */
+            END;
+         RETURN;
+         END;
+      IF CHARX <= CHARX_MAX  AND  (C = CT_E  OR  C = CT_N)
+                                        /* CHECK IF ERASE/NIL ALLOC           */
+       THEN DO;
+              /**
+              ***   'NIL' OR 'ERASE' ALLOCATION.
+              **/
+         DCB_NBR = C;                   /* SAVE ALLOC TYPE INDICATOR          */
+         CALL UT_INC_CHARX;             /* SKIP OVER E OR N                   */
+         CALL UT_JUNK_CHK;
+         IF VAL_FAULT ~= 0 THEN RETURN; /* RETURN IF ILLEGAL JUNK             */
+         IF DCB_NBR = CT_E              /* SET VECTOR ON ERASE/NIL            */
+          THEN FPT_RESULTSV = VECTOR( ERASE );
+          ELSE FPT_RESULTSV = VECTOR( NIL );
+         IF BTYPE ~= BT_UNUSED THEN CALL UT_DEALLOC_BUF( BUF$ );
+                                        /* DEALLOCATE PREVIOUS USE            */
+         BUF$ -> BUF.TYPE  = BT_MAPPED; /* MAPPED TYPE BUFFER                 */
+         BUF$ -> BUF.WIDTH = (FPT_RESULTS.BOUND + 1) * 9;
+                                        /* CALC BIT SIZE FROM BOUND           */
+         BUF$ -> BUF.BLK$  = FPT_RESULTS.DATA$;
+                                        /* SET ERASE/NIL POINTER              */
+         IF NOT (ZY$ -> BT36# & ZYF_DONT_GOSSIP)
+                                        /* SHOULD WE TELL USER                */
+          THEN DO;                      /* YES                                */
+            CALL UT_OUTPUT_CHAR( BIX );
+                                        /* TELL USER ALLOC OK                 */
+            CALL UT_OUTPUT_CHARS( ' allocated as ', 14 );
+            IF DCB_NBR = CT_E
+             THEN CALL UT_OUTPUT_CHARS( 'ERASE', 5 );
+             ELSE CALL UT_OUTPUT_CHARS( 'NIL', 3 );
+            END;
+         RETURN;
+         END;
+      IF CHARX <= CHARX_MAX  AND  C = CT_C
+                                        /* CHECK IF COMMAND ALLOCATION        */
+       THEN DO;                         /* IT IS                              */
+              /**
+              ***   COMMAND ALLOCATION.
+              **/
+         CALL UT_INC_CHARX;             /* SKIP OVER C                        */
+         CALL UT_JUNK_CHK;
+         IF VAL_FAULT ~= 0 THEN RETURN; /* RETURN IF JUNK                     */
+         CALL UT_GET_CMND( VAL$, SIZE, 1 );
+                              /* GET COMMAND, PTR TO DESC AND # BYTES READ    */
+         IF VAL_FAULT ~= 0 THEN RETURN;
+         IF BTYPE ~= BT_UNUSED THEN CALL UT_DEALLOC_BUF( BUF$ );
+                                        /* DEALLOCATE PREVIOUS USE            */
+         TEMP1             = BUF$ -> BUF.ID;
+                                        /* SAVE BUFFER'S ID                   */
+         BUF$ -> BUF       = VAL$ -> BUF;
+                                        /* MAKE DESCRIPTORS THE SAME          */
+         VAL$ -> BUF.TYPE  = BT_UNUSED; /* RELEASE VAL DESC                   */
+         BUF$ -> BUF.ID    = TEMP1;     /* EXCEPT FOR ID                      */
+         BUF$ -> BUF.TYPE  = BT_VAR_BUF;
+                                        /* AND TYPE                           */
+         TPTR1$            = PINCRW( BUF$ -> BUF.BLK$, -1 );
+                                   /* POINT TO THE ASSOCIATED BLOCK'S HEADER  */
+         TPTR1$ -> BLK.ID  = TEMP1;     /* SET ASSOCIATED DESC ID             */
+                                        /* IN HEADER AND                      */
+         TPTR1$            = PINCRW( TPTR1$, TPTR1$ -> BLK.SIZE - 2 );
+                                        /* AND IN THE FOOTER                  */
+         TPTR1$ -> BLK_FTR.ID = TEMP1;
+         RETURN;
+         END;
+         /**
+         ***   DCB ALLOCATION.
+         **/
+      CALL UT_SBIN_VALUE( LGL_DCB_NBR ); /* GET THE DCB NUMBER                */
+      IF VAL_FAULT ~= 0 THEN RETURN;
+      CALL UT_JUNK_CHK;                 /* CHECK FOR ILLEGAL JUNK             */
+      IF VAL_FAULT ~= 0 THEN RETURN;
+      DO CASE (LGL_DCB_NBR);            /* GET DCB POINTER                    */
+       CASE(1);
+         DCB_NBR = DCBNUM( M$F1 );
+       CASE(2);
+         DCB_NBR = DCBNUM( M$F2 );
+       CASE(3);
+         DCB_NBR = DCBNUM( M$F3 );
+       CASE(ELSE);                      /* Use literal DCB number             */
+         DCB_NBR = LGL_DCB_NBR;
+       CASE(0,4,5,6,7,8,9);
+         DO;                            /* ILLEGAL DCB NUMBER                 */
+            VAL_FAULT = 64;
+                              /*E* 64V XQC_ALLOCATE: ILLEGAL DCB NUMBER       */
+            RETURN;
+            END;
+       END;
+      IF DCB_NBR > 30
+       THEN DO;                         /* Not too reasonable                 */
+         VAL_FAULT = 64; /*E* 64V XQC_ALLOCATE: ILLEGAL DCB NUMBER */
+         RETURN;
+         END;
+      IF BTYPE ~= BT_UNUSED THEN CALL UT_DEALLOC_BUF( BUF$ );
+                                        /* DEALLOCATE PREVIOUS BUFFER         */
+      BUF$ -> BUF.TYPE  = BT_DCB;       /* TYPE IS DCB                        */
+      BUF$ -> BUF.BLK$  = DCBADDR( DCB_NBR );
+                                        /* POINT TO CONTENTS                  */
+      BUF$ -> BUF.IX    = LGL_DCB_NBR;  /* SAVE DCB NUMBER                    */
+      TPTR1$ = DCBADDR( DCBNUM( M$F1 ) ); /* GET POINTER TO DCB               */
+      BUF$ -> BUF.WIDTH = SIZEB( TPTR1$ -> F$DCB );
+                                        /* SET SIZE OF DCB                    */
+      IF NOT (ZY$ -> BT36# & ZYF_DONT_GOSSIP)
+                                        /* SHOULD WE TELL USER                */
+       THEN DO;                         /* YES                                */
+         CALL UT_OUTPUT_CHAR( BIX );    /* NAME OF BUFFER                     */
+         CALL UT_OUTPUT_CHARS( ' allocated as DCB', 17 );
+         END;
+      RETURN;
+      END;
+/********************
+***   ORDINARY ALLOCATION: BUFFER IS EITHER UNUSED, FIXED OR
+***   VARIABLE...   GET THE NEW SIZE.
+**/
+   CALL EV_EVAL_SIZE( SIZE, GOT_SIZE );
+                                        /* GET DESIRED SIZE OF BUFFER         */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERRORS                   */
+   IF GOT_SIZE = 0                      /* MUST HAVE SIZE SPEC                */
+    THEN DO;
+      VAL_FAULT = 15; /*E* 15V XQC_ALLOCATE: EXPECTED SIZE IS MISSING */
+      RETURN;
+      END;
+   CALL UT_JUNK_CHK;                    /* MAKE SURE NO ILLEGAL JUNK FOLLOWS  */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF JUNK                     */
+ 
+/**
+***   IF BUFFER IS ALREADY ALLOCATED, EXPAND OR CONTRACT IT.
+**/
+   IF BTYPE ~= BT_UNUSED                /* IS BUFFER ALREADY ALLOCATED?       */
+    THEN DO;                            /* YES                                */
+      IF SIZE < 0                       /* SIZE MUST BE GREATER THAN -1       */
+       THEN DO;                         /* IT ISN'T                           */
+         VAL_FAULT = 35;
+         RETURN;
+         END;
+      CALL UT_NEW_SIZE( BUF$, SIZE );   /* GIVE NEW SIZE TO BUFFER            */
+      IF VAL_FAULT ~=0 THEN RETURN;     /* RETURN IF ERRORS                   */
+      IF NOT (ZY$ -> BT36# & ZYF_DONT_GOSSIP)
+                                        /* SHOULD WE TELL THE USER            */
+       THEN DO;                         /* YES                                */
+         CALL UT_OUTPUT_CHAR( BIX );    /* TELL USER OF SIZE CHANGE           */
+         CALL UT_OUTPUT_CHAR( CT_SPACE );
+         CALL UT_PRINT_SIZE( SIZE );
+         END;
+      RETURN;
+      END;
+/**
+***   COMPUTE THE DESIRED SIZE OF THE BUFFER IN WORDS; TRY TO GET IT.
+**/
+   WSIZE = (SIZE+35) / 36;              /* CALC SIZE IN WORDS                 */
+   CALL AM_ALLOC_BLK( BUF$, WSIZE, BLK_IX );
+                                        /* GET A NEW BUFFER                   */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* GET ONE?                           */
+/**
+***   SET BUFFER DESCRIPTOR FIELDS.
+**/
+   BUF$ -> BUF.WIDTH = SIZE;            /* SET WIDTH OF BUFFER                */
+   BUF$ -> BUF.TYPE  = BT_FIX_BUF;      /* SET BUFFER TYPE                    */
+/**
+***   PRINT ALLOCATION MESSAGE AND RETURN.
+**/
+   IF NOT (ZY$ -> BT36# & ZYF_DONT_GOSSIP) /* SHOULD WE TELL USER             */
+    THEN DO;                            /* YES                                */
+      CALL UT_OUTPUT_CHAR( BIX );       /* NAME OF BUFFER                     */
+      CALL UT_OUTPUT_CHARS( ' allocated', 10 );
+      END;
+ 
+   RETURN;
+ 
+END XQC_ALLOCATE;
+ 
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**
+***   COMMAND.
+**/
+ 
+XQC_DISPLAY: PROC;
+ 
+/*********************
+***   LOCALS:
+**/
+DCL   LOCAL_TEMP        SBIN WORD ALIGNED   AUTO;
+ 
+/********************
+***  IF COMMAND IS 'D' ONLY, PRINT THE DEFAULT DCB NUMBER.
+**/
+   CALL UT_INC_IGNORE;                  /* SKIP OVER 'D'                      */
+   IF C = CT_SEMI_COLON  OR  CHARX > CHARX_MAX
+                                        /* ANYTHING FOLLOW?                   */
+    THEN DO;                            /* NOPE                               */
+      IF DFLT_DCB_NUM = DCBNUM( M$F1 )  /* FIND OUT DCB NUMBER                */
+       THEN LOCAL_TEMP = 1;
+       ELSE IF DFLT_DCB_NUM = DCBNUM( M$F2 )
+          THEN LOCAL_TEMP = 2;
+          ELSE IF DFLT_DCB_NUM = DCBNUM( M$F3 )
+             THEN LOCAL_TEMP = 3;
+             ELSE DO;                   /* CORRECT DEFAULT                    */
+               LOCAL_TEMP = DFLT_DCB_NUM;
+               END;
+      CALL UT_OUTPUT_CHARS( 'D=', 2 );  /* TELL USER THE DCB NUMBER           */
+      CALL UT_DISPLAY( ADDR(LOCAL_TEMP), 36, -DT_DECIMAL );
+      RETURN;
+      END;
+ 
+/********************
+***   SOMETHING FOLLOWED THE 'D'. IF IT IS '=' WE ASSIGN A
+***   NEW DCB NUMBER.
+**/
+   IF C = CT_EQUAL                      /* = FOLLOWS?                         */
+    THEN DO;                            /* SURE DID!                          */
+      CALL UT_INC_CHARX;                /* SKIP OVER IT                       */
+      CALL UT_SBIN_VALUE( LOCAL_TEMP );
+                                        /* GET THE NEW DEFAULT DCB NUMBER     */
+      IF VAL_FAULT = 0 THEN CALL UT_JUNK_CHK;
+                                        /* CHECK JUNK                         */
+      IF VAL_FAULT ~= 0 THEN RETURN;    /* RETURN IF ERROR                    */
+      DO CASE(LOCAL_TEMP);              /* TRANSLATE DCB NUMBER TO DCBNUM     */
+       CASE(1);
+         DFLT_DCB_NUM = DCBNUM( M$F1 );
+       CASE(2);
+         DFLT_DCB_NUM = DCBNUM( M$F2 );
+       CASE(3);
+         DFLT_DCB_NUM = DCBNUM( M$F3 );
+       CASE(ELSE);
+         DFLT_DCB_NUM = LOCAL_TEMP;     /* Use literal DCB number             */
+       CASE(4,5,6,7,8,9);               /* ILLEGAL DCB NUMBER                 */
+         VAL_FAULT = 64;
+                              /*E* 64V XQC_DISPLAY: ILLEGAL DCB NUMBER        */
+       END;
+      RETURN;
+      END;
+ 
+/********************
+***   DISPLAY COMMAND NOT IMPLEMENTED YET.
+**/
+   VAL_FAULT = 21;                      /* NOT IMPLEMENTED                    */
+   RETURN;
+END XQC_DISPLAY;
+/*********************************************************************/
+%EJECT;
+/********************************************************************/
+/**
+***   XQC_UNDERTAKE   7 OCT 77   (PRY)   EXECUTE THE UNDERTAKE COMMAND.
+**/
+ 
+XQC_UNDERTAKE: PROC;
+ 
+   CALL UT_INC_CHARX;                   /* SKIP OVER 'U'                      */
+   CALL XQ_GOTO_LABEL( 1, 1 );          /* SAVE RETURN, GOTO LABEL            */
+   RETURN;
+ 
+END XQC_UNDERTAKE;
+/********************************************************************/
+%EJECT;
+/********************************************************************/
+/**
+***   XQC_GOTO   7 OCT 77   (PRY)   EXECUTE THE GOTO COMMAND.
+**/
+ 
+XQC_GOTO: PROC;
+ 
+   CALL UT_INC_CHARX;                   /* SKIP OVER 'G'                      */
+   CALL XQ_GOTO_LABEL( 0, 1 );          /* DON'T SAVE RETURN, GOTO LABEL      */
+   RETURN;
+ 
+END XQC_GOTO;
+/********************************************************************/
+%EJECT;
+/********************************************************************/
+/**
+***   XQ_GOTO_LABEL   7 OCT 77   (PRY)   EXECUTES GOTOS AND SAVES CURRENT
+***   POSITION.
+**/
+ 
+XQ_GOTO_LABEL: PROC( SAVE_RETURN#, GOTO# );
+ 
+/********************
+***   PARAMETERS:
+**/
+DCL   SAVE_RETURN#      SBIN WORD ALIGNED;
+                              /* INDICATES IF RETURN POINT IS TO BE SAVED     */
+DCL   GOTO#             SBIN WORD ALIGNED;
+                              /* FLAG INDICATING IF GOT IS TO BE EXECUTED     */
+ 
+/********************
+***   LOCALS:
+**/
+DCL   CMND$           PTR ALIGNED AUTO; /* DESTINATION BUFFER                 */
+DCL   CMNDX     SBIN WORD ALIGNED AUTO; /* DESTINATION CHARX                  */
+DCL   CMNDX_MAX SBIN WORD ALIGNED AUTO; /* DESTINATION CHARX_MAX              */
+DCL   CR_CMNDX  SBIN WORD ALIGNED AUTO; /* DESTINATION CR_CHARX               */
+DCL   CR_CMNDC  SBIN WORD ALIGNED AUTO; /* DESTINATION CR_COUNT               */
+DCL DEST_OFFSET SBIN WORD ALIGNED AUTO; /* Destination offset                 */
+ 
+/********************
+***   GET THE DESTINATION.
+**/
+   CALL XQ_GET_GOTO;                    /* GET DESTINATION VALUES             */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERRORS                   */
+   IF GOTO# = 0 THEN RETURN;            /* DON'T EXECUTE GOTO IF FLAG NOT SET */
+ 
+/********************
+***   SAVE THE CURRENT POSITION IF SAVE WAS SPECIFIED.
+**/
+   IF SAVE_RETURN# = 1                  /* SAVE SPECIFIED?                    */
+    THEN DO;                            /* YES                                */
+      CALL UT_PUSH_EXEC_STACK( STRING$, CHARX, CHARX_MAX, CR_CHARX, CR_COUNT );
+      IF VAL_FAULT ~= 0 THEN RETURN;    /* RETURN IF ERROR                    */
+      END;
+/********************
+***   CHANGE THE EXECUTION POSITION.
+**/
+   CALL UT_PUSH_EXEC_STACK( CMND$, CMNDX, CMNDX_MAX, CR_CMNDX, CR_CMNDC );
+   EXECUTING_CMND = 0;                  /* STOP EXECUTION OF CURRENT COMMAND  */
+   RETURN;                              /* RESTART EXECUTION                  */
+ 
+/********************************************************************/
+/********************************************************************/
+/**
+***   XQ_GET_GOTO   7 OCT 77  (PRY)   CONVERT DESTINATION SPECIFICATION
+***   TO CMNDX,CMND$, CR_CMNDC AND CR_CMNDX.
+**/
+ 
+XQ_GET_GOTO: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   VALUE     SBIN WORD ALIGNED AUTO; /* ADJUSTED VALUE                     */
+ 
+/********************
+***   IF END OF COMMAND, GOTO BEGINNING OF CURRENT COMMAND STRING.
+**/
+   CR_CMNDX = 0;                        /* ASSUME RESUME EXEC AT FIRST BYTE   */
+   CR_CMNDC = 0;
+   CMNDX    = 0;
+   CALL UT_IGNORE_BLANKS;               /* FIND NEXT ITEM IN COMMAND          */
+   IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* END OF COMMAND?                    */
+    THEN DO;                            /* YES                                */
+      CMND$     = STRING$;              /* CURRENT COMMAND STRING             */
+      CMNDX_MAX = CHARX_MAX;
+      RETURN;
+      END;
+ 
+/********************
+***   IF ONLY A BUFFER ID FOLLOWS, GO TO ITS BEGINNING.
+**/
+   IF C = CT_ASTERISK  OR  (C <= CT_Z  AND  C >= CT_A)
+                                        /* BUFFER ID?                         */
+    THEN DO;                            /* YES                                */
+      CALL UT_IDENTIFY_BUFFER( CMND$, VALUE );
+                                        /* GET BUFFER TO GO TO                */
+      IF GOTO# = 1                 /* CHECK BUFFER NAME IF BRANCH TO BE TAKEN */
+       THEN DO;
+         IF VAL_FAULT ~= 0 THEN RETURN; /* RETURN IF ERROR                    */
+         TEMP1 = CMND$ -> BUF.TYPE;     /* GET BUFFER TYPE                    */
+         IF TEMP1 = BT_UNUSED           /* IS BUFFER ALLOCATED?               */
+          THEN DO;                      /* NO                                 */
+            VAL_FAULT = 27;
+                              /*E* 27V XQ_GOTO_LABEL: BUFFER IS UNALLOCATED   */
+            RETURN;
+            END;
+         IF TEMP1 ~= BT_FIX_BUF  AND  TEMP1 ~= BT_VAR_BUF
+           AND TEMP1 ~= BT_CMND_BUF
+                                        /* IS IT A LEGAL DESTINATION BUFFER?  */
+          THEN DO;                      /* NO                                 */
+            VAL_FAULT = 55;
+          /*E* 55V XQ_GOTO_LABEL: THAT BUFFER IS NOT A LEGAL DESTINATION      */
+            RETURN;
+            END;
+         CMNDX_MAX = (CMND$ -> BUF.WIDTH) / 9 - 1;
+                                        /* CALC MAXIMUM CHARX                 */
+         END;
+       ELSE VAL_FAULT = 0;              /* DON'T CARE WHAT ID_BUF SAID        */
+      CALL UT_IGNORE_BLANKS;
+      IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* ONLY BUFFER NAME GIVEN?            */
+       THEN RETURN;                     /* YES                                */
+      END;
+    ELSE DO;                            /* OTHERWISE DEST IN CURRENT BUFFER   */
+      CMND$    = STRING$;
+      CMNDX_MAX = CHARX_MAX;            /* SAME MAXIMUM                       */
+      END;
+/********************
+***   A : <VALUE> MUST FOLLOW.
+**/
+   IF C = CT_COLON
+    THEN DEST_OFFSET = 0;               /* No offset                          */
+    ELSE IF C = CT_MINUS
+       THEN DEST_OFFSET = 1;            /* Subtract                           */
+       ELSE IF C = CT_PLUS
+          THEN DEST_OFFSET = 2;         /* Add offset                         */
+          ELSE DO;
+            VAL_FAULT = 56; /*E* 56V XQ_GET_GOTO:  EXPECTED : IS MISSING    */
+            RETURN;
+            END;
+   CALL UT_INC_IGNORE;                  /* SKIP OVER :                        */
+   IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* WELL...?                           */
+    THEN RETURN;                        /* NO                                 */
+                         /* START WITH BEGINNING BYTE OF DESTINATION BUFFER   */
+   CALL UT_SBIN_VALUE( VALUE );         /* GET THE VALUE                      */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERROR                    */
+/********************
+***   WE HAVE THE LINE NUMBER.
+**/
+   CALL UT_JUNK_CHK;                    /* ANY SURPLUS IS ILLEGAL             */
+   IF VAL_FAULT ~=0 THEN RETURN;
+   IF GOTO# = 0 THEN RETURN;
+                                   /* LINE NEED NOT EXIST IF BRANCH NOT TAKEN */
+   DO CASE(DEST_OFFSET);
+    CASE(1);                            /* VALUE is negative offset           */
+      VALUE = CR_COUNT - VALUE + 1;     /* +1 to convert to line #            */
+    CASE(2);
+      VALUE = CR_COUNT + VALUE + 1;
+    END;
+   IF VALUE <= 0                        /* IS IT A 'RETURN' ?                 */
+    THEN DO;                            /* YES                                */
+      CMNDX   = CMNDX_MAX + 1;          /* IF THAT'S WHAT IS WANTED!          */
+      RETURN;
+      END;
+   TPTR1$ = CMND$ -> BUF.BLK$;          /* GET POINTER TO DESTINATION BUFFER  */
+   VALUE = VALUE - 1;                   /* CALC NUMBER OF CR'S WE MUST BYPASS */
+   TEMP2 = 0;                           /* PREVIOUS CHAR                      */
+   IF VALUE = 0 THEN RETURN;            /* FIRST LINE IS BUFFER BEGINNING     */
+   DO CMNDX=0 TO CMNDX_MAX;             /* FIND THE LINE NUMBER               */
+      IF TEMP2 = CT_CR                  /* END OF LINE?                       */
+       THEN DO;                         /* YES                                */
+         CR_CMNDX = CMNDX;              /* SAVE LOC OF LAST CR                */
+         CR_CMNDC = CR_CMNDC + 1;       /* INCREASE CR COUNT                  */
+         IF CR_CMNDC = VALUE THEN RETURN;
+                                        /* RETURN WHEN CMNDX FOUND            */
+         END;
+      TEMP2 = TPTR1$ -> UBIN9#(CMNDX);  /* SET PREVIOUS CHAR                  */
+      END;
+/********************
+***   NO LINE WITH SPECIFIED LINE NUMBER.
+**/
+   VAL_FAULT = 57;
+                    /*E* 57V XQ_GET_GOTO: DESTINATION DOES NOT EXIST          */
+   RETURN;
+ 
+END XQ_GET_GOTO;
+ 
+END XQ_GOTO_LABEL;
+/*******************************************************************/
+%EJECT;
+/********************************************************************/
+/**
+***   UT_PUSH_EXEC_STACK   7 OCT 77   (PRY)   PUSHES ARGUMENT ONTO THE
+***   EXECUTION STACK.
+**/
+ 
+UT_PUSH_EXEC_STACK: PROC( STRING$#, CHARX#, CHARX_MAX#, CR_CHARX#, CR_COUNT# );
+ 
+/********************
+***   PARAMETERS:
+**/
+DCL   STRING$#          PTR       ALIGNED;
+DCL   CHARX#            SBIN WORD ALIGNED;
+DCL   CR_CHARX#         SBIN WORD ALIGNED;
+DCL   CHARX_MAX#        SBIN WORD ALIGNED;
+DCL   CR_COUNT#         SBIN WORD ALIGNED;
+/********************
+***   PUSH ARGUMENTS IF THERE'S STILL ROOM.
+**/
+ 
+   IF EXEC_STACK_IX >= EXEC_STACK_IX_MAX /* ATTEMPTED OVERFLOW?               */
+    THEN DO;                            /* YES                                */
+      VAL_FAULT = 22;
+          /*E* 22V XQ_GOTO_LABEL: ATTEMPTED EXECUTION STACK OVERFLOW          */
+      RETURN;
+      END;
+   TPTR1$        = STRING$#;
+                              /* GET THE POINTER TO THE BUFFER DESCRIPTOR     */
+   EXEC_STACK_IX = EXEC_STACK_IX + 1;   /* PUSH CURRENTS                      */
+   EXEC_STACK.STRING$(EXEC_STACK_IX)    = TPTR1$;
+   TPTR1$ -> BUF.LOCK                   = TPTR1$ -> BUF.LOCK + 1;
+                                        /* LOCK THE BUFFER                    */
+   EXEC_STACK.CHARX(EXEC_STACK_IX)      = CHARX#;
+   EXEC_STACK.CHARX_MAX(EXEC_STACK_IX)  = CHARX_MAX#;
+   EXEC_STACK.CR_CHARX(EXEC_STACK_IX)   = CR_CHARX#;
+   EXEC_STACK.CR_COUNT(EXEC_STACK_IX)   = CR_COUNT#;
+ 
+   RETURN;
+ 
+END UT_PUSH_EXEC_STACK;
+/********************************************************************/
+%EJECT;
+/********************************************************************/
+/**
+***   XQC_IF   9 OCT 77   (PRY)   EXECUTE THE IF COMMAND.
+**/
+ 
+XQC_IF: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   VAL1$             PTR       ALIGNED   AUTO;
+                                        /* POINTER TO FIRST VALUE DESC        */
+DCL   VAL2$             PTR       ALIGNED   AUTO;
+                                        /* POINTER TO SECOND VALUE DESC       */
+DCL   BLK_IX1   SBIN WORD ALIGNED AUTO; /* FIRST BLOCK INDEX                  */
+DCL   BLK_IX2   SBIN WORD ALIGNED AUTO; /* SECOND BLOCK INDEX                 */
+DCL   NOT_OP    SBIN WORD ALIGNED AUTO; /* NOT OPERATOR                       */
+DCL   REL_OP    SBIN WORD ALIGNED AUTO; /* RELATIONAL OPERATOR                */
+DCL  VAL1_WIDTH SBIN WORD ALIGNED AUTO; /* WIDTH OF THE FIRST VALUE           */
+DCL   VAL2_WIDTH        SBIN WORD ALIGNED   AUTO;
+                                        /* WIDTH OF THE SECOND VALUE          */
+DCL   SAV_RTN           SBIN WORD ALIGNED   AUTO;
+                                        /* FLAG SET IF RETURN IS TO BE SAVED  */
+DCL   REL       SBIN WORD ALIGNED AUTO; /* RELATION BETWEEN VALUES            */
+DCL   GOTO_OK           SBIN WORD ALIGNED   AUTO;
+                                        /* FLAG SET IF GOTO IS TO BE EXECUTED */
+ 
+/********************
+***   GET FIRST VALUE.
+**/
+   CALL UT_INC_CHARX;                   /* SKIP OVER THE F                    */
+   CALL EV_GET_VALUE( VAL1$, BLK_IX1 ); /* GET THE FIRST VALUE                */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ANY ERRORS               */
+ 
+/********************
+***   NOW FIND THE RELATIONAL OPERATOR.
+**/
+   CALL UT_IGNORE_BLANKS;               /* FIND IT                            */
+   IF CHARX <= CHARX_MAX AND C = CT_TILDE /* NOT?                             */
+    THEN DO;                            /* YES                                */
+      NOT_OP = -1;                      /* SET NOT FLAG                       */
+      CALL UT_INC_IGNORE;               /* SKIP OVER ~                        */
+      END;
+    ELSE NOT_OP = 1;                    /* NOT NOT                            */
+ 
+   IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* END OF COMMAND?                    */
+    THEN DO;                            /* YES: ERROR                         */
+      CALL UT_DEALLOC_BUF( VAL1$ );     /* GET RID OF VALUE                   */
+      VAL_FAULT = 66;
+                    /*E* 66V XQC_IF: EXPECTED RELATIONAL OPERATOR IS MISSING  */
+      RETURN;
+      END;
+     /**
+     ***   THE RELATIONAL OPERATOR SHOULD FOLLOW.
+     **/
+   IF C = CT_EQUAL                      /* =?                                 */
+    THEN DO;                            /* YES                                */
+      CALL UT_INC_IGNORE;               /* SKIP OVER =                        */
+      IF CHARX <= CHARX_MAX             /* MIGHT < OR > FOLLOW?               */
+       THEN DO;                         /* YES                                */
+         IF C = CT_LCARAT THEN REL_OP = -2;
+                                        /* <=                                 */
+ 
+          ELSE IF C = CT_RCARAT THEN REL_OP = -3;
+                                        /* >=                                 */
+             ELSE DO;                   /* JUST =                             */
+               CHARX  = CHARX - 1;      /* RESCAN LAST CHAR                   */
+               REL_OP = 1;              /* =                                  */
+               END;
+         END;
+      END;
+    ELSE DO;                            /* MAYBE < OR >                       */
+      IF C = CT_LCARAT                  /* <?                                 */
+       THEN DO;                         /* YES                                */
+         CALL UT_INC_IGNORE;            /* SKIP OVER <                        */
+         IF CHARX <= CHARX_MAX          /* MIGHT = FOLLOW?                    */
+          THEN DO;                      /* YES                                */
+            IF C = CT_EQUAL
+             THEN REL_OP = -2;          /* <=                                 */
+             ELSE DO;                   /* JUST <                             */
+               CHARX  = CHARX - 1;      /* RESCAN LAST CHAR                   */
+               REL_OP = 3;              /* <                                  */
+               END;
+            END;
+         END;
+       ELSE DO;                         /* MAYBE >                            */
+         IF C = CT_RCARAT               /* >?                                 */
+          THEN DO;                      /* YES                                */
+            CALL UT_INC_IGNORE;         /* SKIP OVER >                        */
+            IF CHARX <= CHARX_MAX       /* MIGHT = FOLLOW?                    */
+             THEN DO;                   /* YES                                */
+               IF C = CT_EQUAL
+                THEN REL_OP = -3;       /* >=                                 */
+                ELSE DO;                /* JUST >                             */
+                  CHARX  = CHARX - 1;
+                                        /* RESCAN LAST CHAR                   */
+                  REL_OP = 2;           /* >                                  */
+                  END;
+               END;
+            END;
+          ELSE DO;                      /* ILLEGAL OPERATOR                   */
+            CALL UT_DEALLOC_BUF( VAL1$ );
+                                        /* GET RID OF THE VALUE               */
+            VAL_FAULT = 66;
+            RETURN;
+            END;
+         END;
+      END;
+ 
+/********************
+***   CONVERT RELATIONAL OPERATOR ACCORDING TO NOT OPERATOR.
+**/
+   REL_OP = REL_OP * NOT_OP + 3;
+ 
+/********************
+***   GET THE SECOND VALUE.
+**/
+   CALL UT_INC_CHARX;                   /* SKIP OVER LAST CHAR OF OPERATOR    */
+   CALL EV_GET_VALUE( VAL2$, BLK_IX2 ); /* GET THE SECOND VALUE               */
+   IF VAL_FAULT ~= 0                    /* ERROR?                             */
+    THEN DO;                            /* YES                                */
+      CALL UT_DEALLOC_BUF( VAL1$ );     /* FREE THE FIRST VALUE               */
+      RETURN;
+      END;
+ 
+ 
+/********************
+***   MAKE SURE G OR U FOLLOWS.
+**/
+   CALL UT_IGNORE_BLANKS;               /* FIND G OR U                        */
+   IF CHARX <= CHARX_MAX                /* CAN G OR U FOLLOW?                 */
+    THEN DO;                            /* YES                                */
+      IF C = CT_G THEN SAV_RTN = 0;
+                                        /* DON'T SAVE RETURN FOR GOTO         */
+       ELSE IF C = CT_U THEN SAV_RTN = 1;
+                                        /* SAVE RETURN FOR UNDERTAKE          */
+          ELSE DO;                      /* ERROR: NOT G OR U                  */
+            CALL UT_DEALLOC_BUF( VAL1$ ); /* GET RID OF BOTH VALUES           */
+            CALL UT_DEALLOC_BUF( VAL2$ );
+            VAL_FAULT = 67;
+                              /*E* 67V XQC_IF: ONLY G OR U SHOULD BE HERE     */
+            RETURN;
+            END;
+      CALL UT_INC_CHARX;                /* SKIP OVER G OR U                   */
+      END;
+    ELSE DO;                            /* NOT G OR U                         */
+      CALL UT_DEALLOC_BUF( VAL1$ );     /* GET RID OF VALUES                  */
+      CALL UT_DEALLOC_BUF( VAL2$ );
+      VAL_FAULT = 67;
+      RETURN;
+      END;
+/********************
+***   GET VALUE WIDTHS;  SET UP COMPARE DATA.
+**/
+   VAL1_WIDTH = VAL1$ -> BUF.WIDTH;
+   VAL2_WIDTH = VAL2$ -> BUF.WIDTH;
+ 
+   IF VAL1_WIDTH >= VAL2_WIDTH
+                              /* FIND OUT HOW COMPARE WILL NEED TO PROCEED    */
+    THEN DO;             /* FIRST VALUE LONGER OR EQUAL IN WIDTH TO SECOND    */
+      TPTR1$ = VAL1$ -> BUF.BLK$;
+                                        /* GET POINTER TO  LONGER VALUE       */
+      TPTR2$ = VAL2$ -> BUF.BLK$;
+                                        /* GET POINTER TO SHORTER VALUE       */
+      TEMP1  = VAL2_WIDTH;              /* GET NUMBER OF BITS TO COMPARE      */
+      TEMP2  = VAL1_WIDTH - VAL2_WIDTH - 1;
+                                   /* CALC NUMBER OF EXTRA BITS TO COMPARE    */
+      END;
+    ELSE DO;                            /* SECOND VALUE IS LONGER             */
+      TPTR1$ = VAL2$ -> BUF.BLK$;
+                                        /* GET POINTER TO LONGER VALUE        */
+      TPTR2$ = VAL1$ -> BUF.BLK$;
+                                        /* GET POINTER TO SHORTER VALUE       */
+      TEMP1  = VAL1_WIDTH;              /* GET NUMBER OF BITS TO COMPARE      */
+      TEMP2  = VAL2_WIDTH - VAL1_WIDTH - 1;
+                                   /* CALC NUMBER OF EXTRA BITS TO COMPARE    */
+      DO CASE (REL_OP);
+                         /* CONVERT TELATIONAL OPERATOR TO 'INVERSE' COMPARE  */
+       CASE(0);                         /* >= TO =<                           */
+         REL_OP = 1;
+       CASE(1);                         /* <= TO =>                           */
+         REL_OP = 0;
+       CASE(5);                         /* > TO <                             */
+         REL_OP = 6;
+       CASE(6);                         /* < TO >                             */
+         REL_OP = 5;
+       CASE(ELSE);                      /* ~= TO ~=, = TO =                   */
+       END;
+      END;
+ 
+/********************
+***   COMPARE THE VALUES.
+**/
+   TIX1 = 1;                            /* INIT COMPARE INDEX                 */
+   REL = 0;                             /* ASSUME VALUES ARE EQUAL            */
+   DO WHILE (TIX1 <= TEMP1 AND REL = 0); /* COMPARE 'TIL NOT EQUAL            */
+      IF TPTR1$ -> BT1#                 /* BIT SET?                           */
+       THEN IF TPTR2$ -> BT1#
+          THEN REL = 0;                 /* STILL EQUAL -- BOTH BITS SET       */
+          ELSE REL = 1;                 /* FIRST VALUE IS GREATER             */
+       ELSE IF TPTR2$ -> BT1#
+          THEN REL = 2;                 /* SECOND VALUE IS GREATER            */
+          ELSE REL = 0;                 /* BOTH ZERO --  STILL EQUAL          */
+      TIX1    = TIX1 + 1;               /* COUNT COMPARISON                   */
+      TPTR1$  = PINCRB( TPTR1$, 1 );    /* INCREMENT BIT POINTERS             */
+      TPTR2$  = PINCRB( TPTR2$, 1 );
+      END;
+ 
+/********************
+***   COMPARE REMAINDER IS NECESSARY.
+**/
+   IF REL = 0                           /* IF EQUAL COMPARE MORE (IF ANY)     */
+    THEN DO;
+      TIX1 = 0;                         /* INIT COMPARE INDEX                 */
+      DO WHILE (TIX1 <= TEMP2  AND  REL = 0);
+         IF TPTR1$ -> BIT#(TIX1)        /* IF ANY BIT IS SET                  */
+          THEN REL = 1;                 /* THEN FIRST VALUE IS GREATER        */
+          ELSE TIX1 = TIX1 + 1;         /* ELSE COMPARE MORE                  */
+         END;
+      END;
+ 
+/********************
+***   FREE THE VALUES; EXECUTE GOTO.
+**/
+   CALL UT_DEALLOC_BUF( VAL1$ );
+   CALL UT_DEALLOC_BUF( VAL2$ );
+   GOTO_OK = 0;                         /* ASSUME CONDITION IS FALSE          */
+   DO CASE (REL);
+                         /* ACTUAL CONDITION MUST BE A SUBSET OF CONDITIONAL  */
+    CASE(0);                            /* EQUAL                              */
+      IF REL_OP = 0  OR  REL_OP = 1  OR  REL_OP = 4
+                                        /* >=, <= OR =                        */
+       THEN GOTO_OK = 1;
+    CASE(1);                            /* GREATER                            */
+      IF REL_OP = 0  OR  REL_OP = 2  OR  REL_OP = 5
+                                        /* >=, ~= OR >                        */
+       THEN GOTO_OK = 1;
+    CASE(2);                            /* LESS THAN                          */
+      IF REL_OP = 1  OR  REL_OP = 2  OR  REL_OP = 6
+                                        /* <=, ~= OR <                        */
+       THEN GOTO_OK = 1;
+    END;
+ 
+   CALL XQ_GOTO_LABEL( SAV_RTN, GOTO_OK );
+ 
+   RETURN;
+ 
+END XQC_IF;
+/********************************************************************/
+%EJECT;
+/**********************************************************************/
+/**
+***   XQC_HEADS_OR_TAILS   28 SEP 77   (PRY)   DOES SOMETHING
+***   WITH INVALID COMMAND.
+**/
+ 
+XQC_HEADS_OR_TAILS: PROC;
+ 
+/********************
+***   LOCALS:
+**
+**/
+DCL   VAL$            PTR ALIGNED AUTO; /* VALUE DESC POINTER                 */
+DCL   BLK_IX    SBIN WORD ALIGNED AUTO; /* VALUE BLOCK INDEX                  */
+DCL   FMT       SBIN WORD ALIGNED AUTO; /* DESIRED DISPLAY FORMAT             */
+DCL   VAL_PTR$          PTR       ALIGNED   AUTO;
+                                        /* POINTER TO VALUE TO DISPLAY        */
+DCL   VAL_WIDTH         SBIN WORD ALIGNED   AUTO;
+                                        /* WIDTH OF VALUE TO DISPLAY          */
+ 
+/********************
+***   RESCAN COMMAND; TRY TO GET A VALUE.
+**/
+   DO WHILE( '1'B );                    /* PROCESS ALL VALUES                 */
+      CALL EV_GET_VALUE( VAL$, BLK_IX ); /* TRY TO GET A VALUE                */
+      IF VAL_FAULT ~=0 THEN RETURN;     /* RETURN IF ERROR                    */
+/********************
+***   GET FORMAT; DEFAULT IS MACHINE.
+**/
+      CALL UT_IGNORE_BLANKS;            /* IGNORE INTERVENING BLANKS          */
+      FMT = -1;                         /* ASSUME NO FORMAT APPEARS           */
+      IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON OR C = CT_COMMA
+       THEN DO;                         /* Possibly use default               */
+         IF DFLT_DT ~= DT_MACHINE
+          THEN FMT = DFLT_DT;           /* If not machine, use actual default */
+          ELSE IF VAL$->BUF.WIDTH > 36
+             THEN FMT = DT_DUMP; /* Instead of machine, use dump if more than one word */
+             ELSE FMT = DFLT_DT;
+         END;
+       ELSE IF CHARX <= CHARX_MAX THEN DO;
+            IF C = FT_MACHINE THEN FMT = DT_MACHINE;
+             ELSE IF C = FT_TEXT THEN FMT = DT_TEXT;
+                ELSE IF C = FT_DECIMAL THEN FMT = -DT_DECIMAL;
+                   ELSE IF C = FT_TEXTC THEN FMT = DT_TEXTC;
+                      ELSE IF C = FT_NOTHING THEN FMT = DT_NOTHING;
+                         ELSE IF C = FT_BASED THEN FMT = DT_BASED;
+                            ELSE IF C = FT_MIXED THEN FMT = DT_MIXED;
+                               ELSE IF C = FT_COMMAND THEN FMT = DT_COMMAND;
+                                  ELSE IF C = FT_WIDTH THEN FMT = DT_WIDTH;
+                                     ELSE IF C = FT_NTEXT THEN FMT = DT_NTEXT;
+                                        ELSE IF C = FT_DUMP THEN FMT = DT_DUMP;
+            CALL UT_INC_CHARX;          /* SKIP OVER FORMAT                   */
+            END;
+ 
+/********************
+***   IF WE GOT A FORMAT, DISPLAY THE VALUE.
+**/
+      IF FMT >= 0 OR FMT =-3            /* GOT A FORMAT?                      */
+       THEN DO;                         /* YES                                */
+         VAL_PTR$  = VAL$ -> BUF.BLK$;  /* GET POINTER TO VALUE               */
+         VAL_WIDTH = VAL$ -> BUF.WIDTH; /* GET WIDTH OF VALUE                 */
+         CALL UT_DISPLAY( VAL_PTR$, VAL_WIDTH, FMT );
+                                        /* DISPLAY VALUE                      */
+         CALL UT_DEALLOC_BUF( VAL$ );
+         CALL UT_IGNORE_BLANKS;         /* SKIP BLANKS                        */
+         IF CHARX > CHARX_MAX OR C = CT_SEMI_COLON THEN RETURN;
+                                        /* RETURN IF END OF BUFFER            */
+         IF C ~= CT_COMMA               /* CHECK FOR ILLEGAL JUNK             */
+          THEN DO;
+            VAL_FAULT = 37; /*E* 37V XQC_HEADS_OR_TAILS: WRONG ERROR */
+            RETURN;
+            END;
+         CALL UT_INC_IGNORE;            /* SKIP OVER COMMA                    */
+         END;
+ 
+       ELSE DO;                         /* ILLEGAL FORMAT DESIGNATION         */
+         IF VAL$ -> BUF.WIDTH = 0
+                                   /* IF NO VALUE ERROR IS UNKNOWN COMMAND    */
+          THEN VAL_FAULT = 37;
+                              /*E* 37V XQC_HEADS_OR_TAILS: UNKNOWN COMMAND    */
+          ELSE VAL_FAULT = 72;
+                              /*E* 72V XQC_HEADS_OR_TAILS: ILLEGAL FORMAT     */
+         CALL UT_DEALLOC_BUF( VAL$ );
+         RETURN;
+         END;
+      END;
+ 
+END XQC_HEADS_OR_TAILS;
+ 
+/**********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**
+***   XQC_COMMENT   26 SEP 77   (PRY)   EXECUTE THE COMMENT COMMAND.
+**/
+ 
+XQC_COMMENT: PROC;
+ 
+/********************
+***   FIND THE MATCHING * /
+**/
+   CALL UT_INC_CHARX;                   /* SKIP OVER FIRST SLASH              */
+   DO WHILE ('1'B);
+      DO WHILE (CHARX <= CHARX_MAX  AND  C ~= CT_ASTERISK);
+         CALL UT_INC_CHARX;             /* IGNORE CHARACTER                   */
+         END;
+      IF CHARX > CHARX_MAX              /* END OF COMMENT NOT FOUND?          */
+       THEN DO;                         /* YES--ERROR                         */
+         VAL_FAULT = 42;
+                              /*E* 42V XQC_COMMENT: END OF COMMENT MISSING    */
+         RETURN;
+         END;
+      CALL UT_INC_CHARX;                /* SKIP OVER *                        */
+      IF CHARX <= CHARX_MAX  AND  C = CT_SLASH
+                                        /* END OF COMMENT?                    */
+       THEN DO;                         /* YES                                */
+         CALL UT_INC_CHARX;             /* SKIP OVER SLASH                    */
+         CALL UT_JUNK_CHK;              /* CHECK FOR ILLEGAL JUNK             */
+         RETURN;
+         END;
+      END;
+END XQC_COMMENT;
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**   XQC_BUF_MODIFICATION   23 SEP 77   (PRY)   EXECUTE THE
+***   BUFFER SET COMMAND.
+**/
+ 
+XQC_BUF_MODIFICATION: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   BUF$              PTR       ALIGNED   AUTO;
+                                        /* POINTER TO BUFFER DESCRIPTOR       */
+DCL   BIX       SBIN WORD ALIGNED AUTO; /* BUFFER DESCRIPTOR INDEX            */
+DCL   BTYPE     SBIN WORD ALIGNED AUTO; /* BUFFER TYPE                        */
+DCL   BWIDTH    SBIN WORD ALIGNED AUTO; /* BUFFER WIDTH                       */
+DCL   VAL$              PTR       ALIGNED   AUTO;
+                                        /* POINTER TO VALUE DESCRIPTOR        */
+DCL   TO$          PTR       ALIGNED   AUTO;
+                                        /* SOURCE POINTER                     */
+DCL   FROM$        PTR       ALIGNED   AUTO;
+                                        /* DESTINATION POINTER                */
+DCL   NBR_BITS     SBIN WORD ALIGNED   AUTO;
+                                        /* NUMBER OF BITS TO MOVE             */
+DCL   BLK_IX    SBIN WORD ALIGNED AUTO; /* INDEX OF VALUE BLOCK               */
+DCL   VWIDTH    SBIN WORD ALIGNED AUTO; /* WIDTH OF VALUE                     */
+DCL   NEW_BWIDTH        SBIN WORD ALIGNED   AUTO;
+                              /* DESIRED WIDTH OF BUFFER AFTER MODIFICATION   */
+DCL   NEW_WSIZE         SBIN WORD ALIGNED   AUTO;
+                                        /* SIZE OF BUFFER BLOCK IN WORDS      */
+DCL  RANGE_STRT SBIN WORD ALIGNED AUTO; /* SPECIFIED RANGE START              */
+DCL  RANGE_SIZE SBIN WORD ALIGNED AUTO; /* SPECIFIED RANGE SIZE               */
+DCL   DFLT_RSIZE        SBIN WORD ALIGNED   AUTO;
+                         /* FLAG REMEMBERS IF DEFAULT RANGE SIZE IS SPECIFIED */
+ 
+/********************
+***   SKIP OVER 'S' AND IDENTIFY BUFFER.
+**/
+   CALL UT_INC_CHARX;                   /* SKIP OVER 'S'                      */
+   CALL UT_IDENTIFY_BUFFER( BUF$, BIX );
+                                        /* GET POINTER TO BUFFER DESCRIPTOR   */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERROR                    */
+   BTYPE  = BUF$ -> BUF.TYPE;           /* GET BUFFER TYPE                    */
+   IF BTYPE ~= BT_UNUSED  AND  BUF$ -> BUF.LOCK > 0
+                                        /* IS THIS BUFFER LOCKED?             */
+    THEN DO;                            /* YES                                */
+      VAL_FAULT = 70;                   /* TELL USER                          */
+                    /*E* 70V XQC_BUF_MODIFICATION: THIS BUFFER IS LOCKED      */
+      RETURN;
+      END;
+ 
+/********************
+***   THE BUFFER IS USED.  IT MUST NOT BE ERASE OR NIL.
+**/
+   IF BTYPE = BT_MAPPED                 /* COULD BUFFER BE ERASE/NIL          */
+    THEN DO;                            /* POSSIBLY                           */
+      TPTR1$ = BUF$ -> BUF.BLK$;
+                                        /* GET THE POINTER FOR CHECK          */
+      IF TPTR1$ = ADDR( NIL )  OR  TPTR1$ = ADDR( ERASE )
+       THEN DO;                         /* NIL OR ERASE                       */
+         VAL_FAULT = 78;
+          /*E* 78V XQC_BUF_MODIFICATION: SPECIFIED BUFFER IS NIL/ERASE        */
+         RETURN;
+         END;
+      END;
+ 
+/********************
+***   GET THE SPECIFIED RANGE, BUFFER TYPE AND WIDTH.  SET DEFAULT
+***   RANGE START IF NECESSARY.
+**/
+   CALL EV_GET_RANGE( RANGE_STRT, RANGE_SIZE );
+                                        /* GET THE RANGE                      */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERROR                    */
+   BWIDTH = BUF$ -> BUF.WIDTH;          /* GET BUFFER WIDTH                   */
+   IF RANGE_STRT < 0 THEN RANGE_STRT = 0;
+                              /* SET DEFAULT RANGE START TO BUFFER BEGINNING  */
+ 
+/********************
+***   IF BUFFER TYPE IS ONE OF THE FIXED-SIZE TYPES, THE RANGE MUST BE
+***   WITHIN THE BUFFER.
+**/
+   IF RANGE_SIZE ~= MASKR(35)           /* AVOID ARITH OVFLW                  */
+    THEN NEW_BWIDTH = RANGE_STRT + RANGE_SIZE;
+                                        /* CALC RANGE END WIDTH               */
+   IF BTYPE = BT_FIX_BUF  OR  BTYPE = BT_DCB  OR  BTYPE = BT_MAPPED
+     OR  BTYPE = BT_FPT_BUF
+    THEN DO;                            /* FIXED-SIZE TYPE BUFFER             */
+      IF RANGE_SIZE ~= MASKR(35)        /* DEFAULT RANGE SIZE?                */
+       THEN DO;                         /* NO                                 */
+         IF BWIDTH < NEW_BWIDTH
+                              /* SPECIFIED RANGE END MUST BE WITHIN BUFFER    */
+          THEN DO;
+            VAL_FAULT = 19;
+          /*E* 19V XQC_BUF_MODIFICATION: RANGE END IS NOT WITHIN BUFFER       */
+            RETURN;
+            END;
+         END;
+      END;
+ 
+/********************
+***   FIND '=' AND GET THE VALUE.
+**/
+   CALL UT_IGNORE_BLANKS;               /* SKIP BLANKS 'TIL THE =             */
+   IF CHARX > CHARX_MAX OR C ~= CT_EQUAL /* COULD = FOLLOW?                   */
+    THEN DO;                            /* NO                                 */
+      VAL_FAULT = 38;
+                    /*E* 38V XQC_BUF_MODIFICATION: EXPECTED = IS MISSING      */
+      RETURN;
+      END;
+   CALL UT_INC_CHARX;                   /* SKIP OVER THE '='                  */
+   VWIDTH = CHARX;
+   CALL EV_GET_VALUE( VAL$, BLK_IX );   /* GET THE SPECIFIED VALUE            */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERROR                    */
+   IF CHARX = VWIDTH AND CHARX < CHARX_MAX THEN DO; /* TRY A VLP IF ERROR     */
+      IF RANGE_STRT>0 OR RANGE_SIZE~=MASKR(35) THEN RETURN; /* M.B. FULL BUF  */
+      VAL$ = Y_FPT_BUF$;
+      Y_FPT_BUF$ = BUF$;
+      PMME_IX = -1;
+      CALL XCQ_MON_VLP;
+      Y_FPT_BUF$ = VAL$;
+      RETURN;
+      END;
+   VWIDTH = VAL$ -> BUF.WIDTH;          /* GET VALUE'S WIDTH                  */
+/**      IF VWIDTH < 1        /* VALUE MUST BE GREATER THAN 0 BITS WIDE       */
+/**        THEN DO;                               /* IT ISN'T                 */
+/**           CALL UT_DEALLOC_BUF( VAL$ );        /* GET RID OF THE VALUE     */
+/**           VAL_FAULT = 40;
+/**       /*E* 40V XQC_BUF_MODIFICATION: VALUE ISN'T >= ONE BIT WIDE          */
+/**           RETURN;
+/**           END;
+/**/
+ 
+/********************
+***   DEFAULT RANGE SIZE IS THE SIZE OF THE VALUE BUT IF THE
+***   RANGE SIZE IS SPECIFIED, THE VALUE MUST FIT INTO IT.
+**/
+   IF RANGE_SIZE = MASKR(35)            /* WAS A RANGE SIZE SPECIFIED?        */
+    THEN DO;                            /* NO: SET DEFAULT RANGE SIZE         */
+      DFLT_RSIZE = 1;                   /* DEFAULT SIZE                       */
+      RANGE_SIZE = VWIDTH;
+      NEW_BWIDTH = RANGE_STRT + RANGE_SIZE;
+                                        /* CALC NECESSARY WIDTH OF BUFFER     */
+      END;
+    ELSE DO;                            /* YES: RANGE SIZE WAS SPECIFIED      */
+      DFLT_RSIZE = 0;                   /* NOT DEFAULT SIZE                   */
+      IF RANGE_SIZE < VWIDTH            /* VALUE WILL FIT INTO RANGE?         */
+       THEN DO;                         /* NO IT WON'T                        */
+         TEMP1 = VWIDTH - RANGE_SIZE - 1;
+                                        /* CALC IX OF LAST OVFLW BIT          */
+         TPTR1$ = VAL$ -> BUF.BLK$;     /* GET PTR TO VALUE                   */
+         DO TIX1=0 TO TEMP1;            /* CHECK IF ANY LEADING BITS ARE SET  */
+            IF TPTR1$ -> BIT#(TIX1)     /* SET?                               */
+             THEN DO;                   /* YES                                */
+               CALL UT_DEALLOC_BUF( VAL$ );
+                                        /* GET RID OF THE VALUE               */
+               VAL_FAULT = 39;
+          /*E* 39V XQC_BUF_MODIFICATION: VALUE WON'T FIT INTO SPECIFIED RANGE */
+               RETURN;
+               END;
+            END;
+         END;
+      END;
+ 
+/********************
+***   EXPAND VARIABLE-SIZE TYPE BUFFERS IF NECESSARY; ALLOCATE AN
+***   UNUSED BUFFER WITH TYPE VARIABLE.
+**/
+   NEW_WSIZE = (NEW_BWIDTH+35) / 36;
+                                        /* CALC SIZE OF BUFFER IN WORDS       */
+   IF BTYPE = BT_VAR_BUF  OR  BTYPE = BT_CMND_BUF
+                                        /* VARIABLE-SIZE TYPE BUFFER?         */
+    THEN DO;                            /* YES                                */
+      IF BWIDTH < NEW_BWIDTH  OR  DFLT_RSIZE = 1
+                                        /* EXPANSION NECESSARY?               */
+       THEN DO;                         /* IT SURE IS                         */
+         CALL UT_NEW_SIZE( BUF$, NEW_BWIDTH );
+                                        /* CHANGE SIZE OF BUFFER              */
+         IF VAL_FAULT ~= 0 THEN RETURN; /* RETURN IF ERRORS                   */
+         BWIDTH            = NEW_BWIDTH;
+                                        /* WIDTH IS NEW WIDTH                 */
+         END;
+      END;
+    ELSE DO;                            /* NOT A VARIABLE-SIZE BUFFER TYPE    */
+      IF BTYPE = BT_UNUSED              /* UNUSED BUFFER?                     */
+       THEN DO;                         /* YES: ALLOCATE A BLOCK FOR IT       */
+         CALL AM_ALLOC_BLK( BUF$, NEW_WSIZE, BLK_IX );
+                         /* ALLOCATE A BLOCK FOR THE NEWLY ALLOCATED BUFFER   */
+         IF VAL_FAULT ~= 0 THEN RETURN; /* RETURN IF ERROR                    */
+         BUF$ -> BUF.WIDTH = NEW_BWIDTH;
+                                        /* SET NEW WIDTH                      */
+         BWIDTH            = NEW_BWIDTH;
+                                        /* WIDTH IS NEW WIDTH                 */
+         BUF$ -> BUF.TYPE  = BT_VAR_BUF;
+                                        /* TYPE IS VARIABLE                   */
+         END;
+       ELSE DO;
+              /**
+              ***   FOR FIXED SIZE TYPE BUFFER, MAKE SURE THERE'S ROOM FOR VALUE.
+              **/
+         IF BWIDTH < NEW_BWIDTH         /* ENOUGH ROOM FOR VALUE?             */
+          THEN DO;                      /* NO                                 */
+            CALL UT_DEALLOC_BUF( VAL$ );
+                                        /* GET RID OF THE VALUE               */
+            VAL_FAULT = 41;
+          /*E* 41V XQC_BUF_MODIFICATION: VALUE IS TOO LARGE FOR BUFFER        */
+            RETURN;
+            END;
+         END;
+      END;
+ 
+/********************
+***   MAKE SURE NO ILLEGAL JUNK FOLLOWS.
+**/
+   CALL UT_JUNK_CHK;
+   IF VAL_FAULT ~= 0                    /* ERROR?                             */
+    THEN DO;                            /* YES                                */
+      CALL UT_DEALLOC_BUF( VAL$ );      /* GET RID OF VALUE                   */
+      RETURN;
+      END;
+ 
+/********************
+***   MOVE THE VALUE INTO THE BUFFER AREA SPECIFIED BY THE RANGE.
+**/
+   TPTR1$ = PINCRB( BUF$ -> BUF.BLK$, RANGE_STRT );
+                                        /* POINT TO TARGET BIT IN BUFFER      */
+   TPTR2$ = VAL$ -> BUF.BLK$;
+                                   /* POINT TO SOURCE BITS IN VALUE BLOCK     */
+   TEMP1 = VWIDTH - RANGE_SIZE;
+                                   /* CALC NUMBER OF BITS OF VALUE TO IGNORE  */
+   IF TEMP1 > 0                         /* ANY TO IGNORE?                     */
+    THEN DO;                            /* YES                                */
+      TPTR2$ = PINCRB( TPTR2$, TEMP1 ); /* POINT TO ACTUAL BITS               */
+      NBR_BITS  = RANGE_SIZE;
+      END;
+    ELSE DO;                            /* NO: USE ALL OF VALUE               */
+      NBR_BITS = VWIDTH;
+      END;
+   TO$ = TPTR1$;                        /* SET ARGUMENTS FOR BUFFER MOVER     */
+   FROM$ = TPTR2$;
+   CALL UT_MOVE_BITS_FWD( FROM$, TO$, NBR_BITS );
+   TPTR1$ = PINCRB( TO$, VWIDTH );      /* POINT TO BITS TO ZERO              */
+   TEMP1  = RANGE_SIZE - VWIDTH - 1;
+                                        /* CALC INDEX OF LAST BIT TO ZERO     */
+   DO TIX1=0 TO TEMP1;                  /* ZERO REMAINING BITS TO RIGHT       */
+      TPTR1$ -> BIT#(TIX1) = '0'B;
+      END;
+   CALL UT_DEALLOC_BUF( VAL$ );         /* GET RID OF VALUE                   */
+ 
+   RETURN;
+ 
+END XQC_BUF_MODIFICATION;
+ 
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**
+***   XQ_GET_CMND   23 SEP 77   (PRY)   GET AND IDENTIFY A
+***   MONITOR CALL COMMAND.
+**/
+ 
+XQ_GET_CMND: PROC( PMME_IX#, CMND_IX# );
+ 
+/********************
+***   PARAMETERS:
+**/
+DCL PMME_IX# SBIN WORD ALIGNED;         /* Index of PMME to execute           */
+DCL CMND_IX# SBIN WORD ALIGNED;         /* Index of FPT to use                */
+/********************
+***   LOCALS:
+**/
+DCL   CMND_IX   SBIN WORD ALIGNED AUTO; /* LOCAL CMND_IX#                     */
+DCL   CMNDPTR_TBL$    PTR ALIGNED AUTO; /*POINTER TO COMMAND TABLE            */
+DCL FPT_NAME_GENERATED BIT(1) AUTO;     /* Flag tells if FPT name generated   */
+ 
+/********************
+***   SKIP OVER 'M'; SKIP OVER '$' IF PRESENT.
+**/
+   FPT_NAME_GENERATED = '0'B;
+   CALL UT_INC_IGNORE;                  /* SKIP OVER 'M'                      */
+   IF CHARX <= CHARX_MAX  AND  C = CT_DOLLAR
+                                        /* SKIP '$' IF PRESENT                */
+    THEN CALL UT_INC_IGNORE;
+   IF CHARX > CHARX_MAX OR C = ASCBIN(';') /* ANYTHING LEFT?                  */
+    THEN DO;                            /* NOPE                               */
+      VAL_FAULT = 43; /*E* 43V XQ_GET_CMND: PMME NAME IS MISSING        */
+      RETURN;
+      END;
+ 
+/********************
+***   GET THE NAME.
+**/
+   CALL UT_GET_NAME;                    /* GET THE NAME                       */
+   IF VAL_FAULT ~=0 THEN RETURN;
+   IF CRNT_NAME.LENGTH <= 0             /* GET ANYTHING?                      */
+    THEN DO;                            /* NO                                 */
+      VAL_FAULT = 43;
+      RETURN;
+      END;
+/********************
+***   LOOK UP THE NAME IN THE COMMAND TABLE.
+**/
+   CMNDPTR_TBL$ = ADDR( PMMEPTR_TBL );
+                                        /* GET POINTER TO COMMAND TABLE       */
+   PMME_IX# = -1;                       /* INITIALIZE SEARCH PARAMETER        */
+   CALL UT_LOOKUP( CMNDPTR_TBL$, PMME_IX# );
+                                        /* LOOK UP COMMAND--RETURN INDEX      */
+   IF PMME_IX# < 0                      /* FOUND?                             */
+    THEN DO;                            /* NO                                 */
+      VAL_FAULT = 44;           /*E* 44V XQ_GET_CMND: Unknown PMME name */
+      RETURN;
+      END;
+ 
+ /***
+  *** Check if FPT name follows.
+  ***/
+ 
+   CALL UT_IGNORE_BLANKS;
+   IF CHARX > CHARX_MAX OR C = ASCBIN(';')
+    THEN CALL XQ_GEN_FPT_NAME;
+    ELSE IF C ~= ASCBIN('/')
+       THEN CALL XQ_GEN_FPT_NAME;
+       ELSE DO;                         /* FPT name must follow               */
+         CALL UT_INC_IGNORE;            /* Skip over '/'                      */
+XQ@GET_VLPNAM:;
+         IF CHARX > CHARX_MAX OR C = ASCBIN(';')
+          THEN DO;                      /* FPT name missing                   */
+            VAL_FAULT = 87;             /*E* 87V XQ_GET_CMND: FPT name missing */
+            RETURN;
+            END;
+         CALL UT_GET_NAME;
+         IF VAL_FAULT ~= 0 THEN RETURN;
+         IF CRNT_NAME.LENGTH <= 0
+          THEN DO;
+            VAL_FAULT = 87;             /*E* 87V XQ_GET_CMND: FPT name missing */
+            RETURN;
+            END;
+         END;
+   CMND_IX = -1;
+   CMNDPTR_TBL$ = ADDR( CMNDPTR_TBL );
+   CALL UT_LOOKUP( CMNDPTR_TBL$, CMND_IX, CMND_IX ); /* Valid FPT name not changeable */
+   IF CMND_IX < 0
+    THEN DO;                            /* Not FPT name                       */
+      IF FPT_NAME_GENERATED
+       THEN VAL_FAULT = 49; /*E* 49V XQ_GET_CMND: No FPT for PMME   */
+       ELSE VAL_FAULT = 86; /*E* 86V XQ_GET_CMND: Invalid FPT name  */
+      RETURN;
+      END;
+   CMND_IX# = CMND_IX;
+   TPTR1$      = CMNDPTR_TBL.FPT_PTR;
+                                        /* GET POINTER TO FPT POINTER TABLE   */
+   FPTPTR_TBL$ = TPTR1$ -> PTR#$(CMND_IX); /* GET POINTER TO FPT TABLE        */
+ 
+   RETURN;
+ 
+XQ_GET_VLPNAM: ENTRY (PMME_IX#, CMND_IX#);
+   GOTO XQ@GET_VLPNAM;
+ 
+XQ_GEN_FPT_NAME: PROC;
+/*F*     NAME: XQ_GEN_FPT_NAME
+         PURPOSE: Generate FPT name from PMME name.
+ ***/
+ 
+/********************/
+ 
+   FPT_NAME_GENERATED = '1'B;
+   TPTR1$ = ADDR( CRNT_NAME.CHR(0) );
+   TEMP1 = CRNT_NAME.LENGTH;            /* Save name                          */
+   ADDR(ERRBUFFER)->CHARS = TPTR1$->CHARS;
+   CRNT_NAME.LENGTH = TEMP1 + 4;
+   CALL CONCAT( CRNT_NAME.CHARS, 'FPT_', ADDR(ERRBUFFER)->CHARS );
+   RETURN;
+ 
+END XQ_GEN_FPT_NAME;
+ 
+END XQ_GET_CMND;
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/***
+ *** XQC_HELP  2 FEB 79  (PRY) EXECUTE HELP COMMNAND.
+ ***/
+ 
+XQC_HELP: PROC;
+ 
+ /***
+  *** LOCALS:
+  ***/
+ 
+DCL CMND_IX SBIN WORD ALIGNED AUTO;     /* COMMAND INDEX                      */
+DCL CMNDPTR_TBL$ PTR AUTO;              /* COMMAND POINTER TABLE              */
+DCL KEY_STRT SBIN WORD AUTO;            /* Initial help key                   */
+DCL KEY_END SBIN WORD AUTO;             /* Last help key                      */
+ 
+/********************/
+ 
+ /***
+  *** List help file if 'H' only.
+  ***/
+ 
+   CMND_IX = C;
+   IF C ~= CT_QUESTION
+    THEN DO;
+      CMND_IX = CHARX+1;
+      CALL UT_INC_IGNORE;
+      IF CHARX > CHARX_MAX OR C = CT_SEMI_COLON
+       THEN DO;
+         KEY_STRT = 0;                  /* List entire help file              */
+         KEY_END = 255999;
+         CALL UT_DUMP_HELP;
+         RETURN;
+         END;
+ 
+ /***
+  *** If not M, help for specific command.
+  ***/
+ 
+      IF C = CT_E AND CHARX = CMND_IX
+       THEN DO;                         /* Look for HELP                      */
+         CALL UT_INC_CHARX;
+         IF C ~= CT_L OR CHARX > CHARX_MAX
+          THEN EXIT;
+         CALL UT_INC_CHARX;
+         IF C ~= CT_P OR CHARX > CHARX_MAX
+          THEN EXIT;
+         CALL UT_INC_IGNORE;
+         IF C ~= CT_SEMI_COLON AND CHARX <= CHARX_MAX
+          THEN EXIT;
+         KEY_STRT = 0;
+         KEY_END = 255999;
+         CALL UT_DUMP_HELP;
+         RETURN;
+         END;
+      IF C = CT_SPACE
+       THEN CALL UT_INC_IGNORE;
+      KEY_STRT = C * 1000;              /* Start with key C.004               */
+      KEY_END = C * 1000 + 999;         /* List entire range                  */
+      CMND_IX = C;
+      IF CMND_IX ~= CT_M                /* Done if not M command help         */
+       THEN DO;
+         CALL UT_INC_IGNORE;
+         CALL UT_JUNK_CHK;
+         IF VAL_FAULT = 0
+          THEN CALL UT_DUMP_HELP;
+         RETURN;
+         END;
+      END;
+ 
+ /***
+  *** If nothing follows 'M', list known FPT names.
+  ***/
+ 
+   CALL UT_INC_IGNORE;
+   IF CHARX > CHARX_MAX OR C = CT_SEMI_COLON
+    THEN DO;                            /* Just list known FPT/VLP/VLR names  */
+      IF CMND_IX = CT_M
+       THEN CALL UT_DUMP_HELP;
+      CALL UT_OUTPUT_CHARS( 'Known PMME names:', 17 );
+      CALL UT_FLUSH_BUF;
+      CALL UT_NAME_LIST( ADDR(PMMEPTR_TBL) );
+      CALL UT_FLUSH_BUF;
+      CALL UT_OUTPUT_CHARS( 'Known FPT/VLP/VLR names:', 24 );
+      CALL UT_FLUSH_BUF;
+      CALL UT_NAME_LIST( ADDR( CMNDPTR_TBL ) );
+      RETURN;
+      END;
+ 
+ /***
+  *** AN FPT NAME MUST FOLLOW.
+  ***/
+ 
+   CALL UT_GET_NAME;                    /* GET THE NAME                       */
+   IF VAL_FAULT ~=0 THEN RETURN;
+   IF CRNT_NAME.LENGTH <= 0
+    THEN DO;                            /* BAD NAME                           */
+      VAL_FAULT = 86; /*E* 86V XQC_HELP: FPT NAME IS MISSING */
+      RETURN;
+      END;
+ 
+   KEY_END = C;
+   IF C = CT_PERIOD THEN CALL UT_INC_IGNORE;
+   CALL UT_JUNK_CHK;                    /* CHECK FOR ANY JUNK                 */
+   IF VAL_FAULT ~=0 THEN RETURN;
+   CMNDPTR_TBL$ = ADDR( CMNDPTR_TBL );
+   CMND_IX = -1;                        /* BEGIN SEARCH INDEX                 */
+   CALL UT_LOOKUP( CMNDPTR_TBL$, CMND_IX );
+   IF CMND_IX < 0
+    THEN DO;                            /* UNKNOWN COMMAND                    */
+      VAL_FAULT = 86; /*E* 86V XQC_HELP: Unknown FPT/VLP/VLR name */
+      RETURN;
+      END;
+   TPTR1$ = CMNDPTR_TBL.FPT_PTR;        /* GET PTR TO COMMAND TABLE           */
+   CMNDPTR_TBL$ = TPTR1$->PTR#$(CMND_IX);
+ 
+ /***
+  *** LIST OPTIONS IF ANY.
+  ***/
+ 
+   IF CMNDPTR_TBL$->FPT_TBL.FPT ~= ADDR( NIL ) AND KEY_END ~= CT_PERIOD
+    THEN DO;                            /* List option names                  */
+      CALL UT_OUTPUT_CHARS( 'Known option names:', 19 );
+      CMNDPTR_TBL$ = CMNDPTR_TBL$->FPT_TBL.OPT_TBL;
+      END;
+    ELSE CALL UT_OUTPUT_CHARS( 'Known item names:', 17 );
+   CALL UT_FLUSH_BUF;
+   CALL UT_NAME_LIST(CMNDPTR_TBL$);
+   RETURN;
+ 
+/***
+ ***  UT_DUMP_HELP  10 FEB 79  (PRY) Dumps help file.
+ ***/
+ 
+UT_DUMP_HELP: PROC;
+ 
+/********************/
+ 
+   HELPBUF = DCBADDR(2)->F$DCB.ACCT#;
+   CALL M$OPEN(HELPOPEN) ALTRET(WHYALT); /* Open the help file                */
+   HELPREAD.V.KEYS# = '1'B;
+   HELPKEY.L = 3;
+   HELPKEY.U27 = KEY_STRT;         /* File should be keyed by command name    */
+   KEY_STRT = 0;                        /* Count # help records               */
+   HELPREAD.V.KEYR# = '1'B;
+   DO WHILE('1'B);
+      CALL UT_FLUSH_BUF;
+      CALL M$READ(HELPREAD) WHENRETURN DO;
+         THEERRCODE = 0;
+         HELPKEY.U27 = HELPKEY.U27+1;
+         END; WHENALTRETURN DO;
+         THEERRCODE = B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE;
+         END;
+      IF HELPKEY.U27 > KEY_END OR BRK_FLAG ~= 0
+        OR (THEERRCODE ~= %E$LD AND THEERRCODE ~= 0
+        AND THEERRCODE ~= %E$NOKEY)
+       THEN DO;                         /* Done with help file                */
+         IF KEY_STRT = 0
+          THEN DO;                      /* No help                            */
+            CALL UT_OUTPUT_CHARS( 'No help available', 17 );
+            CALL UT_FLUSH_BUF;
+            END;
+         CALL M$CLOSE(HELPCLOSE) ALTRET(JUSTRET);
+         RETURN;
+         END;
+      CALL UT_OUTPUT_CHARS( HELPBUF, DCBADDR(DCBNUM(F$HELP))->F$DCB.ARS#+0 );
+      IF THEERRCODE = %E$NOKEY
+       THEN CALL UT_OUTPUT_CHARS( ' ',1);
+      KEY_STRT = KEY_STRT + 1;
+      END;
+ 
+WHYALT: ;                               /* Couldn't open help file            */
+   CALL UT_OUTPUT_CHARS( 'Can''t open help file...JIT.ERR.CODE = ', 38 );
+   KEY_STRT = B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE;
+   CALL UT_DISPLAY( ADDR(KEY_STRT), 36, -DT_DECIMAL );
+   CALL UT_FLUSH_BUF;
+JUSTRET: ;
+   RETURN;
+END UT_DUMP_HELP;
+END XQC_HELP;
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/***
+ *** UT_NAME_LIST  2 FEB 79 (PRY) LIST NAMES IN TABLE.
+ ***/
+ 
+UT_NAME_LIST: PROC(T$);
+ 
+ /***
+  *** PARAMETERS:
+  ***/
+ 
+DCL T$ PTR;                             /* POINTER TO INFORMATION TABLE       */
+ 
+ /***
+  *** LOCALS:
+  ***/
+ 
+DCL NAMEX SBIN WORD ALIGNED AUTO;
+DCL NLEN SBIN WORD ALIGNED AUTO;
+DCL 1 NAME_BUF AUTO,
+      2 FRST4 SBIN WORD UNAL,
+      2 REST CHAR(75) UNAL;
+DCL NAM_TBL$ PTR AUTO;
+DCL NAM_LIX$ PTR AUTO;
+DCL NAM_IX$ PTR AUTO;
+DCL NAM_CONT$ PTR AUTO;
+ 
+/********************/
+ 
+   CALL UT_FLUSH_BUF;                   /* CLEAN OUTPUT BUFFER                */
+   NAM_TBL$ = T$->PTR_TBL.TBL;          /* Localize FPT information           */
+   NAM_LIX$ = T$->PTR_TBL.LIX;
+   NAM_IX$ = T$->PTR_TBL.IX;
+   NAM_CONT$ = T$->PTR_TBL.CONT;
+   DO NAMEX = 0 TO T$->PTR_TBL.SIZE-1;  /* LIST ALL NAMES                     */
+      CALL UT_LIST_NAME;
+      IF NLEN > LINE_WID-2 THEN NLEN = LINE_WID-2;
+      IF NLEN + OUT_CHARX > LINE_WID-2
+       THEN CALL UT_FLUSH_BUF;
+      TEMP1 = (NLEN+1+7)/8 * 8;         /* EVERY 8 CHARS                      */
+      TPTR1$ = ADDR(NAME_BUF);
+      IF TEMP1 + OUT_CHARX <= LINE_WID-2
+       THEN DO;                         /* Filled name will fit               */
+         NLEN = TEMP1;                  /* Fill with blanks                   */
+         CALL UT_OUTPUT_CHARS( TPTR1$->CHARS, NLEN );
+         END;
+       ELSE DO;                    /* Filled name won't fit but name will     */
+         CALL UT_OUTPUT_CHARS( TPTR1$->CHARS, NLEN );
+         CALL UT_FLUSH_BUF;
+         END;
+      IF BRK_FLAG ~= 0 THEN RETURN;
+      END;
+   RETURN;
+ 
+UT_LIST_NAME: PROC;
+ 
+ 
+ /***
+  *** MOVE NAME TO OUTPUT STAGING AREA.
+  ***/
+ 
+   NAME_BUF.FRST4 = NAM_TBL$->WORD#(NAMEX); /* GET FIRST 4 CHARS              */
+   TIX1 = NAM_LIX$->HALF#(0);           /* FIND LENGTH OF NAME                */
+   DO WHILE (NAM_LIX$->HALF#(TIX1) > NAMEX );
+      TIX1 = TIX1 - 1;
+      END;
+ 
+   IF TIX1 <= 4
+    THEN NAME_BUF.REST = ' ';           /* REST IS BLANKS                     */
+    ELSE DO;                            /* MUST MOVE CONTINUATION CHARS       */
+      TIX2 = NAM_IX$->HALF#(NAMEX);     /* GET CONTINUATION INDEX             */
+      TEMP1 = TIX1 - 4;                 /* NUMBER OF CONTINUATION CHARS       */
+      TPTR1$ = PINCRC( NAM_CONT$, TIX2 ); /* PTR TO CONT CHARS                */
+      NAME_BUF.REST = TPTR1$->CHARS;
+      END;
+ 
+   NLEN = TIX1;                         /* RETURN LENGTH OF NAME              */
+   RETURN;
+ 
+END UT_LIST_NAME;
+END UT_NAME_LIST;
+/*********************************************************************/
+%EJECT;
+/*********************************************************************/
+/**
+***   XQC_MON_CALL   30 SEP 77   (PRY)   EXECUTE MONITOR CALL
+***   COMMANDS.
+**/
+ 
+XQC_MON_CALL: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   CMND_IX           SBIN WORD ALIGNED   AUTO  ;
+                                        /* INDEX OF FPT                       */
+DCL   READY_TO_EXEC     SBIN WORD ALIGNED   AUTO  ;
+                                        /* FLAG INDICATING END OF PARAMS      */
+DCL   FPT_INFO$         PTR       ALIGNED   AUTO  ;
+                                        /* POINTER TO FPT INFO TABLE          */
+DCL   MJR_IX            SBIN WORD ALIGNED   AUTO  ;
+                                        /* MAJOR INDEX                        */
+DCL   BSIZE             SBIN WORD ALIGNED   AUTO  ;
+                                        /* SIZE IN BITS                       */
+DCL   WSIZE             SBIN WORD ALIGNED   AUTO  ;
+                                        /* SIZE IN WORDS                      */
+DCL   BLK_IX            SBIN WORD ALIGNED   AUTO  ;
+                                        /* INDEX OF BLOCK                     */
+DCL   OUSAGE            SBIN WORD ALIGNED   AUTO  ;
+                                        /* OPTION USAGE                       */
+DCL   OLENGTH           SBIN WORD ALIGNED   AUTO  ;
+                                        /* OPTION LENGTH                      */
+DCL   OVALUE            SBIN WORD ALIGNED   AUTO  ;
+                                        /* OPTION ASSOCIATED VALUE            */
+DCL   OVALUE$           PTR       ALIGNED   AUTO  ;
+                                        /* POINTER TO OPTION VALUE            */
+DCL   VALUE_TYPE        SBIN WORD ALIGNED   AUTO  ;
+                                        /* OPTION VALUE TYPE                  */
+DCL   OPTPTR_TBL$       PTR       ALIGNED   AUTO  ;
+                                        /* POINTER TO OPTION TABLE            */
+DCL   OPTINFO$          PTR       ALIGNED   AUTO  ;
+DCL   BUF$              PTR       ALIGNED   AUTO  ;
+                                        /* BUFFER/VALUE DESCRIPTOR POINTER    */
+DCL   SAVE_EXEC_STACK_IX     SBIN WORD ALIGNED   AUTO  ;
+                                        /* SAVES THE EXEC STACK IX            */
+DCL   OPTUSAGE$         PTR       ALIGNED   AUTO  ;
+                                        /* POINTER TO OPT USAGE VECTOR        */
+DCL   SAVE_VAL          SBIN WORD ALIGNED   AUTO  ;
+                                        /* FLAG SET IF VALUE IS TO BE SAVED   */
+DCL   OPT_INIT_NBR      SBIN WORD ALIGNED   AUTO  ;
+                                   /* NUMBER OF ITEMS THAT THE OPTION INITS   */
+DCL   FPT_ITEM_IX       SBIN WORD ALIGNED   AUTO  ;
+                                        /* IX OF ITEM   "   "    "   "        */
+DCL   FPT_ITEM_LOC      SBIN WORD ALIGNED   AUTO  ;
+                                        /* STARTING BIT OF INITED ITEM        */
+DCL   FPT_ITEM_SIZE     SBIN WORD ALIGNED   AUTO  ;
+                                        /* WIDTH OF ITEM                      */
+DCL   FPT_INIT_FCN      SBIN WORD ALIGNED   AUTO  ;
+                                        /* INITIALIZATION FUNCTION OF ITEM    */
+DCL   IVALUE$           PTR       ALIGNED   AUTO  ;
+                                   /* POINTER TO VALUE TO INITIALIZE WITH     */
+DCL   ILENGTH           SBIN WORD ALIGNED   AUTO  ;
+                                        /* LENGTH OF VALUE TO INITIALIZE WITH */
+DCL   OINIT             SBIN WORD ALIGNED   AUTO  ;
+                                        /* INITIALIZATION                     */
+DCL   FPT$         PTR  ALIGNED AUTO  ; /* POINTER TO SOURCE FPT              */
+DCL   NBR_ITEMS    SBIN ALIGNED AUTO  ; /* NUMBER OF FPT ITEMS                */
+DCL   LOCAL_TEMP1  SBIN ALIGNED AUTO  ; /* LOCAL TEMPORARIES                  */
+DCL   LOCAL_TEMP2  SBIN WORD ALIGNED   AUTO;
+DCL   DFLTD_DCB         SBIN WORD ALIGNED   AUTO;
+                                        /* COUNTS USE OF DEFAULT DCB          */
+DCL REINIT_IX SBIN AUTO;
+DCL REINIT_IX_MAX SBIN AUTO;            /* Ix of last reinit                  */
+DCL 1 REINIT(0:100) AUTO,               /* Reinitializations                  */
+      2 OLENGTH SBIN,
+      2 BUF$ PTR,
+      2 FPT_ITEM_LOC SBIN,
+      2 FPT_ITEM_SIZE SBIN,
+      2 FPT_INIT_FCN SBIN,
+      2 VALUE_TYPE SBIN,
+      2 FPT_ITEM_IX SBIN;
+ 
+ /***
+  *** BASED:
+  ***/
+ 
+DCL 1 AN_FPT DALIGNED BASED,
+      2 *(0:20) BIT(72);
+DCL 1 BPTR BASED ALIGNED,
+      2 * BIT(24),
+      2 SEGID BIT(12);
+ 
+/********************
+***   GET THE COMMAND.
+**/
+   NOT_X_ONLY = 1;                      /* ALWAYS SAVE MONITOR CALL COMMANDS  */
+   CALL XQ_GET_CMND( PMME_IX, CMND_IX ); /* GET IX OF COMMAND                 */
+   GOTO MON_COMMON;
+ 
+XCQ_MON_VLP: ENTRY;
+   CALL XQ_GET_VLPNAM ( ,CMND_IX);
+ 
+MON_COMMON:;
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERROR                    */
+   IF FPTPTR_TBL$ -> FPT_TBL.FPT = ADDR( NIL )
+                                        /* NO ASSOCIATED FPT?                 */
+    THEN DO;                            /* NONE AT ALL!  ILLEGAL COMMAND      */
+      VAL_FAULT = 88; /*E* 88V XQC_MON_CALL: Not real FPT */
+      RETURN;
+      END;
+   CALL UT_IGNORE_BLANKS;               /* FIND FIRST PARAM                   */
+ 
+/********************
+***   FIND SIZE OF THE NECESSARY FPT TABLE.
+**/
+   FPT_INFO$   = FPTPTR_TBL$ -> FPT_TBL.INFO;
+                                        /* GET POINTER TO OPTION INFORMATION  */
+   MJR_IX      = FPTPTR_TBL$ -> FPT_TBL.MAJOR;
+                                        /* GET IX OF MAJOR ITEM IN FPT TABLE  */
+   BSIZE       = FPT_INFO$ -> FPT_INFO.SIZE(MJR_IX);
+                              /* GET SIZE OF FPT TABLE = SIZE OF MAJOR ITEM   */
+   WSIZE       = (BSIZE + 35) / 36;     /* CALC SIZE IN WORDS                 */
+ 
+/********************
+***   SET UP THE FPT BUFFER.
+**/
+   TEMP1 = Y_FPT_BUF$ -> BUF.TYPE;      /* GET TYPE OF FPT BUFFER             */
+   IF TEMP1 = BT_DCB  OR  TEMP1 = BT_MAPPED
+    THEN Y_FPT_BUF$ -> BUF.TYPE = BT_UNUSED;
+   IF Y_FPT_BUF$ -> BUF.TYPE = BT_UNUSED /* SET UP YET?                       */
+    THEN CALL AM_ALLOC_BLK( Y_FPT_BUF$, WSIZE, BLK_IX );
+                                        /* NO: ALLOCATE IT                    */
+    ELSE CALL UT_NEW_SIZE( Y_FPT_BUF$, BSIZE );
+                                        /* GIVE IT THE APPROPRIATE SIZE       */
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERROR                    */
+ 
+/********************
+***   SET UP THE Y-BUFFER WITH THE DEFAULT FPT.
+**/
+   Y_FPT_BUF$ -> BUF.WIDTH = BSIZE;     /* SET BUFFER WIDTH                   */
+   Y_FPT_BUF$ -> BUF.TYPE = BT_FPT_BUF; /* TYPE IS FPT BUFFER                 */
+   TPTR1$                  = Y_FPT_BUF$ -> BUF.BLK$;
+                                        /* GET POINTER TO BUFFER CONTENTS     */
+   FPT$                    = FPTPTR_TBL$ -> FPT_TBL.FPT;
+                                        /* GET POINTER TO DEFAULT FPT         */
+   DO TIX1=0 TO WSIZE-1;                /* MOVE IN DEFAULT FPT                */
+      TPTR1$ -> WORD#(TIX1) = FPT$ -> WORD#(TIX1);
+      END;
+ 
+/********************
+***   GET READY TO UNDERSTAND OPTIONS.
+**/
+   CALL UT_IGNORE_BLANKS;               /* FIND FIRST OPTION                  */
+   IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* END OF COMMAND?                    */
+    THEN READY_TO_EXEC = 1;             /* YES: WE'RE READY                   */
+    ELSE DO;                            /* NO: EXPECT OPTIONS                 */
+      READY_TO_EXEC = 0;
+      OPTPTR_TBL$      = FPTPTR_TBL$ -> FPT_TBL.OPT_TBL;
+                                        /* GET POINTER TO OPTION TABLE        */
+      OPTINFO$         = OPTPTR_TBL$ -> OPT_TBL.INFO;
+                                        /* GET INFO TABLE POINTER             */
+      OPTUSAGE$        = OPTPTR_TBL$ -> OPT_TBL.USAGE;
+                                        /* GET USAGE VECTOR POINTER           */
+      END;
+   SAVE_EXEC_STACK_IX = EXEC_STACK_IX;  /* SAVE FOR POP LIMITS                */
+   REINIT_IX_MAX = -1;                  /* No reinits                         */
+ 
+/********************
+***   SET UP FPT WITH OPTION INFORMATION.
+**/
+   DO WHILE (READY_TO_EXEC = 0);
+      CALL UT_GET_OPT_INFO( OUSAGE, OLENGTH, OVALUE );
+                                        /* GET OPTION INFORMATION             */
+      IF VAL_FAULT ~= 0                 /* RETURN IF ERROR                    */
+       THEN GOTO MON_CALL_ERR;
+ 
+          /**
+          *** GET VALUE TO STORE IN FPT.
+          **/
+      IF (CHARX <= CHARX_MAX AND  C = CT_EQUAL)
+                                        /* ASSIGN?                            */
+       THEN DO;                         /* YES                                */
+         CALL UT_INC_CHARX;             /* SKIP OVER =?                       */
+              /**
+              ***   GET BUFFER ID OR VALUE.
+              **/
+         CALL UT_IGNORE_BLANKS;
+ 
+         IF C = CT_SEMI_COLON THEN DO;  /* End of command after "=".          */
+            VAL_FAULT = 90;   /* 90V XQC_MON_CALL:  Option value missing.     */
+            GOTO MON_CALL_ERR;
+            END;
+                                   /* FIND BEGINNING OF BUFFER ID OR VALUE    */
+         TPTR2$ = STRING$ -> BUF.BLK$;  /* GET PTR TO CHARS                   */
+         TEMP1  = TPTR2$ -> UBIN9#(CHARX+1);
+                                        /* GET FOLLOWING CHARS                */
+         TEMP2  = TPTR2$ -> UBIN9#(CHARX+2);
+         CALL UT_NAME_CHAR( TEMP1 );
+         CALL UT_NAME_CHAR( TEMP2 );
+                                        /* DETERMINE IF VALID NAME CHARS      */
+         IF CHARX <= CHARX_MAX
+                                        /* DETERMINE TYPE OF FOLLOWING ARG    */
+          THEN IF C = CT_ASTERISK       /* *-INDIRECT BUFFER                  */
+             THEN TEMP1 = 1;            /* YES: BUFFER SPEC                   */
+             ELSE IF C = CT_Z
+                                        /* Z CAN BEGIN Z-REG, Z BUF OR OPTION */
+                THEN IF CHARX+2 <= CHARX_MAX
+                                        /* CHECK FOLLOWING CHARS              */
+                    AND  TEMP1 < 0  AND  TEMP2 < 0
+                                        /* BOTH CHARS VALID NAME CHARS?       */
+                   THEN TEMP1 = 2;
+                                        /* OPTION                             */
+                   ELSE IF CHARX+1 <= CHARX_MAX
+                       AND  TEMP1 <= -CT_A  AND  TEMP1 >= -CT_Z
+                                        /* Z FOLLOWED BY ALPHA CHAR?          */
+                      THEN TEMP1 = 3;
+                                        /* YES: ZA VALUE                      */
+                      ELSE TEMP1 = 1;
+                                        /* JUST Z...BUFFER                    */
+                ELSE IF C >= CT_A  AND  C <= CT_Y
+                                        /* OTHER ALPHA?                       */
+                   THEN IF TEMP1 < 0
+                                        /* YES: NEXT CHAR A VALID NAME CHAR?  */
+                      THEN TEMP1 = 2;
+                                        /* YES: OPTION                        */
+                      ELSE TEMP1 = 1;
+                                        /* JUST ALPHA...BUFFER NAME           */
+                   ELSE TEMP1 = 0;
+                                        /* SOMETHING ELSE                     */
+          ELSE TEMP1 = 0;               /* SOMETHING ELSE                     */
+                                        /* TEMP1 HAS BEEN SET TO 0-SOMETHING, */
+                                        /* 1-BUFFER, 2-OPTION NAME, 3-VALUE   */
+         IF TEMP1 = 1  OR  TEMP1 = 2    /* BUFFER ID FOLLOWS?                 */
+          THEN DO;                      /* SURE DOES                          */
+            IF TEMP1 = 2                /* OPTION NAME...                     */
+             THEN DO;                   /* CHAR FOLLOWING FIRST ALPHA IS      */
+                              /* VALID NAME CHAR--THIS MUST BE AN OPT NAME    */
+               VALUE_TYPE = 0;          /* VALUE TYPE IS PARAM                */
+               CALL UT_GET_VAL_INFO( LOCAL_TEMP1, OLENGTH, OVALUE );
+                                        /* GET OPTION VALUE                   */
+               IF VAL_FAULT ~= 0
+                                        /* RETURN IF ERRORS                   */
+                THEN GOTO MON_CALL_ERR;
+               OVALUE$ = ADDR( OVALUE );
+                                        /* POINT TO THE VALUE                 */
+               END;
+             ELSE DO;                   /* MUST BE A BUFFER SPECIFICATION     */
+               VALUE_TYPE = 1;          /* TYPE IS BUFFER                     */
+               CALL UT_IDENTIFY_BUFFER( BUF$, BLK_IX );
+                                        /* GET BUFFER                         */
+               IF VAL_FAULT ~= 0
+                THEN GOTO MON_CALL_ERR;
+ 
+               IF BUF$ -> BUF.TYPE = BT_UNUSED
+                                        /* FOR NOW UNALLOC BUFFER IS ILLEGAL  */
+                THEN DO;
+                  VAL_FAULT = 27;
+                    /*E* 27V XQC_MON_CALL: THAT BUFFER IS UNALLOCATED         */
+                  GOTO MON_CALL_ERR;
+                  END;
+ 
+               OVALUE$ = BUF$ -> BUF.BLK$;
+                                        /* GET POINTER TO DATA                */
+               OLENGTH = BUF$ -> BUF.WIDTH;
+                                        /* GET SIZE OF VALUE                  */
+               CALL UT_IGNORE_BLANKS;
+               IF C = CT_LPAREN AND CHARX <= CHARX_MAX
+                THEN DO;                /* Size spec follows                  */
+                  CALL UT_INC_IGNORE;   /* Skip over paren                    */
+                  CALL EV_EVAL_SIZE( LOCAL_TEMP1, LOCAL_TEMP2 );
+                                        /* Get desired size of buffer         */
+                  IF VAL_FAULT ~= 0 THEN RETURN; /* Return if error           */
+                  IF LOCAL_TEMP2 ~= 0
+                   THEN DO;             /* Got a size                         */
+                     IF OLENGTH < LOCAL_TEMP1
+                      THEN DO;          /* Can't be greater than buffer size  */
+                        VAL_FAULT = 19;
+                     /*E* 19V XQC_MON_CALL: SPECIFIFIED SIZE GREATER THAN BUFFER */
+                        GOTO MON_CALL_ERR;
+                        END;
+                      ELSE OLENGTH = LOCAL_TEMP1;
+                     END;
+                  CALL UT_IGNORE_BLANKS;
+                  IF C = CT_RPAREN AND CHARX <= CHARX_MAX
+                   THEN CALL UT_INC_CHARX;
+                   ELSE DO;             /* Closing ) missing                  */
+                     VAL_FAULT = 45;
+                        /*E* 45V XQC_MON_CALL: MISSING ) */
+                     GOTO MON_CALL_ERR;
+                     END;
+                  END;
+               END;
+            END;
+          ELSE DO;                      /* PARAM NEEDS A VALUE                */
+            VALUE_TYPE = 2;             /* TYPE IS VALUE                      */
+            CALL EV_GET_VALUE( BUF$, BLK_IX );
+            IF VAL_FAULT ~= 0           /* ERROR?                             */
+             THEN GOTO MON_CALL_ERR;    /* YES                                */
+            OVALUE$ = BUF$ -> BUF.BLK$;
+                                        /* GET POINTER TO DATA                */
+            OLENGTH = BUF$ -> BUF.WIDTH;
+                                        /* GET SIZE OF VALUE                  */
+            END;
+         END;
+       ELSE DO;                    /* USE VALUE ASSOCIATED WITH PARAM NAME    */
+         VALUE_TYPE = 0;                /* VALUE TYPE IS PARAM                */
+         OVALUE$    = ADDR( OVALUE );   /* POINT TO VALUE                     */
+         END;
+ 
+          /**
+          *** MOVE VALUE TO FPT LOCATION SPECIFIED.
+          **/
+      SAVE_VAL = 0;                     /* ASSUME ONLY VALUE OF VALUE IS USED */
+      IF OUSAGE < 0  OR  OUSAGE > MASKR(17)
+                                        /* IS OPTION USED TO INIT FPT?        */
+       THEN DO;                         /* NO                                 */
+         CALL UT_PSBL_ERR( 2 );
+                    /*E* 2P XQC_MON_CALL: THAT OPTION DOESN'T INIT ANYTHING   */
+         END;
+       ELSE DO;                         /* FPT IS CHANGED BY OPTION           */
+         OPT_INIT_NBR = OPTUSAGE$ -> HALF#(OUSAGE);
+                                        /* GET NUMBER OF INITS                */
+         DO WHILE (OPT_INIT_NBR > 0);   /* INITIALIZE THE FPT                 */
+            OPT_INIT_NBR  = OPT_INIT_NBR - 1;
+                                        /* COUNT DOWN INITS                   */
+            OUSAGE        = OUSAGE + 1;
+                                        /* CALC INDEX OF USAGE VECTOR         */
+            FPT_ITEM_IX   = OPTUSAGE$ -> HALF#(OUSAGE);
+                                        /* GET IX OF FPT ITEM INITED          */
+            FPT_ITEM_LOC  = FPT_INFO$ -> FPT_INFO.LOC(FPT_ITEM_IX);
+                                        /* GET LOCATION OF FPT ITEM INITED    */
+            FPT_ITEM_SIZE = FPT_INFO$ -> FPT_INFO.SIZE(FPT_ITEM_IX);
+                                        /* GET SIZE OF ITEM INITED            */
+            FPT_INIT_FCN  = FPT_INFO$ -> FPT_INFO.INITFCN(FPT_ITEM_IX);
+                                        /* GET INIT FUNCTION CODE             */
+            CALL XQ_INIT_FPT;
+                         /* INITIALIZE FPT FIELD ACCORDING TO INIT FUNCTION   */
+            IF VAL_FAULT ~= 0 THEN GOTO MON_CALL_ERR;
+                                        /* RETURN IF ERROR                    */
+            END;
+              /**
+              ***   FPT ITEM IS SET UP; SAVE VALUE BUFFER ONLY IF NEEDED.
+              **/
+         IF VALUE_TYPE = 2              /* VALUE?                             */
+          THEN DO;                      /* YES                                */
+            IF SAVE_VAL = 0             /* SHOULD VALUE BE SAVED?             */
+             THEN CALL UT_DEALLOC_BUF( BUF$ );
+                                        /* NOPE                               */
+             ELSE DO;                   /* YES                                */
+               IF EXEC_STACK_IX >= EXEC_STACK_IX_MAX
+                                        /* POSSIBLE TO SAVE?                  */
+                THEN DO;                /* NO                                 */
+                  VAL_FAULT = 22;
+                    /*E* 22V XQC_MON_CALL: ATTEMPT TO OVERFLOW EXEC STACK     */
+                  GOTO MON_CALL_ERR;
+                  END;
+                ELSE DO;                /* SAVE VALUE                         */
+                  EXEC_STACK_IX = EXEC_STACK_IX + 1;
+                                        /* PUSH VALUE DESCRIPTOR POINTER      */
+                  EXEC_STACK.STRING$(EXEC_STACK_IX) = BUF$;
+                  REINIT_IX_MAX = REINIT_IX_MAX + 1;
+                  REINIT.OLENGTH(REINIT_IX_MAX) = OLENGTH;
+                  REINIT.BUF$(REINIT_IX_MAX) = BUF$;
+                  REINIT.FPT_ITEM_LOC(REINIT_IX_MAX) = FPT_ITEM_LOC;
+                  REINIT.FPT_ITEM_SIZE(REINIT_IX_MAX) = FPT_ITEM_SIZE;
+                  REINIT.FPT_INIT_FCN(REINIT_IX_MAX) = FPT_INIT_FCN;
+                  REINIT.FPT_ITEM_IX(REINIT_IX_MAX) = FPT_ITEM_IX;
+                  REINIT.VALUE_TYPE(REINIT_IX_MAX) = VALUE_TYPE;
+                  END;
+               END;
+            END;
+         END;
+ 
+     /**
+     ***   CHECK IF ANOTHER PARAM FOLLOWS.
+     **/
+      CALL UT_IGNORE_BLANKS;
+      IF CHARX > CHARX_MAX  OR  C = CT_SEMI_COLON
+                                        /* END OF COMMAND?                    */
+       THEN READY_TO_EXEC = 1;          /* YES                                */
+       ELSE DO;                         /* NO: EXPECT A ,                     */
+         IF C ~= CT_COMMA               /* GET IT?                            */
+          THEN DO;                      /* NO                                 */
+            VAL_FAULT = 48;
+                              /*E* 48V XQC_MON_CALL: EXPECTED , IS MISSING    */
+            GOTO MON_CALL_ERR;
+            END;
+          ELSE CALL UT_INC_CHARX;       /* SKIP OVER ,                        */
+         END;
+      END;
+ 
+/********************
+***   NOW WE MUST ADJUST THE FPT INTERNAL POINTERS TO REFLECT THE MOVE
+***   TO OUR BLOCK.
+***   WE ALSO SUPPLY THE DEFAULT DCB NUMBER TO FIELD
+***   WHICH ARE INITIALIZED WITH THE DCBNUM FUNCTION BUT
+***   ARE ZERO (NOT SPECIFIED BY THE USER).
+**/
+   NBR_ITEMS = FPTPTR_TBL$ -> FPT_TBL.SIZE; /* GET # FPT ITEMS                */
+   IVALUE$   = ADDR( OVALUE$ );         /* INIT WITH POINTER                  */
+   ILENGTH   = 36;                      /* WHICH IS A 36 BIT QUANTITY         */
+   DFLTD_DCB = 0;                       /* INIT COUNT OF DEFAULT USE          */
+   DO FPT_ITEM_IX=0 TO NBR_ITEMS-1;
+                                        /* SEARCH ENTIRE FPT INFO TABLE       */
+      TEMP2 = FPT_INFO$ -> FPT_INFO.INITFCN(FPT_ITEM_IX);
+                                        /* ADDR INITIALIZATION FUNCTION?      */
+      IF TEMP2 = IF_ADDR  OR  TEMP2 = IF_VECTOR
+       THEN DO;                         /* YES                                */
+         TEMP1 = FPT_INFO$ -> FPT_INFO.INITOPT(FPT_ITEM_IX);
+                              /* GET INDEX OF OPTION THAT ITEM IS INITED WITH */
+         IF TEMP1 < 0  OR  TEMP1 > MASKR(17)
+                                        /* INITIED WITH OPT?                  */
+          THEN DO;                      /* NOPE                               */
+            FPT_ITEM_LOC = FPT_INFO$ -> FPT_INFO.LOC(FPT_ITEM_IX);
+                                        /* GET LOC OF ITEM                    */
+            FPT_ITEM_SIZE = FPT_INFO$ -> FPT_INFO.SIZE(FPT_ITEM_IX);
+                                        /* AND ITS SIZE                       */
+            IF TEMP2 = IF_VECTOR
+                                        /* VECTOR POINTER IS SECOND WORD      */
+             THEN DO;                   /* VECTOR                             */
+               FPT_ITEM_SIZE = 36;      /* PTR IS FULL WORD                   */
+               FPT_ITEM_LOC  = FPT_ITEM_LOC + 36;
+                                        /* SKIP FIRST WORD (FLAGSV AND BOUND) */
+               END;
+            TPTR1$ = PINCRB( FPT$, FPT_ITEM_LOC );
+                         /* POINT TO THE ORIGINAL FIELD IN THE SKELETON FPT   */
+            TEMP1  = POFFC( TPTR1$ -> PR#$, FPT$ );
+                         /* FIND OUT WHERE IN THE FPT THAT THE POINTER POINTS */
+            OVALUE$ = PINCRC( Y_FPT_BUF$ -> BUF.BLK$, TEMP1 );
+                                        /* MAKE IT A POINTER TO OUR NEW FPT   */
+            IF TPTR1$->BPTR.SEGID ~= ADDR(FPT$)->BPTR.SEGID
+             THEN EXIT;                 /* ONLY IF WE STARTED WITH A POINTER. */
+            CALL XQ_RJ_FPT_FIELD;       /* STORE IT INTO THE FPT              */
+            END;
+         END;
+       ELSE DO;                    /* INIT FUNCTION WASN'T ADDR OR VECTOR     */
+                    /* IF IT WAS DCBNUM WE MIGHT HAVE TO SUPPLY THE NUMBER    */
+         IF TEMP2 = IF_DCBNUM           /* DCBNUM?                            */
+          THEN DO;                      /* YES                                */
+            FPT_ITEM_LOC = FPT_INFO$ -> FPT_INFO.LOC(FPT_ITEM_IX);
+                                        /* GET ITEM LOC AND SIZE              */
+            FPT_ITEM_SIZE = FPT_INFO$ -> FPT_INFO.SIZE(FPT_ITEM_IX);
+            TPTR1$ = PINCRB( Y_FPT_BUF$ -> BUF.BLK$,
+              FPT_ITEM_LOC );
+                                        /* POINT TO FIRST BIT OF ITEM         */
+                   /**
+                   ***   IF FIELD IS ZERO, WE SUPPLY THE DEFAULT.
+                   **/
+            TIX1 = 0;                   /* INIT BIT CHECK IX                  */
+            DO WHILE (TIX1 < FPT_ITEM_SIZE  AND
+              TPTR1$ -> BIT#(TIX1) = '0'B);
+               TIX1 = TIX1 + 1;         /* LOOK AT NEXT BIT                   */
+               END;
+            IF TIX1 >= FPT_ITEM_SIZE    /* ENTIRELY ZERO?                     */
+             THEN DO;                   /* YES: SUPPLY DEFAULT                */
+               IVALUE$ -> WRD# = DFLT_DCB_NUM;
+               CALL XQ_RJ_FPT_FIELD;
+                                        /* PUT IN FPT                         */
+               DFLTD_DCB = DFLTD_DCB + 1;
+                                        /* COUNT USE OF DEFAULT               */
+/*             IF DFLTD_DCB = 2         /* USED MORE THAN ONCE?               */
+/*              THEN CALL UT_PSBL_ERR( 3 );
+/*        /*E* 3P XQC_MON_CALL: THE DEFAULT DCB WAS USED MORE THAN ONCE       */
+/**/
+               END;
+            END;
+         END;
+      END;
+ 
+ /***
+  *** Do any reinitializations necessary.
+  ***/
+ 
+   DO REINIT_IX = 0 TO REINIT_IX_MAX;
+      OLENGTH = REINIT.OLENGTH(REINIT_IX);
+      BUF$ = REINIT.BUF$(REINIT_IX);
+      OVALUE$ = BUF$->BUF.BLK$;
+      FPT_ITEM_LOC = REINIT.FPT_ITEM_LOC(REINIT_IX);
+      FPT_ITEM_SIZE = REINIT.FPT_ITEM_SIZE(REINIT_IX);
+      FPT_INIT_FCN = REINIT.FPT_INIT_FCN(REINIT_IX);
+      FPT_ITEM_IX = REINIT.FPT_ITEM_IX(REINIT_IX);
+      VALUE_TYPE = REINIT.VALUE_TYPE(REINIT_IX);
+      CALL XQ_INIT_FPT;
+      IF VAL_FAULT ~= 0 THEN GOTO MON_CALL_ERR;
+      END;
+   IF PMME_IX<0 THEN GOTO MON_CALL_ERR; /* MUST BE XQC_MON_VLP CALL           */
+/********************
+***   EXECUTE THE MONITOR CALL.
+**/
+%LIST;
+%INCLUDE FILER_II8;
+%PLIST;
+ 
+   ZX$ -> WRD# = 0;                     /* NO ERRORS                          */
+MON_CALL_ERR:;
+   CALL UT_RELEASE_MON_CALL_VALS;
+   RETURN;
+ 
+XQC_MON_CALL_ALTRET:
+   ZX$->WRD# = B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE;
+   CALL UT_RELEASE_MON_CALL_VALS;
+   IF NOT (ZY$ -> BT36# & ZYF_DONT_TALTRET)
+                                        /* SHOULD WE TELL USER ABOUT ALTRETS  */
+    THEN DO;                            /* YES                                */
+      IF NOT (ZY$->BT36# & ZYF_DONT_USE_ERRMSG)
+       THEN DO;                         /* Use M$ERRMSG                       */
+         ERRMSGFPT.V.DCB# = B$TCB$->B$TCB.ALT$->B$ALT.DCB#;
+         ERRCODE = B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+         ERRCODE.SEV = 0;
+         CALL M$ERRMSG( ERRMSGFPT );
+         END;
+       ELSE DO;                         /* Just list code                     */
+         CALL UT_OUTPUT_CHARS( 'ALTRET ', 7);
+         BUF$ = ADDR(B$TCB$->B$TCB.ALT$->B$ALT.ERR);
+         OVALUE$ = ADDR( OINIT );       /* PRINT ERROR CODE                   */
+         DO ILENGTH=1 TO 3;
+            OINIT = BUF$ -> UBIN6# + CT_A - 1;
+                                        /* NEXT CHAR                          */
+            CALL UT_OUTPUT_CHAR( OINIT );
+            BUF$ = PINCRB( BUF$, 6 );
+            END;
+         CALL UT_OUTPUT_CHAR( CT_MINUS );
+         OINIT = B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE;
+         CALL UT_DISPLAY( OVALUE$, 36, -DT_DECIMAL );
+         CALL UT_OUTPUT_CHAR( CT_MINUS );
+         OINIT = B$TCB$->B$TCB.ALT$->B$ALT.ERR.SEV;
+         CALL UT_DISPLAY( OVALUE$, 36, -DT_DECIMAL );
+         END;
+      END;
+   IF ZY$->BT36# & ZYF_ABORT_ON_ALTRET
+    THEN VAL_FAULT = 89; /*E* 89V XQC_MON_CALL: YOU ASKED FOR ABORT ON ALTRET */
+   RETURN;
+%EJECT;
+/********************************************************************/
+/********************************************************************/
+/**
+***   XQ_INIT_FPT   ISOLATED 27 OCT 77   (PRY)   INITIALIZES FIELD OF
+***   FPT ACCORDING TO INIT FUNCTION.
+**/
+ 
+XQ_INIT_FPT: PROC;
+ 
+/********************
+***   INITIALIZE ACCORDING TO INIT FUNCTION.
+**/
+   ILENGTH  = 36;                       /* PROBABLE SIZE IS 36 BITS           */
+   DO CASE (FPT_INIT_FCN);              /* INITIALIZE THE FPT ITEM SPECIFIED  */
+    CASE(0,12,13);                      /* NONE, INTEGER, STRING              */
+      IVALUE$ = OVALUE$;                /* JUST USE VALUE                     */
+      ILENGTH = OLENGTH;
+    CASE(1,7);                          /* ADDR, VECTOR                       */
+      IF VALUE_TYPE = 0
+                              /* CAN'T TAKE ADDR OR VECTOR OF NON BUF/VAL     */
+       THEN DO;
+         VAL_FAULT = 53;
+          /*E* 53V XQC_MON_CALL: THAT PARAM REQUIRES A BUFFER OR VALUE        */
+         RETURN;
+         END;
+      IVALUE$  = ADDR( OVALUE$ );
+                                        /* POINTER TO VALUE                   */
+      SAVE_VAL = 1;                     /* VALUE MUST BE SAVED                */
+      IF FPT_INIT_FCN ~= 1              /* ADDR?                              */
+       THEN DO;                         /* NO--VECTOR: INIT OTHER FIELDS      */
+         FPT_ITEM_LOC  = FPT_ITEM_LOC + 36;
+         FPT_ITEM_SIZE = 36;            /* INIT POINTER                       */
+         CALL XQ_RJ_FPT_FIELD;
+         ILENGTH       = 36;
+         FPT_ITEM_LOC  = FPT_ITEM_LOC - 36;
+         IVALUE$       = ADDR( OINIT );
+         OINIT         = (OLENGTH / 9 - 1) * TWO_POWER(16) + 2045*32;
+         END;
+    CASE(2,8);                          /* SIZEB, LENGTHB                     */
+      IVALUE$ = ADDR( OLENGTH );
+                                        /* SIZE IN BITS                       */
+    CASE(3,9);                          /* SIZEC, LENGTHC                     */
+      IVALUE$ = ADDR( OINIT );          /* SIZE IN CHARACTERS                 */
+      OINIT   = OLENGTH / 9;
+    CASE(4,10);                         /* SIZEV, LENGTHV                     */
+      IVALUE$ = ADDR( OINIT );          /* SIZE IN CHARS - 1                  */
+      OINIT   = OLENGTH / 9 - 1;
+    CASE(5,11);                         /* SIZEW, LENGTHW                     */
+      IVALUE$ = ADDR( OINIT );          /* SIZE IN WORDS                      */
+      OINIT   = OLENGTH / 36;
+    CASE(6);                            /* DCBNUM                             */
+      IF VALUE_TYPE ~= 2                /* VALUE TYPE MUST BE VALUE           */
+       THEN DO;                         /* IT ISN'T                           */
+         VAL_FAULT = 63;
+                    /*E* 63V XQC_MON_CALL: THIS PARAMETER REQUIRES A VALUE    */
+         RETURN;
+         END;
+      CALL UT_ONE_WORD_VALUE( OLENGTH, BLK_IX, OINIT );
+                                   /* CONVERT DCB NUMBER TO SINGLE WORD VALUE */
+      IF VAL_FAULT ~= 0                 /* ERROR?                             */
+       THEN DO;                         /* YES                                */
+         CALL UT_DEALLOC_BUF( BUF$ );
+                                        /* DEALLOCATE THE VALUE               */
+         RETURN;
+         END;
+      IVALUE$ = ADDR( OINIT );          /* VALUE IS DCB NUMBER                */
+      DO CASE (OINIT);                  /* GET ACTUAL DCB NUMBER              */
+       CASE(1);
+         OINIT = DCBNUM( M$F1 );
+       CASE(2);
+         OINIT = DCBNUM( M$F2 );
+       CASE(3);
+         OINIT = DCBNUM( M$F3 );
+       CASE(ELSE);                      /* Use specified number as DCB#       */
+       CASE(4,5,6,7,8,9);               /* ILLEGAL DCB NUMBER                 */
+         VAL_FAULT = 64;
+                              /*E* 64V XQC_MON_CALL: ILLEGAL DCB NUMBER       */
+         CALL UT_DEALLOC_BUF( BUF$ );
+         RETURN;
+       END;
+    CASE(ELSE);                         /* UNIMPLEMENTED--ILLEGAL             */
+      VAL_FAULT = 52;
+                    /*E* 52V XQC_MON_CALL: INIT FUNCTION CODE IS UNKNOWN      */
+      IF VALUE_TYPE = 2 THEN CALL UT_DEALLOC_BUF( BUF$ );
+      RETURN;
+    END;
+   CALL XQ_RJ_FPT_FIELD;
+ 
+   RETURN;
+ 
+END XQ_INIT_FPT;
+%EJECT;
+/********************************************************************/
+/*******************************************************************/
+/**
+***   UT_RELEASE_MON_CALL_VALS   5 OCT 77  (PRY)  RELEASE
+***   ALL SAVED VALUES.
+**/
+ 
+UT_RELEASE_MON_CALL_VALS: PROC;
+   DO WHILE(EXEC_STACK_IX > SAVE_EXEC_STACK_IX);
+      BUF$ = EXEC_STACK.STRING$(EXEC_STACK_IX);
+                                        /* POP STACK                          */
+      CALL UT_DEALLOC_BUF( BUF$ );
+      EXEC_STACK_IX = EXEC_STACK_IX - 1;
+      END;
+   RETURN;
+END UT_RELEASE_MON_CALL_VALS;
+%EJECT;
+/*******************************************************************/
+/*******************************************************************/
+/**
+***   XQ_RJ_FPT_FIELD   (MOVED) 17 OCT 77   (PRY)   RIGHT JUSTIFIES
+***   THE SPECIFIED VALUE IN THE FPT FIELD.
+**/
+ 
+XQ_RJ_FPT_FIELD: PROC;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   TEMP_IT           SBIN WORD ALIGNED   AUTO;
+DCL FBITS BIT(FPT_ITEM_SIZE) BASED;
+DCL FCHARS CHAR(TEMP2) BASED;
+                                        /* HOLDS ITEM TYPE FOR COMPARES       */
+ 
+ 
+/********************
+***   CALC POINTER TO FIELD TO INITIALIZE.
+**/
+   TPTR1$ = PINCRB( Y_FPT_BUF$ -> BUF.BLK$, FPT_ITEM_LOC );
+                                        /* GET POINTER TO TARGET FIELD        */
+   TEMP_IT = FPT_INFO$ -> FPT_INFO.TYPE(FPT_ITEM_IX);
+                                        /* GET TYPE OF ITEM                   */
+ 
+/********************
+***   IF FIELD TO BE INITED IS OF BIT OR CHAR TYPE, LEFT JUSTIFY.
+**/
+   IF TEMP_IT = IT_BIT  OR  TEMP_IT = IT_CHAR
+                                        /* CHAR TYPE FIELD?                   */
+    THEN DO;                            /* YES: LEFT JUSTIFY ARGUMENT         */
+      TEMP1 = ILENGTH;
+      IF TEMP_IT = IT_BIT
+       THEN TPTR1$ -> FBITS = IVALUE$ -> BITS;
+       ELSE DO;
+         TEMP1 = TEMP1/9;
+         TEMP2 = FPT_ITEM_SIZE/9;
+         TPTR1$ -> FCHARS = IVALUE$ -> CHARS;
+         END;
+      RETURN;
+      END;
+/********************
+**   RIGHT JUSTIFY THE SPECIFIED VALUE IN THE FPT FIELD.
+*/
+   TPTR1$ -> FBITS = '0'B;              /* ZERO ALL OF FPT FIELD              */
+/*
+**   CALC POINTER TO BEGINNING OF SOURCE VALUE TO MOVE.
+*/
+   TEMP1 = MINIMUM (FPT_ITEM_SIZE, ILENGTH);
+   TPTR2$ = PINCRB( IVALUE$, ILENGTH - TEMP1 ); /* POINT TO NON-OVERFLOW      */
+   TPTR1$ = PINCRB( TPTR1$, FPT_ITEM_SIZE - TEMP1);
+                                        /* CALC ACTUAL NUMBER OF BITS TO MOVE */
+/*
+**   MOVE VALUE BITS INTO FPT.
+*/
+   TPTR1$ -> BITS = TPTR2$ -> BITS;
+ 
+   RETURN;
+ 
+END XQ_RJ_FPT_FIELD;
+%EJECT;
+/*******************************************************************/
+/********************************************************************/
+/**
+***   UT_GET_OPT_INFO  ISOLATED 9 NOV 77  (PRY)  GETS OPTION NAME FROM
+***   THE CURRENT STRING AND RETURNS ITS INDEX, TYPE, USAGE, LENGTH
+***   AND VALUE.
+**/
+ 
+UT_GET_OPT_INFO: PROC( OUSAGE#, OLENGTH#, OVALUE# );
+ 
+/********************
+***   PARAMETERS:
+**/
+DCL   OUSAGE#        SBIN WORD ALIGNED; /* USAGE OF OPTION                    */
+DCL   OLENGTH#       SBIN WORD ALIGNED; /* LENGTH OF OPTION                   */
+DCL   OVALUE#        SBIN WORD ALIGNED; /* VALUE OF OPTION                    */
+ 
+/********************
+***   LOCALS:
+**/
+DCL   TBL_IX            SBIN WORD ALIGNED   AUTO;
+                                        /* USED IN NAME TABLE SEARCH          */
+DCL   CALL_TYPE    SBIN;                /* LOOKING FOR NAME OR VALUE          */
+ 
+   CALL_TYPE = 0;                       /* ANYTHING'S OK                      */
+   GOTO COMMON_CODE;
+ 
+UT_GET_VAL_INFO: ENTRY ( OUSAGE#, OLENGTH#, OVALUE# );
+ 
+   CALL_TYPE = -999;                    /* NEED A VALUE ONLY                  */
+COMMON_CODE:;
+ 
+/********************
+***   GET THE OPTION NAME.
+**/
+   CALL UT_GET_NAME;                    /* GET OPTION NAME                    */
+   CALL UT_IGNORE_BLANKS;
+   IF VAL_FAULT ~= 0 THEN RETURN;       /* RETURN IF ERROR                    */
+   IF CRNT_NAME.LENGTH <= 0             /* GET ANYTHING?                      */
+    THEN DO;                            /* NO                                 */
+      VAL_FAULT = 46;
+                    /*E* 46V XQC_MON_CALL: EXPECTED PARAM IS MISSING          */
+      RETURN;
+      END;
+ 
+/**
+***  LOOK UP THE OPTION NAME.
+**/
+   TBL_IX = -1;                         /* INITIALIZE  SEARCH PARAMETER       */
+KEEP_LOOKING:;
+   CALL UT_LOOKUP( OPTPTR_TBL$, TBL_IX ); /* IDENTIFY THE OPTION              */
+   IF TBL_IX < 0                        /* UNKNOWN OPT?                       */
+    THEN DO;                            /* YES: TELL USER                     */
+      IF CALL_TYPE <= 0                 /* DID WE FIND ANY MATCH?             */
+       THEN VAL_FAULT = 47;     /*E* 47V XQC_MON_CALL: UNKNOWN OPTION */
+       ELSE VAL_FAULT = 53;
+      RETURN;
+      END;
+   CALL_TYPE = CALL_TYPE+1;
+/**
+***   GET OPTION INFORMATION.
+**/
+   TEMP1  = OPTINFO$ -> OPT_INFO.TYPE(TBL_IX);
+   IF TEMP1 < 10                        /* THIS OPTION NEEDS A VALUE          */
+     AND (CALL_TYPE < 0                 /* BUT WE ALREADY HAVE AN OPTION NAME */
+     OR C ~= CT_EQUAL)                  /* OR NO VALUE FOLLOWS                */
+    THEN GOTO KEEP_LOOKING;
+    ELSE IF TEMP1 >= 100
+       THEN IF C = CT_EQUAL THEN GOTO KEEP_LOOKING;
+          ELSE TEMP1 = TEMP1 - 100;
+   OUSAGE# = OPTINFO$ -> OPT_INFO.USAGE(TBL_IX);
+ 
+   TEMP2   = OPTINFO$ -> OPT_INFO.LENGTH(TBL_IX);
+   DO CASE ( MOD(TEMP1, 10));           /*  ACTUAL LENGTH DEPENDS ON TYPE     */
+    CASE(0);                            /* NONE                               */
+    CASE(1);                            /* NAME                               */
+    CASE(2);                            /* INTEGER                            */
+      TEMP2 = 36;                       /* FULL WORD                          */
+    CASE(3);                            /* STRING                             */
+      TEMP2 = TEMP2 * 9;                /* NINE BITS PER CHAR                 */
+    CASE(4);                            /* BINARY STRING                      */
+    CASE(5);                            /* OCTAL STRING                       */
+      TEMP2 = TEMP2 * 3;                /* THREE BITS PER OCTAL CHAR          */
+    CASE(ELSE);                         /* ILLEGAL TYPE                       */
+      DO;
+         VAL_FAULT = 50;
+                    /*E* 50V XQC_MON_CALL: OPTION TYPE CODE IS UNKNOWN        */
+         RETURN;
+         END;
+    END;
+   OLENGTH# = TEMP2;                    /* RETURN THE LENGTH                  */
+   OVALUE# = OPTINFO$ -> OPT_INFO.VALUE(TBL_IX);
+ 
+   RETURN;
+ 
+END UT_GET_OPT_INFO;
+/********************************************************************/
+/*********************************************************************/
+/**
+***   UT_NAME_CHAR   15 NOV 77   (PRY)  DETERMINE IF ARGUMENT CHAR
+***   IS A VALID PL6 NAME CHARACTER.  CHAR IS INVERTED IF SO.
+**/
+ 
+UT_NAME_CHAR: PROC( THE_CHAR# );
+ 
+/********************
+***   PARAMETERS:
+**/
+DCL   THE_CHAR#         SBIN WORD ALIGNED;
+ 
+/********************
+***   LOCALS:
+**/
+DCL   THE_CHAR          SBIN WORD ALIGNED   AUTO  ;
+ 
+/********************
+***   IF CHAR IS A VALID NAME CHAR, INVERT IT.
+**/
+   THE_CHAR = THE_CHAR#;                /* LOCALIZE PARM                      */
+   IF (THE_CHAR >= CT_A  AND  THE_CHAR <= CT_Z)
+     OR  (THE_CHAR >= CT_0  AND  THE_CHAR <= CT_9)
+     OR  THE_CHAR = CT_POUND  OR  THE_CHAR = CT_AT
+     OR  THE_CHAR = CT_DOLLAR  OR  THE_CHAR = CT_UNDERSCORE
+    THEN THE_CHAR# = - THE_CHAR;
+ 
+   RETURN;
+ 
+END UT_NAME_CHAR;
+ 
+END XQC_MON_CALL;
+ 
+/*********************************************************************/
+END FILER;
+ 
+/*********************************************************************/

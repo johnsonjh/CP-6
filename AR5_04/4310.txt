@@ -1,0 +1,457 @@
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+CB: PROC MAIN;
+
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B_ERRORS_C;
+%INCLUDE NK_VFC_C;
+%INCLUDE XU_MACRO_C;
+%INCLUDE XUR_ENTRY;
+%INCLUDE CB_C61;
+
+DCL M$CBCG DCB;
+DCL M$UCIN DCB;
+DCL M$UCOUT DCB;
+DCL M$LM DCB;
+DCL M$DO DCB;
+%F$DCB;
+%EQU_CG;
+
+DCL EVENT_HANDLER ENTRY ASYNC;
+DCL XCON_HANDLER ENTRY ASYNC;
+DCL BREAK_HANDLER ENTRY ASYNC;
+
+DCL CB_NODES UBIN SYMREF;
+
+%FPT_EVENT (FPTN=FPT_EVENT,UENTRY=EVENT_HANDLER);
+%FPT_XCON (FPTN=FPT_XCON,UENTRY=XCON_HANDLER);
+%FPT_INT (FPTN=FPT_INT,UENTRY=BREAK_HANDLER);
+
+%FPT_OPEN (FPTN=FPT_OPENCG,DCB=M$CBCG,ASN=COMGROUP,NAME=CGNAME,
+          ACCT=RUACCT,FUN=UPDATE,SCRUB=YES);
+%VLP_SETSTA (FPTN=AUSTA,MYSTATION='CBAU');
+%VLP_NAME (FPTN=CGNAME,NAME='CBCG');
+%VLP_ACCT (FPTN=RUACCT);
+%FPT_CLOSE (FPTN=FPT_CLOSECG,DCB=M$CBCG);
+%FPT_READ (FPTN=FPT_READCG,DCB=M$CBCG,WAIT=NO,EVENT=2);
+%FPT_WRITE (FPTN=FPT_WRITECG,DCB=M$CBCG,STATION=WRTSTA);
+%VLP_STATION (FPTN=WRTSTA,STATION='CBAU');
+%FPT_WAIT (FPTN=FPT_WAIT,UNITS=1000);
+
+%FPT_OPEN (FPTN=FPT_OPENUCOUT,DCB=M$UCOUT,ORG=TERMINAL,FUN=UPDATE,ASN=DEVICE);
+%FPT_WRITE (FPTN=FPT_WRITEUC,DCB=M$UCOUT);
+%FPT_CLOSE (FPTN=FPT_CLOSEUCOUT,DCB=M$UCOUT);
+
+%FPT_OPEN (FPTN=FPT_OPENUCIN,DCB=M$UCIN,ORG=TERMINAL,FUN=UPDATE,ASN=DEVICE);
+%FPT_READ (FPTN=FPT_READUC,DCB=M$UCIN,WAIT=NO,EVENT=1);
+%FPT_PROMPT (FPTN=FPT_PROMPT,DCB=M$UCIN,PROMPT=CBPRMPT.C,VFC=YES,STCLASS="STATIC SYMDEF");
+%FPT_CLOSE (FPTN=FPT_CLOSEUCIN,DCB=M$UCIN);
+%FPT_OPEN (FPTN=FPT_OPENUCWND,DCB=M$UCIN,RES='UC20',WINDOW=INPWINDOW);
+%VLP_WINDOW (FPTN=INPWINDOW,FWINDOW='UC01',LENGTH=3,BTMBRDR=YES,POSITION=TOP);
+ 
+%M$DCB (DCBN=M$SI,NAME=':CB_CMD',ASN=FILE);
+%FPT_OPEN (FPTN=FPT_OPENSI,DCB=M$SI,FUN=IN);
+%FPT_READ (FPTN=FPT_READSI,DCB=M$SI,BUF=FILEBUF,STRPVFC=YES);
+%FPT_CLOSE (FPTN=FPT_CLOSESI,DCB=M$SI,DISP=SAVE);
+DCL FILEBUF CHAR(80) STATIC;
+ 
+%FPT_TRMCTL (FPTN=FPT_TRMCTL,DCB=M$UCOUT,TRMCTL=GTRMCTL);
+%VLP_TRMCTL (FPTN=GTRMCTL);
+%VLP_TRMCTL (FPTN=STRMCTL,WORDWRAPCLM=60);
+
+DCL XCVRX UBIN;
+DCL CHANNEL UBIN;
+DCL OLDCHAN UBIN;
+
+DCL 1 CGRDBUF,
+      2 TYP UBIN BYTE CALIGNED,
+      2 MSG CHAR(79),
+      2 MSGU(0:78) REDEF MSG UBIN BYTE CALIGNED;
+DCL 1 CGWRBUF,
+      2 MSGTYP UBIN BYTE CALIGNED,
+      2 XCVRX UBIN BYTE CALIGNED,
+      2 MSG CHAR(78),
+      2 MSGU(0:77) REDEF MSG UBIN BYTE CALIGNED;
+DCL UCRDBUF CHAR(80);
+DCL UCWRBUF CHAR(80);
+
+DCL CGEVENT(0:35) BIT(1) STATIC SYMDEF;
+DCL EVARS(0:2) UBIN STATIC SYMDEF;
+%VLP_ERRCODE (FPTN="EVERR(0:2)",STCLASS="STATIC SYMDEF");
+DCL SIMULATING BIT(1) STATIC SYMDEF;
+DCL COMMAND BIT(1) STATIC SYMDEF;
+DCL XCONCNT UBIN STATIC SYMDEF INIT(0);
+DCL 1 CMDPRMPT CONSTANT SYMDEF,
+      2 VFC BIT(1) INIT('1'B),
+      2 L UBIN(8) UNAL INIT(SIZEC(CMDPRMPT.C)),
+      2 C,
+        3 * CHAR(1) INIT(%VFC_TRANSITION0),
+        3 * CHAR(5) INIT('Cmd: ');
+DCL 1 CBPRMPT STATIC SYMDEF,
+      2 VFC BIT(1) INIT('1'B),
+      2 L UBIN(8) UNAL INIT(SIZEC(CBPRMPT.C)),
+      2 C,
+        3 * CHAR(1) INIT(%VFC_TRANSITION0),
+        3 * CHAR(3) INIT('ch '),
+        3 CHN CHAR(2) INIT('19'),
+        3 * CHAR(2) INIT(': ');
+
+DCL TOP$ PTR;
+%PARSE$OUT (NAME=TOP,STCLASS="BASED(TOP$)");
+%PARSE$OUT (NAME=OUT,STCLASS=BASED);
+%PARSE$SYM (NAME=SYM,STCLASS=BASED);
+
+%XUR_INIT (SYNTAX=NO,COMMANDS=NO);
+
+%EJECT;
+
+        CALL INITIALIZE;
+        CALL M$READ(FPT_READCG);
+ 
+        CALL WAIT;                      /* WAIT FOR CONNECT MESSAGE           */
+        CALL PROCESS_MESSAGE;
+        CALL READ_FILE;
+ 
+        CALL M$READ(FPT_READUC);
+
+        DO WHILE(SIMULATING);
+           CALL WAIT;
+           CALL PROCESS_MESSAGE;
+           END;
+        CALL M$CLOSE(FPT_CLOSECG);
+
+        FPT_TRMCTL.TRMCTL_=VECTOR(GTRMCTL);
+        CALL M$STRMCTL(FPT_TRMCTL);
+        CALL M$CLOSE(FPT_CLOSEUCIN);
+        CALL M$CLOSE(FPT_CLOSEUCOUT);
+
+        FPT_XCON.V.UENTRY#=ENTADDR(NIL);
+        CALL M$XCON(FPT_XCON);
+        RETURN;
+
+INITIALIZE: PROC;
+
+        CALL XUR$INIT(XUR_INIT);
+        RUACCT.ACCT#=DCBADDR(DCBNUM(M$LM))->F$DCB.ACCT#;
+
+        FPT_READCG.BUF_=VECTOR(CGRDBUF);
+        FPT_WRITECG.BUF_=VECTOR(CGWRBUF);
+        FPT_READUC.BUF_=VECTOR(UCRDBUF);
+        FPT_WRITEUC.BUF_=VECTOR(UCWRBUF);
+
+        CHANNEL=19;
+        OLDCHAN=19;
+        SIMULATING='1'B;
+
+        CALL M$OPEN(FPT_OPENCG);
+        CALL M$OPEN(FPT_OPENUCIN);
+        CALL M$OPEN(FPT_OPENUCOUT);
+        CALL M$GTRMCTL(FPT_TRMCTL);
+        FPT_TRMCTL.TRMCTL_=VECTOR(STRMCTL);
+        CALL M$STRMCTL(FPT_TRMCTL);
+
+        COMMAND='0'B;
+        CALL M$PROMPT(FPT_PROMPT);
+
+        CGEVENT='0'B;
+        CALL M$EVENT(FPT_EVENT);
+        CALL M$XCON(FPT_XCON);
+        CALL M$INT(FPT_INT);
+
+        RETURN;
+
+END INITIALIZE;
+
+READ_FILE: PROC;
+ 
+        CALL M$OPEN(FPT_OPENSI) WHENRETURN DO;
+           DO INHIBIT;
+              CGEVENT(0) = '1'B;
+              END;
+           DO WHILE('1'B);
+              CALL M$READ(FPT_READSI) WHENRETURN DO;
+                 EVARS(1) = DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+                 IF SUBSTR(FILEBUF,0,1) = '"' THEN DO;
+                    EVARS(1) = EVARS(1) - 1;
+                    UCRDBUF = SUBSTR(FILEBUF,1,EVARS(1));
+                    COMMAND = '0'B;
+                    END;
+                 ELSE DO;
+                    UCRDBUF = FILEBUF;
+                    COMMAND = '1'B;
+                    END;
+                 CALL UC_MESSAGE;
+                 END;
+              WHENALTRETURN DO;
+                 CALL M$CLOSE(FPT_CLOSESI) WHENALTRETURN DO; END;
+                 COMMAND = '0'B;
+                 DO INHIBIT;
+                    CGEVENT(0) = '0'B;
+                    END;
+                 RETURN;
+                 END;
+              END;
+           END;
+ 
+END READ_FILE;
+ 
+WAIT: PROC;
+
+        DO INHIBIT;
+           DO WHILE(NOT CGEVENT);
+              CALL M$WAIT(FPT_WAIT);
+              END;
+           END;
+
+        RETURN;
+
+END WAIT;
+
+PROCESS_MESSAGE: PROC;
+
+DCL I UBIN;
+
+        DO I=0 TO 2;
+           IF CGEVENT(I) THEN DO INHIBIT;
+              CGEVENT(I)='0'B;
+              DO CASE(I);
+               CASE(0);
+                 SIMULATING='0'B;
+               CASE(1);
+                 CALL UC_MESSAGE;
+               CASE(2);
+                 CALL CG_MESSAGE;
+               END;
+              END;
+           END;
+
+        RETURN;
+
+END PROCESS_MESSAGE;
+
+UC_MESSAGE: PROC;
+
+        IF EVERR.ERR#(1)=%E$EOF THEN DO;
+           SIMULATING='0'B;
+           CGEVENT(0)='1'B;
+           RETURN;
+           END;
+
+        IF COMMAND THEN DO;
+           DO INHIBIT;
+              COMMAND='0'B;
+              END;
+           IF EVARS(1)~=0 THEN
+           CALL XUR$GETCMD(CB_NODES,TOP$,CMDPRMPT,UCRDBUF,EVARS(1)) WHENRETURN DO;
+              CALL PROCESS_COMMAND;
+              END;
+           WHENALTRETURN DO;
+              CALL XUR$ERRPTR(,DCBNUM(M$DO));
+              END;
+           FPT_PROMPT.PROMPT_=VECTOR(CBPRMPT.C);
+           CALL M$PROMPT(FPT_PROMPT);
+           END;
+        ELSE DO;
+           IF EVARS(1)~=0 THEN DO;
+              CGWRBUF.MSGTYP=%CB_TEXT;
+              CGWRBUF.XCVRX=XCVRX;
+              CGWRBUF.MSG=SUBSTR(UCRDBUF,0,EVARS(1));
+              CALL M$WRITE(FPT_WRITECG);
+              END;
+           END;
+
+        IF NOT CGEVENT(0) THEN DO;
+           CALL M$READ(FPT_READUC);
+           END;
+
+        RETURN;
+
+END UC_MESSAGE;
+
+CG_MESSAGE: PROC;
+
+        IF EVERR.ERR#(2)=%E$DACTR THEN DO;
+           SIMULATING='0'B;
+           CGEVENT(0)='1'B;
+           UCWRBUF='The airwaves have been shut down.';
+           CALL M$WRITE(FPT_WRITEUC);
+           RETURN;
+           END;
+
+        DO CASE(CGRDBUF.TYP);
+         CASE(%CB_TEXT);
+           UCWRBUF=CGRDBUF.MSG;
+           CALL M$WRITE(FPT_WRITEUC);
+         CASE(%CB_CONNECT);
+           XCVRX=CGRDBUF.MSGU(0);
+         CASE(%CB_NOXCVR);
+           CGEVENT(0)='1'B;
+           UCWRBUF='No CB tranceivers are available';
+           CALL M$WRITE(FPT_WRITEUC);
+         CASE(%CB_NOTUNE);
+           CHANNEL=CGRDBUF.MSGU(0);
+           CALL SETCHANNEL(CHANNEL);
+         END;
+
+        CALL M$READ(FPT_READCG);
+
+        RETURN;
+
+END CG_MESSAGE;
+
+PROCESS_COMMAND: PROC;
+
+DCL I UBIN;
+DCL BUFX UBIN;
+DCL NUM UBIN;
+DCL WRITECG BIT(1);
+
+        CGWRBUF.MSGTYP=TOP.CODE;
+        CGWRBUF.XCVRX=XCVRX;
+        BUFX=0;
+        WRITECG='1'B;
+        DO CASE(TOP.CODE);
+         CASE(%CB_TUNE,%CB_MONITOR,%CB_UNMONITOR,%CB_LIST);
+           DO I=0 TO TOP.NSUBLKS-1;
+              CALL CHARBIN(NUM,TOP.SUBLK$(I)->SYM.TEXT);
+              IF NUM>0 AND NUM<41 THEN DO;
+                 CGWRBUF.MSGU(BUFX)=NUM;
+                 BUFX=BUFX+1;
+                 END;
+              ELSE DO;
+                 CALL CONCAT(UCWRBUF,'There is no channel ',TOP.SUBLK$(I)->SYM.TEXT,'.');
+                 CALL M$WRITE(FPT_WRITEUC);
+                 END;
+              END;
+           CGWRBUF.MSGU(BUFX)=0;
+           IF TOP.CODE=%CB_TUNE THEN DO;
+              IF BUFX=1 THEN
+                 CALL SETCHANNEL(NUM);
+              ELSE
+                 WRITECG='0'B;
+              END;
+         CASE(%CB_END);
+           CGEVENT(0)='1'B;
+           WRITECG='0'B;
+         CASE(%CB_HANDLE);
+           CGWRBUF.MSG=TOP.SUBLK$(0)->SYM.TEXT;
+         CASE(%CB_WINDOW);
+           WRITECG='0'B;
+           CALL M$CLOSE(FPT_CLOSEUCIN) WHENRETURN DO;
+              CALL M$OPEN(FPT_OPENUCWND) WHENALTRETURN DO; END;
+              END;
+         END;
+
+        IF WRITECG THEN CALL M$WRITE(FPT_WRITECG);
+
+        RETURN;
+
+END PROCESS_COMMAND;
+
+
+SETCHANNEL: PROC(CHN);
+
+DCL CHN UBIN;
+
+        CALL BINCHAR(CBPRMPT.C.CHN,CHN);
+        IF SUBSTR(CBPRMPT.C.CHN,0,1)='0' THEN SUBSTR(CBPRMPT.C.CHN,0,1)=' ';
+        DO INHIBIT;
+           IF NOT COMMAND THEN CALL M$PROMPT(FPT_PROMPT);
+           END;
+
+        RETURN;
+
+END SETCHANNEL;
+
+
+END CB;
+
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+
+EVENT_HANDLER: PROC ASYNC;
+
+%INCLUDE CP_6;
+
+%B$EXCFR;
+%B$NWIO;
+%B$TCB;
+DCL B$TCB$ PTR SYMREF;
+DCL EVENT UBIN;
+
+DCL CGEVENT(0:35) BIT(1) SYMREF;
+DCL EVARS(0:2) UBIN SYMREF;
+%VLP_ERRCODE (FPTN="EVERR(0:2)",STCLASS=SYMREF);
+
+
+        EVENT=B$TCB$->B$TCB.STK$->B$EXCFR.EVID;
+        DO INHIBIT;
+           CGEVENT(EVENT)='1'B;
+           EVARS(EVENT)=B$TCB$->B$TCB.STK$->B$NWIO.ARS;
+           EVERR(EVENT)=B$TCB$->B$TCB.STK$->B$NWIO.ERR;
+           END;
+
+        RETURN;
+
+END EVENT_HANDLER;
+
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+
+XCON_HANDLER: PROC ASYNC;
+
+%INCLUDE CP_6;
+ 
+%FPT_XCON;
+ 
+DCL XCONCNT UBIN SYMREF;
+DCL CGEVENT(0:35) BIT(1) SYMREF;
+
+        CALL M$XCON(FPT_XCON);
+        CGEVENT(0)='1'B;
+        XCONCNT=XCONCNT+1;
+        RETURN;
+
+END XCON_HANDLER;
+
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+
+BREAK_HANDLER: PROC ASYNC;
+
+%INCLUDE CP_6;
+
+%FPT_PROMPT (FPTN=FPT_PROMPT,STCLASS=SYMREF);
+DCL COMMAND BIT(1) SYMREF;
+DCL 1 CMDPRMPT SYMREF,
+      2 VFC BIT(1),
+      2 L UBIN(8) UNAL,
+      2 C CHAR(CMDPRMPT.L);
+
+        DO INHIBIT;
+           IF NOT COMMAND THEN DO;
+              COMMAND='1'B;
+              FPT_PROMPT.PROMPT_=VECTOR(CMDPRMPT.C);
+              CALL M$PROMPT(FPT_PROMPT);
+              END;
+           END;
+
+        RETURN;
+
+END BREAK_HANDLER;

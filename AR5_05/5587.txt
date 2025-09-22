@@ -1,0 +1,583 @@
+/*M*    make_command:c    -- Parses make commands and builds tree.  */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+#include   <setjmp.h>
+#include   <stdlib.h>
+#include   <stdio.h>
+#include   <errno:h>
+#include   "MAKE_Cc13"
+#include   "MAKE_Cc14"
+#include   "xu_cp6_c.h"
+#include   "xu_macro_c.h"
+#include   "xu_subs_c.h"
+ 
+extern FILE *Makefile;
+extern char *alloc_text(int, char *);
+extern struct value evaluate( struct parse_out * );
+extern int PrintExpr( FILE *, struct value * );
+extern FILE *OpenInclude(char *);
+int   WithinIf(void);
+ 
+extern  struct p_node  MAKECOMMAND;
+extern  int            UserParse();
+extern  int            ReportParseLexemes();
+extern  void           ReportParseErr();
+extern  int            DoMacSublk();
+extern  int            X_PARSE();
+ 
+extern  char         *ParseWork;
+extern  unsigned      ParseWorkSize;
+extern  jmp_buf       ExpandParseRetry;
+ 
+ 
+struct  sym_target  **TargetBuf = 0;
+unsigned              TargetBufSize = 0;
+ 
+static     int       Intarget = 0;
+unsigned   int       if_stack[ MAX_IF ];
+ 
+ 
+struct p_pcb        CommandPCB = {0, &MAKECOMMAND, 0, 0, UserParse,
+              0, 1, 0, 0, 0, 1, 0, 0, {0,0,0,0,0}, {0,0,0,0}, 0,
+              1, 0, 0, 0, 0, 0, ReportParseLexemes};
+ 
+ 
+void
+MakeCommand(buf, bsize, verbose)
+  char     *buf;
+  unsigned  bsize;
+  int       verbose;
+{
+  void   SetupTargets();
+  struct parse_out  *p;
+  struct parse_out  *pb;
+  struct parse_sym  *ps;
+  struct sym_macro  *macsym;
+  struct sym_target **td;
+  static struct command_line **cmdpp = 0;
+  struct sym_owner *get_email_address();
+  struct sym_owner *addr;
+  FILE *strm;
+ 
+  int   i, nt, nd, ntot;
+  char  *c;
+ 
+  CommandPCB.text   = buf;
+  CommandPCB.nchars = bsize;
+ 
+  setjmp(ExpandParseRetry);
+ 
+  CommandPCB.work   = ParseWork;
+  CommandPCB.wksz   = ParseWorkSize >> 2;
+ 
+  if (!X_PARSE(&CommandPCB)) {
+     UserParseAlt(&CommandPCB);
+     if (!file_table[InputNo].flags)
+        ReportParseErr(&CommandPCB);
+     return;
+     }
+ 
+  p = CommandPCB.out;
+  i = p->code;
+  if (file_table[InputNo].flags   &&   ( i < 7  ||  i > 10))
+     return;
+  switch (i)  {  /* 1=macro, 2=dependancy, 3=jcl, 4=comment */
+ 
+  case 1:  /***   Macro Definition    ***/
+     ps = (struct parse_sym*) p->sublk[0];  /* Macro Name */
+     Intarget = 0;
+ 
+  if (buf == MacRecBuf)   {
+     if (AltRecSize < bsize) {
+        int i = (bsize + 1023)/1024 * 1024;
+        if (!(AltRecBuf = (char *)realloc(AltRecBuf,(AltRecSize=i))))
+           crash("Out of Memory: MakeCommand");
+        }
+     memcpy(AltRecBuf, buf, bsize);
+     buf = AltRecBuf;
+     }
+ 
+     MacRecLen = 0;
+     i = 1;
+     do {
+        i = DoMacSublk(p, i, buf, bsize);
+        } while (i > 0);
+     MacRecBuf[ MacRecLen++ ] = 0;
+ 
+     macsym = lookup_sym_macro(&(ps->text[1]), ps->text[0], 1);
+ 
+     if (!macsym) crash("Out of Memory: MakeCommand");
+     if (!macsym->mc_cmdline) {
+        if (macsym->mc_deflen && opt_warn && !macsym->mc_default)
+           warning("\"%s\" line %d: variable \"%s\" redefined\n",
+              file_table[InputNo].fid, file_table[InputNo].recno,
+              macsym->mc_sym);
+        macsym->mc_default = 0;
+        macsym->mc_def = c = (char *) malloc(MacRecLen);
+        if (!c) crash("Out of Memory: MakeCommand");
+        memcpy(c, MacRecBuf, MacRecLen);
+        macsym->mc_deflen = MacRecLen-1;
+        mem_macstr += MacRecLen;
+        }
+     else if (verbose)
+         warning("\"%s\" line %d: Command line variable \"%s\": not redefined!\n",
+           file_table[InputNo].fid, file_table[InputNo].recno,
+            macsym->mc_sym);
+     break;
+ 
+  case 2:  /***  Dependancy           ***/
+     Intarget = 1;
+     nt = p->sublk[0]->nsublks;
+     nd = (p->nsublks > 1) ? p->sublk[1]->nsublks : 0;
+     ntot = nt + nd;
+     if (TargetBufSize < ntot) {
+        i = 20 * ((ntot + 40) / 20);
+        i = (TargetBufSize == 0)? i+40 : i;
+        TargetBuf = (struct sym_target**)realloc(TargetBuf,i<<2);
+        if (!TargetBuf)
+           crash("Out of Memory: MakeCommand");
+        TargetBufSize = i;
+        }
+ 
+     td = TargetBuf + nt;
+     SetupTargets(TargetBuf, p->sublk[0]);
+     if (nd > 0)
+        SetupTargets(td, p->sublk[1]);
+ 
+     alloc_target_rule();
+     for ( i=0 ; i<nt ; )
+        build_dependancy( TargetBuf[i++], td, nd);
+     break;
+ 
+  case 3:  /*    some jcl       */
+     if (Intarget)  {
+        struct command_line *cmd;
+        struct dependancy   *d  = LineList->tr_depend;
+        struct command_list *cm = LineList->tr_commands;
+        if (!cm) {
+           LineList->tr_commands = cm = (struct command_list *)
+                              malloc(sizeof(struct command_list));
+           if (!cm) crash("Out of memory: MakeCommand");
+           cm->cm_lines = 0;
+           cmdpp = &cm->cm_lines;
+           cm->cm_flags = 0;
+           cm->next     = 0;
+           mem_comrules += sizeof(struct command_list);
+           while (d)  {
+              if (d->dp_target->tg_commands)
+                 warning("\"%s\" line %d: warning target \"%s\" had build commands assigned on line %d of file %s\n",
+                    file_table[InputNo].fid,file_table[InputNo].recno,
+                    d->dp_target->tg_text,
+                    d->dp_target->tg_commands->tr_num,
+                    d->dp_target->tg_commands->tr_fid);
+              else d->dp_target->tg_commands = LineList;
+              d = d->next;
+              }
+           }
+ 
+        cmd = (struct command_line *)
+              malloc(sizeof(struct command_line)-4+InputRecLen+1);
+        if (!cmd) crash("Out of Memory: MakeCommand");
+        *cmdpp = cmd;
+        cmdpp  = &cmd->next;
+        cmd->next = 0;
+        cm->cm_flags |= SpecMacroFlags;
+        cmd->cmd_len   = InputRecLen;
+        memcpy(&(cmd->cmd_text[0]), InputRec, InputRecLen);
+        cmd->cmd_text[InputRecLen] = 0;
+        mem_commands += sizeof(struct command_line)-4 + InputRecLen+1;
+        }
+     else warning("\"%s\" line %d: build command is not associated with a target rule\n",
+        file_table[InputNo].fid, file_table[InputNo].recno);
+     break;
+ 
+  case 5:  /*    An EMAIL address    */
+     Intarget = 0;
+     nd = (p->nsublks > 1) ? p->sublk[1]->nsublks : 0;
+     addr = get_email_address( p->sublk[0]);
+     if (!addr) break;
+     pb = p->sublk[1];
+ 
+     for (i=0 ; i<nd ; )  {  /* Update owner of each target */
+        ps = (struct parse_sym *) pb->sublk[i++];
+        if (ps->code == 1)   {
+           struct sym_target *t = lookup_sym_target( ps->text+1, *ps->text, 1);
+           if (!t) break; /* out of memory? */
+           if (!t->tg_owner)
+              t->tg_owner = addr;
+           else warning("\"%s\" line %d: (warning) email address for %s redefined\n",
+              file_table[InputNo].fid, file_table[InputNo].recno,
+              t->tg_text);
+           }
+        else error("\"%s\" line %d: Illegal target name: \"%s\"\n",
+           file_table[InputNo].fid, file_table[InputNo].recno,
+              sym_macro_specials[ ps->code ]->mc_sym);
+        }
+     break;
+ 
+ 
+  case 4:  /*    A comment!     */
+     if (!memchr(buf, '#', bsize))
+        Intarget = 0;
+     break;
+ 
+ 
+  case 6:  /*    : include <filename>       */
+     ps = (struct parse_sym *)p->sublk[0];
+     if (InputNo >= MAX_INCL-1) {
+        error("\"%s\" line %d: maximum include file nesting is %d\n",
+              file_table[InputNo].fid,  file_table[InputNo].recno,
+              MAX_INCL-1 );
+        break;
+        }
+     c = alloc_text( 1 + (i = ps->text[0]), &(ps->text[1]) );
+     c[i] = 0;
+     strm = OpenInclude(c);
+     if (!strm) {
+        error("\"%s\" line %d, Can't open include file: %s\n",
+              file_table[InputNo].fid,  file_table[InputNo].recno,
+              strerror(errno)                                    );
+        break;
+        }
+     InputNo++;
+     file_table[InputNo].strm    = strm;
+     file_table[InputNo].fid     = c;
+     file_table[InputNo].recno   = 0;
+     file_table[InputNo].ifdepth = file_table[InputNo-1].ifdepth;
+     file_table[InputNo].flags   = 0;
+     Makefile                    = strm;
+     break;
+ 
+  case 7:  /*    : if  expression           */
+     if (file_table[InputNo].ifdepth+1 >= MAX_IF) {
+        error("\"%s\" line %d: :if directive nested too deeply\n",
+               file_table[InputNo].fid,  file_table[InputNo].recno );
+        break;
+        }
+     i = file_table[InputNo].ifdepth++;
+     if_stack[i] = file_table[InputNo].flags;
+     if ( !if_stack[i] )  {  /* Evaluate expression...  */
+        struct value val;
+        val = evaluate( p->sublk[0] );
+        if (!eval_logl(val))
+           file_table[InputNo].flags |= 1; /* false, skip this */
+        }
+     else file_table[InputNo].flags |= 4;  /* skip nested if   */
+     break;
+ 
+  case 8:  /*    :elif expression           */
+     if (WithinIf())
+        switch (file_table[InputNo].flags)  {
+           struct value val;
+           case 0:  file_table[InputNo].flags |= 2;  break;
+           case 1:
+              val = evaluate( p->sublk[0] );
+              if (eval_logl(val))
+                 file_table[InputNo].flags = 0;
+              break;
+           }
+     break;
+ 
+  case 9:  /*    :else                      */
+     if (WithinIf())
+        switch (file_table[InputNo].flags)  {
+           case 0:  file_table[InputNo].flags |= 2;  break;
+           case 1:  file_table[InputNo].flags  = 0;  break;
+           }
+     break;
+ 
+  case 10: /*    :endif                     */
+     if (WithinIf())   {
+        i = --file_table[InputNo].ifdepth;
+        file_table[InputNo].flags = if_stack[i];
+        }
+     break;
+ 
+  case 11: /*    : error   expr,expr,...    */
+  case 12: /*    : print   expr,expr,...    */
+ 
+     nd = p->code;
+     strm = stdout;
+ 
+     if (nd == 11)  {
+        error("\"%s\" line %d: ",
+              file_table[InputNo].fid, file_table[InputNo].recno );
+        }
+     nt = p->nsublks;
+ 
+     for (nd = 0 ; nd < nt ; )     {
+        struct value val;
+        val = evaluate( p->sublk[nd++]);
+        PrintExpr(strm, &val);
+        }
+     fprintf(strm, "\n");
+     break;
+ 
+  }
+  return;
+}
+ 
+ 
+void
+SetupTargets(tbuf, pb)
+  struct   sym_target  **tbuf;
+  struct   parse_out   *pb;
+{
+  struct   parse_sym   *ps;
+  int      i;
+  int      n = pb->nsublks;
+ 
+  for ( i=0 ; i<n ; )  {
+     if ((ps = (struct parse_sym *) pb->sublk[i])->code == 1)
+        tbuf[i++] = lookup_sym_target(&(ps->text[1]), ps->text[0], 1);
+     else error("\"%s\" line %d: Illegal Target Name: \"%s\"\n",
+         file_table[InputNo].fid, file_table[InputNo].recno,
+                 sym_macro_specials[ps->code]->mc_sym), i++;
+     }
+  return;
+}
+ 
+ 
+/*D*    NAME:       get_email_address
+        PURPOSE:    To translate a targetnamelist into an email
+                    address.
+        DESCRIPTION:
+           The targetname list pieces are joined together with a
+           single blank between components and the name is looked
+           up.
+*/
+struct sym_owner *
+get_email_address(pb)
+  struct   parse_out   *pb;
+{
+  char                 buf[256];
+  struct   parse_sym   *ps;
+  int      i, j = 0;
+  int      n = pb->nsublks;
+ 
+  for ( i=0 ; i<n ; i++ )  {
+     ps = (struct parse_sym *) pb->sublk[i];
+     if (ps->code == 1)   {
+        int len = *ps->text;
+        if ( j+len > 254)
+           error("\"%s\" line %d: Address too long\n",
+              file_table[InputNo].fid, file_table[InputNo].recno);
+        if (j > 0) buf[j++] = ' ';
+        memcpy( buf+j, ps->text+1, len);
+        j += len;
+        }
+     else error("\"%s\" line %d: Illegal address component: \"%s\"\n",
+           file_table[InputNo].fid, file_table[InputNo].recno,
+                 sym_macro_specials[ps->code]->mc_sym);
+     }
+  buf[j] = 0;
+  return lookup_sym_owner(buf, j, 1);
+}
+ 
+ 
+ 
+/*F*    NAME:       WithinIf(void)
+        PURPOSE:    To indicate if we are processing a :if.
+        DESCRIPTION:
+           We are processing an :if when
+ 
+           1. the current ifdepth is greater than 0
+   ( AND   2. the input stream is the base make file
+     OR    3. the current file ifdepth is greater than the
+              previous include file's ifdepth.
+   )
+*/
+ 
+int
+WithinIf(void)
+{
+  int   rs = 0;
+ 
+  if (  file_table[InputNo].ifdepth   &&
+      (    InputNo == 0
+        || file_table[InputNo].ifdepth > file_table[InputNo-1].ifdepth
+      ))
+     rs++;
+ 
+  if (!rs)
+     error("\"%s\" line %d: directive must be within an :if\n",
+           file_table[InputNo].fid,  file_table[InputNo].recno );
+ 
+  return rs;
+}
+ 
+ 
+ 
+/*D*    NAME:       alloc_target_rule(LineNo)
+        PURPOSE:    To allocate a target rule block.
+        DESCRIPTION:
+           Every time a makefile line contains a dependancy rule,
+           a target_rule structure is allocated to hold the
+           dependancy information.
+*/
+ 
+alloc_target_rule()
+{
+  struct target_rule *t;
+ 
+  t = (struct target_rule *) malloc(sizeof(struct target_rule));
+  if (!t) crash("Out of Memory: MakeCommand");
+ 
+  t->next        = LineList;
+  LineList       = t;
+  t->tr_depend   = 0;
+  t->tr_commands = 0;
+  t->tr_num      = file_table[InputNo].recno;
+  t->tr_fid      = file_table[InputNo].fid;
+  mem_rulelist += sizeof(struct target_rule);
+  return;
+}
+ 
+ 
+/*D*    NAME:       build_dependancy
+        PURPOSE:    To build a dependancy list for a target.
+        DESCRIPTION:
+           This function allocates a dependancy block for the
+           specified function.  This block is linked to the
+           target_rule block in which the dependancy was indicated,
+           and to its sym_target block.
+*/
+ 
+build_dependancy(target, dlist, nd)
+  struct   sym_target  *target;
+  struct   sym_target  **dlist;
+  unsigned             nd;
+{
+  struct dependancy *d;
+  int               i, j;
+  int               tg_blen = target->tg_len - target->tg_suffix_len;
+ 
+  if ( *(target->tg_text) == '.') {
+     if (target == PseudoPhony) {
+        for ( i=0 ; i<nd ; i++)
+           (*dlist++)->tg_phony |= 1;
+        return;
+        }
+     else if (target == PseudoPrecious)  {
+        for ( i=0 ; i<nd ; i++)
+           (*dlist++)->tg_precious |= 1;
+        return;
+        }
+     else if (target == PseudoOnline)    {
+        for ( i=0 ; i<nd ; i++)
+           (*dlist++)->tg_online |= 1;
+        return;
+        }
+     else if (target == PseudoSuffixes || target == PseudoDefault ||
+              target == PseudoIgnore   || target == PseudoSilent    ) {
+        warning("\"%s\" line %d: Fake Target %s not supported in CP-6 Make\n",
+           file_table[InputNo].fid, file_table[InputNo].recno,
+           target->tg_text);
+        return;
+        }
+     }
+  else if (!MakeTarget) MakeTarget = target;
+ 
+  d = (struct dependancy *) malloc(i=sizeof(struct dependancy)-16+4*nd);
+  if (!d) crash("Out of Memory: MakeCommand");
+  mem_dependlist[0] += i;
+  mem_dependlist[1]++;
+ 
+  d->next    = LineList->tr_depend;
+  LineList->tr_depend = d;
+ 
+  d->dp_tgdepend = target->tg_depend;
+  target->tg_depend = d;
+ 
+  d->dp_rule  = LineList;
+  d->dp_target   = target;
+  d->dp_num      = nd;
+ 
+  for ( i=j=0 ; i<nd ; i++)  {
+     struct sym_target *t = *dlist++;
+     int                t_blen = t->tg_len - t->tg_suffix_len;
+ 
+     if ( t_blen )  {
+        d->dp_list[j++] = t;
+        if (tg_blen == t_blen && !memcmp(target->tg_text, t->tg_text, tg_blen))
+           target->tg_depbase++;
+        }
+     else target->tg_inftype = t->tg_ftype;
+     }
+ 
+  d->dp_num = j;
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       setup_pseudo_targets()
+        PURPOSE:    To create target entries for the pseudo targets
+                    .PHONY, .PRECIOUS, .SUFFIXES, .DEFAULT, .IGNORE
+                    and .SILENT.
+*/
+ 
+setup_pseudo_targets()
+{
+  PseudoPhony     = lookup_sym_target(".PHONY",    6, 2);
+  PseudoPrecious  = lookup_sym_target(".PRECIOUS", 9, 2);
+  PseudoSuffixes  = lookup_sym_target(".SUFFIXES", 9, 2);
+  PseudoDefault   = lookup_sym_target(".DEFAULT",  8, 2);
+  PseudoIgnore    = lookup_sym_target(".IGNORE",   7, 2);
+  PseudoSilent    = lookup_sym_target(".SILENT",   7, 2);
+  PseudoOnline    = lookup_sym_target(".ONLINE",   7, 2);
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:          dump_dependancies(LS_width)
+        PURPOSE:       To nicely format the current dependancy
+                       information.
+        DESCRIPTION:
+           The dependancy information is found by chasing the chain
+           created through TargetHead.  As each new sym_target is
+           allocated, it is linked into TargetHead to provide this
+           chain.
+*/
+ 
+dump_dependancies(LS_width)
+  unsigned    LS_width;
+{
+  struct   sym_target  *t = TargetList.tg_list;
+  struct   dependancy  *d;
+  int                  fw;
+  unsigned             w_printed = 0;
+ 
+  printf("\n\n***   Makefile Dependancies   ***\n");
+  while (t)   {
+     if ( *(t->tg_text) != '.'  || ( t->tg_depend &&
+          (t->tg_depend->dp_num != 0 || t->tg_depend->dp_tgdepend))) {
+        d = t->tg_depend;
+        fw = (t->tg_len < 14) ? 15 : t->tg_len + 2;
+        printf("\n%-*s   : ", fw, t->tg_text, state_names[1+t->tg_status]);
+        w_printed = LS_width;
+        while (d)   {
+           int i, nd = d->dp_num;
+           for ( i=0; i<nd ; )  {
+              struct sym_target *tg = d->dp_list[i++];
+              fw = 5 * ((tg->tg_len + 5)/5);
+              w_printed += fw;
+              if (w_printed >= LS_width)
+                 printf("\\\n          "), w_printed = fw + 10;
+              printf("%-*s", fw, tg->tg_text);
+              }
+           d = d->dp_tgdepend;
+           }
+        }
+     t = t->tg_list;
+     }
+  printf("\n");
+}
+ 

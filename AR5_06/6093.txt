@@ -1,0 +1,410 @@
+/*M* SOLVENT - UNIX tar file remover */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMR,PLM=5,IND=3,CTI=3,SDI=3,MCL=10,CSI=0,ECI=0 */
+SOLVENT: PROC MAIN;
+ 
+   %INCLUDE CP_6;
+   %INCLUDE XU_FORMAT_C;
+   %INCLUDE XUF_ENTRY;
+   %INCLUDE B_ERRORS_C;
+ 
+DCL M$SI DCB;
+DCL M$LO DCB;
+DCL M$EO DCB;
+ 
+%FPT_READ (DCB=M$SI, BUF=TAR_BUF);
+DCL TAR_BUF    CHAR(10240) STATIC;
+ 
+%FPT_WRITE (DCB=M$EO);
+ 
+%FPT_CLOSE (DCB=M$EO, DISP=SAVE, STCLASS="STATIC SYMDEF");
+ 
+DCL TAR$    PTR STATIC INIT(ADDR(NIL));
+DCL TAR_TEXT CHAR(TEXT_SIZE) BASED (TAR$);
+DCL TEXT_SIZE SBIN WORD;
+DCL 1 TAR_CONTROL BASED (TAR$) CALIGNED,
+       2 NAME     CHAR(100),
+       2 MODE     CHAR(8),
+       2 UID      CHAR(8),
+       2 GID      CHAR(8),
+       2 SIZE     CHAR(12),
+       2 MTIME    CHAR(12),
+       2 CHKSUM   CHAR(8),
+       2 LINKFLAG CHAR(1),
+       2 LINKNAME CHAR(100),
+       2 * (0:254) CHAR(1);
+ 
+%F_FDS (NAME=F_FDS, STCLASS="STATIC SYMDEF", BUF=FDS_BUFFER, DCB=M$LO);
+DCL FDS_BUFFER CHAR(256) STATIC;
+DCL FMT_DONE CHAR(0) CONSTANT INIT
+   ('processing terminated.');
+ 
+DCL 1 OPTIONS EXTROOT,
+       2 LIST     BIT(1) INIT('0'B),
+       2 ND       BIT(1) INIT('0'B),
+       2 AUTORENAME BIT(1) INIT('0'B),
+       2 NONL      BIT(1) INIT('0'B),
+       2 KEEPNL    BIT(1) INIT('0'B),
+       2 STD       BIT(1) INIT('0'B),
+       2 NLVALUE   CHAR(1) INIT(BINASC(10)),
+       2 D        UBIN INIT(0),
+       2 NUMBER   UBIN INIT(1),
+       2 STDNAME  CHAR(100) INIT(BINASC(0));
+ 
+%EQU HEADER = 0;
+%EQU DATA = 1;
+DCL STATE         UBIN STATIC INIT(%HEADER);
+DCL REC_LENGTH    SBIN STATIC INIT(0);
+DCL DCB$          PTR;
+%F$DCB(STCLASS ="BASED (DCB$)");
+ 
+DCL B$TCB$        PTR SYMREF READONLY;
+%B$TCB;
+%B$ALT;
+%SUB SYS_CODE = "B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR#";
+ 
+DCL SIZE       SBIN STATIC INIT(0);
+DCL CREATE_FILE BIT(1) STATIC ALIGNED INIT('0'B);
+DCL DECODE_HEADER ENTRY(3) ALTRET;
+ 
+DCL PARSE_OPTIONS ENTRY;
+DCL I SBIN;
+DCL J SBIN;
+DCL SPAN BIT(1) STATIC INIT('0'B);
+ 
+     CALL PARSE_OPTIONS;
+     DCB$ = DCBADDR(DCBNUM(M$SI));
+ 
+     DO WHILE '1'B;
+        IF TAR$ = ADDR(NIL) OR POFFC(TAR$, ADDR(TAR_BUF)) >= REC_LENGTH THEN
+           CALL M$READ (FPT_READ)
+           WHENRETURN DO;
+              TAR$ = ADDR(TAR_BUF);
+              REC_LENGTH = F$DCB.ARS#;
+              END;
+           WHENALTRETURN DO;
+              IF SYS_CODE = %E$EOF THEN GOTO ENDOFFILE;
+              CALL M$MERC;
+              END;
+ 
+           DO CASE (STATE);
+           CASE (%HEADER);
+              CALL DECODE_HEADER(TAR_CONTROL, SIZE, CREATE_FILE) ALTRET(ENDOFFILE);
+              TAR$ = PINCRC(TAR$, 512);
+              IF SIZE > 0 THEN DO;
+                 STATE = %DATA;
+                 END;
+              ELSE
+                 STATE = %HEADER;
+ 
+           CASE (%DATA);
+              IF POFFC(TAR$,ADDR(TAR_BUF)) + SIZE > REC_LENGTH THEN DO;
+                 SPAN = '1'B;
+                 TEXT_SIZE = REC_LENGTH - POFFC(TAR$,ADDR(TAR_BUF));
+                 END;
+              ELSE DO;
+                 SPAN = '0'B;
+                 TEXT_SIZE = SIZE;
+                 END;
+              I = 0; J = 0;
+              IF NOT OPTIONS.LIST AND CREATE_FILE THEN
+                 IF OPTIONS.NONL THEN DO;
+                    FPT_WRITE.V.DVBYTE.CONT# = '1'B;
+                    FPT_WRITE.BUF_ = VECTOR(SUBSTR(TAR_TEXT,,TEXT_SIZE));
+                    CALL M$WRITE (FPT_WRITE);
+                    END;
+                 ELSE DO WHILE I < TEXT_SIZE;
+                    CALL INDEX (I,OPTIONS.NLVALUE,TAR_TEXT,J)
+                    WHENRETURN DO;
+                       FPT_WRITE.V.DVBYTE.CONT# = '0'B;
+                       IF OPTIONS.KEEPNL THEN
+                          I = I + LENGTHC(OPTIONS.NLVALUE);
+                       END;
+                    WHENALTRETURN DO;
+                       FPT_WRITE.V.DVBYTE.CONT# = '1'B;
+                       END;
+                    IF I - J > 0 THEN
+                       FPT_WRITE.BUF_ = VECTOR(SUBSTR(TAR_TEXT,J,I-J));
+                    ELSE
+                       FPT_WRITE.BUF_ = VECTOR(NIL);
+                    CALL M$WRITE (FPT_WRITE);
+                    J = I;
+                    IF NOT OPTIONS.KEEPNL THEN J = J + LENGTHC(OPTIONS.NLVALUE);
+                  /* note that this may cause J to be beyond the end
+                     of the string, if this was a spanned record, but
+                     the value of I is the only thing that matters in
+                     this case
+                  */
+                    END;
+              SIZE = SIZE - TEXT_SIZE;
+              TAR$ = PINCRC (TAR$, TEXT_SIZE);
+              IF NOT SPAN THEN DO;
+                 I = MOD(POFFC(TAR$,ADDR(TAR_BUF)),512);
+                 IF I ~= 0 THEN TAR$ = PINCRC(TAR$, 512 - I);
+                 STATE = %HEADER;
+                 IF NOT OPTIONS.LIST THEN CALL M$CLOSE (FPT_CLOSE);
+                 END;
+           END;
+        END;
+ENDOFFILE:
+     CALL X$WRITE (F_FDS, VECTOR(FMT_DONE));
+ 
+END;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+DECODE_HEADER: PROC (TAR_CONTROL, SIZE, CREATE_FILE) ALTRET;
+ 
+   %INCLUDE XUF_ENTRY;
+   %INCLUDE CP_6;
+   %INCLUDE B_ERRORS_C;
+ 
+DCL 1 TAR_CONTROL CALIGNED,
+       2 NAME     CHAR(100),
+       2 MODE     CHAR(8),
+       2 UID      CHAR(8),
+       2 GID      CHAR(8),
+       2 SIZE     CHAR(12),
+       2 MTIME    CHAR(12),
+       2 CHKSUM   CHAR(8),
+       2 LINKFLAG CHAR(1),
+       2 LINKNAME CHAR(100),
+       2 * (0:254) CHAR(1);
+DCL SIZE SBIN;
+DCL CREATE_FILE BIT(1) ALIGNED;
+ 
+DCL 1 OPTIONS EXTROOT,
+       2 LIST     BIT(1),
+       2 ND       BIT(1),
+       2 AUTORENAME BIT(1),
+       2 NONL     BIT(1),
+       2 KEEPNL   BIT(1),
+       2 STD      BIT(1),
+       2 NLVALUE  CHAR(1),
+       2 D        UBIN,
+       2 NUMBER   UBIN,
+       2 STDNAME  CHAR(100);
+ 
+%VLP_NAME (FPTN=NAME,LEN=100,STCLASS="");
+DCL I SBIN;
+DCL J SBIN;
+DCL 1 IS,
+       2 DIRECTORY BIT(1),
+       2 LINK     BIT(1),
+       2 FILE     BIT(1);
+DCL NEWNAME CHAR(8);
+DCL CHECK_FILE    ENTRY(2);
+DCL M$EO DCB;
+DCL M$ME DCB;
+%F$DCB;
+%FPT_READ (FPTN=FPT_READNAME, DCB=M$ME);
+%FPT_OPEN (FPTN=FPT_OPEN, DCB=M$EO, FUN=CREATE, EXIST=NEWFILE);
+%FPT_CLOSE (STCLASS="SYMREF");
+DCL B$TCB$        PTR SYMREF READONLY;
+%B$TCB;
+%B$ALT;
+ 
+DCL F_FDS BIT(1) SYMREF;
+DCL FMT_DIRECTORY CHAR(0) CONSTANT INIT
+   (' directory %<>A');
+DCL FMT_FILE CHAR(0) CONSTANT INIT
+   (' file %<>A');
+DCL FMT_LINK CHAR(0) CONSTANT INIT
+   (' link %<>A to %<>A');
+DCL FMT_NEWNAME CHAR(0) CONSTANT INIT
+   ('cannot create file (error %J).  Enter new name:');
+DCL FMT_AUTONAME CHAR(0) CONSTANT INIT
+   ('rename %<>A to %<>A');
+ 
+/* local utility procedures */
+OCTBIN: PROC (BIN,OCT);
+ 
+DCL BIN SBIN;
+DCL OCT CHAR(1);
+ 
+DCL I SBIN;
+DCL DIGIT_FOUND BIT(1);
+ 
+     I=0;
+     BIN=0;
+     DIGIT_FOUND = '0'B;
+     DO WHILE (SUBSTR(OCT,I,1) ~= BINASC(0));
+        IF SUBSTR(OCT,I,1)~=' ' THEN DO;
+           BIN=(BIN*8)+(ASCBIN(SUBSTR(OCT,I,1))-ASCBIN('0'));
+           DIGIT_FOUND = '1'B;
+           END;
+        ELSE IF DIGIT_FOUND THEN RETURN;
+        I = I + 1;
+        END;
+END;
+ 
+/* end of local utility procedures */
+ 
+     CALL INDEX (I, BINASC(0), TAR_CONTROL.NAME);
+     NAME.NAME#=SUBSTR(TAR_CONTROL.NAME,0,I+1);
+     NAME.L# = I;
+     IF I = 0 THEN ALTRETURN;
+ 
+     IS='0'B;
+     IF SUBSTR(NAME.NAME#,I-1,1)='/' THEN IS.DIRECTORY = '1'B;
+     ELSE IS.FILE = '1'B;
+     IF TAR_CONTROL.LINKFLAG ~= BINASC(0) AND
+        TAR_CONTROL.LINKFLAG ~= '0' THEN
+        IS.LINK = '1'B;
+     CALL OCTBIN(SIZE,TAR_CONTROL.SIZE);
+     CREATE_FILE = '1'B;
+     IF OPTIONS.STD THEN
+        CALL CHECK_FILE (NAME, CREATE_FILE);
+     IF NOT CREATE_FILE THEN
+        RETURN;
+     IF IS.LINK THEN DO;
+        SIZE = 0;
+        CALL INDEX (J, BINASC(0), TAR_CONTROL.LINKNAME);
+        CALL X$WRITE (F_FDS, VECTOR(FMT_LINK), VECTOR(NAME.NAME#),
+           VECTOR(SUBSTR(TAR_CONTROL.LINKNAME,0,J)));
+        END;
+     ELSE IF IS.DIRECTORY THEN
+           CALL X$WRITE (F_FDS, VECTOR(FMT_DIRECTORY), VECTOR(NAME.NAME#));
+        ELSE DO;                        /* it is a file */
+           CALL X$WRITE (F_FDS, VECTOR(FMT_FILE),VECTOR(NAME.NAME#));
+           IF NOT OPTIONS.LIST AND CREATE_FILE THEN DO;
+              IF OPTIONS.ND THEN
+                 CALL INDEX1R(J,'/',NAME.NAME#)
+                 WHENRETURN DO;
+                    I = I - (J+1);
+                    NAME.NAME# = SUBSTR(NAME.NAME#,J+1,I);
+                    NAME.L# = I;
+                    END;
+                 DO J = 0 TO I-1;
+                    DO SELECT (SUBSTR(NAME.NAME#,J,1));
+                    SELECT('/'); SUBSTR(NAME.NAME#,J,1)='$';
+                    SELECT('.'); SUBSTR(NAME.NAME#,J,1)=':';
+                    SELECT('='); SUBSTR(NAME.NAME#,J,1)='-';
+                    SELECT('+'); SUBSTR(NAME.NAME#,J,1)='`';
+                    END;
+                    END;
+              FPT_OPEN.NAME_ = VECTOR(NAME);
+AGAIN:        CALL M$OPEN (FPT_OPEN)
+              WHENALTRETURN DO;
+                 IF NOT OPTIONS.AUTORENAME OR (B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# ~= %E$BADFNME) THEN DO;
+                    CALL X$WRITE (F_FDS, VECTOR(FMT_NEWNAME),VECTOR(B$TCB$->B$TCB.ALT$->B$ALT.ERR));
+                    FPT_READNAME.BUF_ = VECTOR(NAME.NAME#);
+                    CALL M$READ (FPT_READNAME);
+                    NAME.L# = DCBADDR(DCBNUM(M$ME))->F$DCB.ARS#;
+                    GOTO AGAIN;
+                    END; ELSE DO;
+                    NEWNAME='$';
+                    CALL BINCHAR(SUBSTR(NEWNAME,1), OPTIONS.NUMBER);
+                    CALL X$WRITE (F_FDS, VECTOR(FMT_AUTONAME), VECTOR(NEWNAME), VECTOR(NAME.NAME#));
+                    NAME.NAME# = NEWNAME;
+                    NAME.L# = LENGTHC(NEWNAME);
+                    OPTIONS.NUMBER = OPTIONS.NUMBER + 1;
+                    GOTO AGAIN;
+                    END;
+                 END;
+              IF SIZE = 0 THEN CALL M$CLOSE (FPT_CLOSE); /* it was a null file */
+              END;
+           END;
+END;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+PARSE_OPTIONS: PROC;
+%INCLUDE CP_6;
+%INCLUDE XU_MACRO_C;
+%INCLUDE B$JIT;
+DCL B$JIT$           PTR SYMREF READONLY;
+ 
+DCL X$PARSE          ENTRY(1) ALTRET;
+%P_PCB (R=SOLVENT_OPTIONS, W=WORKAREA, WSZ=64, U$=PARSE_DEMON, CNTU=NO);
+DCL SOLVENT_OPTIONS BIT(1) SYMREF;
+DCL WORKAREA (0:63) BIT(36) STATIC;
+DCL PARSE_DEMON      ENTRY(1);
+ 
+     IF B$JIT.CCDISP = B$JIT.CCARS THEN RETURN;
+     P_PCB.TEXT$ = ADDR(SUBSTR(B$JIT.CCBUF,B$JIT.CCDISP,1));
+     P_PCB.NCHARS = B$JIT.CCARS - B$JIT.CCDISP;
+     CALL X$PARSE (P_PCB)
+     WHENALTRETURN DO;
+        CALL M$ERR;
+        END;
+END;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+PARSE_DEMON: PROC (PARAMETER);
+%INCLUDE XU_MACRO_C;
+%INCLUDE XU_SUBS_C;
+%INCLUDE SOLVENT_C61;
+ 
+%PARSE$PARAM(NAME=PARAMETER, STCLASS="");
+ 
+%PARSE$OUT(STCLASS="BASED");
+%PARSE$SYM(STCLASS="BASED");
+ 
+DCL 1 OPTIONS EXTROOT,
+       2 LIST     BIT(1),
+       2 ND       BIT(1),
+       2 AUTORENAME BIT(1),
+       2 NONL     BIT(1),
+       2 KEEPNL   BIT(1),
+       2 STD      BIT(1),
+       2 NLVALUE  CHAR(1),
+       2 D        UBIN,
+       2 NUMBER   UBIN,
+       2 STDNAME  CHAR(100);
+DCL VALUE   UBIN;
+ 
+     IF PARAMETER.TYPE ~= %SUCC# THEN DO;
+        PARAMETER.REJECT = '1'B;
+        RETURN;
+        END;
+     DO CASE (PARAMETER.CODE);
+     CASE (%L#);
+        OPTIONS.LIST = '1'B;
+        PARAMETER.ACCEPT = '1'B;
+     CASE (%D#);
+        CALL CHARBIN(OPTIONS.D,PARAMETER.OUT$->OUT$SYM.TEXT);
+        PARAMETER.ACCEPT = '1'B;
+     CASE (%ND#);
+        OPTIONS.ND = '1'B;
+        PARAMETER.ACCEPT='1'B;
+     CASE (%AUTORENAME#);
+        OPTIONS.AUTORENAME = '1'B;
+        PARAMETER.ACCEPT='1'B;
+     CASE (%AUTONUMBER#);
+        CALL CHARBIN(OPTIONS.NUMBER, PARAMETER.OUT$->OUT$SYM.TEXT);
+        PARAMETER.ACCEPT = '1'B;
+     CASE (%NONL#);
+        OPTIONS.NONL = '1'B;
+        PARAMETER.ACCEPT = '1'B;
+     CASE (%KEEPNL#);
+        OPTIONS.KEEPNL = '1'B;
+        PARAMETER.ACCEPT = '1'B;
+     CASE (%NLVALUE#);
+        CALL CHARBIN(VALUE, PARAMETER.OUT$->OUT$SYM.TEXT);
+        IF VALUE > 255 THEN PARAMETER.REJECT = '1'B;
+        ELSE PARAMETER.ACCEPT = '1'B;
+        OPTIONS.NLVALUE = BINASC(VALUE);
+     CASE (%STD#);
+        SUBSTR (OPTIONS.STDNAME,,100) = PARAMETER.OUT$->OUT$BLK.SUBLK$(0)->OUT$SYM.TEXT;
+        SUBSTR (OPTIONS.STDNAME,PARAMETER.OUT$->OUT$BLK.SUBLK$(0)->OUT$SYM.COUNT,1) = BINASC(0);
+        PARAMETER.ACCEPT = '1'B;
+        OPTIONS.STD = '1'B;
+     CASE (ELSE);
+        PARAMETER.REJECT = '1'B;
+     END;
+END;

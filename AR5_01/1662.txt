@@ -1,0 +1,3184 @@
+VERSION E05
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:1    
+        1        1        /*M* NIL$POSTER - LINE PRINTER POSTER */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR */
+        8        8        NIL$POSTER: PROC(PAR,INTLVL,STATUS);
+        9        9        /*D*  NAME:  NIL$POSTER
+       10       10              CALL:  CALL NIL$POSTER(PAR$,INTLVL,STATUS);
+       11       11              ENVIRONMENT:  Monitor Linkage Segment, Interrupt Level
+       12       12              INPUT:  PAR$ - Pointer to DQH if INTLVL=0,1,2,3 or 4
+       13       13                             Pointer to IOS packet if INTLVL=5
+       14       14                      INTLVL - 0 = Overhead (Fault channel) interrupt
+       15       15                               1 = Terminate interrupt
+       16       16                               2 = Marker interrupt (Ignored)
+       17       17                               3 = Special interrupt
+       18       18                               4 = Lost interrupt
+       19       19                               5 = Repost
+       20       20                      STATUS - Status words for special and fault channel interrupts
+       21       21              DESCRIPTION:
+       22       22                  This routine handles all post-processing functions for
+       23       23              I/O to local line printers.  If the just completed request was
+       24       24              a T & D request the next operation on the queue is initated and
+       25       25              the request is sent to TDC$COMP to be posted to the caller.  No
+       26       26              retry functions are performed for T & D requests.  For normal
+       27       27              I/O requests up to eight retry attempts will be made before
+       28       28              returning an error TYC to the caller.  Once the retry count has
+       29       29              been exhausted or the operation completes normally the packet
+       30       30              is passed to NIO$COMP to post the request to the user.  The
+       31       31              description of the status codes returened by the line printer may
+       32       32              be found in the EPS-1 for the PRT401/402.
+       33       33        */
+       34       34        /*
+       35       35                Includes
+       36       36        */
+       37       37        %INCLUDE                CP_6_SUBS ;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:2    
+       38      577        %INCLUDE                EL_SUBS_C ;
+       39      661        %INCLUDE                HF_DATA_R ;
+       40      704        %INCLUDE                HF_LOCK_C ;
+       41      718        %INCLUDE                NI$ERRLOG ;
+       42      784        %INCLUDE                NI_DATA_C ;
+       43      897        %INCLUDE                NI_DATA_R ;
+       44     1334        %INCLUDE                NI_DEVCMD_C ;
+       45     1517        %INCLUDE                NI_MACROS_C ;
+       46     1784        %INCLUDE                N_FC_C ;
+       47     1821        %INCLUDE                OC_SUBS_C ;
+       48     2552        %INCLUDE                PM$NI ;
+       49     2576        /*
+       50     2577                Parameters
+       51     2578        */
+       52     2579    1   DCL INTLVL              UBIN(18) PARAM ;
+       53     2580    1   DCL PAR                 SBIN PARAM ;
+       54     2581    1   DCL STATUS              BIT(72) DALIGNED PARAM ;
+       55     2582        /*
+       56     2583                Entries
+       57     2584        */
+       58     2585    1   DCL 1 NIA$LOGERR        ENTRY(4) ;
+       59     2586    1   DCL 1 NIA$SPURINT       ENTRY(4) ;
+       60     2587    1   DCL 1 NIF$ANFAULT       ENTRY(3) ALTRET ;
+       61     2588    1   DCL 1 NIF$ANIOM         ENTRY(2) ALTRET ;
+       62     2589    1   DCL 1 NIK$OPMSG         ENTRY(5) ;
+       63     2590    1   DCL 1 NIO$DCWBLD        ENTRY(1) ALTRET ;
+       64     2591    1   DCL 1 NIO$COMP          ENTRY(2) ;
+       65     2592    1   DCL 1 NIO$SPCOMP        ENTRY(1) ;
+       66     2593    1   DCL 1 NIQ$GET           ENTRY(1) ALTRET ;
+       67     2594    1   DCL 1 NIQ$REL           ENTRY(1) ALTRET ;
+       68     2595    1   DCL 1 NIS$MASK          ENTRY(2) ;
+       69     2596    1   DCL 1 NIU$DEVSCHED      ENTRY(2) ;
+       70     2597    1   DCL 1 NIU$FIXARCT       ENTRY(2) ALTRET ;
+       71     2598    1   DCL 1 NIW$LDFW          ENTRY(2) ALTRET ;
+       72     2599    1   DCL 1 NIW$MPCSTOP       ENTRY(1) ;
+       73     2600    1   DCL 1 OCI$MK_STTM       ENTRY(1) ;
+       74     2601    1   DCL 1 PMN$COLLECT       ENTRY(3) ;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:3    
+       75     2602        /*
+       76     2603                Auto
+       77     2604        */
+       78     2605    1   DCL 1 CHANTIME          SBIN ALIGNED AUTO ;
+       79     2606    1   DCL 1 DCT$              PTR ALIGNED AUTO ;
+       80     2607    1   DCL 1 DQH$              PTR ALIGNED AUTO ;
+       81     2608    1   DCL 1 EXTST$            PTR ALIGNED AUTO ;
+       82     2609    1   DCL 1 I                 SBIN ALIGNED AUTO ;
+       83     2610    1   DCL 1 IOS$              PTR ALIGNED AUTO ;
+       84     2611    1   DCL 1 NEWSTATE          UBIN WORD ALIGNED AUTO;
+       85     2612        %NI$EXTST               ( NAME=NI$EXTST, STCLASS=AUTO);
+       86     2646    1   DCL 1 RCVR              ALIGNED AUTO,
+       87     2647    1         2 RETRY           BIT(1),
+       88     2648    1         2 RESET           BIT(1),
+       89     2649    1         2 LDVFC           BIT(1),
+       90     2650    1         2 LDTRAIN         BIT(1),
+       91     2651    1         2 NOINC           BIT(1),
+       92     2652    1         2 LOGERR          BIT(1),
+       93     2653    1         2 EXTST           BIT(1),
+       94     2654    1         2 OPMSG           BIT(1),
+       95     2655    1         2 ONLYRETRY       BIT(1);
+       96     2656    1   DCL 1 RELOAD$           PTR ALIGNED AUTO ;
+       97     2657    1   DCL 1 REQ$              PTR ALIGNED AUTO ;
+       98     2658    1   DCL 1 SQH$              PTR ALIGNED AUTO ;
+       99     2659        /*
+      100     2660                Based
+      101     2661        */
+      102     2662        %NI$DCT                 ( NAME=DCT,      STCLASS="BASED(DCT$)" ) ;
+      103     2710        %NI$DQH                 ( NAME=DQH,      STCLASS="BASED(DQH$)" ) ;
+      104     2733        %NI$IOM                 ( NAME=IOM,      STCLASS=BASED ) ;
+      105     2738        %NI$REQ                 ( NAME=IOS,      STCLASS="BASED(IOS$)" ) ;
+      106     2763        %NI$IOSTAT              ( NAME=IOSTAT,   STCLASS=BASED ) ;
+      107     2772        %NI$MBX                 ( NAME=MBX,      STCLASS=BASED ) ;
+      108     2791        %NI$IOERR               ( NAME=NI$IOERR, STCLASS=BASED ) ;
+      109     2845        %N$REQ                  ( NAME=REQ,      STCLASS="BASED(REQ$)" ) ;
+      110     2903        %NI$SQH                 ( NAME=SQH,      STCLASS="BASED(SQH$)" ) ;
+      111     2916        /*
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:4    
+      112     2917                Constants
+      113     2918        */
+      114     2919        %SUB RETRY#='400'O;
+      115     2920        %SUB RESET#='200'O;
+      116     2921        %SUB LDVFC#='100'O;
+      117     2922        %SUB LDTRAIN#='040'O;
+      118     2923        %SUB NOINC#='020'O;
+      119     2924        %SUB LOGERR#='010'O;
+      120     2925        %SUB EXTST#='004'O;
+      121     2926        %SUB OPMSG# = '002'O;
+      122     2927        %SUB ONLYRETRY#='001'O;
+      123     2928        %SUB FOREVER="WHILE('1'B)";
+      124     2929        %SUB NEVER="WHILE('0'B)";
+      125     2930        %SUB LDTRAIN_DC=1;
+      126     2931        %SUB LDVFC_DC=5;
+      127     2932        %SUB EXTST_DCW='000000000006'O;
+      128     2933        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:5    
+      129     2934        /* NEW LINE PRINTER POSTER FOR NEW IO SYSTEM */
+      130     2935    2           DO INHIBIT;
+      131     2936    3              DO CASE(INTLVL);
+      132     2937    3               CASE(%OVERHEAD,%TERMINATE,%LOST);
+      133     2938    3                 DQH$ = ADDR(PAR);
+      134     2939    3                 SQH$ = DQH.SQH$;
+      135     2940                      %LOCK(G#=SQH.GATE);
+      136     2943    3                 IF  DQH.STATE ~= %BUSY
+      137     2944    4                 THEN DO ;
+      138     2945    4                    IF  ADDR(STATUS) = ADDR(NIL)
+      139     2946    4                    THEN
+      140     2947    4                       CALL NIA$SPURINT ( DQH, EL_SPURINT, INTLVL, NI_DBLZERO ) ;
+      141     2948    4                    ELSE
+      142     2949    4                       CALL NIA$SPURINT ( DQH, EL_SPURINT, INTLVL, STATUS ) ;
+      143     2950                         %UNLOCK ( G#=SQH.GATE ) ;
+      144     2953    4                    RETURN ;
+      145     2954    4                    END ;
+      146     2955    3                 REQ$ = DQH.IO$;
+      147     2956    3                 DCT$ = REQ.DCT$;
+      148     2957    3                 IF HW_IMX THEN
+      149     2958    3                    REQ.FLPW = DQH.IOSTATUS$->IOSTAT.LPW_RESIDUE;
+      150     2959    3                 ELSE
+      151     2960    3                    REQ.FLPW = DQH.MBX$->MBX.LPW;
+      152     2961    4                 IF INTLVL = %TERMINATE THEN DO;
+      153     2962    4                    REQ.STATUS = DQH.IOSTATUS$->IOSTAT.STATUS;
+      154     2963    4                    IF HW_IOP THEN    /* ignore IOP generated lost interrupt */
+      155     2964    4                       IF REQ.STATUS.MAJOR = %READY AND
+      156     2965    5                         REQ.STATUS.IOM.CHANNEL = %LOSTINT THEN DO;
+      157     2966                               %UNLOCK (G#=SQH.GATE);
+      158     2969    5                          RETURN;
+      159     2970    5                          END;
+      160     2971    4                    END;
+      161     2972    4                 ELSE DO;
+      162     2973    4                    REQ.STATUS = STATUS;
+      163     2974    5                    IF REQ.STATUS.MAJOR = %LOST_INTERRUPT THEN DO;
+      164     2975    5                       CALL NIS$MASK(DQH,%IMX_CCW_MASK_CHAN);
+      165     2976    5                       END;                /* IF LOST INTERRUPT */
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:6    
+      166     2977    4                    END;                   /* ELSE */
+      167     2978    3                 NI$EXTST.EXTST=DQH.IOSTATUS$->IOSTAT.EXTST;
+              2978                          /* MEANINGFUL FOR IOP/IMX */
+      168     2979    3                 IF REQ.IOFLG.REL
+      169     2980    3                 THEN DQH.MPC$->DCT.DFLG.MPCSUSPENDED = '0'B;
+      170     2981    3                 CALL RELCHAN;
+      171     2982                      %UNLOCK(G#=SQH.GATE);
+      172     2985    3                 IF DCT.SQ$ = ADDR(NIL)
+      173     2986    3                 THEN CALL PMN$COLLECT(DCT.PM,%PM_IDLE);
+      174     2987    3                 ELSE CALL PMN$COLLECT(DCT.PM,%PM_WAIT);
+      175     2988    3               CASE(%MARKER);
+      176     2989    3                 DQH$ = ADDR(PAR);
+      177     2990    3                 IF DQH.IO$ = ADDR(NIL)
+      178     2991    3                 THEN CALL NIA$SPURINT(DQH,EL_SPURINT,INTLVL,NI_DBLZERO);
+      179     2992    3                 ELSE CALL NIA$SPURINT(DQH,EL_SPURINT,INTLVL,DQH.IOSTATUS$->IOSTAT.
+              2992                          STATUS);
+      180     2993    3                 RETURN;
+      181     2994    3               CASE(%SPECIAL);
+      182     2995    3                 IF ADDR(STATUS)=ADDR(NIL) THEN
+      183     2996    3                    RETURN;
+      184     2997    3                 DQH$ = ADDR(PAR);
+      185     2998    3                 SQH$ = DQH.SQH$;
+      186     2999    3                 DCT$ = ADDR(NIL);
+      187     3000    4                 DO I = SQH.FDCT TO SQH.FDCT + SQH.NDCT - 1;
+      188     3001    4                    IF N$DCT$(I)->DCT.DQH$ = DQH$
+      189     3002    4                    THEN DCT$ = N$DCT$(I);
+      190     3003    4                    END;                   /* DO I */
+      191     3004    4                 IF DCT$ = ADDR(NIL) THEN DO;
+      192     3005    4                    IF ADDR(STATUS) = ADDR(NIL)
+      193     3006    4                    THEN CALL NIA$SPURINT(DQH,EL_SPURINT,INTLVL,NI_DBLZERO);
+      194     3007    4                    ELSE CALL NIA$SPURINT(DQH,EL_SPURINT,INTLVL,STATUS);
+      195     3008    4                    RETURN;
+      196     3009    4                    END;                   /* IF */
+      197     3010                      %LOCK(G#=SQH.GATE);
+      198     3013    4                 IF NOT DCT.SPSTAT.PRESENCE THEN DO;
+      199     3014    4                    DCT.SPSTAT = STATUS;
+      200     3015                         %UNLOCK(G#=SQH.GATE);
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:7    
+      201     3018    5                    IF DCT.STATE = %SPWAIT THEN DO;
+      202     3019    6                       IF DCT.MSG# > 0 THEN DO;
+      203     3020    6                          CALL OCI$MK_STTM(DCT.MSG#);
+      204     3021    6                          DCT.MSG# = 0;
+      205     3022    6                          END;             /* IF MSG# > 0 */
+      206     3023    5                       CALL NIU$DEVSCHED(DCT,%IDLE);
+      207     3024    5                       END;                /* IF SPWAIT */
+      208     3025    4                    ELSE CALL NIO$SPCOMP(DCT);
+      209     3026    4                    DCT.SPSTAT.PRESENCE = '0'B;
+      210     3027    4                    END;                   /* IF NOT PRESENCE */
+      211     3028    3                 ELSE
+      212     3029                         %UNLOCK(G#=SQH.GATE);
+      213     3032    3                 RETURN;
+      214     3033    3               CASE(%REPOST);
+      215     3034    3                 REQ$ = ADDR(PAR);
+      216     3035    3                 DCT$ = REQ.DCT$;
+      217     3036    3                 DQH$ = DCT.DQH$;
+      218     3037    3                 NI$EXTST.EXTST = '0'B;
+      219     3038    3               END;                        /* DO CASE INTLVL */
+      220     3039    2              END;                         /* DO INHIBIT */
+      221     3040        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:8    
+      222     3041    1           REQ.TYC = '0'B;
+      223     3042    1           RCVR = '0'B;
+      224     3043    1           EXTST$ = ADDR(NIL);
+      225     3044    1           RELOAD$ = ADDR(NIL);
+      226     3045    1           NEWSTATE = %IDLE;
+      227     3046    1           IF REQ.FC = %N_EXTST OR REQ.FC = %N_RQSTAT OR REQ.COMP = %COMP_TD
+      228     3047    1           THEN GOTO BYPASS_STATUS_ANALYSIS;
+      229     3048    2           IF REQ.STATUS.POWEROFF THEN DO;
+      230     3049    2              RCVR = RETRY#|LOGERR#|OPMSG#;
+      231     3050    2              IF DQH.MPC$->DCT.MPC.FWNAME = 'NONE' THEN
+      232     3051    2                 NEWSTATE = %KIWAIT;
+      233     3052    2              ELSE
+      234     3053    2                 NEWSTATE = %MPCWAIT;
+      235     3054    2              END;                         /* IF POWEROFF */
+      236     3055    1           ELSE
+      237     3056    2           DO CASE(REQ.STATUS.MAJOR);
+      238     3057    2            CASE(%READY);
+      239     3058    3              IF REQ.STATUS.IOM THEN DO;
+      240     3059    3                 RCVR = LOGERR#|ONLYRETRY#;
+      241     3060    3                 CALL NIF$ANIOM(REQ,RCVR.RETRY) ALTRET(L1);
+      242     3061    3                 END;                      /* IF */
+      243     3062    3              DO NEVER;
+      244     3063    3   L1:           NEWSTATE = %KIWAIT;
+      245     3064    3                 END;                      /* DO NEVER */
+      246     3065    2            CASE(%DEVICE_BUSY);
+      247     3066    2              REQ.TYC.IOERR = '1'B;
+      248     3067    2              RCVR = LOGERR#;
+      249     3068    2            CASE(%ATTENTION);
+      250     3069    2              RCVR=LOGERR#|EXTST#;
+      251     3070    3              IF REQ.STATUS.MINOR='00'O THEN DO;
+      252     3071    3                 RCVR.RETRY = '1'B;
+      253     3072    3                 REQ.TYC.IOERR = '1'B;
+      254     3073    3                 END;
+      255     3074    3              ELSE DO;
+      256     3075    3                 IF REQ.IOS$->IOS.IDCW.DC(0)=%(BITBIN(LP_LDVFC)) AND
+      257     3076    4                   REQ.FC=%N_SYMB THEN DO;
+      258     3077                         /*  Using the IPC-UR firmware, there are times that the VFC
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:9    
+      259     3078                             does not get loaded right when using a channel command
+      260     3079                             of '06' when the device is in standby.  So, this kludge
+      261     3080                             catches those possible failures and forces a normal load
+      262     3081                             VFC command, not using the channel command of '06'.
+      263     3082                          */
+      264     3083    4                    RCVR.LDVFC = '1'B;
+      265     3084    4                    END;
+      266     3085    3                 RCVR.RETRY = REQ.STATUS.ININT;
+      267     3086    3                 REQ.TYC.IOERR = REQ.STATUS.ININT;
+      268     3087    3                 END;
+      269     3088    2              NEWSTATE = %SPWAIT;
+      270     3089    2            CASE(%DATA_ALERT);
+      271     3090    2              IF REQ.STATUS.MINOR='00'O THEN
+      272     3091    2                 RCVR=RETRY#|LDTRAIN#|EXTST#;
+      273     3092    3              ELSE IF REQ.STATUS.MINOR&'27'O THEN DO;
+      274     3093    3                    RCVR=RETRY#|LOGERR#|EXTST#|OPMSG#;
+      275     3094    3                    END;
+      276     3095    2                 ELSE IF REQ.STATUS.MINOR & '40'O THEN
+      277     3096    2                       REQ.TYC.EOF='1'B;
+      278     3097    2            CASE(%COMMAND_REJECT);
+      279     3098    3              IF REQ.STATUS.MINOR = '00'O THEN DO;
+      280     3099    3                 RCVR = RETRY#|LDVFC#;
+      281     3100    3                 REQ.TYC.IOERR = '1'B;
+      282     3101    3                 END;                      /* IF '00'O */
+      283     3102    2              ELSE
+      284     3103    3                 IF REQ.STATUS.MINOR & '07'O THEN DO;
+      285     3104    3                    RCVR = RETRY#|LOGERR#;
+      286     3105    3                    REQ.TYC.IOERR = '1'B;
+      287     3106    3                    END;                   /* IF MINOR & '07'O */
+      288     3107    2                 ELSE
+      289     3108    3                    IF REQ.STATUS.MINOR & '10'O THEN DO;
+      290     3109    3                       RCVR = RETRY#|LDTRAIN#;
+      291     3110    3                       REQ.TYC.IOERR = '1'B;
+      292     3111    3                       END;                /* IF MINOR & '10'O */
+      293     3112    2                    ELSE
+      294     3113    3                       IF REQ.STATUS.MINOR & '60'O THEN DO;
+      295     3114    3                          RCVR = RETRY#|LOGERR#|RESET#;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:10   
+      296     3115    3                          REQ.TYC.IOERR = '1'B;
+      297     3116    3                          END;             /* IF MINOR & '60'O */
+      298     3117    2            CASE(%LOST_INTERRUPT);
+      299     3118    2              RCVR=RETRY#|LOGERR#|OPMSG#;
+      300     3119    2              REQ.STATUS.NCP = 7;
+      301     3120    2              REQ.ARSIZE = 0;
+      302     3121    2              NEWSTATE=%KIWAIT;
+      303     3122    2              REQ.TYC.TIMO='1'B;
+      304     3123    2            CASE(%MPC_ATTENTION);
+      305     3124    2              RCVR=RETRY#|LOGERR#|OPMSG#;
+      306     3125    2              NEWSTATE=%KIWAIT;
+      307     3126    2            CASE(%MPC_DATA_ALERT);
+      308     3127    2              REQ.TYC.IOERR = '1'B;
+      309     3128    2              RCVR = RETRY#|LOGERR#;
+      310     3129    2            CASE(%MPC_COMMAND_REJECT);
+      311     3130    2              REQ.TYC.IOERR = '1'B;
+      312     3131    2              RCVR = RETRY#|LOGERR#;
+      313     3132    2            CASE(%SYSTEM_FAULT);
+      314     3133    2              RCVR = LOGERR#;
+      315     3134    2              CALL NIF$ANFAULT(REQ,RCVR.RETRY) ALTRET(L2);
+      316     3135    3              DO NEVER;
+      317     3136    3   L2:           NEWSTATE = %KIWAIT;
+      318     3137    3                 END;                      /* DO NEVER */
+      319     3138    2            CASE(ELSE);
+      320     3139    2              REQ.TYC.IOERR = '1'B;
+      321     3140    2            END;                           /* CASE REQ.STATUS.MAJOR */
+      322     3141        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:11   
+      323     3142        /**/
+      324     3143        /* NOW PERFORM THE INDICATED RETRY OPERATIONS */
+      325     3144        /**/
+      326     3145    1   BYPASS_STATUS_ANALYSIS:
+      327     3146    2           DO CASE(REQ.COMP);
+      328     3147    2            CASE(%COMP_REG);               /* REGULAR REQUEST PACKETS */
+      329     3148    3              IF REQ.FC = %N_SYMB AND NOT RCVR.ONLYRETRY THEN DO;
+      330     3149    3                 CALL NIU$FIXARCT(REQ,RCVR.RETRY) ALTRET(NO_MORE_RECS);
+      331     3150    3                 IF NOT RCVR.RETRY THEN RCVR = RCVR|%(RETRY#|NOINC#);
+      332     3151    3                 END;                      /* IF FC = %N_SYMB */
+      333     3152    2   NO_MORE_RECS: ;
+      334     3153    2              IF RCVR.RETRY AND NOT RCVR.NOINC THEN REQ.ERRCT=REQ.ERRCT+1;
+      335     3154    3              IF RCVR.RETRY AND REQ.ERRCT>8 THEN DO;
+      336     3155    3                 IF NEWSTATE<=%ASSIGNED THEN NEWSTATE=%KIWAIT;
+      337     3156    3                 END;
+      338     3157    3              IF RCVR.LOGERR THEN DO;
+      339     3158    3                 CALL NIA$LOGERR(REQ,EL_IOERR);
+      340     3159    3                 RCVR.LOGERR='0'B;
+      341     3160    3                 END;
+      342     3161    3              IF NEWSTATE>=%SPWAIT THEN DO;
+      343     3162    3                 REQ.ERRCT=0;
+      344     3163    3                 CALL NIK$OPMSG(DCT,LP_MSG#,M_UR,NEWSTATE,REQ);
+      345     3164    3                 END;
+      346     3165    3              IF RCVR.LDTRAIN THEN DO;
+      347     3166    3                 CALL NIQ$GET(RELOAD$) ALTRET(REPOST);
+      348     3167    3                 RELOAD$->REQ.FC = %N_LDCHAIN;
+      349     3168    3                 RELOAD$->REQ.DLA = REQ.DLA;
+      350     3169    3                 RELOAD$->REQ.COMP = %COMP_IOS;
+      351     3170    3                 RELOAD$->REQ.OPFLG.BPF = '1'B;
+      352     3171    3                 RELOAD$->REQ.BUF$ = DCT.LP.CHAIN$;
+      353     3172    3                 RELOAD$->REQ.BUFSIZE = 60 * 4; /* CHAIN IMAGE = 60 WORDS */
+      354     3173    3                 CALL NIO$DCWBLD(RELOAD$->REQ) ALTRET(NOLDTRAIN);
+      355     3174    3                 RCVR.LDTRAIN = '0'B;
+      356     3175    4                 DO NEVER;
+      357     3176    4   NOLDTRAIN:       CALL NIQ$REL(RELOAD$);
+      358     3177    4                    GOTO REPOST;
+      359     3178    4                    END;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:12   
+      360     3179    3                 END;                      /* IF */
+      361     3180    3              IF RCVR.LDVFC THEN DO;
+      362     3181    3                 CALL NIQ$GET(RELOAD$) ALTRET(REPOST);
+      363     3182    3                 RELOAD$->REQ.FC = %N_LDVFC;
+      364     3183    3                 RELOAD$->REQ.DLA = REQ.DLA;
+      365     3184    3                 RELOAD$->REQ.COMP = %COMP_IOS;
+      366     3185    3                 RELOAD$->REQ.OPFLG.BPF = '1'B;
+      367     3186    3                 RELOAD$->REQ.BUF$ = DCT.LP.VFC$;
+      368     3187    3                 RELOAD$->REQ.BUFSIZE = DCT.LP.VFCL * 4;
+      369     3188    3                 CALL NIO$DCWBLD(RELOAD$->REQ) ALTRET(NOLDVFC);
+      370     3189    3                 RCVR.LDVFC = '0'B;
+      371     3190    4                 DO NEVER;
+      372     3191    4   NOLDVFC:         CALL NIQ$REL(RELOAD$);
+      373     3192    4                    GOTO REPOST;
+      374     3193    4                    END;
+      375     3194    3                 END;                      /* IF */
+      376     3195    3              IF RCVR.RESET THEN DO;
+      377     3196    3                 CALL NIQ$GET(RELOAD$) ALTRET(REPOST);
+      378     3197    3                 RELOAD$->REQ.FC = %N_RESET;
+      379     3198    3                 RELOAD$->REQ.DLA = REQ.DLA;
+      380     3199    3                 RELOAD$->REQ.COMP = %COMP_IOS;
+      381     3200    3                 CALL NIO$DCWBLD(RELOAD$->REQ) ALTRET(NORESET);
+      382     3201    3                 RCVR.RESET = '0'B;
+      383     3202    4                 DO NEVER;
+      384     3203    4   NORESET:         CALL NIQ$REL(RELOAD$);
+      385     3204    4                    GOTO REPOST;
+      386     3205    4                    END;
+      387     3206    3                 END;                      /* IF */
+      388     3207    3              IF REQ.ERR$~=ADDR(NIL) THEN DO;
+      389     3208    4                 IF NOT REQ.ERR$->NI$IOERR.GOTEXTST THEN DO;
+      390     3209    5                    IF HW_EXT_STATUS THEN DO;
+      391     3210    6                       IF NI$EXTST.EXTSTT.WRD(0)~=0 THEN DO;
+      392     3211    6                          REQ.ERR$->NI$IOERR.EXTST=NI$EXTST.EXTST;
+      393     3212    6                          REQ.ERR$->NI$IOERR.GOTEXTST='1'B;
+      394     3213    6                          END;
+      395     3214    5                       END;
+      396     3215    5                    ELSE IF RCVR.EXTST THEN DO;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:13   
+      397     3216    5                          CALL NIQ$GET(EXTST$) ALTRET(NOEXTST);
+      398     3217    5                          EXTST$->REQ.FC=%N_EXTST;
+      399     3218    5                          EXTST$->REQ.OPFLG=OP_BPF;
+      400     3219    5                          EXTST$->REQ.BUF$=ADDR(REQ.ERR$->NI$IOERR.EXTST);
+      401     3220    5                          EXTST$->REQ.BUFSIZE = SIZEC(NI$IOERR.EXTST);
+      402     3221    5                          EXTST$->REQ.DLA=REQ.DLA;
+      403     3222    5                          EXTST$->REQ.COMP = %COMP_IOS;
+      404     3223    5                          EXTST$->REQ.POSTER=NEWSTATE;
+      405     3224    5                          CALL NIO$DCWBLD(EXTST$->REQ) ALTRET(NOEXTST0);
+      406     3225    5                          NEWSTATE=%IDLE;
+      407     3226    5                          REQ.ERR$->NI$IOERR.GOTEXTST='1'B;
+      408     3227    6                          DO NEVER;
+      409     3228    6   NOEXTST0:                 CALL NIQ$REL(EXTST$);
+      410     3229    6                             END;
+      411     3230    5   NOEXTST:               END;
+      412     3231    4                    END;
+      413     3232    3                 END;
+      414     3233    2            CASE(%COMP_IOS);               /* IOS CALLED THIS ONE */
+      415     3234    3              IF REQ.FC = %N_EXTST THEN DO;
+      416     3235    3                 NEWSTATE = REQ.POSTER;
+      417     3236    3                 RCVR = '0'B;
+      418     3237    3                 END;                      /* IF %N_EXTST */
+      419     3238    3              ELSE DO;
+      420     3239    4                 IF REQ.TYC.IOERR THEN DO;
+      421     3240    4                    CALL NIO$COMP(REQ,NI$EXTST);
+      422     3241    4                    RCVR.RETRY = '0'B;
+      423     3242    4                    IF NEWSTATE ~= %SPWAIT THEN
+      424     3243    4                       NEWSTATE = %KIWAIT;
+      425     3244    4                    CALL NIK$OPMSG(DCT,LP_MSG#,M_UR,NEWSTATE,REQ);
+      426     3245    4                    REQ$ = ADDR(NIL);
+      427     3246    4                    END;                   /* IF TYC.IOERR */
+      428     3247    3                 END;                      /* ELSE */
+      429     3248    2            END;                           /* DO CASE REQ.COMP */
+      430     3249    2           IF RCVR.RETRY THEN DO;
+      431     3250                   %LOCK(G#=SQH.GATE);
+      432     3253                   %REQUEUE(P#=REQ,Q#=DCT.SQ$);
+      433     3256                   %UNLOCK(G#=SQH.GATE);
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:14   
+      434     3259    2              END;
+      435     3260    1           ELSE
+      436     3261    1              IF REQ$ ~= ADDR(NIL)
+      437     3262    1              THEN CALL NIO$COMP(REQ,NI$EXTST);
+      438     3263    2           IF RELOAD$ ~= ADDR(NIL) THEN DO;
+      439     3264                   %LOCK(G#=SQH.GATE);
+      440     3267                   %REQUEUE(P#="RELOAD$->REQ",Q#=DCT.SQ$);
+      441     3270                   %UNLOCK(G#=SQH.GATE);
+      442     3273    2              END;                         /* IF RELOAD$ ~= ADDR(NIL) */
+      443     3274    2           IF EXTST$ ~= ADDR(NIL) THEN DO;
+      444     3275                   %LOCK(G#=SQH.GATE);
+      445     3278                   %REQUEUE(P#="EXTST$->REQ",Q#=DCT.SQ$);
+      446     3281                   %UNLOCK(G#=SQH.GATE);
+      447     3284    2              END;                         /* IF EXTST$ ~= ADDR(NIL) */
+      448     3285    1           CALL NIU$DEVSCHED(DCT,NEWSTATE);
+      449     3286    1           RETURN;
+      450     3287        /**/
+      451     3288    1   REPOST:
+      452     3289    1           CALL SETREPOST;
+      453     3290    1           RETURN;
+      454     3291        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:15   
+      455     3292    1   RELCHAN: PROC;
+      456     3293    2           DQH.STATE = %IDLE;
+      457     3294    3           IF DQH.CHANSTATE THEN DO;
+      458     3295    4              IF DQH.CHANSTATE.STOP THEN DO;
+      459     3296                      %UNLOCK(G#=SQH.GATE);
+      460     3299    4                 CALL NIW$MPCSTOP(DQH.MPC$->DCT);
+      461     3300                      %LOCK(G#=SQH.GATE);
+      462     3303    4                 END;                      /* IF */
+      463     3304    3              END;
+      464     3305    2           RETURN;
+      465     3306    2   END RELCHAN;
+      466     3307        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:16   
+      467     3308    1   SETREPOST: PROC;
+      468     3309    3           IF EXTST$ ~= ADDR(NIL) THEN DO ;
+      469     3310    3              EXTST$->REQ.IOQFLG.IOQUED = '0'B ;
+      470     3311    3              CALL NIQ$REL ( EXTST$ ) ;
+      471     3312    3              END ;
+      472     3313    3           IF RELOAD$ ~= ADDR(NIL) THEN DO ;
+      473     3314    3              RELOAD$->REQ.IOQFLG.IOQUED = '0'B ;
+      474     3315    3              CALL NIQ$REL ( RELOAD$ ) ;
+      475     3316    3              END ;
+      476     3317                %LOCK(G#=NI$RP.GATE);
+      477     3320                %ENQUEUE(Q#=NI$RP.RP$,P#=REQ);
+      478     3323                %UNLOCK(G#=NI$RP.GATE);
+      479     3326    2           NEWSTATE = %SUSPENDED;
+      480     3327    2           REQ$ = ADDR(NIL);
+      481     3328    2           RETURN;
+      482     3329    2   END SETREPOST;
+      483     3330    1   END NIL$POSTER;
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:17   
+--  Include file information  --
+
+   PM$NI.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   NI_MACROS_C.:E05TOU  cannot be made into a system file and is referenced.
+   NI_DEVCMD_C.:E05TOU  is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   NI_DATA_C.:E05TOU  is referenced.
+   NI$ERRLOG.:E05TOU  is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   HF_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   EL_SUBS_C.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+      No diagnostics issued in procedure NIL$POSTER.
+
+   Procedure NIL$POSTER requires 989 words for executable code.
+   Procedure NIL$POSTER requires 34 words of local(AUTO) storage.
+
+    No errors detected in file NIL$POSTER.:E05TSI    .
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:18   
+
+ Object Unit name= NIL$POSTER                                 File name= NIL$POSTER.:E05TOU
+ UTS= JUL 30 '97 03:33:46.92 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS      2      2  NIL$POSTER
+    1   Proc  even  none   989   1735  NIL$POSTER
+    2  RoData even  none    19     23  NIL$POSTER
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        3  NIL$POSTER
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:19   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 HFC$LOCK
+         yes           Std       4 NIA$SPURINT
+         yes           Std       1 HFC$UNLOCK
+         yes           Std       2 NIS$MASK
+         yes           Std       2 NIM$REQUEUE
+         yes           Std       3 PMN$COLLECT
+         yes           Std       1 OCI$MK_STTM
+         yes           Std       2 NIU$DEVSCHED
+ yes     yes           Std       1 NIQ$REL
+ yes     yes           Std       1 NIQ$GET
+         yes           Std       1 NIO$SPCOMP
+ yes     yes           Std       2 NIF$ANIOM
+ yes     yes           Std       3 NIF$ANFAULT
+         yes           Std       2 NIO$COMP
+ yes     yes           Std       2 NIU$FIXARCT
+         yes           Std       4 NIA$LOGERR
+         yes           Std       5 NIK$OPMSG
+ yes     yes           Std       1 NIO$DCWBLD
+         yes           Std       1 NIW$MPCSTOP
+         yes           Std       2 NIM$ENQUEUE
+                       nStd      0 X66_AUTO_3
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:20   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     HW_IOP                                HW_EXT_STATUS                         HW_IMX
+     N$DCT$$                               N$FQ$                                 NI$FQ$
+     NI$IBUF$                              NI$RP$                                NI_DBLZERO
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:21   
+
+
+        1        1        /*M* NIL$POSTER - LINE PRINTER POSTER */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR */
+        8        8        NIL$POSTER: PROC(PAR,INTLVL,STATUS);
+
+      8  1 000000   000000 700200 xent  NIL$POSTER   TSX0  ! X66_AUTO_3
+         1 000001   000042 000003                    ZERO    34,3
+
+        9        9        /*D*  NAME:  NIL$POSTER
+       10       10              CALL:  CALL NIL$POSTER(PAR$,INTLVL,STATUS);
+       11       11              ENVIRONMENT:  Monitor Linkage Segment, Interrupt Level
+       12       12              INPUT:  PAR$ - Pointer to DQH if INTLVL=0,1,2,3 or 4
+       13       13                             Pointer to IOS packet if INTLVL=5
+       14       14                      INTLVL - 0 = Overhead (Fault channel) interrupt
+       15       15                               1 = Terminate interrupt
+       16       16                               2 = Marker interrupt (Ignored)
+       17       17                               3 = Special interrupt
+       18       18                               4 = Lost interrupt
+       19       19                               5 = Repost
+       20       20                      STATUS - Status words for special and fault channel interrupts
+       21       21              DESCRIPTION:
+       22       22                  This routine handles all post-processing functions for
+       23       23              I/O to local line printers.  If the just completed request was
+       24       24              a T & D request the next operation on the queue is initated and
+       25       25              the request is sent to TDC$COMP to be posted to the caller.  No
+       26       26              retry functions are performed for T & D requests.  For normal
+       27       27              I/O requests up to eight retry attempts will be made before
+       28       28              returning an error TYC to the caller.  Once the retry count has
+       29       29              been exhausted or the operation completes normally the packet
+       30       30              is passed to NIO$COMP to post the request to the user.  The
+       31       31              description of the status codes returened by the line printer may
+       32       32              be found in the EPS-1 for the PRT401/402.
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:22   
+       33       33        */
+       34       34        /*
+       35       35                Includes
+       36       36        */
+       37       37        %INCLUDE                CP_6_SUBS ;
+       38      577        %INCLUDE                EL_SUBS_C ;
+       39      661        %INCLUDE                HF_DATA_R ;
+       40      704        %INCLUDE                HF_LOCK_C ;
+       41      718        %INCLUDE                NI$ERRLOG ;
+       42      784        %INCLUDE                NI_DATA_C ;
+       43      897        %INCLUDE                NI_DATA_R ;
+       44     1334        %INCLUDE                NI_DEVCMD_C ;
+       45     1517        %INCLUDE                NI_MACROS_C ;
+       46     1784        %INCLUDE                N_FC_C ;
+       47     1821        %INCLUDE                OC_SUBS_C ;
+       48     2552        %INCLUDE                PM$NI ;
+       49     2576        /*
+       50     2577                Parameters
+       51     2578        */
+       52     2579    1   DCL INTLVL              UBIN(18) PARAM ;
+       53     2580    1   DCL PAR                 SBIN PARAM ;
+       54     2581    1   DCL STATUS              BIT(72) DALIGNED PARAM ;
+       55     2582        /*
+       56     2583                Entries
+       57     2584        */
+       58     2585    1   DCL 1 NIA$LOGERR        ENTRY(4) ;
+       59     2586    1   DCL 1 NIA$SPURINT       ENTRY(4) ;
+       60     2587    1   DCL 1 NIF$ANFAULT       ENTRY(3) ALTRET ;
+       61     2588    1   DCL 1 NIF$ANIOM         ENTRY(2) ALTRET ;
+       62     2589    1   DCL 1 NIK$OPMSG         ENTRY(5) ;
+       63     2590    1   DCL 1 NIO$DCWBLD        ENTRY(1) ALTRET ;
+       64     2591    1   DCL 1 NIO$COMP          ENTRY(2) ;
+       65     2592    1   DCL 1 NIO$SPCOMP        ENTRY(1) ;
+       66     2593    1   DCL 1 NIQ$GET           ENTRY(1) ALTRET ;
+       67     2594    1   DCL 1 NIQ$REL           ENTRY(1) ALTRET ;
+       68     2595    1   DCL 1 NIS$MASK          ENTRY(2) ;
+       69     2596    1   DCL 1 NIU$DEVSCHED      ENTRY(2) ;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:23   
+       70     2597    1   DCL 1 NIU$FIXARCT       ENTRY(2) ALTRET ;
+       71     2598    1   DCL 1 NIW$LDFW          ENTRY(2) ALTRET ;
+       72     2599    1   DCL 1 NIW$MPCSTOP       ENTRY(1) ;
+       73     2600    1   DCL 1 OCI$MK_STTM       ENTRY(1) ;
+       74     2601    1   DCL 1 PMN$COLLECT       ENTRY(3) ;
+       75     2602        /*
+       76     2603                Auto
+       77     2604        */
+       78     2605    1   DCL 1 CHANTIME          SBIN ALIGNED AUTO ;
+       79     2606    1   DCL 1 DCT$              PTR ALIGNED AUTO ;
+       80     2607    1   DCL 1 DQH$              PTR ALIGNED AUTO ;
+       81     2608    1   DCL 1 EXTST$            PTR ALIGNED AUTO ;
+       82     2609    1   DCL 1 I                 SBIN ALIGNED AUTO ;
+       83     2610    1   DCL 1 IOS$              PTR ALIGNED AUTO ;
+       84     2611    1   DCL 1 NEWSTATE          UBIN WORD ALIGNED AUTO;
+       85     2612        %NI$EXTST               ( NAME=NI$EXTST, STCLASS=AUTO);
+       86     2646    1   DCL 1 RCVR              ALIGNED AUTO,
+       87     2647    1         2 RETRY           BIT(1),
+       88     2648    1         2 RESET           BIT(1),
+       89     2649    1         2 LDVFC           BIT(1),
+       90     2650    1         2 LDTRAIN         BIT(1),
+       91     2651    1         2 NOINC           BIT(1),
+       92     2652    1         2 LOGERR          BIT(1),
+       93     2653    1         2 EXTST           BIT(1),
+       94     2654    1         2 OPMSG           BIT(1),
+       95     2655    1         2 ONLYRETRY       BIT(1);
+       96     2656    1   DCL 1 RELOAD$           PTR ALIGNED AUTO ;
+       97     2657    1   DCL 1 REQ$              PTR ALIGNED AUTO ;
+       98     2658    1   DCL 1 SQH$              PTR ALIGNED AUTO ;
+       99     2659        /*
+      100     2660                Based
+      101     2661        */
+      102     2662        %NI$DCT                 ( NAME=DCT,      STCLASS="BASED(DCT$)" ) ;
+      103     2710        %NI$DQH                 ( NAME=DQH,      STCLASS="BASED(DQH$)" ) ;
+      104     2733        %NI$IOM                 ( NAME=IOM,      STCLASS=BASED ) ;
+      105     2738        %NI$REQ                 ( NAME=IOS,      STCLASS="BASED(IOS$)" ) ;
+      106     2763        %NI$IOSTAT              ( NAME=IOSTAT,   STCLASS=BASED ) ;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:24   
+      107     2772        %NI$MBX                 ( NAME=MBX,      STCLASS=BASED ) ;
+      108     2791        %NI$IOERR               ( NAME=NI$IOERR, STCLASS=BASED ) ;
+      109     2845        %N$REQ                  ( NAME=REQ,      STCLASS="BASED(REQ$)" ) ;
+      110     2903        %NI$SQH                 ( NAME=SQH,      STCLASS="BASED(SQH$)" ) ;
+      111     2916        /*
+      112     2917                Constants
+      113     2918        */
+      114     2919        %SUB RETRY#='400'O;
+      115     2920        %SUB RESET#='200'O;
+      116     2921        %SUB LDVFC#='100'O;
+      117     2922        %SUB LDTRAIN#='040'O;
+      118     2923        %SUB NOINC#='020'O;
+      119     2924        %SUB LOGERR#='010'O;
+      120     2925        %SUB EXTST#='004'O;
+      121     2926        %SUB OPMSG# = '002'O;
+      122     2927        %SUB ONLYRETRY#='001'O;
+      123     2928        %SUB FOREVER="WHILE('1'B)";
+      124     2929        %SUB NEVER="WHILE('0'B)";
+      125     2930        %SUB LDTRAIN_DC=1;
+      126     2931        %SUB LDVFC_DC=5;
+      127     2932        %SUB EXTST_DCW='000000000006'O;
+      128     2933        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:25   
+      129     2934        /* NEW LINE PRINTER POSTER FOR NEW IO SYSTEM */
+      130     2935    2           DO INHIBIT;
+
+      131     2936    3              DO CASE(INTLVL);
+
+   2936  1 000002   200004 470700                    LDP0  ! @INTLVL,,AUTO
+         1 000003   000000 220300                    LDX0  ! 0,,PR0
+         1 000004   000006 100203                    CMPX0 ! 6,DU
+         1 000005   000007 602210 1                  TNC   ! s:2936+5,X0
+         1 000006   000454 710200 1                  TRA   ! s:3041
+         1 000007   000015 710200 1                  TRA   ! s:2938
+         1 000010   000015 710200 1                  TRA   ! s:2938
+         1 000011   000222 710200 1                  TRA   ! s:2989
+         1 000012   000257 710200 1                  TRA   ! s:2995
+         1 000013   000015 710200 1                  TRA   ! s:2938
+         1 000014   000441 710200 1                  TRA   ! s:3034
+
+      132     2937    3               CASE(%OVERHEAD,%TERMINATE,%LOST);
+
+      133     2938    3                 DQH$ = ADDR(PAR);
+
+   2938  1 000015   200003 236300                    LDQ   ! @PAR,,AUTO
+         1 000016   200010 756300                    STQ   ! DQH$,,AUTO
+
+      134     2939    3                 SQH$ = DQH.SQH$;
+
+   2939  1 000017   200010 471700                    LDP1  ! DQH$,,AUTO
+         1 000020   100013 236300                    LDQ   ! 11,,PR1
+         1 000021   200030 756300                    STQ   ! SQH$,,AUTO
+
+      135     2940                      %LOCK(G#=SQH.GATE);
+
+   2941  1 000022   200030 630700                    EPPR0 ! SQH$,,AUTO
+         1 000023   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000024   000000 701200 xent               TSX1  ! HFC$LOCK
+         1 000025   000000 011200                    NOP   ! 0
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:26   
+      136     2943    3                 IF  DQH.STATE ~= %BUSY
+
+   2943  1 000026   200010 470700                    LDP0  ! DQH$,,AUTO
+         1 000027   000001 236300                    LDQ   ! 1,,PR0
+         1 000030   000077 376207                    ANQ   ! 63,DL
+         1 000031   000005 116207                    CMPQ  ! 5,DL
+         1 000032   000067 600200 1                  TZE   ! s:2955
+
+      137     2944    4                 THEN DO ;
+
+      138     2945    4                    IF  ADDR(STATUS) = ADDR(NIL)
+
+   2945  1 000033   200005 236300                    LDQ   ! @STATUS,,AUTO
+         1 000034   000001 116200 xsym               CMPQ  ! B_VECTNIL+1
+         1 000035   000051 601200 1                  TNZ   ! s:2949
+
+      139     2946    4                    THEN
+      140     2947    4                       CALL NIA$SPURINT ( DQH, EL_SPURINT, INTLVL, NI_DBLZERO ) ;
+
+   2947  1 000036   000001 236200 2                  LDQ   ! 1
+         1 000037   200004 235300                    LDA   ! @INTLVL,,AUTO
+         1 000040   200036 757300                    STAQ  ! SQH$+6,,AUTO
+         1 000041   000002 236200 2                  LDQ   ! 2
+         1 000042   200010 235300                    LDA   ! DQH$,,AUTO
+         1 000043   200034 757300                    STAQ  ! SQH$+4,,AUTO
+         1 000044   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000045   000022 631600 xsym               EPPR1 ! B_VECTNIL+18
+         1 000046   000000 701200 xent               TSX1  ! NIA$SPURINT
+         1 000047   000000 011200                    NOP   ! 0
+         1 000050   000062 710200 1                  TRA   ! s:2951
+
+      141     2948    4                    ELSE
+      142     2949    4                       CALL NIA$SPURINT ( DQH, EL_SPURINT, INTLVL, STATUS ) ;
+
+   2949  1 000051   200004 237300                    LDAQ  ! @INTLVL,,AUTO
+         1 000052   200036 757300                    STAQ  ! SQH$+6,,AUTO
+         1 000053   000002 236200 2                  LDQ   ! 2
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:27   
+         1 000054   200010 235300                    LDA   ! DQH$,,AUTO
+         1 000055   200034 757300                    STAQ  ! SQH$+4,,AUTO
+         1 000056   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000057   000022 631600 xsym               EPPR1 ! B_VECTNIL+18
+         1 000060   000000 701200 xent               TSX1  ! NIA$SPURINT
+         1 000061   000000 011200                    NOP   ! 0
+
+      143     2950                         %UNLOCK ( G#=SQH.GATE ) ;
+
+   2951  1 000062   200030 630700                    EPPR0 ! SQH$,,AUTO
+         1 000063   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000064   000000 701200 xent               TSX1  ! HFC$UNLOCK
+         1 000065   000000 011200                    NOP   ! 0
+
+      144     2953    4                    RETURN ;
+
+   2953  1 000066   000000 702200 xent               TSX2  ! X66_ARET
+
+      145     2954    4                    END ;
+      146     2955    3                 REQ$ = DQH.IO$;
+
+   2955  1 000067   000014 236300                    LDQ   ! 12,,PR0
+         1 000070   200027 756300                    STQ   ! REQ$,,AUTO
+
+      147     2956    3                 DCT$ = REQ.DCT$;
+
+   2956  1 000071   200027 471700                    LDP1  ! REQ$,,AUTO
+         1 000072   100002 236300                    LDQ   ! 2,,PR1
+         1 000073   200007 756300                    STQ   ! DCT$,,AUTO
+
+      148     2957    3                 IF HW_IMX THEN
+
+   2957  1 000074   000000 234200 xsym               SZN   ! HW_IMX
+         1 000075   000102 605200 1                  TPL   ! s:2960
+
+      149     2958    3                    REQ.FLPW = DQH.IOSTATUS$->IOSTAT.LPW_RESIDUE;
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:28   
+   2958  1 000076   000016 473700                    LDP3  ! 14,,PR0
+         1 000077   300003 236300                    LDQ   ! 3,,PR3
+         1 000100   100016 756300                    STQ   ! 14,,PR1
+         1 000101   000105 710200 1                  TRA   ! s:2961
+
+      150     2959    3                 ELSE
+      151     2960    3                    REQ.FLPW = DQH.MBX$->MBX.LPW;
+
+   2960  1 000102   000021 473700                    LDP3  ! 17,,PR0
+         1 000103   300000 236300                    LDQ   ! 0,,PR3
+         1 000104   100016 756300                    STQ   ! 14,,PR1
+
+      152     2961    4                 IF INTLVL = %TERMINATE THEN DO;
+
+   2961  1 000105   200004 473700                    LDP3  ! @INTLVL,,AUTO
+         1 000106   300000 220300                    LDX0  ! 0,,PR3
+         1 000107   000001 100203                    CMPX0 ! 1,DU
+         1 000110   000132 601200 1                  TNZ   ! s:2973
+
+      153     2962    4                    REQ.STATUS = DQH.IOSTATUS$->IOSTAT.STATUS;
+
+   2962  1 000111   000016 474700                    LDP4  ! 14,,PR0
+         1 000112   400000 237300                    LDAQ  ! 0,,PR4
+         1 000113   100014 757300                    STAQ  ! 12,,PR1
+
+      154     2963    4                    IF HW_IOP THEN    /* ignore IOP generated lost interrupt */
+
+   2963  1 000114   000000 234200 xsym               SZN   ! HW_IOP
+         1 000115   000150 605200 1                  TPL   ! s:2978
+
+      155     2964    4                       IF REQ.STATUS.MAJOR = %READY AND
+
+   2964  1 000116   100014 236300                    LDQ   ! 12,,PR1
+         1 000117   170000 316203                    CANQ  ! 61440,DU
+         1 000120   000150 601200 1                  TNZ   ! s:2978
+         1 000121   100014 236300                    LDQ   ! 12,,PR1
+         1 000122   700000 376207                    ANQ   ! -32768,DL
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:29   
+         1 000123   400000 116207                    CMPQ  ! -131072,DL
+         1 000124   000150 601200 1                  TNZ   ! s:2978
+
+      156     2965    5                         REQ.STATUS.IOM.CHANNEL = %LOSTINT THEN DO;
+
+      157     2966                               %UNLOCK (G#=SQH.GATE);
+
+   2967  1 000125   200030 630700                    EPPR0 ! SQH$,,AUTO
+         1 000126   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000127   000000 701200 xent               TSX1  ! HFC$UNLOCK
+         1 000130   000000 011200                    NOP   ! 0
+
+      158     2969    5                          RETURN;
+
+   2969  1 000131   000000 702200 xent               TSX2  ! X66_ARET
+
+      159     2970    5                          END;
+      160     2971    4                    END;
+      161     2972    4                 ELSE DO;
+
+      162     2973    4                    REQ.STATUS = STATUS;
+
+   2973  1 000132   200005 474700                    LDP4  ! @STATUS,,AUTO
+         1 000133   400000 237300                    LDAQ  ! 0,,PR4
+         1 000134   100014 757300                    STAQ  ! 12,,PR1
+
+      163     2974    5                    IF REQ.STATUS.MAJOR = %LOST_INTERRUPT THEN DO;
+
+   2974  1 000135   100014 236300                    LDQ   ! 12,,PR1
+         1 000136   170000 376203                    ANQ   ! 61440,DU
+         1 000137   100000 116203                    CMPQ  ! 32768,DU
+         1 000140   000150 601200 1                  TNZ   ! s:2978
+
+      164     2975    5                       CALL NIS$MASK(DQH,%IMX_CCW_MASK_CHAN);
+
+   2975  1 000141   000003 236200 2                  LDQ   ! 3
+         1 000142   200010 235300                    LDA   ! DQH$,,AUTO
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:30   
+         1 000143   200034 757300                    STAQ  ! SQH$+4,,AUTO
+         1 000144   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000145   000020 631600 xsym               EPPR1 ! B_VECTNIL+16
+         1 000146   000000 701200 xent               TSX1  ! NIS$MASK
+         1 000147   000000 011200                    NOP   ! 0
+
+      165     2976    5                       END;                /* IF LOST INTERRUPT */
+
+      166     2977    4                    END;                   /* ELSE */
+
+      167     2978    3                 NI$EXTST.EXTST=DQH.IOSTATUS$->IOSTAT.EXTST;
+              2978                          /* MEANINGFUL FOR IOP/IMX */
+
+   2978  1 000150   200010 470700                    LDP0  ! DQH$,,AUTO
+         1 000151   000016 471700                    LDP1  ! 14,,PR0
+         1 000152   000100 100700                    MLR   ! fill='000'O
+         1 000153   100010 000040                    ADSC9   8,,PR1                   cn=0,n=32
+         1 000154   200015 000040                    ADSC9   NI$EXTST,,AUTO           cn=0,n=32
+
+      168     2979    3                 IF REQ.IOFLG.REL
+
+   2979  1 000155   200027 471700                    LDP1  ! REQ$,,AUTO
+         1 000156   100004 236300                    LDQ   ! 4,,PR1
+         1 000157   002000 316207                    CANQ  ! 1024,DL
+         1 000160   000164 600200 1                  TZE   ! s:2981
+
+      169     2980    3                 THEN DQH.MPC$->DCT.DFLG.MPCSUSPENDED = '0'B;
+
+   2980  1 000161   000015 473700                    LDP3  ! 13,,PR0
+         1 000162   000004 236200 2                  LDQ   ! 4
+         1 000163   300006 356300                    ANSQ  ! 6,,PR3
+
+      170     2981    3                 CALL RELCHAN;
+
+   2981  1 000164   001624 701200 1                  TSX1  ! RELCHAN
+         1 000165   000000 011200                    NOP   ! 0
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:31   
+      171     2982                      %UNLOCK(G#=SQH.GATE);
+
+   2983  1 000166   200030 630700                    EPPR0 ! SQH$,,AUTO
+         1 000167   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000170   000000 701200 xent               TSX1  ! HFC$UNLOCK
+         1 000171   000000 011200                    NOP   ! 0
+
+      172     2985    3                 IF DCT.SQ$ = ADDR(NIL)
+
+   2985  1 000172   200007 470700                    LDP0  ! DCT$,,AUTO
+         1 000173   000001 236300                    LDQ   ! 1,,PR0
+         1 000174   000001 116200 xsym               CMPQ  ! B_VECTNIL+1
+         1 000175   000210 601200 1                  TNZ   ! s:2987
+
+      173     2986    3                 THEN CALL PMN$COLLECT(DCT.PM,%PM_IDLE);
+
+   2986  1 000176   000005 236200 2                  LDQ   ! 5
+         1 000177   200035 756300                    STQ   ! SQH$+5,,AUTO
+         1 000200   200007 236300                    LDQ   ! DCT$,,AUTO
+         1 000201   000010 036203                    ADLQ  ! 8,DU
+         1 000202   200034 756300                    STQ   ! SQH$+4,,AUTO
+         1 000203   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000204   000020 631600 xsym               EPPR1 ! B_VECTNIL+16
+         1 000205   000000 701200 xent               TSX1  ! PMN$COLLECT
+         1 000206   000000 011200                    NOP   ! 0
+         1 000207   000454 710200 1                  TRA   ! s:3041
+
+      174     2987    3                 ELSE CALL PMN$COLLECT(DCT.PM,%PM_WAIT);
+
+   2987  1 000210   000006 236200 2                  LDQ   ! 6
+         1 000211   200035 756300                    STQ   ! SQH$+5,,AUTO
+         1 000212   200007 236300                    LDQ   ! DCT$,,AUTO
+         1 000213   000010 036203                    ADLQ  ! 8,DU
+         1 000214   200034 756300                    STQ   ! SQH$+4,,AUTO
+         1 000215   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000216   000020 631600 xsym               EPPR1 ! B_VECTNIL+16
+         1 000217   000000 701200 xent               TSX1  ! PMN$COLLECT
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:32   
+         1 000220   000000 011200                    NOP   ! 0
+         1 000221   000454 710200 1                  TRA   ! s:3041
+
+      175     2988    3               CASE(%MARKER);
+
+      176     2989    3                 DQH$ = ADDR(PAR);
+
+   2989  1 000222   200003 236300                    LDQ   ! @PAR,,AUTO
+         1 000223   200010 756300                    STQ   ! DQH$,,AUTO
+
+      177     2990    3                 IF DQH.IO$ = ADDR(NIL)
+
+   2990  1 000224   200010 471700                    LDP1  ! DQH$,,AUTO
+         1 000225   100014 236300                    LDQ   ! 12,,PR1
+         1 000226   000001 116200 xsym               CMPQ  ! B_VECTNIL+1
+         1 000227   000243 601200 1                  TNZ   ! s:2992
+
+      178     2991    3                 THEN CALL NIA$SPURINT(DQH,EL_SPURINT,INTLVL,NI_DBLZERO);
+
+   2991  1 000230   000001 236200 2                  LDQ   ! 1
+         1 000231   200004 235300                    LDA   ! @INTLVL,,AUTO
+         1 000232   200036 757300                    STAQ  ! SQH$+6,,AUTO
+         1 000233   000002 236200 2                  LDQ   ! 2
+         1 000234   200010 235300                    LDA   ! DQH$,,AUTO
+         1 000235   200034 757300                    STAQ  ! SQH$+4,,AUTO
+         1 000236   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000237   000022 631600 xsym               EPPR1 ! B_VECTNIL+18
+         1 000240   000000 701200 xent               TSX1  ! NIA$SPURINT
+         1 000241   000000 011200                    NOP   ! 0
+         1 000242   000256 710200 1                  TRA   ! s:2993
+
+      179     2992    3                 ELSE CALL NIA$SPURINT(DQH,EL_SPURINT,INTLVL,DQH.IOSTATUS$->IOSTAT.
+              2992                          STATUS);
+
+   2992  1 000243   100016 473700                    LDP3  ! 14,,PR1
+         1 000244   200037 453700                    STP3  ! SQH$+7,,AUTO
+         1 000245   200004 236300                    LDQ   ! @INTLVL,,AUTO
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:33   
+         1 000246   200036 756300                    STQ   ! SQH$+6,,AUTO
+         1 000247   000002 236200 2                  LDQ   ! 2
+         1 000250   200010 235300                    LDA   ! DQH$,,AUTO
+         1 000251   200034 757300                    STAQ  ! SQH$+4,,AUTO
+         1 000252   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000253   000022 631600 xsym               EPPR1 ! B_VECTNIL+18
+         1 000254   000000 701200 xent               TSX1  ! NIA$SPURINT
+         1 000255   000000 011200                    NOP   ! 0
+
+      180     2993    3                 RETURN;
+
+   2993  1 000256   000000 702200 xent               TSX2  ! X66_ARET
+
+      181     2994    3               CASE(%SPECIAL);
+
+      182     2995    3                 IF ADDR(STATUS)=ADDR(NIL) THEN
+
+   2995  1 000257   200005 236300                    LDQ   ! @STATUS,,AUTO
+         1 000260   000001 116200 xsym               CMPQ  ! B_VECTNIL+1
+         1 000261   000263 601200 1                  TNZ   ! s:2997
+
+      183     2996    3                    RETURN;
+
+   2996  1 000262   000000 702200 xent               TSX2  ! X66_ARET
+
+      184     2997    3                 DQH$ = ADDR(PAR);
+
+   2997  1 000263   200003 236300                    LDQ   ! @PAR,,AUTO
+         1 000264   200010 756300                    STQ   ! DQH$,,AUTO
+
+      185     2998    3                 SQH$ = DQH.SQH$;
+
+   2998  1 000265   200010 471700                    LDP1  ! DQH$,,AUTO
+         1 000266   100013 236300                    LDQ   ! 11,,PR1
+         1 000267   200030 756300                    STQ   ! SQH$,,AUTO
+
+      186     2999    3                 DCT$ = ADDR(NIL);
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:34   
+
+   2999  1 000270   000001 236200 xsym               LDQ   ! B_VECTNIL+1
+         1 000271   200007 756300                    STQ   ! DCT$,,AUTO
+
+      187     3000    4                 DO I = SQH.FDCT TO SQH.FDCT + SQH.NDCT - 1;
+
+   3000  1 000272   200030 473700                    LDP3  ! SQH$,,AUTO
+         1 000273   300002 236300                    LDQ   ! 2,,PR3
+         1 000274   000022 772200                    QRL   ! 18
+         1 000275   200012 756300                    STQ   ! I,,AUTO
+         1 000276   000310 710200 1                  TRA   ! s:3003+1
+
+      188     3001    4                    IF N$DCT$(I)->DCT.DQH$ = DQH$
+
+   3001  1 000277   000000 470600 xsym               LDP0  ! N$DCT$$
+         1 000300   200012 720300                    LXL0  ! I,,AUTO
+         1 000301   000000 471710                    LDP1  ! 0,X0,PR0
+         1 000302   100023 236300                    LDQ   ! 19,,PR1
+         1 000303   200010 116300                    CMPQ  ! DQH$,,AUTO
+         1 000304   000307 601200 1                  TNZ   ! s:3003
+
+      189     3002    4                    THEN DCT$ = N$DCT$(I);
+
+   3002  1 000305   000000 236310                    LDQ   ! 0,X0,PR0
+         1 000306   200007 756300                    STQ   ! DCT$,,AUTO
+
+      190     3003    4                    END;                   /* DO I */
+
+   3003  1 000307   200012 054300                    AOS   ! I,,AUTO
+         1 000310   200030 470700                    LDP0  ! SQH$,,AUTO
+         1 000311   000002 236300                    LDQ   ! 2,,PR0
+         1 000312   777777 376207                    ANQ   ! -1,DL
+         1 000313   200034 756300                    STQ   ! SQH$+4,,AUTO
+         1 000314   000002 236300                    LDQ   ! 2,,PR0
+         1 000315   000022 772200                    QRL   ! 18
+         1 000316   200034 036300                    ADLQ  ! SQH$+4,,AUTO
+         1 000317   000277 604200 1                  TMI   ! s:3001
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:35   
+         1 000320   200012 116300                    CMPQ  ! I,,AUTO
+         1 000321   000277 605600 1                  TPNZ  ! s:3001
+
+      191     3004    4                 IF DCT$ = ADDR(NIL) THEN DO;
+
+   3004  1 000322   200007 236300                    LDQ   ! DCT$,,AUTO
+         1 000323   000001 116200 xsym               CMPQ  ! B_VECTNIL+1
+         1 000324   000355 601200 1                  TNZ   ! s:3011
+
+      192     3005    4                    IF ADDR(STATUS) = ADDR(NIL)
+
+   3005  1 000325   200005 236300                    LDQ   ! @STATUS,,AUTO
+         1 000326   000001 116200 xsym               CMPQ  ! B_VECTNIL+1
+         1 000327   000343 601200 1                  TNZ   ! s:3007
+
+      193     3006    4                    THEN CALL NIA$SPURINT(DQH,EL_SPURINT,INTLVL,NI_DBLZERO);
+
+   3006  1 000330   000001 236200 2                  LDQ   ! 1
+         1 000331   200004 235300                    LDA   ! @INTLVL,,AUTO
+         1 000332   200036 757300                    STAQ  ! SQH$+6,,AUTO
+         1 000333   000002 236200 2                  LDQ   ! 2
+         1 000334   200010 235300                    LDA   ! DQH$,,AUTO
+         1 000335   200034 757300                    STAQ  ! SQH$+4,,AUTO
+         1 000336   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000337   000022 631600 xsym               EPPR1 ! B_VECTNIL+18
+         1 000340   000000 701200 xent               TSX1  ! NIA$SPURINT
+         1 000341   000000 011200                    NOP   ! 0
+         1 000342   000354 710200 1                  TRA   ! s:3008
+
+      194     3007    4                    ELSE CALL NIA$SPURINT(DQH,EL_SPURINT,INTLVL,STATUS);
+
+   3007  1 000343   200004 237300                    LDAQ  ! @INTLVL,,AUTO
+         1 000344   200036 757300                    STAQ  ! SQH$+6,,AUTO
+         1 000345   000002 236200 2                  LDQ   ! 2
+         1 000346   200010 235300                    LDA   ! DQH$,,AUTO
+         1 000347   200034 757300                    STAQ  ! SQH$+4,,AUTO
+         1 000350   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:36   
+         1 000351   000022 631600 xsym               EPPR1 ! B_VECTNIL+18
+         1 000352   000000 701200 xent               TSX1  ! NIA$SPURINT
+         1 000353   000000 011200                    NOP   ! 0
+
+      195     3008    4                    RETURN;
+
+   3008  1 000354   000000 702200 xent               TSX2  ! X66_ARET
+
+      196     3009    4                    END;                   /* IF */
+      197     3010                      %LOCK(G#=SQH.GATE);
+
+   3011  1 000355   200030 630700                    EPPR0 ! SQH$,,AUTO
+         1 000356   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000357   000000 701200 xent               TSX1  ! HFC$LOCK
+         1 000360   000000 011200                    NOP   ! 0
+
+      198     3013    4                 IF NOT DCT.SPSTAT.PRESENCE THEN DO;
+
+   3013  1 000361   200007 470700                    LDP0  ! DCT$,,AUTO
+         1 000362   000017 234300                    SZN   ! 15,,PR0
+         1 000363   000434 604200 1                  TMI   ! s:3030
+
+      199     3014    4                    DCT.SPSTAT = STATUS;
+
+   3014  1 000364   200005 471700                    LDP1  ! @STATUS,,AUTO
+         1 000365   100000 236300                    LDQ   ! 0,,PR1
+         1 000366   000017 756300                    STQ   ! 15,,PR0
+
+      200     3015                         %UNLOCK(G#=SQH.GATE);
+
+   3016  1 000367   200030 630700                    EPPR0 ! SQH$,,AUTO
+         1 000370   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000371   000000 701200 xent               TSX1  ! HFC$UNLOCK
+         1 000372   000000 011200                    NOP   ! 0
+
+      201     3018    5                    IF DCT.STATE = %SPWAIT THEN DO;
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:37   
+   3018  1 000373   200007 470700                    LDP0  ! DCT$,,AUTO
+         1 000374   000007 236300                    LDQ   ! 7,,PR0
+         1 000375   000077 376207                    ANQ   ! 63,DL
+         1 000376   000003 116207                    CMPQ  ! 3,DL
+         1 000377   000424 601200 1                  TNZ   ! s:3025
+
+      202     3019    6                       IF DCT.MSG# > 0 THEN DO;
+
+   3019  1 000400   000027 720300                    LXL0  ! 23,,PR0
+         1 000401   000414 600200 1                  TZE   ! s:3023
+
+      203     3020    6                          CALL OCI$MK_STTM(DCT.MSG#);
+
+   3020  1 000402   200007 236300                    LDQ   ! DCT$,,AUTO
+         1 000403   000007 036200 2                  ADLQ  ! 7
+         1 000404   200034 756300                    STQ   ! SQH$+4,,AUTO
+         1 000405   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000406   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000407   000000 701200 xent               TSX1  ! OCI$MK_STTM
+         1 000410   000000 011200                    NOP   ! 0
+
+      204     3021    6                          DCT.MSG# = 0;
+
+   3021  1 000411   000000 220203                    LDX0  ! 0,DU
+         1 000412   200007 470700                    LDP0  ! DCT$,,AUTO
+         1 000413   000027 440300                    SXL0  ! 23,,PR0
+
+      205     3022    6                          END;             /* IF MSG# > 0 */
+
+      206     3023    5                       CALL NIU$DEVSCHED(DCT,%IDLE);
+
+   3023  1 000414   000005 236200 2                  LDQ   ! 5
+         1 000415   200007 235300                    LDA   ! DCT$,,AUTO
+         1 000416   200034 757300                    STAQ  ! SQH$+4,,AUTO
+         1 000417   200034 630700                    EPPR0 ! SQH$+4,,AUTO
+         1 000420   000020 631600 xsym               EPPR1 ! B_VECTNIL+16
+         1 000421   000000 701200 xent               TSX1  ! NIU$DEVSCHED
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:38   
+         1 000422   000000 011200                    NOP   ! 0
+
+      207     3024    5                       END;                /* IF SPWAIT */
+
+   3024  1 000423   000430 710200 1                  TRA   ! s:3026
+
+      208     3025    4                    ELSE CALL NIO$SPCOMP(DCT);
+
+   3025  1 000424   200007 630700                    EPPR0 ! DCT$,,AUTO
+         1 000425   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000426   000000 701200 xent               TSX1  ! NIO$SPCOMP
+         1 000427   000000 011200                    NOP   ! 0
+
+      209     3026    4                    DCT.SPSTAT.PRESENCE = '0'B;
+
+   3026  1 000430   200007 470700                    LDP0  ! DCT$,,AUTO
+         1 000431   000031 236200 xsym               LDQ   ! B_VECTNIL+25
+         1 000432   000017 356300                    ANSQ  ! 15,,PR0
+
+      210     3027    4                    END;                   /* IF NOT PRESENCE */
+
+   3027  1 000433   000440 710200 1                  TRA   ! s:3032
+
+      211     3028    3                 ELSE
+      212     3029                         %UNLOCK(G#=SQH.GATE);
+
+   3030  1 000434   200030 630700                    EPPR0 ! SQH$,,AUTO
+         1 000435   000017 631600 xsym               EPPR1 ! B_VECTNIL+15
+         1 000436   000000 701200 xent               TSX1  ! HFC$UNLOCK
+         1 000437   000000 011200                    NOP   ! 0
+
+      213     3032    3                 RETURN;
+
+   3032  1 000440   000000 702200 xent               TSX2  ! X66_ARET
+
+      214     3033    3               CASE(%REPOST);
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:39   
+      215     3034    3                 REQ$ = ADDR(PAR);
+
+   3034  1 000441   200003 236300                    LDQ   ! @PAR,,AUTO
+         1 000442   200027 756300                    STQ   ! REQ$,,AUTO
+
+      216     3035    3                 DCT$ = REQ.DCT$;
+
+   3035  1 000443   200027 471700                    LDP1  ! REQ$,,AUTO
+         1 000444   100002 236300                    LDQ   ! 2,,PR1
+         1 000445   200007 756300                    STQ   ! DCT$,,AUTO
+
+      217     3036    3                 DQH$ = DCT.DQH$;
+
+   3036  1 000446   200007 473700                    LDP3  ! DCT$,,AUTO
+         1 000447   300023 236300                    LDQ   ! 19,,PR3
+         1 000450   200010 756300                    STQ   ! DQH$,,AUTO
+
+      218     3037    3                 NI$EXTST.EXTST = '0'B;
+
+   3037  1 000451   000100 100600                    MLR   ! fill='000'O
+         1 000452   000002 000001 xsym               ADSC9   B_VECTNIL+2              cn=0,n=1
+         1 000453   200015 000040                    ADSC9   NI$EXTST,,AUTO           cn=0,n=32
+
+      219     3038    3               END;                        /* DO CASE INTLVL */
+
+      220     3039    2              END;                         /* DO INHIBIT */
+
+      221     3040        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:40   
+      222     3041    1           REQ.TYC = '0'B;
+
+   3041  1 000454   200027 470500                    LDP0    REQ$,,AUTO
+         1 000455   000021 450100                    STZ     17,,PR0
+
+      223     3042    1           RCVR = '0'B;
+
+   3042  1 000456   200025 450100                    STZ     RCVR,,AUTO
+
+      224     3043    1           EXTST$ = ADDR(NIL);
+
+   3043  1 000457   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000460   200011 756100                    STQ     EXTST$,,AUTO
+
+      225     3044    1           RELOAD$ = ADDR(NIL);
+
+   3044  1 000461   200026 756100                    STQ     RELOAD$,,AUTO
+
+      226     3045    1           NEWSTATE = %IDLE;
+
+   3045  1 000462   200014 450100                    STZ     NEWSTATE,,AUTO
+
+      227     3046    1           IF REQ.FC = %N_EXTST OR REQ.FC = %N_RQSTAT OR REQ.COMP = %COMP_TD
+
+   3046  1 000463   000003 236100                    LDQ     3,,PR0
+         1 000464   000777 376007                    ANQ     511,DL
+         1 000465   000033 116007                    CMPQ    27,DL
+         1 000466   001001 600000 1                  TZE     BYPASS_STATUS_ANALYSIS
+         1 000467   000001 116007                    CMPQ    1,DL
+         1 000470   001001 600000 1                  TZE     BYPASS_STATUS_ANALYSIS
+         1 000471   000027 236100                    LDQ     23,,PR0
+         1 000472   177000 376007                    ANQ     65024,DL
+         1 000473   004000 116007                    CMPQ    2048,DL
+         1 000474   001001 600000 1                  TZE     BYPASS_STATUS_ANALYSIS
+
+      228     3047    1           THEN GOTO BYPASS_STATUS_ANALYSIS;
+      229     3048    2           IF REQ.STATUS.POWEROFF THEN DO;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:41   
+
+   3048  1 000475   000014 236100                    LDQ     12,,PR0
+         1 000476   200000 316003                    CANQ    65536,DU
+         1 000477   000515 600000 1                  TZE     s:3056
+
+      230     3049    2              RCVR = RETRY#|LOGERR#|OPMSG#;
+
+   3049  1 000500   412000 236003                    LDQ     -125952,DU
+         1 000501   200025 756100                    STQ     RCVR,,AUTO
+
+      231     3050    2              IF DQH.MPC$->DCT.MPC.FWNAME = 'NONE' THEN
+
+   3050  1 000502   200010 471500                    LDP1    DQH$,,AUTO
+         1 000503   100015 473500                    LDP3    13,,PR1
+         1 000504   300041 236100                    LDQ     33,,PR3
+         1 000505   000001 116000 0                  CMPQ    1
+         1 000506   000512 601000 1                  TNZ     s:3053
+
+      232     3051    2                 NEWSTATE = %KIWAIT;
+
+   3051  1 000507   000004 235007                    LDA     4,DL
+         1 000510   200014 755100                    STA     NEWSTATE,,AUTO
+         1 000511   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      233     3052    2              ELSE
+      234     3053    2                 NEWSTATE = %MPCWAIT;
+
+   3053  1 000512   000007 235007                    LDA     7,DL
+         1 000513   200014 755100                    STA     NEWSTATE,,AUTO
+
+      235     3054    2              END;                         /* IF POWEROFF */
+
+   3054  1 000514   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      236     3055    1           ELSE
+      237     3056    2           DO CASE(REQ.STATUS.MAJOR);
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:42   
+   3056  1 000515   000014 236100                    LDQ     12,,PR0
+         1 000516   000036 772000                    QRL     30
+         1 000517   000017 376007                    ANQ     15,DL
+         1 000520   000020 116007                    CMPQ    16,DL
+         1 000521   000523 602006 1                  TNC     s:3056+6,QL
+         1 000522   000777 710000 1                  TRA     s:3139
+         1 000523   000543 710000 1                  TRA     s:3058
+         1 000524   000564 710000 1                  TRA     s:3066
+         1 000525   000571 710000 1                  TRA     s:3069
+         1 000526   000633 710000 1                  TRA     s:3090
+         1 000527   000777 710000 1                  TRA     s:3139
+         1 000530   000661 710000 1                  TRA     s:3098
+         1 000531   000777 710000 1                  TRA     s:3139
+         1 000532   000777 710000 1                  TRA     s:3139
+         1 000533   000727 710000 1                  TRA     s:3118
+         1 000534   000777 710000 1                  TRA     s:3139
+         1 000535   000742 710000 1                  TRA     s:3124
+         1 000536   000747 710000 1                  TRA     s:3127
+         1 000537   000777 710000 1                  TRA     s:3139
+         1 000540   000754 710000 1                  TRA     s:3130
+         1 000541   000777 710000 1                  TRA     s:3139
+         1 000542   000761 710000 1                  TRA     s:3133
+
+      238     3057    2            CASE(%READY);
+
+      239     3058    3              IF REQ.STATUS.IOM THEN DO;
+
+   3058  1 000543   000014 236100                    LDQ     12,,PR0
+         1 000544   770000 316007                    CANQ    -4096,DL
+         1 000545   000560 600000 1                  TZE     s:3062
+
+      240     3059    3                 RCVR = LOGERR#|ONLYRETRY#;
+
+   3059  1 000546   011000 236003                    LDQ     4608,DU
+         1 000547   200025 756100                    STQ     RCVR,,AUTO
+
+      241     3060    3                 CALL NIF$ANIOM(REQ,RCVR.RETRY) ALTRET(L1);
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:43   
+
+   3060  1 000550   200025 631500                    EPPR1   RCVR,,AUTO
+         1 000551   200035 451500                    STP1    SQH$+5,,AUTO
+         1 000552   200027 236100                    LDQ     REQ$,,AUTO
+         1 000553   200034 756100                    STQ     SQH$+4,,AUTO
+         1 000554   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 000555   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 000556   000000 701000 xent               TSX1    NIF$ANIOM
+         1 000557   000561 702000 1                  TSX2    L1
+
+      242     3061    3                 END;                      /* IF */
+
+      243     3062    3              DO NEVER;
+
+   3062  1 000560   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      244     3063    3   L1:           NEWSTATE = %KIWAIT;
+
+   3063  1 000561   000004 235007       L1           LDA     4,DL
+         1 000562   200014 755100                    STA     NEWSTATE,,AUTO
+
+      245     3064    3                 END;                      /* DO NEVER */
+
+   3064  1 000563   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      246     3065    2            CASE(%DEVICE_BUSY);
+
+      247     3066    2              REQ.TYC.IOERR = '1'B;
+
+   3066  1 000564   001000 236003                    LDQ     512,DU
+         1 000565   000021 256100                    ORSQ    17,,PR0
+
+      248     3067    2              RCVR = LOGERR#;
+
+   3067  1 000566   010000 236003                    LDQ     4096,DU
+         1 000567   200025 756100                    STQ     RCVR,,AUTO
+         1 000570   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:44   
+
+      249     3068    2            CASE(%ATTENTION);
+
+      250     3069    2              RCVR=LOGERR#|EXTST#;
+
+   3069  1 000571   014000 236003                    LDQ     6144,DU
+         1 000572   200025 756100                    STQ     RCVR,,AUTO
+
+      251     3070    3              IF REQ.STATUS.MINOR='00'O THEN DO;
+
+   3070  1 000573   000014 236100                    LDQ     12,,PR0
+         1 000574   007700 316003                    CANQ    4032,DU
+         1 000575   000603 601000 1                  TNZ     s:3075
+
+      252     3071    3                 RCVR.RETRY = '1'B;
+
+   3071  1 000576   400000 236003                    LDQ     -131072,DU
+         1 000577   200025 256100                    ORSQ    RCVR,,AUTO
+
+      253     3072    3                 REQ.TYC.IOERR = '1'B;
+
+   3072  1 000600   001000 236003                    LDQ     512,DU
+         1 000601   000021 256100                    ORSQ    17,,PR0
+
+      254     3073    3                 END;
+
+   3073  1 000602   000630 710000 1                  TRA     s:3088
+
+      255     3074    3              ELSE DO;
+
+      256     3075    3                 IF REQ.IOS$->IOS.IDCW.DC(0)=%(BITBIN(LP_LDVFC)) AND
+
+   3075  1 000603   000012 471500                    LDP1    10,,PR0
+         1 000604   100002 236100                    LDQ     2,,PR1
+         1 000605   770000 376003                    ANQ     -4096,DU
+         1 000606   050000 116003                    CMPQ    20480,DU
+         1 000607   000616 601000 1                  TNZ     s:3085
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:45   
+         1 000610   000003 236100                    LDQ     3,,PR0
+         1 000611   000777 376007                    ANQ     511,DL
+         1 000612   000032 116007                    CMPQ    26,DL
+         1 000613   000616 601000 1                  TNZ     s:3085
+
+      257     3076    4                   REQ.FC=%N_SYMB THEN DO;
+
+      258     3077                         /*  Using the IPC-UR firmware, there are times that the VFC
+      259     3078                             does not get loaded right when using a channel command
+      260     3079                             of '06' when the device is in standby.  So, this kludge
+      261     3080                             catches those possible failures and forces a normal load
+      262     3081                             VFC command, not using the channel command of '06'.
+      263     3082                          */
+      264     3083    4                    RCVR.LDVFC = '1'B;
+
+   3083  1 000614   100000 236003                    LDQ     32768,DU
+         1 000615   200025 256100                    ORSQ    RCVR,,AUTO
+
+      265     3084    4                    END;
+
+      266     3085    3                 RCVR.RETRY = REQ.STATUS.ININT;
+
+   3085  1 000616   000014 236100                    LDQ     12,,PR0
+         1 000617   000020 736000                    QLS     16
+         1 000620   200025 676100                    ERQ     RCVR,,AUTO
+         1 000621   400000 376003                    ANQ     -131072,DU
+         1 000622   200025 656100                    ERSQ    RCVR,,AUTO
+
+      267     3086    3                 REQ.TYC.IOERR = REQ.STATUS.ININT;
+
+   3086  1 000623   000014 236100                    LDQ     12,,PR0
+         1 000624   000010 736000                    QLS     8
+         1 000625   000021 676100                    ERQ     17,,PR0
+         1 000626   001000 376003                    ANQ     512,DU
+         1 000627   000021 656100                    ERSQ    17,,PR0
+
+      268     3087    3                 END;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:46   
+
+      269     3088    2              NEWSTATE = %SPWAIT;
+
+   3088  1 000630   000003 235007                    LDA     3,DL
+         1 000631   200014 755100                    STA     NEWSTATE,,AUTO
+         1 000632   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      270     3089    2            CASE(%DATA_ALERT);
+
+      271     3090    2              IF REQ.STATUS.MINOR='00'O THEN
+
+   3090  1 000633   000014 236100                    LDQ     12,,PR0
+         1 000634   007700 316003                    CANQ    4032,DU
+         1 000635   000641 601000 1                  TNZ     s:3092
+
+      272     3091    2                 RCVR=RETRY#|LDTRAIN#|EXTST#;
+
+   3091  1 000636   444000 236003                    LDQ     -112640,DU
+         1 000637   200025 756100                    STQ     RCVR,,AUTO
+         1 000640   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      273     3092    3              ELSE IF REQ.STATUS.MINOR&'27'O THEN DO;
+
+   3092  1 000641   000014 236100                    LDQ     12,,PR0
+         1 000642   000006 736000                    QLS     6
+         1 000643   770000 376003                    ANQ     -4096,DU
+         1 000644   270000 376003                    ANQ     94208,DU
+         1 000645   000651 600000 1                  TZE     s:3095
+
+      274     3093    3                    RCVR=RETRY#|LOGERR#|EXTST#|OPMSG#;
+
+   3093  1 000646   416000 236003                    LDQ     -123904,DU
+         1 000647   200025 756100                    STQ     RCVR,,AUTO
+
+      275     3094    3                    END;
+
+   3094  1 000650   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:47   
+
+      276     3095    2                 ELSE IF REQ.STATUS.MINOR & '40'O THEN
+
+   3095  1 000651   000014 236100                    LDQ     12,,PR0
+         1 000652   000006 736000                    QLS     6
+         1 000653   770000 376003                    ANQ     -4096,DU
+         1 000654   400000 376003                    ANQ     -131072,DU
+         1 000655   001001 600000 1                  TZE     BYPASS_STATUS_ANALYSIS
+
+      277     3096    2                       REQ.TYC.EOF='1'B;
+
+   3096  1 000656   004000 236003                    LDQ     2048,DU
+         1 000657   000021 256100                    ORSQ    17,,PR0
+         1 000660   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      278     3097    2            CASE(%COMMAND_REJECT);
+
+      279     3098    3              IF REQ.STATUS.MINOR = '00'O THEN DO;
+
+   3098  1 000661   000014 236100                    LDQ     12,,PR0
+         1 000662   007700 316003                    CANQ    4032,DU
+         1 000663   000671 601000 1                  TNZ     s:3103
+
+      280     3099    3                 RCVR = RETRY#|LDVFC#;
+
+   3099  1 000664   500000 236003                    LDQ     -98304,DU
+         1 000665   200025 756100                    STQ     RCVR,,AUTO
+
+      281     3100    3                 REQ.TYC.IOERR = '1'B;
+
+   3100  1 000666   001000 236003                    LDQ     512,DU
+         1 000667   000021 256100                    ORSQ    17,,PR0
+
+      282     3101    3                 END;                      /* IF '00'O */
+
+   3101  1 000670   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:48   
+      283     3102    2              ELSE
+      284     3103    3                 IF REQ.STATUS.MINOR & '07'O THEN DO;
+
+   3103  1 000671   000014 236100                    LDQ     12,,PR0
+         1 000672   000006 736000                    QLS     6
+         1 000673   770000 376003                    ANQ     -4096,DU
+         1 000674   070000 376003                    ANQ     28672,DU
+         1 000675   000703 600000 1                  TZE     s:3108
+
+      285     3104    3                    RCVR = RETRY#|LOGERR#;
+
+   3104  1 000676   410000 236003                    LDQ     -126976,DU
+         1 000677   200025 756100                    STQ     RCVR,,AUTO
+
+      286     3105    3                    REQ.TYC.IOERR = '1'B;
+
+   3105  1 000700   001000 236003                    LDQ     512,DU
+         1 000701   000021 256100                    ORSQ    17,,PR0
+
+      287     3106    3                    END;                   /* IF MINOR & '07'O */
+
+   3106  1 000702   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      288     3107    2                 ELSE
+      289     3108    3                    IF REQ.STATUS.MINOR & '10'O THEN DO;
+
+   3108  1 000703   000014 236100                    LDQ     12,,PR0
+         1 000704   000006 736000                    QLS     6
+         1 000705   770000 376003                    ANQ     -4096,DU
+         1 000706   100000 376003                    ANQ     32768,DU
+         1 000707   000715 600000 1                  TZE     s:3113
+
+      290     3109    3                       RCVR = RETRY#|LDTRAIN#;
+
+   3109  1 000710   440000 236003                    LDQ     -114688,DU
+         1 000711   200025 756100                    STQ     RCVR,,AUTO
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:49   
+      291     3110    3                       REQ.TYC.IOERR = '1'B;
+
+   3110  1 000712   001000 236003                    LDQ     512,DU
+         1 000713   000021 256100                    ORSQ    17,,PR0
+
+      292     3111    3                       END;                /* IF MINOR & '10'O */
+
+   3111  1 000714   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      293     3112    2                    ELSE
+      294     3113    3                       IF REQ.STATUS.MINOR & '60'O THEN DO;
+
+   3113  1 000715   000014 236100                    LDQ     12,,PR0
+         1 000716   000006 736000                    QLS     6
+         1 000717   770000 376003                    ANQ     -4096,DU
+         1 000720   600000 376003                    ANQ     -65536,DU
+         1 000721   001001 600000 1                  TZE     BYPASS_STATUS_ANALYSIS
+
+      295     3114    3                          RCVR = RETRY#|LOGERR#|RESET#;
+
+   3114  1 000722   610000 236003                    LDQ     -61440,DU
+         1 000723   200025 756100                    STQ     RCVR,,AUTO
+
+      296     3115    3                          REQ.TYC.IOERR = '1'B;
+
+   3115  1 000724   001000 236003                    LDQ     512,DU
+         1 000725   000021 256100                    ORSQ    17,,PR0
+
+      297     3116    3                          END;             /* IF MINOR & '60'O */
+
+   3116  1 000726   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      298     3117    2            CASE(%LOST_INTERRUPT);
+
+      299     3118    2              RCVR=RETRY#|LOGERR#|OPMSG#;
+
+   3118  1 000727   412000 236003                    LDQ     -125952,DU
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:50   
+         1 000730   200025 756100                    STQ     RCVR,,AUTO
+
+      300     3119    2              REQ.STATUS.NCP = 7;
+
+   3119  1 000731   700000 236007                    LDQ     -32768,DL
+         1 000732   000015 256100                    ORSQ    13,,PR0
+
+      301     3120    2              REQ.ARSIZE = 0;
+
+   3120  1 000733   177777 236007                    LDQ     65535,DL
+         1 000734   000027 356100                    ANSQ    23,,PR0
+
+      302     3121    2              NEWSTATE=%KIWAIT;
+
+   3121  1 000735   000004 235007                    LDA     4,DL
+         1 000736   200014 755100                    STA     NEWSTATE,,AUTO
+
+      303     3122    2              REQ.TYC.TIMO='1'B;
+
+   3122  1 000737   000010 236003                    LDQ     8,DU
+         1 000740   000021 256100                    ORSQ    17,,PR0
+         1 000741   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      304     3123    2            CASE(%MPC_ATTENTION);
+
+      305     3124    2              RCVR=RETRY#|LOGERR#|OPMSG#;
+
+   3124  1 000742   412000 236003                    LDQ     -125952,DU
+         1 000743   200025 756100                    STQ     RCVR,,AUTO
+
+      306     3125    2              NEWSTATE=%KIWAIT;
+
+   3125  1 000744   000004 235007                    LDA     4,DL
+         1 000745   200014 755100                    STA     NEWSTATE,,AUTO
+         1 000746   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      307     3126    2            CASE(%MPC_DATA_ALERT);
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:51   
+
+      308     3127    2              REQ.TYC.IOERR = '1'B;
+
+   3127  1 000747   001000 236003                    LDQ     512,DU
+         1 000750   000021 256100                    ORSQ    17,,PR0
+
+      309     3128    2              RCVR = RETRY#|LOGERR#;
+
+   3128  1 000751   410000 236003                    LDQ     -126976,DU
+         1 000752   200025 756100                    STQ     RCVR,,AUTO
+         1 000753   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      310     3129    2            CASE(%MPC_COMMAND_REJECT);
+
+      311     3130    2              REQ.TYC.IOERR = '1'B;
+
+   3130  1 000754   001000 236003                    LDQ     512,DU
+         1 000755   000021 256100                    ORSQ    17,,PR0
+
+      312     3131    2              RCVR = RETRY#|LOGERR#;
+
+   3131  1 000756   410000 236003                    LDQ     -126976,DU
+         1 000757   200025 756100                    STQ     RCVR,,AUTO
+         1 000760   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      313     3132    2            CASE(%SYSTEM_FAULT);
+
+      314     3133    2              RCVR = LOGERR#;
+
+   3133  1 000761   010000 236003                    LDQ     4096,DU
+         1 000762   200025 756100                    STQ     RCVR,,AUTO
+
+      315     3134    2              CALL NIF$ANFAULT(REQ,RCVR.RETRY) ALTRET(L2);
+
+   3134  1 000763   200025 631500                    EPPR1   RCVR,,AUTO
+         1 000764   200035 451500                    STP1    SQH$+5,,AUTO
+         1 000765   200027 236100                    LDQ     REQ$,,AUTO
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:52   
+         1 000766   200034 756100                    STQ     SQH$+4,,AUTO
+         1 000767   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 000770   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 000771   000000 701000 xent               TSX1    NIF$ANFAULT
+         1 000772   000774 702000 1                  TSX2    L2
+
+      316     3135    3              DO NEVER;
+
+   3135  1 000773   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      317     3136    3   L2:           NEWSTATE = %KIWAIT;
+
+   3136  1 000774   000004 235007       L2           LDA     4,DL
+         1 000775   200014 755100                    STA     NEWSTATE,,AUTO
+
+      318     3137    3                 END;                      /* DO NEVER */
+
+   3137  1 000776   001001 710000 1                  TRA     BYPASS_STATUS_ANALYSIS
+
+      319     3138    2            CASE(ELSE);
+
+      320     3139    2              REQ.TYC.IOERR = '1'B;
+
+   3139  1 000777   001000 236003                    LDQ     512,DU
+         1 001000   000021 256100                    ORSQ    17,,PR0
+
+      321     3140    2            END;                           /* CASE REQ.STATUS.MAJOR */
+
+      322     3141        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:53   
+      323     3142        /**/
+      324     3143        /* NOW PERFORM THE INDICATED RETRY OPERATIONS */
+      325     3144        /**/
+      326     3145    1   BYPASS_STATUS_ANALYSIS:
+      327     3146    2           DO CASE(REQ.COMP);
+
+   3146  1 001001   200027 470500       BYPASS_STAT* LDP0    REQ$,,AUTO
+         1 001002   000027 236100                    LDQ     23,,PR0
+         1 001003   000011 772000                    QRL     9
+         1 001004   000177 376007                    ANQ     127,DL
+         1 001005   000004 116007                    CMPQ    4,DL
+         1 001006   001010 602006 1                  TNC     BYPASS_STATUS_ANALYSIS+7,QL
+         1 001007   001505 710000 1                  TRA     s:3249
+         1 001010   001014 710000 1                  TRA     s:3148
+         1 001011   001505 710000 1                  TRA     s:3249
+         1 001012   001505 710000 1                  TRA     s:3249
+         1 001013   001434 710000 1                  TRA     s:3234
+
+      328     3147    2            CASE(%COMP_REG);               /* REGULAR REQUEST PACKETS */
+
+      329     3148    3              IF REQ.FC = %N_SYMB AND NOT RCVR.ONLYRETRY THEN DO;
+
+   3148  1 001014   000003 236100                    LDQ     3,,PR0
+         1 001015   000777 376007                    ANQ     511,DL
+         1 001016   000032 116007                    CMPQ    26,DL
+         1 001017   001040 601000 1                  TNZ     NO_MORE_RECS
+         1 001020   200025 430100                    FSZN    RCVR,,AUTO
+         1 001021   001040 604000 1                  TMI     NO_MORE_RECS
+
+      330     3149    3                 CALL NIU$FIXARCT(REQ,RCVR.RETRY) ALTRET(NO_MORE_RECS);
+
+   3149  1 001022   200025 631500                    EPPR1   RCVR,,AUTO
+         1 001023   200035 451500                    STP1    SQH$+5,,AUTO
+         1 001024   200027 236100                    LDQ     REQ$,,AUTO
+         1 001025   200034 756100                    STQ     SQH$+4,,AUTO
+         1 001026   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001027   000020 631400 xsym               EPPR1   B_VECTNIL+16
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:54   
+         1 001030   000000 701000 xent               TSX1    NIU$FIXARCT
+         1 001031   001040 702000 1                  TSX2    NO_MORE_RECS
+
+      331     3150    3                 IF NOT RCVR.RETRY THEN RCVR = RCVR|%(RETRY#|NOINC#);
+
+   3150  1 001032   200025 234100                    SZN     RCVR,,AUTO
+         1 001033   001040 604000 1                  TMI     NO_MORE_RECS
+
+   3150  1 001034   200025 236100                    LDQ     RCVR,,AUTO
+         1 001035   777000 376003                    ANQ     -512,DU
+         1 001036   420000 276003                    ORQ     -122880,DU
+         1 001037   200025 756100                    STQ     RCVR,,AUTO
+
+      332     3151    3                 END;                      /* IF FC = %N_SYMB */
+
+   3148  1 001040                       NO_MORE_RECS null
+      333     3152    2   NO_MORE_RECS: ;
+      334     3153    2              IF RCVR.RETRY AND NOT RCVR.NOINC THEN REQ.ERRCT=REQ.ERRCT+1;
+
+   3153  1 001040   200025 234100                    SZN     RCVR,,AUTO
+         1 001041   001051 605000 1                  TPL     s:3154
+         1 001042   200025 236100                    LDQ     RCVR,,AUTO
+         1 001043   020000 316003                    CANQ    8192,DU
+         1 001044   001051 601000 1                  TNZ     s:3154
+
+   3153  1 001045   200027 470500                    LDP0    REQ$,,AUTO
+         1 001046   000003 236100                    LDQ     3,,PR0
+         1 001047   001000 036003                    ADLQ    512,DU
+         1 001050   000003 552140                    STBQ    3,'40'O,PR0
+
+      335     3154    3              IF RCVR.RETRY AND REQ.ERRCT>8 THEN DO;
+
+   3154  1 001051   200025 234100                    SZN     RCVR,,AUTO
+         1 001052   001065 605000 1                  TPL     s:3157
+         1 001053   200027 470500                    LDP0    REQ$,,AUTO
+         1 001054   000003 236100                    LDQ     3,,PR0
+         1 001055   777000 376003                    ANQ     -512,DU
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:55   
+         1 001056   011000 116003                    CMPQ    4608,DU
+         1 001057   001065 602000 1                  TNC     s:3157
+
+      336     3155    3                 IF NEWSTATE<=%ASSIGNED THEN NEWSTATE=%KIWAIT;
+
+   3155  1 001060   200014 235100                    LDA     NEWSTATE,,AUTO
+         1 001061   000003 115007                    CMPA    3,DL
+         1 001062   001065 603000 1                  TRC     s:3157
+
+   3155  1 001063   000004 235007                    LDA     4,DL
+         1 001064   200014 755100                    STA     NEWSTATE,,AUTO
+
+      337     3156    3                 END;
+
+      338     3157    3              IF RCVR.LOGERR THEN DO;
+
+   3157  1 001065   200025 236100                    LDQ     RCVR,,AUTO
+         1 001066   010000 316003                    CANQ    4096,DU
+         1 001067   001101 600000 1                  TZE     s:3161
+
+      339     3158    3                 CALL NIA$LOGERR(REQ,EL_IOERR);
+
+   3158  1 001070   000011 236000 2                  LDQ     9
+         1 001071   200027 235100                    LDA     REQ$,,AUTO
+         1 001072   200034 757100                    STAQ    SQH$+4,,AUTO
+         1 001073   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001074   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 001075   000000 701000 xent               TSX1    NIA$LOGERR
+         1 001076   000000 011000                    NOP     0
+
+      340     3159    3                 RCVR.LOGERR='0'B;
+
+   3159  1 001077   000012 236000 2                  LDQ     10
+         1 001100   200025 356100                    ANSQ    RCVR,,AUTO
+
+      341     3160    3                 END;
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:56   
+      342     3161    3              IF NEWSTATE>=%SPWAIT THEN DO;
+
+   3161  1 001101   200014 235100                    LDA     NEWSTATE,,AUTO
+         1 001102   000003 115007                    CMPA    3,DL
+         1 001103   001124 602000 1                  TNC     s:3165
+
+      343     3162    3                 REQ.ERRCT=0;
+
+   3162  1 001104   200027 470500                    LDP0    REQ$,,AUTO
+         1 001105   000000 236003                    LDQ     0,DU
+         1 001106   000003 552140                    STBQ    3,'40'O,PR0
+
+      344     3163    3                 CALL NIK$OPMSG(DCT,LP_MSG#,M_UR,NEWSTATE,REQ);
+
+   3163  1 001107   200027 236100                    LDQ     REQ$,,AUTO
+         1 001110   200040 756100                    STQ     SQH$+8,,AUTO
+         1 001111   200014 631500                    EPPR1   NEWSTATE,,AUTO
+         1 001112   200037 451500                    STP1    SQH$+7,,AUTO
+         1 001113   000015 236000 2                  LDQ     13
+         1 001114   200036 756100                    STQ     SQH$+6,,AUTO
+         1 001115   000016 236000 2                  LDQ     14
+         1 001116   200007 235100                    LDA     DCT$,,AUTO
+         1 001117   200034 757100                    STAQ    SQH$+4,,AUTO
+         1 001120   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001121   000023 631400 xsym               EPPR1   B_VECTNIL+19
+         1 001122   000000 701000 xent               TSX1    NIK$OPMSG
+         1 001123   000000 011000                    NOP     0
+
+      345     3164    3                 END;
+
+      346     3165    3              IF RCVR.LDTRAIN THEN DO;
+
+   3165  1 001124   200025 236100                    LDQ     RCVR,,AUTO
+         1 001125   040000 316003                    CANQ    16384,DU
+         1 001126   001202 600000 1                  TZE     s:3180
+
+      347     3166    3                 CALL NIQ$GET(RELOAD$) ALTRET(REPOST);
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:57   
+
+   3166  1 001127   200026 630500                    EPPR0   RELOAD$,,AUTO
+         1 001130   200034 450500                    STP0    SQH$+4,,AUTO
+         1 001131   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001132   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001133   000000 701000 xent               TSX1    NIQ$GET
+         1 001134   001621 702000 1                  TSX2    REPOST
+
+      348     3167    3                 RELOAD$->REQ.FC = %N_LDCHAIN;
+
+   3167  1 001135   200026 470500                    LDP0    RELOAD$,,AUTO
+         1 001136   000026 236007                    LDQ     22,DL
+         1 001137   000003 552104                    STBQ    3,'04'O,PR0
+
+      349     3168    3                 RELOAD$->REQ.DLA = REQ.DLA;
+
+   3168  1 001140   200027 470500                    LDP0    REQ$,,AUTO
+         1 001141   000001 236100                    LDQ     1,,PR0
+         1 001142   200026 471500                    LDP1    RELOAD$,,AUTO
+         1 001143   100001 756100                    STQ     1,,PR1
+
+      350     3169    3                 RELOAD$->REQ.COMP = %COMP_IOS;
+
+   3169  1 001144   200026 471500                    LDP1    RELOAD$,,AUTO
+         1 001145   100027 236100                    LDQ     23,,PR1
+         1 001146   000017 376000 2                  ANQ     15
+         1 001147   003000 276007                    ORQ     1536,DL
+         1 001150   100027 756100                    STQ     23,,PR1
+
+      351     3170    3                 RELOAD$->REQ.OPFLG.BPF = '1'B;
+
+   3170  1 001151   000010 236007                    LDQ     8,DL
+         1 001152   100004 256100                    ORSQ    4,,PR1
+
+      352     3171    3                 RELOAD$->REQ.BUF$ = DCT.LP.CHAIN$;
+
+   3171  1 001153   200007 471500                    LDP1    DCT$,,AUTO
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:58   
+         1 001154   100032 236100                    LDQ     26,,PR1
+         1 001155   200026 473500                    LDP3    RELOAD$,,AUTO
+         1 001156   300005 756100                    STQ     5,,PR3
+
+      353     3172    3                 RELOAD$->REQ.BUFSIZE = 60 * 4; /* CHAIN IMAGE = 60 WORDS */
+
+   3172  1 001157   200026 473500                    LDP3    RELOAD$,,AUTO
+         1 001160   300004 236100                    LDQ     4,,PR3
+         1 001161   177777 376007                    ANQ     65535,DL
+         1 001162   000074 276003                    ORQ     60,DU
+         1 001163   300004 756100                    STQ     4,,PR3
+
+      354     3173    3                 CALL NIO$DCWBLD(RELOAD$->REQ) ALTRET(NOLDTRAIN);
+
+   3173  1 001164   200026 630500                    EPPR0   RELOAD$,,AUTO
+         1 001165   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001166   000000 701000 xent               TSX1    NIO$DCWBLD
+         1 001167   001173 702000 1                  TSX2    NOLDTRAIN
+
+      355     3174    3                 RCVR.LDTRAIN = '0'B;
+
+   3174  1 001170   000020 236000 2                  LDQ     16
+         1 001171   200025 356100                    ANSQ    RCVR,,AUTO
+
+      356     3175    4                 DO NEVER;
+
+   3175  1 001172   001202 710000 1                  TRA     s:3180
+
+      357     3176    4   NOLDTRAIN:       CALL NIQ$REL(RELOAD$);
+
+   3176  1 001173   200026 630500       NOLDTRAIN    EPPR0   RELOAD$,,AUTO
+         1 001174   200034 450500                    STP0    SQH$+4,,AUTO
+         1 001175   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001176   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001177   000000 701000 xent               TSX1    NIQ$REL
+         1 001200   000000 011000                    NOP     0
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:59   
+      358     3177    4                    GOTO REPOST;
+
+   3177  1 001201   001621 710000 1                  TRA     REPOST
+
+      359     3178    4                    END;
+
+      360     3179    3                 END;                      /* IF */
+      361     3180    3              IF RCVR.LDVFC THEN DO;
+
+   3180  1 001202   200025 236100                    LDQ     RCVR,,AUTO
+         1 001203   100000 316003                    CANQ    32768,DU
+         1 001204   001262 600000 1                  TZE     s:3195
+
+      362     3181    3                 CALL NIQ$GET(RELOAD$) ALTRET(REPOST);
+
+   3181  1 001205   200026 630500                    EPPR0   RELOAD$,,AUTO
+         1 001206   200034 450500                    STP0    SQH$+4,,AUTO
+         1 001207   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001210   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001211   000000 701000 xent               TSX1    NIQ$GET
+         1 001212   001621 702000 1                  TSX2    REPOST
+
+      363     3182    3                 RELOAD$->REQ.FC = %N_LDVFC;
+
+   3182  1 001213   200026 470500                    LDP0    RELOAD$,,AUTO
+         1 001214   000031 236007                    LDQ     25,DL
+         1 001215   000003 552104                    STBQ    3,'04'O,PR0
+
+      364     3183    3                 RELOAD$->REQ.DLA = REQ.DLA;
+
+   3183  1 001216   200027 470500                    LDP0    REQ$,,AUTO
+         1 001217   000001 236100                    LDQ     1,,PR0
+         1 001220   200026 471500                    LDP1    RELOAD$,,AUTO
+         1 001221   100001 756100                    STQ     1,,PR1
+
+      365     3184    3                 RELOAD$->REQ.COMP = %COMP_IOS;
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:60   
+   3184  1 001222   200026 471500                    LDP1    RELOAD$,,AUTO
+         1 001223   100027 236100                    LDQ     23,,PR1
+         1 001224   000017 376000 2                  ANQ     15
+         1 001225   003000 276007                    ORQ     1536,DL
+         1 001226   100027 756100                    STQ     23,,PR1
+
+      366     3185    3                 RELOAD$->REQ.OPFLG.BPF = '1'B;
+
+   3185  1 001227   000010 236007                    LDQ     8,DL
+         1 001230   100004 256100                    ORSQ    4,,PR1
+
+      367     3186    3                 RELOAD$->REQ.BUF$ = DCT.LP.VFC$;
+
+   3186  1 001231   200007 471500                    LDP1    DCT$,,AUTO
+         1 001232   100030 236100                    LDQ     24,,PR1
+         1 001233   200026 473500                    LDP3    RELOAD$,,AUTO
+         1 001234   300005 756100                    STQ     5,,PR3
+
+      368     3187    3                 RELOAD$->REQ.BUFSIZE = DCT.LP.VFCL * 4;
+
+   3187  1 001235   200026 473500                    LDP3    RELOAD$,,AUTO
+         1 001236   100031 236100                    LDQ     25,,PR1
+         1 001237   000002 736000                    QLS     2
+         1 001240   000020 736000                    QLS     16
+         1 001241   300004 676100                    ERQ     4,,PR3
+         1 001242   000034 376000 xsym               ANQ     B_VECTNIL+28
+         1 001243   300004 656100                    ERSQ    4,,PR3
+
+      369     3188    3                 CALL NIO$DCWBLD(RELOAD$->REQ) ALTRET(NOLDVFC);
+
+   3188  1 001244   200026 630500                    EPPR0   RELOAD$,,AUTO
+         1 001245   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001246   000000 701000 xent               TSX1    NIO$DCWBLD
+         1 001247   001253 702000 1                  TSX2    NOLDVFC
+
+      370     3189    3                 RCVR.LDVFC = '0'B;
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:61   
+   3189  1 001250   000021 236000 2                  LDQ     17
+         1 001251   200025 356100                    ANSQ    RCVR,,AUTO
+
+      371     3190    4                 DO NEVER;
+
+   3190  1 001252   001262 710000 1                  TRA     s:3195
+
+      372     3191    4   NOLDVFC:         CALL NIQ$REL(RELOAD$);
+
+   3191  1 001253   200026 630500       NOLDVFC      EPPR0   RELOAD$,,AUTO
+         1 001254   200034 450500                    STP0    SQH$+4,,AUTO
+         1 001255   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001256   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001257   000000 701000 xent               TSX1    NIQ$REL
+         1 001260   000000 011000                    NOP     0
+
+      373     3192    4                    GOTO REPOST;
+
+   3192  1 001261   001621 710000 1                  TRA     REPOST
+
+      374     3193    4                    END;
+
+      375     3194    3                 END;                      /* IF */
+      376     3195    3              IF RCVR.RESET THEN DO;
+
+   3195  1 001262   200025 236100                    LDQ     RCVR,,AUTO
+         1 001263   200000 316003                    CANQ    65536,DU
+         1 001264   001325 600000 1                  TZE     s:3207
+
+      377     3196    3                 CALL NIQ$GET(RELOAD$) ALTRET(REPOST);
+
+   3196  1 001265   200026 630500                    EPPR0   RELOAD$,,AUTO
+         1 001266   200034 450500                    STP0    SQH$+4,,AUTO
+         1 001267   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001270   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001271   000000 701000 xent               TSX1    NIQ$GET
+         1 001272   001621 702000 1                  TSX2    REPOST
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:62   
+
+      378     3197    3                 RELOAD$->REQ.FC = %N_RESET;
+
+   3197  1 001273   200026 470500                    LDP0    RELOAD$,,AUTO
+         1 001274   000022 236007                    LDQ     18,DL
+         1 001275   000003 552104                    STBQ    3,'04'O,PR0
+
+      379     3198    3                 RELOAD$->REQ.DLA = REQ.DLA;
+
+   3198  1 001276   200027 470500                    LDP0    REQ$,,AUTO
+         1 001277   000001 236100                    LDQ     1,,PR0
+         1 001300   200026 471500                    LDP1    RELOAD$,,AUTO
+         1 001301   100001 756100                    STQ     1,,PR1
+
+      380     3199    3                 RELOAD$->REQ.COMP = %COMP_IOS;
+
+   3199  1 001302   200026 471500                    LDP1    RELOAD$,,AUTO
+         1 001303   100027 236100                    LDQ     23,,PR1
+         1 001304   000017 376000 2                  ANQ     15
+         1 001305   003000 276007                    ORQ     1536,DL
+         1 001306   100027 756100                    STQ     23,,PR1
+
+      381     3200    3                 CALL NIO$DCWBLD(RELOAD$->REQ) ALTRET(NORESET);
+
+   3200  1 001307   200026 630500                    EPPR0   RELOAD$,,AUTO
+         1 001310   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001311   000000 701000 xent               TSX1    NIO$DCWBLD
+         1 001312   001316 702000 1                  TSX2    NORESET
+
+      382     3201    3                 RCVR.RESET = '0'B;
+
+   3201  1 001313   000022 236000 2                  LDQ     18
+         1 001314   200025 356100                    ANSQ    RCVR,,AUTO
+
+      383     3202    4                 DO NEVER;
+
+   3202  1 001315   001325 710000 1                  TRA     s:3207
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:63   
+
+      384     3203    4   NORESET:         CALL NIQ$REL(RELOAD$);
+
+   3203  1 001316   200026 630500       NORESET      EPPR0   RELOAD$,,AUTO
+         1 001317   200034 450500                    STP0    SQH$+4,,AUTO
+         1 001320   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001321   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001322   000000 701000 xent               TSX1    NIQ$REL
+         1 001323   000000 011000                    NOP     0
+
+      385     3204    4                    GOTO REPOST;
+
+   3204  1 001324   001621 710000 1                  TRA     REPOST
+
+      386     3205    4                    END;
+
+      387     3206    3                 END;                      /* IF */
+      388     3207    3              IF REQ.ERR$~=ADDR(NIL) THEN DO;
+
+   3207  1 001325   200027 470500                    LDP0    REQ$,,AUTO
+         1 001326   000017 236100                    LDQ     15,,PR0
+         1 001327   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 001330   001505 600000 1                  TZE     s:3249
+
+      389     3208    4                 IF NOT REQ.ERR$->NI$IOERR.GOTEXTST THEN DO;
+
+   3208  1 001331   000017 471500                    LDP1    15,,PR0
+         1 001332   100020 236100                    LDQ     16,,PR1
+         1 001333   020000 316003                    CANQ    8192,DU
+         1 001334   001505 601000 1                  TNZ     s:3249
+
+      390     3209    5                    IF HW_EXT_STATUS THEN DO;
+
+   3209  1 001335   000000 234000 xsym               SZN     HW_EXT_STATUS
+         1 001336   001350 605000 1                  TPL     s:3215
+
+      391     3210    6                       IF NI$EXTST.EXTSTT.WRD(0)~=0 THEN DO;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:64   
+
+   3210  1 001337   200015 235100                    LDA     NI$EXTST,,AUTO
+         1 001340   001505 600000 1                  TZE     s:3249
+
+      392     3211    6                          REQ.ERR$->NI$IOERR.EXTST=NI$EXTST.EXTST;
+
+   3211  1 001341   000100 100500                    MLR     fill='000'O
+         1 001342   200015 000040                    ADSC9   NI$EXTST,,AUTO           cn=0,n=32
+         1 001343   100007 000040                    ADSC9   7,,PR1                   cn=0,n=32
+
+      393     3212    6                          REQ.ERR$->NI$IOERR.GOTEXTST='1'B;
+
+   3212  1 001344   000017 471500                    LDP1    15,,PR0
+         1 001345   020000 236003                    LDQ     8192,DU
+         1 001346   100020 256100                    ORSQ    16,,PR1
+
+      394     3213    6                          END;
+
+      395     3214    5                       END;
+
+   3214  1 001347   001505 710000 1                  TRA     s:3249
+
+      396     3215    5                    ELSE IF RCVR.EXTST THEN DO;
+
+   3215  1 001350   200025 236100                    LDQ     RCVR,,AUTO
+         1 001351   004000 316003                    CANQ    2048,DU
+         1 001352   001505 600000 1                  TZE     s:3249
+
+      397     3216    5                          CALL NIQ$GET(EXTST$) ALTRET(NOEXTST);
+
+   3216  1 001353   200011 633500                    EPPR3   EXTST$,,AUTO
+         1 001354   200034 453500                    STP3    SQH$+4,,AUTO
+         1 001355   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001356   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001357   000000 701000 xent               TSX1    NIQ$GET
+         1 001360   001433 702000 1                  TSX2    NOEXTST
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:65   
+      398     3217    5                          EXTST$->REQ.FC=%N_EXTST;
+
+   3217  1 001361   200011 470500                    LDP0    EXTST$,,AUTO
+         1 001362   000033 236007                    LDQ     27,DL
+         1 001363   000003 552104                    STBQ    3,'04'O,PR0
+
+      399     3218    5                          EXTST$->REQ.OPFLG=OP_BPF;
+
+   3218  1 001364   200011 470500                    LDP0    EXTST$,,AUTO
+         1 001365   000010 236007                    LDQ     8,DL
+         1 001366   000004 552104                    STBQ    4,'04'O,PR0
+
+      400     3219    5                          EXTST$->REQ.BUF$=ADDR(REQ.ERR$->NI$IOERR.EXTST);
+
+   3219  1 001367   200027 470500                    LDP0    REQ$,,AUTO
+         1 001370   000017 471500                    LDP1    15,,PR0
+         1 001371   100007 633500                    EPPR3   7,,PR1
+         1 001372   200011 474500                    LDP4    EXTST$,,AUTO
+         1 001373   400005 453500                    STP3    5,,PR4
+
+      401     3220    5                          EXTST$->REQ.BUFSIZE = SIZEC(NI$IOERR.EXTST);
+
+   3220  1 001374   200011 471500                    LDP1    EXTST$,,AUTO
+         1 001375   100004 236100                    LDQ     4,,PR1
+         1 001376   177777 376007                    ANQ     65535,DL
+         1 001377   000010 276003                    ORQ     8,DU
+         1 001400   100004 756100                    STQ     4,,PR1
+
+      402     3221    5                          EXTST$->REQ.DLA=REQ.DLA;
+
+   3221  1 001401   000001 236100                    LDQ     1,,PR0
+         1 001402   200011 471500                    LDP1    EXTST$,,AUTO
+         1 001403   100001 756100                    STQ     1,,PR1
+
+      403     3222    5                          EXTST$->REQ.COMP = %COMP_IOS;
+
+   3222  1 001404   200011 471500                    LDP1    EXTST$,,AUTO
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:66   
+         1 001405   100027 236100                    LDQ     23,,PR1
+         1 001406   000017 376000 2                  ANQ     15
+         1 001407   003000 276007                    ORQ     1536,DL
+         1 001410   100027 756100                    STQ     23,,PR1
+
+      404     3223    5                          EXTST$->REQ.POSTER=NEWSTATE;
+
+   3223  1 001411   200014 236100                    LDQ     NEWSTATE,,AUTO
+         1 001412   100010 552104                    STBQ    8,'04'O,PR1
+
+      405     3224    5                          CALL NIO$DCWBLD(EXTST$->REQ) ALTRET(NOEXTST0);
+
+   3224  1 001413   200011 630500                    EPPR0   EXTST$,,AUTO
+         1 001414   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001415   000000 701000 xent               TSX1    NIO$DCWBLD
+         1 001416   001425 702000 1                  TSX2    NOEXTST0
+
+      406     3225    5                          NEWSTATE=%IDLE;
+
+   3225  1 001417   200014 450100                    STZ     NEWSTATE,,AUTO
+
+      407     3226    5                          REQ.ERR$->NI$IOERR.GOTEXTST='1'B;
+
+   3226  1 001420   200027 470500                    LDP0    REQ$,,AUTO
+         1 001421   000017 471500                    LDP1    15,,PR0
+         1 001422   020000 236003                    LDQ     8192,DU
+         1 001423   100020 256100                    ORSQ    16,,PR1
+
+      408     3227    6                          DO NEVER;
+
+   3227  1 001424   001433 710000 1                  TRA     NOEXTST
+
+      409     3228    6   NOEXTST0:                 CALL NIQ$REL(EXTST$);
+
+   3228  1 001425   200011 630500       NOEXTST0     EPPR0   EXTST$,,AUTO
+         1 001426   200034 450500                    STP0    SQH$+4,,AUTO
+         1 001427   200034 630500                    EPPR0   SQH$+4,,AUTO
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:67   
+         1 001430   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001431   000000 701000 xent               TSX1    NIQ$REL
+         1 001432   000000 011000                    NOP     0
+
+      410     3229    6                             END;
+
+      411     3230    5   NOEXTST:               END;
+
+   3230  1 001433                       NOEXTST      null
+      412     3231    4                    END;
+
+      413     3232    3                 END;
+
+   3232  1 001433   001505 710000 1                  TRA     s:3249
+
+      414     3233    2            CASE(%COMP_IOS);               /* IOS CALLED THIS ONE */
+
+      415     3234    3              IF REQ.FC = %N_EXTST THEN DO;
+
+   3234  1 001434   000003 236100                    LDQ     3,,PR0
+         1 001435   000777 376007                    ANQ     511,DL
+         1 001436   000033 116007                    CMPQ    27,DL
+         1 001437   001445 601000 1                  TNZ     s:3239
+
+      416     3235    3                 NEWSTATE = REQ.POSTER;
+
+   3235  1 001440   000010 236100                    LDQ     8,,PR0
+         1 001441   000777 376007                    ANQ     511,DL
+         1 001442   200014 756100                    STQ     NEWSTATE,,AUTO
+
+      417     3236    3                 RCVR = '0'B;
+
+   3236  1 001443   200025 450100                    STZ     RCVR,,AUTO
+
+      418     3237    3                 END;                      /* IF %N_EXTST */
+
+   3237  1 001444   001505 710000 1                  TRA     s:3249
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:68   
+
+      419     3238    3              ELSE DO;
+
+      420     3239    4                 IF REQ.TYC.IOERR THEN DO;
+
+   3239  1 001445   000021 430100                    FSZN    17,,PR0
+         1 001446   001505 605000 1                  TPL     s:3249
+
+      421     3240    4                    CALL NIO$COMP(REQ,NI$EXTST);
+
+   3240  1 001447   200015 631500                    EPPR1   NI$EXTST,,AUTO
+         1 001450   200035 451500                    STP1    SQH$+5,,AUTO
+         1 001451   200027 236100                    LDQ     REQ$,,AUTO
+         1 001452   200034 756100                    STQ     SQH$+4,,AUTO
+         1 001453   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001454   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 001455   000000 701000 xent               TSX1    NIO$COMP
+         1 001456   000000 011000                    NOP     0
+
+      422     3241    4                    RCVR.RETRY = '0'B;
+
+   3241  1 001457   000031 236000 xsym               LDQ     B_VECTNIL+25
+         1 001460   200025 356100                    ANSQ    RCVR,,AUTO
+
+      423     3242    4                    IF NEWSTATE ~= %SPWAIT THEN
+
+   3242  1 001461   200014 235100                    LDA     NEWSTATE,,AUTO
+         1 001462   000003 115007                    CMPA    3,DL
+         1 001463   001466 600000 1                  TZE     s:3244
+
+      424     3243    4                       NEWSTATE = %KIWAIT;
+
+   3243  1 001464   000004 235007                    LDA     4,DL
+         1 001465   200014 755100                    STA     NEWSTATE,,AUTO
+
+      425     3244    4                    CALL NIK$OPMSG(DCT,LP_MSG#,M_UR,NEWSTATE,REQ);
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:69   
+   3244  1 001466   200027 236100                    LDQ     REQ$,,AUTO
+         1 001467   200040 756100                    STQ     SQH$+8,,AUTO
+         1 001470   200014 630500                    EPPR0   NEWSTATE,,AUTO
+         1 001471   200037 450500                    STP0    SQH$+7,,AUTO
+         1 001472   000015 236000 2                  LDQ     13
+         1 001473   200036 756100                    STQ     SQH$+6,,AUTO
+         1 001474   000016 236000 2                  LDQ     14
+         1 001475   200007 235100                    LDA     DCT$,,AUTO
+         1 001476   200034 757100                    STAQ    SQH$+4,,AUTO
+         1 001477   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001500   000023 631400 xsym               EPPR1   B_VECTNIL+19
+         1 001501   000000 701000 xent               TSX1    NIK$OPMSG
+         1 001502   000000 011000                    NOP     0
+
+      426     3245    4                    REQ$ = ADDR(NIL);
+
+   3245  1 001503   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 001504   200027 756100                    STQ     REQ$,,AUTO
+
+      427     3246    4                    END;                   /* IF TYC.IOERR */
+
+      428     3247    3                 END;                      /* ELSE */
+
+      429     3248    2            END;                           /* DO CASE REQ.COMP */
+
+      430     3249    2           IF RCVR.RETRY THEN DO;
+
+   3249  1 001505   200025 234100                    SZN     RCVR,,AUTO
+         1 001506   001530 605000 1                  TPL     s:3261
+
+      431     3250                   %LOCK(G#=SQH.GATE);
+
+   3251  1 001507   200030 630500                    EPPR0   SQH$,,AUTO
+         1 001510   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001511   000000 701000 xent               TSX1    HFC$LOCK
+         1 001512   000000 011000                    NOP     0
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:70   
+      432     3253                   %REQUEUE(P#=REQ,Q#=DCT.SQ$);
+
+   3254  1 001513   200007 236100                    LDQ     DCT$,,AUTO
+         1 001514   000001 036003                    ADLQ    1,DU
+         1 001515   200027 235100                    LDA     REQ$,,AUTO
+         1 001516   200034 757100                    STAQ    SQH$+4,,AUTO
+         1 001517   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001520   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 001521   000000 701000 xent               TSX1    NIM$REQUEUE
+         1 001522   000000 011000                    NOP     0
+
+      433     3256                   %UNLOCK(G#=SQH.GATE);
+
+   3257  1 001523   200030 630500                    EPPR0   SQH$,,AUTO
+         1 001524   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001525   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 001526   000000 011000                    NOP     0
+
+      434     3259    2              END;
+
+   3259  1 001527   001542 710000 1                  TRA     s:3263
+
+      435     3260    1           ELSE
+      436     3261    1              IF REQ$ ~= ADDR(NIL)
+
+   3261  1 001530   200027 236100                    LDQ     REQ$,,AUTO
+         1 001531   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 001532   001542 600000 1                  TZE     s:3263
+
+      437     3262    1              THEN CALL NIO$COMP(REQ,NI$EXTST);
+
+   3262  1 001533   200015 630500                    EPPR0   NI$EXTST,,AUTO
+         1 001534   200035 450500                    STP0    SQH$+5,,AUTO
+         1 001535   200034 756100                    STQ     SQH$+4,,AUTO
+         1 001536   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001537   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 001540   000000 701000 xent               TSX1    NIO$COMP
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:71   
+         1 001541   000000 011000                    NOP     0
+
+      438     3263    2           IF RELOAD$ ~= ADDR(NIL) THEN DO;
+
+   3263  1 001542   200026 236100                    LDQ     RELOAD$,,AUTO
+         1 001543   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 001544   001565 600000 1                  TZE     s:3274
+
+      439     3264                   %LOCK(G#=SQH.GATE);
+
+   3265  1 001545   200030 630500                    EPPR0   SQH$,,AUTO
+         1 001546   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001547   000000 701000 xent               TSX1    HFC$LOCK
+         1 001550   000000 011000                    NOP     0
+
+      440     3267                   %REQUEUE(P#="RELOAD$->REQ",Q#=DCT.SQ$);
+
+   3268  1 001551   200007 236100                    LDQ     DCT$,,AUTO
+         1 001552   000001 036003                    ADLQ    1,DU
+         1 001553   200026 235100                    LDA     RELOAD$,,AUTO
+         1 001554   200034 757100                    STAQ    SQH$+4,,AUTO
+         1 001555   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001556   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 001557   000000 701000 xent               TSX1    NIM$REQUEUE
+         1 001560   000000 011000                    NOP     0
+
+      441     3270                   %UNLOCK(G#=SQH.GATE);
+
+   3271  1 001561   200030 630500                    EPPR0   SQH$,,AUTO
+         1 001562   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001563   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 001564   000000 011000                    NOP     0
+
+      442     3273    2              END;                         /* IF RELOAD$ ~= ADDR(NIL) */
+
+      443     3274    2           IF EXTST$ ~= ADDR(NIL) THEN DO;
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:72   
+   3274  1 001565   200011 236100                    LDQ     EXTST$,,AUTO
+         1 001566   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 001567   001610 600000 1                  TZE     s:3285
+
+      444     3275                   %LOCK(G#=SQH.GATE);
+
+   3276  1 001570   200030 630500                    EPPR0   SQH$,,AUTO
+         1 001571   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001572   000000 701000 xent               TSX1    HFC$LOCK
+         1 001573   000000 011000                    NOP     0
+
+      445     3278                   %REQUEUE(P#="EXTST$->REQ",Q#=DCT.SQ$);
+
+   3279  1 001574   200007 236100                    LDQ     DCT$,,AUTO
+         1 001575   000001 036003                    ADLQ    1,DU
+         1 001576   200011 235100                    LDA     EXTST$,,AUTO
+         1 001577   200034 757100                    STAQ    SQH$+4,,AUTO
+         1 001600   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001601   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 001602   000000 701000 xent               TSX1    NIM$REQUEUE
+         1 001603   000000 011000                    NOP     0
+
+      446     3281                   %UNLOCK(G#=SQH.GATE);
+
+   3282  1 001604   200030 630500                    EPPR0   SQH$,,AUTO
+         1 001605   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001606   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 001607   000000 011000                    NOP     0
+
+      447     3284    2              END;                         /* IF EXTST$ ~= ADDR(NIL) */
+
+      448     3285    1           CALL NIU$DEVSCHED(DCT,NEWSTATE);
+
+   3285  1 001610   200014 630500                    EPPR0   NEWSTATE,,AUTO
+         1 001611   200035 450500                    STP0    SQH$+5,,AUTO
+         1 001612   200007 236100                    LDQ     DCT$,,AUTO
+         1 001613   200034 756100                    STQ     SQH$+4,,AUTO
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:73   
+         1 001614   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001615   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 001616   000000 701000 xent               TSX1    NIU$DEVSCHED
+         1 001617   000000 011000                    NOP     0
+
+      449     3286    1           RETURN;
+
+   3286  1 001620   000000 702200 xent               TSX2  ! X66_ARET
+
+      450     3287        /**/
+      451     3288    1   REPOST:
+      452     3289    1           CALL SETREPOST;
+
+   3289  1 001621   001656 701000 1     REPOST       TSX1    SETREPOST
+         1 001622   000000 011000                    NOP     0
+
+      453     3290    1           RETURN;
+
+   3290  1 001623   000000 702200 xent               TSX2  ! X66_ARET
+
+      454     3291        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:74   
+      455     3292    1   RELCHAN: PROC;
+
+   3292  1 001624   200032 741300       RELCHAN      STX1  ! SQH$+2,,AUTO
+
+      456     3293    2           DQH.STATE = %IDLE;
+
+   3293  1 001625   200010 470500                    LDP0    DQH$,,AUTO
+         1 001626   000000 236003                    LDQ     0,DU
+         1 001627   000001 752101                    STCQ    1,'01'O,PR0
+
+      457     3294    3           IF DQH.CHANSTATE THEN DO;
+
+   3294  1 001630   000020 236100                    LDQ     16,,PR0
+         1 001631   740000 316003                    CANQ    -16384,DU
+         1 001632   001654 600000 1                  TZE     s:3305
+
+      458     3295    4              IF DQH.CHANSTATE.STOP THEN DO;
+
+   3295  1 001633   000020 234100                    SZN     16,,PR0
+         1 001634   001654 605000 1                  TPL     s:3305
+
+      459     3296                      %UNLOCK(G#=SQH.GATE);
+
+   3297  1 001635   200030 630500                    EPPR0   SQH$,,AUTO
+         1 001636   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001637   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 001640   000000 011000                    NOP     0
+
+      460     3299    4                 CALL NIW$MPCSTOP(DQH.MPC$->DCT);
+
+   3299  1 001641   200010 470500                    LDP0    DQH$,,AUTO
+         1 001642   000015 471500                    LDP1    13,,PR0
+         1 001643   200034 451500                    STP1    SQH$+4,,AUTO
+         1 001644   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001645   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001646   000000 701000 xent               TSX1    NIW$MPCSTOP
+         1 001647   000000 011000                    NOP     0
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:75   
+
+      461     3300                      %LOCK(G#=SQH.GATE);
+
+   3301  1 001650   200030 630500                    EPPR0   SQH$,,AUTO
+         1 001651   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001652   000000 701000 xent               TSX1    HFC$LOCK
+         1 001653   000000 011000                    NOP     0
+
+      462     3303    4                 END;                      /* IF */
+
+      463     3304    3              END;
+
+      464     3305    2           RETURN;
+
+   3305  1 001654   200032 221300                    LDX1  ! SQH$+2,,AUTO
+         1 001655   000001 702211                    TSX2  ! 1,X1
+
+      465     3306    2   END RELCHAN;
+      466     3307        %EJECT;
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:76   
+      467     3308    1   SETREPOST: PROC;
+
+   3308  1 001656   200032 741300       SETREPOST    STX1  ! SQH$+2,,AUTO
+
+      468     3309    3           IF EXTST$ ~= ADDR(NIL) THEN DO ;
+
+   3309  1 001657   200011 236100                    LDQ     EXTST$,,AUTO
+         1 001660   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 001661   001673 600000 1                  TZE     s:3313
+
+      469     3310    3              EXTST$->REQ.IOQFLG.IOQUED = '0'B ;
+
+   3310  1 001662   200011 470500                    LDP0    EXTST$,,AUTO
+         1 001663   000022 236000 2                  LDQ     18
+         1 001664   000033 356100                    ANSQ    27,,PR0
+
+      470     3311    3              CALL NIQ$REL ( EXTST$ ) ;
+
+   3311  1 001665   200011 631500                    EPPR1   EXTST$,,AUTO
+         1 001666   200034 451500                    STP1    SQH$+4,,AUTO
+         1 001667   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001670   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001671   000000 701000 xent               TSX1    NIQ$REL
+         1 001672   000000 011000                    NOP     0
+
+      471     3312    3              END ;
+
+      472     3313    3           IF RELOAD$ ~= ADDR(NIL) THEN DO ;
+
+   3313  1 001673   200026 236100                    LDQ     RELOAD$,,AUTO
+         1 001674   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 001675   001707 600000 1                  TZE     s:3318
+
+      473     3314    3              RELOAD$->REQ.IOQFLG.IOQUED = '0'B ;
+
+   3314  1 001676   200026 470500                    LDP0    RELOAD$,,AUTO
+         1 001677   000022 236000 2                  LDQ     18
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:77   
+         1 001700   000033 356100                    ANSQ    27,,PR0
+
+      474     3315    3              CALL NIQ$REL ( RELOAD$ ) ;
+
+   3315  1 001701   200026 631500                    EPPR1   RELOAD$,,AUTO
+         1 001702   200034 451500                    STP1    SQH$+4,,AUTO
+         1 001703   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001704   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001705   000000 701000 xent               TSX1    NIQ$REL
+         1 001706   000000 011000                    NOP     0
+
+      475     3316    3              END ;
+
+      476     3317                %LOCK(G#=NI$RP.GATE);
+
+   3318  1 001707   000000 630400 xsym               EPPR0   NI$RP$
+         1 001710   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001711   000000 701000 xent               TSX1    HFC$LOCK
+         1 001712   000000 011000                    NOP     0
+
+      477     3320                %ENQUEUE(Q#=NI$RP.RP$,P#=REQ);
+
+   3321  1 001713   000000 236000 xsym               LDQ     NI$RP$
+         1 001714   000002 036003                    ADLQ    2,DU
+         1 001715   200027 235100                    LDA     REQ$,,AUTO
+         1 001716   200034 757100                    STAQ    SQH$+4,,AUTO
+         1 001717   200034 630500                    EPPR0   SQH$+4,,AUTO
+         1 001720   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 001721   000000 701000 xent               TSX1    NIM$ENQUEUE
+         1 001722   000000 011000                    NOP     0
+
+      478     3323                %UNLOCK(G#=NI$RP.GATE);
+
+   3324  1 001723   000000 630400 xsym               EPPR0   NI$RP$
+         1 001724   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 001725   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 001726   000000 011000                    NOP     0
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:78   
+
+      479     3326    2           NEWSTATE = %SUSPENDED;
+
+   3326  1 001727   000006 235007                    LDA     6,DL
+         1 001730   200014 755100                    STA     NEWSTATE,,AUTO
+
+      480     3327    2           REQ$ = ADDR(NIL);
+
+   3327  1 001731   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 001732   200027 756100                    STQ     REQ$,,AUTO
+
+      481     3328    2           RETURN;
+
+   3328  1 001733   200032 221300                    LDX1  ! SQH$+2,,AUTO
+         1 001734   000001 702211                    TSX2  ! 1,X1
+
+(unnamed)
+ Sect OctLoc
+   0     000   604000 000000   116117 116105                                    ....NONE
+
+(unnamed)
+ Sect OctLoc
+   2     000   000000 000315   000000 006000   000000 006000   000000 006000    ................
+   2     004   777777 775777   000002 006000   000003 006000   000027 400000    ................
+   2     010   000000 000311   000010 006000   767777 777777   000000 000220    ................
+   2     014   100000 000000   000014 006000   000013 006000   777777 600777    @...............
+   2     020   737777 777777   677777 777777   577777 777777                    ............
+      482     3329    2   END SETREPOST;
+      483     3330    1   END NIL$POSTER;
+
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:79   
+--  Include file information  --
+
+   PM$NI.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   NI_MACROS_C.:E05TOU  cannot be made into a system file and is referenced.
+   NI_DEVCMD_C.:E05TOU  is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   NI_DATA_C.:E05TOU  is referenced.
+   NI$ERRLOG.:E05TOU  is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   HF_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   EL_SUBS_C.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+      No diagnostics issued in procedure NIL$POSTER.
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:80   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @INTLVL                    3-0-0/w PTR         r     1 @PAR
+     5-0-0/w PTR         r     1 @STATUS                    7-0-0/w PTR         r     1 DCT$
+    10-0-0/w PTR         r     1 DQH$                      11-0-0/w PTR         r     1 EXTST$
+    12-0-0/w SBIN        r     1 I                         *0-0-0/w UBIN(18)    r     1 INTLVL
+    13-0-0/w PTR         r     1 IOS$                      14-0-0/w UBIN        r     1 NEWSTATE
+    15-0-0/w STRC(288)   r     1 NI$EXTST                  *0-0-0/w SBIN        r     1 PAR
+    25-0-0/w STRC(9)     r     1 RCVR                      26-0-0/w PTR         r     1 RELOAD$
+    27-0-0/w PTR         r     1 REQ$                      30-0-0/w PTR         r     1 SQH$
+    *0-0-0/d BIT (72)    r     1 STATUS
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w BIT         r     1 HW_EXT_STATUS              0-0-0/w BIT         r     1 HW_IMX
+     0-0-0/w BIT         r     1 HW_IOP                     0-0-0/w PTR         r     1 N$DCT$$
+     0-0-0/w PTR         r     1 N$FQ$                      0-0-0/w PTR         r     1 NI$FQ$
+     0-0-0/w PTR         r     1 NI$IBUF$                   0-0-0/w PTR         r     1 NI$RP$
+     0-0-0/d BIT (72)    r     1 NI_DBLZERO
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(1332)  r     1 DCT                        0-0-0/w STRC(648)   r     1 DQH
+     0-0-0/d STRC(504)   r     1 IOS                        0-0-0/d STRC(576)   r     1 IOSTAT
+     0-0-0/d STRC(144)   r     1 MBX                        0-0-0/w PTR         r     1 N$DCT$(0:0)
+     0-0-0/w STRC(612)   r     1 NI$IOERR                   0-0-0/w STRC(180)   r     1 NI$RP
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:81   
+     0-0-0/d STRC(1080)  r     1 REQ                        0-0-0/w STRC(252)   r     1 SQH
+
+
+   Procedure NIL$POSTER requires 989 words for executable code.
+   Procedure NIL$POSTER requires 34 words of local(AUTO) storage.
+
+    No errors detected in file NIL$POSTER.:E05TSI    .
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:82   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:83   
+          MINI XREF LISTING
+
+BYPASS_STATUS_ANALYSIS
+      3146**LABEL    3047--GOTO
+DCT
+      2671**DCL      3023<>CALL     3025<>CALL     3163<>CALL     3244<>CALL     3285<>CALL     3299<>CALL
+DCT.DFLG.MPCSUSPENDED
+      2676**DCL      2980<<ASSIGN
+DCT.DP
+      2691**DCL      2698--REDEF    2701--REDEF    2702--REDEF    2704--REDEF    2704--REDEF    2705--REDEF
+      2706--REDEF    2706--REDEF
+DCT.DQH$
+      2687**DCL      3001>>IF       3036>>ASSIGN
+DCT.LP.CHAIN$
+      2701**DCL      3171>>ASSIGN
+DCT.LP.VFC$
+      2701**DCL      3186>>ASSIGN
+DCT.LP.VFCL
+      2701**DCL      3187>>ASSIGN
+DCT.MPC.FWNAME
+      2701**DCL      3050>>IF
+DCT.MPC.IOCHANX
+      2699**DCL      2699--REDEF
+DCT.MSG#
+      2691**DCL      3019>>IF       3020<>CALL     3021<<ASSIGN
+DCT.PM
+      2682**DCL      2986<>CALL     2987<>CALL
+DCT.SPSTAT
+      2683**DCL      3014<<ASSIGN
+DCT.SPSTAT.PRESENCE
+      2683**DCL      3013>>IF       3026<<ASSIGN
+DCT.SQ$
+      2671**DCL      2985>>IF       3254<>CALL     3268<>CALL     3279<>CALL
+DCT.STATE
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:84   
+      2681**DCL      3018>>IF
+DCT$
+      2606**DCL      2671--IMP-PTR  2956<<ASSIGN   2985>>IF       2986>>CALL     2987>>CALL     2999<<ASSIGN
+      3002<<ASSIGN   3004>>IF       3013>>IF       3014>>ASSIGN   3018>>IF       3019>>IF       3020>>CALL
+      3021>>ASSIGN   3023>>CALL     3025>>CALL     3026>>ASSIGN   3035<<ASSIGN   3036>>ASSIGN   3163>>CALL
+      3171>>ASSIGN   3186>>ASSIGN   3187>>ASSIGN   3244>>CALL     3254>>CALL     3268>>CALL     3279>>CALL
+      3285>>CALL
+DQH
+      2719**DCL      2947<>CALL     2949<>CALL     2975<>CALL     2991<>CALL     2992<>CALL     3006<>CALL
+      3007<>CALL
+DQH.CHANSTATE
+      2727**DCL      3294>>IF
+DQH.CHANSTATE.STOP
+      2727**DCL      3295>>IF
+DQH.IO$
+      2726**DCL      2955>>ASSIGN   2990>>IF
+DQH.IOCHANX
+      2721**DCL      2722--REDEF
+DQH.IOSTATUS$
+      2726**DCL      2958>>ASSIGN   2962>>ASSIGN   2978>>ASSIGN   2992>>CALL
+DQH.MBX$
+      2730**DCL      2731--REDEF    2960>>ASSIGN
+DQH.MPC$
+      2726**DCL      2980>>ASSIGN   3050>>IF       3299>>CALL
+DQH.SQH$
+      2725**DCL      2939>>ASSIGN   2998>>ASSIGN
+DQH.STATE
+      2723**DCL      2943>>IF       3293<<ASSIGN
+DQH$
+      2607**DCL      2719--IMP-PTR  2938<<ASSIGN   2939>>ASSIGN   2943>>IF       2947>>CALL     2949>>CALL
+      2955>>ASSIGN   2958>>ASSIGN   2960>>ASSIGN   2962>>ASSIGN   2975>>CALL     2978>>ASSIGN   2980>>ASSIGN
+      2989<<ASSIGN   2990>>IF       2991>>CALL     2992>>CALL     2992>>CALL     2997<<ASSIGN   2998>>ASSIGN
+      3001>>IF       3006>>CALL     3007>>CALL     3036<<ASSIGN   3050>>IF       3293>>ASSIGN   3294>>IF
+      3295>>IF       3299>>CALL
+EXTST$
+      2608**DCL      3043<<ASSIGN   3216<>CALL     3217>>ASSIGN   3218>>ASSIGN   3219>>ASSIGN   3220>>ASSIGN
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:85   
+      3221>>ASSIGN   3222>>ASSIGN   3223>>ASSIGN   3224>>CALL     3228<>CALL     3274>>IF       3279>>CALL
+      3309>>IF       3310>>ASSIGN   3311<>CALL
+HFC$LOCK
+       717**DCL-ENT  2941--CALL     3011--CALL     3251--CALL     3265--CALL     3276--CALL     3301--CALL
+      3318--CALL
+HFC$UNLOCK
+       717**DCL-ENT  2951--CALL     2967--CALL     2983--CALL     3016--CALL     3030--CALL     3257--CALL
+      3271--CALL     3282--CALL     3297--CALL     3324--CALL
+HW_EXT_STATUS
+       700**DCL      3209>>IF
+HW_IMX
+       703**DCL      2957>>IF
+HW_IOP
+       700**DCL      2963>>IF
+I
+      2609**DCL      3000<<DOINDEX  3001>>IF       3002>>ASSIGN
+INTLVL
+      2579**DCL         8--PROC     2936>>DOCASE   2947<>CALL     2949<>CALL     2961>>IF       2991<>CALL
+      2992<>CALL     3006<>CALL     3007<>CALL
+IOS.DCW
+      2749**DCL      2752--REDEF
+IOS.DCW.TALLY
+      2750**DCL      2750--REDEF
+IOS.IDCW.DC
+      2752**DCL      3075>>IF
+IOS.IDCW.EXTA
+      2752**DCL      2752--REDEF
+IOS.PCW
+      2754**DCL      2758--REDEF
+IOS.SEEK
+      2759**DCL      2760--REDEF    2761--REDEF
+IOS$
+      2610**DCL      2747--IMP-PTR
+IOSTAT.AESDCW
+      2769**DCL      2769--REDEF
+IOSTAT.EXTST
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:86   
+      2770**DCL      2978>>ASSIGN
+IOSTAT.LPW_RESIDUE
+      2767**DCL      2958>>ASSIGN
+IOSTAT.STATUS
+      2764**DCL      2962>>ASSIGN   2992<>CALL
+L1
+      3063**LABEL    3060--CALLALT
+L2
+      3136**LABEL    3134--CALLALT
+MBX.DCW.CONTROL.AE
+      2788**DCL      2788--REDEF
+MBX.LPW
+      2783**DCL      2960>>ASSIGN
+MBX.LPW.CONTROL.AE
+      2784**DCL      2784--REDEF
+N$DCT$
+      1329**DCL      3001>>IF       3002>>ASSIGN
+N$DCT$$
+      1195**DCL      1329--IMP-PTR  3001>>IF       3002>>ASSIGN
+N$FQ$
+      1195**DCL      1330--IMP-PTR
+N$REQ_INIT.BUFADDR
+      1214**DCL      1215--REDEF    1215--REDEF
+N$REQ_INIT.DLA.DRELADDR
+      1206**DCL      1206--REDEF
+N$REQ_INIT.DVE.EOMCHAR
+      1243**DCL      1244--REDEF
+N$REQ_INIT.EAINFO
+      1237**DCL      1237--REDEF
+N$REQ_INIT.EAINFOX
+      1237**DCL      1238--REDEF
+N$REQ_INIT.EVNTINFO
+      1238**DCL      1238--REDEF
+N$REQ_INIT.STATUS
+      1219**DCL      1225--REDEF
+NEWSTATE
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:87   
+      2611**DCL      3045<<ASSIGN   3051<<ASSIGN   3053<<ASSIGN   3063<<ASSIGN   3088<<ASSIGN   3121<<ASSIGN
+      3125<<ASSIGN   3136<<ASSIGN   3155>>IF       3155<<ASSIGN   3161>>IF       3163<>CALL     3223>>ASSIGN
+      3225<<ASSIGN   3235<<ASSIGN   3242>>IF       3243<<ASSIGN   3244<>CALL     3285<>CALL     3326<<ASSIGN
+NI$EXTST
+      2617**DCL      3240<>CALL     3262<>CALL
+NI$EXTST.EXTST
+      2621**DCL      2623--REDEF    2625--REDEF    2978<<ASSIGN   3037<<ASSIGN   3211>>ASSIGN
+NI$EXTST.EXTSTT.WRD
+      2624**DCL      3210>>IF
+NI$FQ$
+      1255**DCL      1331--IMP-PTR
+NI$IBUF$
+      1255**DCL      1331--IMP-PTR
+NI$IMXMBX_INIT.PAGED_BASE
+      1265**DCL      1266--REDEF    1266--REDEF
+NI$IMXMBX_INIT.SIZE
+      1267**DCL      1267--REDEF
+NI$IOERR.EXTST
+      2819**DCL      2821--REDEF    3211<<ASSIGN   3219--ASSIGN   3220--ASSIGN
+NI$IOERR.GOTEXTST
+      2842**DCL      3208>>IF       3212<<ASSIGN   3226<<ASSIGN
+NI$REQ_INIT.DCW
+      1289**DCL      1292--REDEF
+NI$REQ_INIT.DCW.TALLY
+      1290**DCL      1290--REDEF
+NI$REQ_INIT.IDCW.EXTA
+      1292**DCL      1292--REDEF
+NI$REQ_INIT.PCW
+      1294**DCL      1298--REDEF
+NI$REQ_INIT.SEEK
+      1299**DCL      1300--REDEF    1301--REDEF
+NI$RP.GATE
+      1333**DCL      3318<>CALL     3324<>CALL
+NI$RP.RP$
+      1333**DCL      3321<>CALL
+NI$RP$
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:88   
+      1303**DCL      1333--IMP-PTR  3318>>CALL     3321>>CALL     3324>>CALL
+NIA$LOGERR
+      2585**DCL-ENT  3158--CALL
+NIA$SPURINT
+      2586**DCL-ENT  2947--CALL     2949--CALL     2991--CALL     2992--CALL     3006--CALL     3007--CALL
+NIF$ANFAULT
+      2587**DCL-ENT  3134--CALL
+NIF$ANIOM
+      2588**DCL-ENT  3060--CALL
+NIK$OPMSG
+      2589**DCL-ENT  3163--CALL     3244--CALL
+NIM$ENQUEUE
+      1542**DCL-ENT  3321--CALL
+NIM$REQUEUE
+      1543**DCL-ENT  3254--CALL     3268--CALL     3279--CALL
+NIO$COMP
+      2591**DCL-ENT  3240--CALL     3262--CALL
+NIO$DCWBLD
+      2590**DCL-ENT  3173--CALL     3188--CALL     3200--CALL     3224--CALL
+NIO$SPCOMP
+      2592**DCL-ENT  3025--CALL
+NIQ$GET
+      2593**DCL-ENT  3166--CALL     3181--CALL     3196--CALL     3216--CALL
+NIQ$REL
+      2594**DCL-ENT  3176--CALL     3191--CALL     3203--CALL     3228--CALL     3311--CALL     3315--CALL
+NIS$MASK
+      2595**DCL-ENT  2975--CALL
+NIU$DEVSCHED
+      2596**DCL-ENT  3023--CALL     3285--CALL
+NIU$FIXARCT
+      2597**DCL-ENT  3149--CALL
+NIW$MPCSTOP
+      2599**DCL-ENT  3299--CALL
+NI_DBLZERO
+      1304**DCL      2947<>CALL     2991<>CALL     3006<>CALL
+NI_MBX_INIT.DCW.CONTROL.AE
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:89   
+      1325**DCL      1325--REDEF
+NI_MBX_INIT.LPW.CONTROL.AE
+      1321**DCL      1321--REDEF
+NOEXTST
+      3230**LABEL    3216--CALLALT
+NOEXTST0
+      3228**LABEL    3224--CALLALT
+NOLDTRAIN
+      3176**LABEL    3173--CALLALT
+NOLDVFC
+      3191**LABEL    3188--CALLALT
+NORESET
+      3203**LABEL    3200--CALLALT
+NO_MORE_RECS
+      3148**LABEL    3149--CALLALT
+OCI$MK_STTM
+      2600**DCL-ENT  3020--CALL
+PAR
+      2580**DCL         8--PROC     2938--ASSIGN   2989--ASSIGN   2997--ASSIGN   3034--ASSIGN
+PMN$COLLECT
+      2601**DCL-ENT  2986--CALL     2987--CALL
+RCVR
+      2646**DCL      3042<<ASSIGN   3049<<ASSIGN   3059<<ASSIGN   3067<<ASSIGN   3069<<ASSIGN   3091<<ASSIGN
+      3093<<ASSIGN   3099<<ASSIGN   3104<<ASSIGN   3109<<ASSIGN   3114<<ASSIGN   3118<<ASSIGN   3124<<ASSIGN
+      3128<<ASSIGN   3131<<ASSIGN   3133<<ASSIGN   3150<<ASSIGN   3150>>ASSIGN   3236<<ASSIGN
+RCVR.EXTST
+      2653**DCL      3215>>IF
+RCVR.LDTRAIN
+      2650**DCL      3165>>IF       3174<<ASSIGN
+RCVR.LDVFC
+      2649**DCL      3083<<ASSIGN   3180>>IF       3189<<ASSIGN
+RCVR.LOGERR
+      2652**DCL      3157>>IF       3159<<ASSIGN
+RCVR.NOINC
+      2651**DCL      3153>>IF
+RCVR.ONLYRETRY
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:90   
+      2655**DCL      3148>>IF
+RCVR.RESET
+      2648**DCL      3195>>IF       3201<<ASSIGN
+RCVR.RETRY
+      2647**DCL      3060<>CALL     3071<<ASSIGN   3085<<ASSIGN   3134<>CALL     3149<>CALL     3150>>IF
+      3153>>IF       3154>>IF       3241<<ASSIGN   3249>>IF
+RELCHAN
+      3292**PROC     2981--CALL
+RELOAD$
+      2656**DCL      3044<<ASSIGN   3166<>CALL     3167>>ASSIGN   3168>>ASSIGN   3169>>ASSIGN   3170>>ASSIGN
+      3171>>ASSIGN   3172>>ASSIGN   3173>>CALL     3176<>CALL     3181<>CALL     3182>>ASSIGN   3183>>ASSIGN
+      3184>>ASSIGN   3185>>ASSIGN   3186>>ASSIGN   3187>>ASSIGN   3188>>CALL     3191<>CALL     3196<>CALL
+      3197>>ASSIGN   3198>>ASSIGN   3199>>ASSIGN   3200>>CALL     3203<>CALL     3263>>IF       3268>>CALL
+      3313>>IF       3314>>ASSIGN   3315<>CALL
+REPOST
+      3289**LABEL    3166--CALLALT  3177--GOTO     3181--CALLALT  3192--GOTO     3196--CALLALT  3204--GOTO
+REQ
+      2854**DCL      3060<>CALL     3134<>CALL     3149<>CALL     3158<>CALL     3163<>CALL     3173<>CALL
+      3188<>CALL     3200<>CALL     3224<>CALL     3240<>CALL     3244<>CALL     3254<>CALL     3262<>CALL
+      3268<>CALL     3279<>CALL     3321<>CALL
+REQ.ARSIZE
+      2887**DCL      3120<<ASSIGN
+REQ.BUF$
+      2863**DCL      3171<<ASSIGN   3186<<ASSIGN   3219<<ASSIGN
+REQ.BUFADDR
+      2863**DCL      2864--REDEF    2864--REDEF
+REQ.BUFSIZE
+      2857**DCL      3172<<ASSIGN   3187<<ASSIGN   3220<<ASSIGN
+REQ.COMP
+      2888**DCL      3046>>IF       3146>>DOCASE   3169<<ASSIGN   3184<<ASSIGN   3199<<ASSIGN   3222<<ASSIGN
+REQ.DCT$
+      2855**DCL      2956>>ASSIGN   3035>>ASSIGN
+REQ.DLA
+      2854**DCL      3168<<ASSIGN   3168>>ASSIGN   3183<<ASSIGN   3183>>ASSIGN   3198<<ASSIGN   3198>>ASSIGN
+      3221<<ASSIGN   3221>>ASSIGN
+REQ.DLA.DRELADDR
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:91   
+      2855**DCL      2855--REDEF
+REQ.DVE.EOMCHAR
+      2892**DCL      2893--REDEF
+REQ.EAINFO
+      2886**DCL      2886--REDEF
+REQ.EAINFOX
+      2886**DCL      2887--REDEF
+REQ.ERR$
+      2876**DCL      3207>>IF       3208>>IF       3211>>ASSIGN   3212>>ASSIGN   3219>>ASSIGN   3226>>ASSIGN
+REQ.ERRCT
+      2856**DCL      3153<<ASSIGN   3153>>ASSIGN   3154>>IF       3162<<ASSIGN
+REQ.EVNTINFO
+      2887**DCL      2887--REDEF
+REQ.FC
+      2857**DCL      3046>>IF       3046>>IF       3075>>IF       3148>>IF       3167<<ASSIGN   3182<<ASSIGN
+      3197<<ASSIGN   3217<<ASSIGN   3234>>IF
+REQ.FLPW
+      2875**DCL      2958<<ASSIGN   2960<<ASSIGN
+REQ.IOFLG.REL
+      2859**DCL      2979>>IF
+REQ.IOQFLG.IOQUED
+      2897**DCL      3310<<ASSIGN   3314<<ASSIGN
+REQ.IOS$
+      2867**DCL      3075>>IF
+REQ.OPFLG
+      2860**DCL      3218<<ASSIGN
+REQ.OPFLG.BPF
+      2862**DCL      3170<<ASSIGN   3185<<ASSIGN
+REQ.POSTER
+      2866**DCL      3223<<ASSIGN   3235>>ASSIGN
+REQ.STATUS
+      2868**DCL      2874--REDEF    2962<<ASSIGN   2973<<ASSIGN
+REQ.STATUS.ININT
+      2870**DCL      3085>>ASSIGN   3086>>ASSIGN
+REQ.STATUS.IOM
+      2871**DCL      3058>>IF
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:92   
+REQ.STATUS.IOM.CHANNEL
+      2871**DCL      2964>>IF
+REQ.STATUS.MAJOR
+      2868**DCL      2964>>IF       2974>>IF       3056>>DOCASE
+REQ.STATUS.MINOR
+      2869**DCL      3070>>IF       3090>>IF       3092>>IF       3095>>IF       3098>>IF       3103>>IF
+      3108>>IF       3113>>IF
+REQ.STATUS.NCP
+      2872**DCL      3119<<ASSIGN
+REQ.STATUS.POWEROFF
+      2868**DCL      3048>>IF
+REQ.TYC
+      2876**DCL      3041<<ASSIGN
+REQ.TYC.EOF
+      2878**DCL      3096<<ASSIGN
+REQ.TYC.IOERR
+      2879**DCL      3066<<ASSIGN   3072<<ASSIGN   3086<<ASSIGN   3100<<ASSIGN   3105<<ASSIGN   3110<<ASSIGN
+      3115<<ASSIGN   3127<<ASSIGN   3130<<ASSIGN   3139<<ASSIGN   3239>>IF
+REQ.TYC.TIMO
+      2881**DCL      3122<<ASSIGN
+REQ$
+      2657**DCL      2854--IMP-PTR  2955<<ASSIGN   2956>>ASSIGN   2958>>ASSIGN   2960>>ASSIGN   2962>>ASSIGN
+      2964>>IF       2964>>IF       2973>>ASSIGN   2974>>IF       2979>>IF       3034<<ASSIGN   3035>>ASSIGN
+      3041>>ASSIGN   3046>>IF       3046>>IF       3046>>IF       3048>>IF       3056>>DOCASE   3058>>IF
+      3060>>CALL     3066>>ASSIGN   3070>>IF       3072>>ASSIGN   3075>>IF       3075>>IF       3085>>ASSIGN
+      3086>>ASSIGN   3086>>ASSIGN   3090>>IF       3092>>IF       3095>>IF       3096>>ASSIGN   3098>>IF
+      3100>>ASSIGN   3103>>IF       3105>>ASSIGN   3108>>IF       3110>>ASSIGN   3113>>IF       3115>>ASSIGN
+      3119>>ASSIGN   3120>>ASSIGN   3122>>ASSIGN   3127>>ASSIGN   3130>>ASSIGN   3134>>CALL     3139>>ASSIGN
+      3146>>DOCASE   3148>>IF       3149>>CALL     3153>>ASSIGN   3153>>ASSIGN   3154>>IF       3158>>CALL
+      3162>>ASSIGN   3163>>CALL     3168>>ASSIGN   3183>>ASSIGN   3198>>ASSIGN   3207>>IF       3208>>IF
+      3211>>ASSIGN   3212>>ASSIGN   3219>>ASSIGN   3221>>ASSIGN   3226>>ASSIGN   3234>>IF       3235>>ASSIGN
+      3239>>IF       3240>>CALL     3244>>CALL     3245<<ASSIGN   3254>>CALL     3261>>IF       3262>>CALL
+      3321>>CALL     3327<<ASSIGN
+SETREPOST
+      3308**PROC     3289--CALL
+SQH.DOOR
+PL6.E3A0      #001=NIL$POSTER File=NIL$POSTER.:E05TSI                            WED 07/30/97 03:33 Page:93   
+      2912**DCL      2912--REDEF
+SQH.FDCT
+      2912**DCL      3000>>DOINDEX  3000>>DOINDEX
+SQH.GATE
+      2912**DCL      2941<>CALL     2951<>CALL     2967<>CALL     2983<>CALL     3011<>CALL     3016<>CALL
+      3030<>CALL     3251<>CALL     3257<>CALL     3265<>CALL     3271<>CALL     3276<>CALL     3282<>CALL
+      3297<>CALL     3301<>CALL
+SQH.NDCT
+      2913**DCL      3000>>DOINDEX
+SQH$
+      2658**DCL      2912--IMP-PTR  2939<<ASSIGN   2941>>CALL     2951>>CALL     2967>>CALL     2983>>CALL
+      2998<<ASSIGN   3000>>DOINDEX  3000>>DOINDEX  3000>>DOINDEX  3011>>CALL     3016>>CALL     3030>>CALL
+      3251>>CALL     3257>>CALL     3265>>CALL     3271>>CALL     3276>>CALL     3282>>CALL     3297>>CALL
+      3301>>CALL
+STATUS
+      2581**DCL         8--PROC     2945--IF       2949<>CALL     2973>>ASSIGN   2995--IF       3005--IF
+      3007<>CALL     3014>>ASSIGN

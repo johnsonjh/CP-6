@@ -1,0 +1,3381 @@
+VERSION E05
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:1    
+        1        1        /*M* ELA$SYSLOG - SYSTEM LOGGING ROUTINE */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* */
+        8        8        /*D*  NAME:   ELA$SYSLOG
+        9        9              CALL:   CALL ELA$SYSLOG(TYPE,INFO,SIZE,MMINHIB,FILE,ERRCD) ALTRET(ERR);
+       10       10              INTERFACE:  SSS$SYSTIME,SSR$RUE,SSS$BLOCK,MME$CVM,MMD$STLPP
+       11       11              ENVIRONMENT:    Master mode
+       12       12              INPUT:  TYPE        The type code to be placed in the header.
+       13       13                      INFO        The variable format information to be placed
+       14       14                                  in the entry.
+       15       15                      SIZE        Size of info in words.
+       16       16                      MMINHIB     Set to '1'b to inhibit page stealing for buffers.
+       17       17                      FILE        Number of the file to which the record is
+       18       18                                  to be written.
+       19       19                      ERRCD       Error code on ALTRETURN.
+       20       20              DESCRIPTION:  ELA$SYSLOG provides a means to write records to
+       21       21              disk files in instances where it is difficult or impossible to
+       22       22              open a file, such as the monitor running at interrupt level.
+       23       23              Records written may have a maximum size of 1000 words.  The
+       24       24              file to be written is specified by a file number in the range
+       25       25              1 to 99, where the numbers 1 through 3 are reserved for special
+       26       26              system files.
+       27       27
+       28       28              File number one, the error log, and file number three, the
+       29       29              security log, are indexed files. The keys for error log and
+       30       30              security log records are the concatenation of the UTS and CNTR
+       31       31              fields of the record header.  This header is described in the
+       32       32              EL$ENTRY structure in the include file EL$TABLES.  All records
+       33       33              written to any file will have this header appended.  A record
+       34       34              written to file number two is processed by the ELF routine
+       35       35              AZC$ACCTNG and may or may not be written to the accounting log,
+       36       36              depending on the TYPE code in the record. Currently, all other
+       37       37              files are consecutive and have the name :ELFnn where nn is the
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:2    
+       38       38              file number.
+       39       39
+       40       40              If for any reason an entry cannot be made in the syslog buffers
+       41       41              when a call to ELA$SYSLOG is made, then the ALTRETURN is taken
+       42       42              with the error code returned in ERRCD.
+       43       43
+       44       44              ELA$SYSLOG may also be called from outside the monitor with
+       45       45              the M$WRSYSLOG service.  Error returns are made with the code
+       46       46              TDP-ERRCD-4 when M$WRSYSLOG is used.
+       47       47
+       48       48              Further documentation is contained in the ELF modules and
+       49       49              TD_CP6_C.
+       50       50                                                                           */
+       51       51        ELA$SYSLOG: PROC(TYPE,INFO,SIZE,MMINHIB,FILE,ERRCD) ALTRET;
+       52       52        /* PARAMETERS */
+       53       53    1   DCL INFO CHAR(SIZE4);
+       54       54        %INCLUDE ES_TABLES_M;
+       55      448        %ES$SECLOG (STCLASS=REDEF INFO);
+       56      725    1   DCL TYPE UBIN;
+       57      726    1   DCL SIZE SBIN;
+       58      727    1   DCL MMINHIB BIT(1) ALIGNED;
+       59      728    1   DCL FILE UBIN;
+       60      729    1   DCL ERRCD UBIN;
+       61      730        /* EXTERNAL SUBROUTINES */
+       62      731    1   DCL MME$CVM ENTRY(4) ALTRET;
+       63      732    1   DCL MMD$STLPP ENTRY(2) ALTRET;
+       64      733    1   DCL SSS$SYSTIME ENTRY(1);
+       65      734    1   DCL SSS$CACHE ENTRY;
+       66      735    1   DCL SSS$CACHEBP ENTRY;
+       67      736    1   DCL SSS$BLOCKM ENTRY;
+       68      737    1   DCL SSC$MONTIMR ENTRY(3);
+       69      738    1   DCL SSR$REG ENTRY(3) ALTRET;
+       70      739    1   DCL ELA$KICKELF ENTRY;
+       71      740        /* INTERNAL DATA */
+       72      741        %INCLUDE EL_DATA_C;
+       73      753        %INCLUDE EL_ERRORS_C;
+       74      764    1   DCL CVMPG UBIN(36);
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:3    
+       75      765    1   DCL BP$ PTR;
+       76      766    1   DCL TEMP  UBIN(36);
+       77      767    1   DCL SIZE4 SBIN;
+       78      768    1   DCL SSSIZE4 SBIN;
+       79      769    1   DCL HRSIZE4 SBIN;
+       80      770    1   DCL BUF$ PTR;
+       81      771    1   DCL FILEX UBIN WORD;
+       82      772    1   DCL KICK BIT(1) ALIGNED;
+       83      773    1   DCL LOST_ENTRIES UBIN(36) STATIC INIT(0);
+       84      774    1   DCL NXTWD UBIN WORD;
+       85      775        %SUB WORDS_PER_BUF = 1022;
+       86      776    1   DCL 1 SIZE_PROCERR BASED,
+       87      777    1         2 SIZE UBIN,
+       88      778    1         2 * UBIN,
+       89      779    1         2 HR CHAR(HRSIZE4);
+       90      780    1   DCL SSFRAME CHAR(SSSIZE4) BASED;
+       91      781        /* GLOBAL DATA */
+       92      782        %INCLUDE EL$TABLES;
+       93     1105        %EL$ENTRY (NAME=HDR,INFOSZ=SIZE4,STCLASS="BASED(BP$)");
+       94     1109        %EL$BUF(NAME=BUF,STCLASS="BASED(BUF$)");
+       95     1112        %EL$PROCERR (HRSIZE4=HRSIZE4);
+       96     1122        %INCLUDE EL_SUBS_C;
+       97     1206        %INCLUDE PC_SUBS_C;
+       98     1538        %INCLUDE B_MAGIC_C;
+       99     1656        %B_MPT (FPTN=B_MPT,STCLASS=SYMREF);
+      100     1749        %ES$SECLOG(NAME=ES$SECLOG_INIT,STCLASS=CONSTANT);
+      101     2026    1   DCL 1 EL_BUSY STATIC SYMDEF ALIGNED,
+      102     2027    1         2 LOCK SBIN INIT(1),
+      103     2028    1         2 WHO SBIN INIT(0);
+      104     2029    1   DCL EL_NUMPGS SBIN WORD STATIC SYMDEF INIT(0);
+      105     2030    1   DCL EL_FULLBUFS SBIN WORD STATIC SYMDEF INIT(0);
+      106     2031    1   DCL EL_MAXPGS SBIN WORD STATIC SYMDEF INIT(MAXPAGES#);
+      107     2032    1   DCL EL_FIRSTBUF UBIN STATIC SYMDEF INIT(0);
+      108     2033    1   DCL EL_CURBUF UBIN STATIC SYMDEF INIT(0);
+      109     2034    1   DCL EL_LOGERRS BIT(1) STATIC SYMDEF INIT('0'B);
+      110     2035        %INCLUDE JG_GHOSTS_C;
+      111     2125    1   DCL EL_GJOBUN UBIN BYTE STATIC SYMDEF ALIGNED INIT(JG_ELF#);
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:4    
+      112     2126    1   DCL EL_ERRCT SBIN STATIC SYMDEF INIT(0);
+      113     2127    1   DCL EL_KICKFLG BIT(1) STATIC SYMDEF ALIGNED INIT('0'B);
+      114     2128    1   DCL B$WINDOW$ PTR SYMREF;
+      115     2129    1   DCL B$USRT$ PTR SYMREF;
+      116     2130    1   DCL ES_LOGSYSEXIT UBIN WORD SYMREF;     /* SYMDEFed in ES_CNTRL_D             */
+      117     2131    1   DCL ES_LOGSYSACC UBIN WORD SYMREF;      /* SYMDEFed in ES_CNTRL_D             */
+      118     2132        %INCLUDE UM_CP6;
+      119     2984        %VLR_SITEINFO (FPTN=B_SITEINFO,STCLASS=SYMREF);
+      120     3003    1   DCL IT_CLOCKOK BIT(1) ALIGNED SYMREF;
+      121     3004    1   DCL IT_BOOTFLAG SBIN SYMREF;
+      122     3005        %INCLUDE I_SUBS_C;
+      123     3029        %INCLUDE B_STRINGS_C;
+      124     3158        %INCLUDE M_INFO_C;
+      125     3298        %INCLUDE HF_LOCK_C;
+      126     3312        %INCLUDE B$USER;
+      127     3528        %INCLUDE SS_SCHED_C;
+      128     3761        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:5    
+      129     3762    2           DO INHIBIT ;
+      130     3763    2              IF NOT EL_LOGERRS            /* Can we ERRLOG yet?                 */
+      131     3764    2                OR NOT IT_CLOCKOK          /* Clock garbage still.               */
+      132     3765    2              THEN
+      133     3766    2                 RETURN ;
+      134     3767
+      135     3768    2              IF SIZE > MAXSIZE#
+      136     3769    3              THEN DO ;
+      137     3770    3                 ERRCD = %E$NTRY2BIG ;
+      138     3771    3                 ALTRETURN ;
+      139     3772    3                 END ;
+      140     3773
+      141     3774    2              IF ADDR(FILE) = ADDR(NIL)
+      142     3775    2              THEN
+      143     3776    2                 FILEX = 1 ;
+      144     3777    2              ELSE
+      145     3778    2                 FILEX = FILE ;
+      146     3779
+      147     3780    2              IF FILEX > MAXFILE#
+      148     3781    3              THEN DO ;
+      149     3782    3                 ERRCD = %E$SLFILE ;
+      150     3783    3                 ALTRETURN ;
+      151     3784    3                 END ;
+      152     3785
+      153     3786    2              IF FILEX = EL_SEC
+      154     3787    3              THEN DO ;
+      155     3788                    /* Check to see if we really want to log this system exit
+      156     3789                       or logoff. It's easier to do here than in AZA$LOGOFF
+      157     3790                       since it's too much trouble to look at Control values
+      158     3791                       there.                                               */
+      159     3792    3                 IF ( TYPE = EL_SYS_EXIT
+      160     3793    3                   AND ES_LOGSYSEXIT = %PC_ES_NONE# )
+      161     3794                    /* Also check system accesses, since except for SLUG and PRESCAN,
+      162     3795                       its too much trouble for XSL$CHAM to check, either. */
+      163     3796    3                   OR ( TYPE = EL_SYS_ACCESS
+      164     3797    3                   AND MOD ( ES$SECLOG.REASON+2, 4 ) >= ES_LOGSYSACC )
+      165     3798    3                 THEN
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:6    
+      166     3799    3                    RETURN ;
+      167     3800    3                 END ;
+      168     3801    2              END /* INHIBIT */;
+      169     3802    1   LOGAGIN:
+      170     3803                %LOCK (G#=EL_BUSY);
+      171     3806    1           CALL SSS$CACHEBP;
+      172     3807    1           IF EL_CURBUF=0 THEN CALL GETNEWBUF ALTRET(LOSTERRU);
+      173     3808    2           ELSE DO;
+      174     3809    2              CVMPG=EL_CURBUF;
+      175     3810    2              CALL SSS$CACHE;
+      176     3811    2              CALL MME$CVM(%MONWSQ,%WINDOWHI,CVMPG,ERRCD) ALTRET(BADCVM);
+      177     3812    2              BUF$=PINCRW(B$WINDOW$,(%WINDOWHI-%WINDOWLO)*1024);
+      178     3813    2              END;
+      179     3814                /* Prescan and Slug (EL_SYS_ACCESS) will send the whole
+      180     3815                   security record ready made. Otherwise, entry information
+      181     3816                   needs to be copied to the security record and common stuff
+      182     3817                   filled in from the JIT and maybe DCBs.                */
+      183     3818    2           IF FILEX=EL_SEC AND TYPE~=EL_SYS_ACCESS THEN DO;
+      184     3819    2              CALL MAKE_SECLOG_REC ALTRET(LOSTERRU);
+      185     3820    2              SIZE4=SIZEW(ES$SECLOG_INIT)+HDRWDS#;
+      186     3821    2              END;
+      187     3822    2           ELSE DO;
+      188     3823    2              IF SIZE+HDRWDS#>BUF.WDSLFT THEN CALL GETNEWBUF ALTRET(LOSTERRU);
+      189     3824    2              NXTWD = WORDS_PER_BUF - BUF.WDSLFT;
+      190     3825    2              BP$=ADDR(BUF.INFO(NXTWD));
+      191     3826    2              SSSIZE4 = 0;
+      192     3827    2              HRSIZE4 = 0;
+      193     3828    2              IF TYPE = EL_PROCERR
+      194     3829    3              THEN DO;
+      195     3830    3                 SSSIZE4 = 4 * ADDR(INFO)->EL$PROCERR.SSSIZE;
+      196     3831    3                 HRSIZE4 = 4 * ADDR(INFO)->EL$PROCERR.HRSIZE;
+      197     3832    3                 END;
+      198     3833    2              SIZE4 = 4*SIZE - HRSIZE4 -SSSIZE4;
+      199     3834    2              HDR.INFO = INFO;
+      200     3835    2              IF SSSIZE4 > 0
+      201     3836    3              THEN DO;
+      202     3837    3                 SUBSTR(HDR.INFO,SIZE4,SSSIZE4) = B_MPT.SS$->SSFRAME;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:7    
+      203     3838    3                 IF HRSIZE4 > 0
+      204     3839    3                 THEN SUBSTR(HDR.INFO,SIZE4+SSSIZE4,HRSIZE4) =
+      205     3840    3                      ADDR(SIZE)->SIZE_PROCERR.HR;
+      206     3841    3                 END;
+      207     3842    2              SIZE4=SIZE+HDRWDS#;
+      208     3843    2              END;
+      209     3844    1           HDR.TYPE=TYPE;
+      210     3845    1           HDR.SIZE=SIZE4;
+      211     3846    1           HDR.FILE=FILEX;
+      212     3847    1           CALL SSS$SYSTIME(TEMP);
+      213     3848    1           HDR.UTS=TEMP;
+      214     3849    1           HDR.SITE_ID=B_SITEINFO.SITE_ID#;
+      215     3850    1           BUF.WDSLFT=BUF.WDSLFT-SIZE4;
+      216     3851    1           BUF.COUNT=BUF.COUNT+1;
+      217     3852    1           CALL SSS$CACHEBP;
+      218     3853    1           HDR.LOST=LOST_ENTRIES;
+      219     3854    1           LOST_ENTRIES=0;
+      220     3855    1           EL_ERRCT=EL_ERRCT+1;
+      221     3856    1           CALL SSS$CACHE;
+      222     3857    1           CALL MME$CVM(%MONWSQ,%WINDOWHI,-1,SIZE4);
+      223     3858    1           IF (MOD(EL_ERRCT,10)=1 OR FILEX=EL_ACCT OR FILEX=EL_SEC OR HRSIZE4>0)
+      224     3859    1             AND NOT EL_KICKFLG
+      225     3860    1           THEN KICK='1'B;
+      226     3861    1           ELSE KICK='0'B;
+      227     3862    1           IF KICK
+      228     3863    2           THEN DO;
+      229     3864    2              EL_KICKFLG='1'B;
+      230     3865    2              CALL SSC$MONTIMR(20,ENTADDR(ELA$KICKELF),0);
+      231     3866    2              END;
+      232     3867                %UNLOCK (G#=EL_BUSY);
+      233     3870    1           RETURN;
+      234     3871    1   LOSTERRU:;
+      235     3872                %UNLOCK (G#=EL_BUSY);
+      236     3875    1           IF FILEX = EL_SEC
+      237     3876    2           THEN DO;
+      238     3877    2              CALL SSR$REG (%SS_SL,,1);
+      239     3878    2              GOTO LOGAGIN;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:8    
+      240     3879    2              END;
+      241     3880    1   LOSTERR: LOST_ENTRIES=LOST_ENTRIES+1;
+      242     3881    1           CALL SSS$CACHE;
+      243     3882    1           ALTRETURN;
+      244     3883    1   BADCVM: ;
+      245     3884                %UNLOCK (G#=EL_BUSY);
+      246     3887    1           ALTRETURN;
+      247     3888        /**/
+      248     3889        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:9    
+      249     3890    1   GETNEWBUF: PROC ALTRET;
+      250     3891    2           CALL SSS$CACHEBP;
+      251     3892    2           IF (MMINHIB OR EL_NUMPGS>=EL_MAXPGS) AND
+      252     3893    3             (B$USRT$->B$USER.US(JG_ELF#) ~= %SS_SNULL) THEN DO;
+      253     3894    3              ERRCD=%E$NEEDPAGE;
+      254     3895    3              ALTRETURN;
+      255     3896    3              END;
+      256     3897    2           CALL SSS$CACHE;
+      257     3898    2           CALL MMD$STLPP(CVMPG,%MONWSQ) ALTRET(MMALT);
+      258     3899    2           CALL SSS$CACHEBP;
+      259     3900    2           IF EL_CURBUF~=0 THEN BUF.NXTBUF=CVMPG;
+      260     3901    2           CALL SSS$CACHE;
+      261     3902    2           CALL MME$CVM(%MONWSQ,%WINDOWHI,CVMPG,ERRCD) ALTRET(MMALT);
+      262     3903    2           BUF$=PINCRW(B$WINDOW$,(%WINDOWHI-%WINDOWLO)*1024);
+      263     3904    2           BUF='0'B;
+      264     3905    2           BUF.WDSLFT=1024-2;
+      265     3906    2           CALL SSS$CACHEBP;
+      266     3907    2           EL_CURBUF=CVMPG;
+      267     3908    2           IF EL_FIRSTBUF=0 THEN EL_FIRSTBUF=CVMPG;
+      268     3909    2           ELSE EL_FULLBUFS=EL_FULLBUFS+1;
+      269     3910    2           EL_NUMPGS=EL_NUMPGS+1;
+      270     3911    2           CALL SSS$CACHE;
+      271     3912    2           RETURN;
+      272     3913    2   MMALT:  CALL SSS$CACHEBP;
+      273     3914    2           ERRCD = %E$NEEDPAGE;
+      274     3915    2           ALTRETURN;
+      275     3916    2   END GETNEWBUF;
+      276     3917        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:10   
+      277     3918    1   MAKE_SECLOG_REC: PROC ALTRET;
+      278     3919
+      279     3920    2   DCL JDCB$ PTR;
+      280     3921    2   DCL SECLOG$ PTR;
+      281     3922    2   DCL INFO$ PTR;
+      282     3923    2   DCL JIT$ PTR;
+      283     3924    2   DCL NAMELEN UBIN;
+      284     3925    2   DCL FILENAME CHAR(NAMELEN) BASED;
+      285     3926
+      286     3927        %INCLUDE B$JIT;
+      287     4530        %INCLUDE F$DCB;
+      288     4579    2   DCL B$JIT$ PTR SYMREF;
+      289     4580
+      290     4581        %INCLUDE CP_6_SUBS;
+      291     5121        %INCLUDE ES_SUBS_E;
+      292     5147        %ES$SECLOG(NAME=ES$SECLOG,STCLASS="BASED(SECLOG$)");
+      293     5424        %ES$FILE_ACCESS(NAME=ES$FILE_ACCESS,STCLASS="BASED(INFO$)");
+      294     5438        %ES$PRIV_CHANGE(NAME=ES$PRIV_CHANGE,STCLASS="BASED(INFO$)");
+      295     5452        %ES$MON_SRV(NAME=ES$MON_SRV,STCLASS="BASED(INFO$)");
+      296     5467        %ES$SYS_EXIT(NAME=ES$SYS_EXIT,STCLASS="BASED(INFO$)");
+      297     5481        %ES$ARES_BYPASS(NAME=ES$ARES_BYPASS,STCLASS="BASED(INFO$)");
+      298     5497        /**/
+      299     5498    2           CALL SECLOG_REC_INIT ALTRET(LOST_ENTRY);
+      300     5499    2           SIZE4=4*SIZE;
+      301     5500    2           INFO$=ADDR(INFO);
+      302     5501    2           CALL SECLOG_COMMON;
+      303     5502    3           DO CASE(TYPE);
+      304     5503    3            CASE(EL_FILE_ACCESS);
+      305     5504    3              ES$SECLOG.REASON=ES$FILE_ACCESS.REASON#;
+      306     5505    3              ES$SECLOG.GRANTED=ES$FILE_ACCESS.GRANTED#;
+      307     5506    3              JDCB$=JIT$->B$JIT.DCB$;
+      308     5507    3              ES$SECLOG.FILE.FUN=JDCB$->F$DCB.FUN;
+      309     5508    3              ES$SECLOG.FILE.ASN=JDCB$->F$DCB.ASN;
+      310     5509    3              ES$SECLOG.FILE.FFLG=JDCB$->F$DCB.FFLG;
+      311     5510    3              ES$SECLOG.FILE.RES=JDCB$->F$DCB.RES;
+      312     5511    3              ES$SECLOG.FILE.SN=JDCB$->F$DCB.PSN;
+      313     5512    3              ES$SECLOG.FILE.ACCT=JDCB$->F$DCB.ACCT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:11   
+      314     5513    3              IF ES$SECLOG.FILE.ACCT=' ' THEN
+      315     5514    3                 ES$SECLOG.FILE.ACCT=JIT$->B$JIT.FACCN;
+      316     5515    3              NAMELEN=JDCB$->F$DCB.NAME.L;
+      317     5516    3              ES$SECLOG.FILE.NAME#.L=NAMELEN;
+      318     5517    3              ES$SECLOG.FILE.NAME#.C=ADDR(JDCB$->F$DCB.NAME.C)->FILENAME;
+      319     5518    3              IF ES$SECLOG.REASON=%ES_ACS_DENIED# THEN
+      320     5519    3                 ES$SECLOG.ERR=JIT$->B$JIT.ERR;
+      321     5520    3              JDCB$->F$DCB.LOGSEC='1'B;    /* Mark it logged in DCB              */
+      322     5521    3            CASE(EL_PRIV_CHANGE);
+      323     5522    3              ES$SECLOG.REASON=ES$PRIV_CHANGE.REASON#;
+      324     5523    3              ES$SECLOG.GRANTED=ES$PRIV_CHANGE.GRANTED#;
+      325     5524    3              ES$SECLOG.PRIVS_REQUIRED=ES$PRIV_CHANGE.PRIV#;
+      326     5525    3              IF ES$SECLOG.REASON=%ES_PRIV_CHNG_DENIED# THEN
+      327     5526    3                 ES$SECLOG.ERR=JIT$->B$JIT.ERR;
+      328     5527    3            CASE(EL_MON_SRV);
+      329     5528    3              ES$SECLOG.REASON=ES$MON_SRV.REASON#;
+      330     5529    3              ES$SECLOG.GRANTED=ES$MON_SRV.GRANTED#;
+      331     5530    3              ES$SECLOG.PMME_TYPE=ES$MON_SRV.PMME_TYPE#;
+      332     5531    3              ES$SECLOG.PRIVS_REQUIRED=ES$MON_SRV.PRIV#;
+      333     5532    3              IF ES$SECLOG.REASON=%ES_MON_SRV_DENIED# THEN
+      334     5533    3                 ES$SECLOG.ERR=JIT$->B$JIT.ERR;
+      335     5534    3            CASE(EL_SYS_EXIT);
+      336     5535    3              ES$SECLOG.REASON=%ES_LOG_ALL#;
+      337     5536    3              ES$SECLOG.GRANTED='1'B;
+      338     5537    3            CASE(EL_ARES_BYPASS);
+      339     5538    3              IF ES$ARES_BYPASS.REASON#=0 THEN
+      340     5539    3                 ES$SECLOG.REASON=%ES_PRIV_USER#;
+      341     5540    3              ELSE ES$SECLOG.REASON=ES$ARES_BYPASS.REASON#;
+      342     5541    3              ES$SECLOG.GRANTED=ES$ARES_BYPASS.GRANTED#;
+      343     5542    3              ES$SECLOG.FILE.FUN=%UPDATE#;
+      344     5543    3              ES$SECLOG.FILE.ASN=%FILE#;
+      345     5544    3              ES$SECLOG.FILE.SN=ES$ARES_BYPASS.PSN#;
+      346     5545    3              ES$SECLOG.FILE.ACCT=ES$ARES_BYPASS.ACCT#;
+      347     5546    3              ES$SECLOG.FILE.NAME#=ES$ARES_BYPASS.MODEL_NAME;
+      348     5547    3            CASE(ELSE);
+      349     5548                            /* No idea what this is, so just write it as it came.     */
+      350     5549    3              ES$SECLOG='0'B;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:12   
+      351     5550    3              HDR.INFO=INFO;
+      352     5551    3            END;
+      353     5552
+      354     5553    2           RETURN;
+      355     5554    2   LOST_ENTRY:;
+      356     5555    2           ALTRETURN;
+      357     5556        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:13   
+      358     5557    2   SECLOG_REC_INIT: PROC ALTRET;
+      359     5558        /**/
+      360     5559    3           IF SIZEW(ES$SECLOG_INIT) + HDRWDS# > BUF.WDSLFT THEN
+      361     5560    3              CALL GETNEWBUF ALTRET(LOST_IT);
+      362     5561    3           NXTWD=WORDS_PER_BUF - BUF.WDSLFT;
+      363     5562    3           BP$=ADDR(BUF.INFO(NXTWD));
+      364     5563    3           SECLOG$=PINCRW(BP$,HDRWDS#);
+      365     5564    3           SECLOG$->ES$SECLOG=ES$SECLOG_INIT;
+      366     5565    3           RETURN;
+      367     5566
+      368     5567    3   LOST_IT:;
+      369     5568    3           ALTRETURN;
+      370     5569
+      371     5570    3   END SECLOG_REC_INIT;
+      372     5571        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:14   
+      373     5572    2   SECLOG_COMMON: PROC;
+      374     5573        /**/
+      375     5574        %INCLUDE B$P;
+      376     5658        %INCLUDE NK$LDCT;
+      377     5760        %NK$LDCT (STCLASS="BASED(JIT$)");
+      378     5806        %INCLUDE KQ_MAC_C;
+      379     8356        %INCLUDE KC$CP6V_C;
+      380     8476        %INCLUDE KC_CP6;
+      381     9036        %KQ_CG (STCLASS=BASED);
+      382     9775        %INCLUDE FM$CFU;
+      383     9820        %INCLUDE FM$SET;
+      384     9847        %FM$CFU(BASED="BASED(JIT$)");
+      385     9853        %FM$CFUA(BASED="BASED(JIT$)");
+      386     9859        %FM$SET(BASED="BASED(F$CFU$)");
+      387     9864        %FM$CFUN;
+      388     9867    3   DCL F$CFU$ PTR SYMREF READONLY;
+      389     9868
+      390     9869    3   DCL S$CU$ PTR SYMREF;
+      391     9870
+      392     9871    3   DCL FMO$GETDOMAIN ENTRY(1);
+      393     9872
+      394     9873    3   DCL LMDCB$ PTR;
+      395     9874    3   DCL WSR SBIN;
+      396     9875    3   DCL CHAR40 CHAR(40) BASED;
+      397     9876        /**/
+      398     9877    3           IF TYPE=EL_SYS_EXIT THEN
+      399     9878    3              IF ES$SYS_EXIT.REASON#~=0 THEN
+      400     9879    3                 JIT$=INFO$;               /* first byte of a jit is nonzero.    */
+      401     9880    4              ELSE DO;                /* KIA calls with a pointer to the LDCT    */
+      402     9881    4                 JIT$=ES$SYS_EXIT.JIT$;    /* gather whatever we can from there  */
+      403     9882    4                 ES$SECLOG.MODE=%M_TP#;
+      404     9883    4                 ES$SECLOG.ACCN=NK$LDCT.DEVNM;
+      405     9884    4                 ES$SECLOG.UNAME=NK$LDCT.LOGON_ACCT;
+      406     9885    4                 ES$SECLOG.TSLINE.FEX=NK$LDCT.RLCID.NODE;
+      407     9886    4                 ES$SECLOG.TSLINE.PORT=BITBIN(NK$LDCT.TERMID.CHAN);
+      408     9887    4                 ES$SECLOG.TSLINE.LEV=NK$LDCT.TERMID.LEV;
+      409     9888    4                 ES$SECLOG.TSLINE.SUBDEVICE=BITBIN(NK$LDCT.TERMID.SUB);
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:15   
+      410     9889    4                 ES$SECLOG.TSLINE.SUBSUBDEVICE=BITBIN(NK$LDCT.TERMID.SUBSUB);
+      411     9890    5                 IF NK$LDCT.CG$~=ADDR(NIL) THEN DO;
+      412     9891    5                    JIT$=NK$LDCT.CG$->KQ_CG.CFU$;
+      413     9892    5                    IF JIT$=ADDR(NIL) THEN EXIT;
+      414     9893    5                    ES$SECLOG.PROC_NAME.C=PINCRC(F$CFU$,FM$CFU.NAMEX)->FM$CFUN.C;
+      415     9894    5                    ES$SECLOG.PROC_NAME.L=PINCRC(F$CFU$,FM$CFU.NAMEX)->FM$CFUN.L;
+      416     9895    5                    JIT$=PINCRW(F$CFU$,FM$CFU.ACCTX);
+      417     9896    5                    ES$SECLOG.PROC_ACCT=FM$CFUA.ACCT;
+      418     9897    5                    ES$SECLOG.PROC_PSN=FM$SET.PSN(FM$CFUA.SETX);
+      419     9898    5                    END;
+      420     9899    4                 RETURN;
+      421     9900    4                 END;
+      422     9901    3           ELSE JIT$=B$JIT$;
+      423     9902    3           ADDR(ES$SECLOG.MODE)->CHAR40=JIT$->CHAR40;
+      424     9903    3           ES$SECLOG.PRIV_ACTIVE=JIT$->B$JIT.PRIV.ACTIVE;
+      425     9904    3           ES$SECLOG.PRIV=JIT$->B$JIT.PRIV.AUTH;
+      426     9905    3           ES$SECLOG.PRIV_PRC=JIT$->B$JIT.PRIV.PRC;
+      427     9906    3           ES$SECLOG.PPRIV=JIT$->B$JIT.PPRIV;
+      428     9907    3           IF JIT$->B$JIT.MODE = %M_INT# THEN
+      429     9908    3              GOTO INT;                    /* Current guy is the originator      */
+      430     9909    3           ES$SECLOG.ORIG_MODE=JIT$->B$JIT.ORIGINATOR_MODE;
+      431     9910    4           DO CASE(JIT$->B$JIT.ORIGINATOR_MODE);
+      432     9911    4            CASE(%M_BATCH#);
+      433     9912    4              ES$SECLOG.DEVICE=JIT$->B$JIT.ORIGINATOR_PORT.FROM_CR.DEVICE;
+      434     9913    4              ES$SECLOG.DEVICE_TNAME=JIT$->B$JIT.ORIGINATOR_PORT.FROM_CR.TNAME;
+      435     9914    4            CASE(%M_GHOST#);
+      436     9915    4              ES$SECLOG.ORIG_SYSID=JIT$->B$JIT.ORIGINATOR_PORT.FROM_GHOST.SYSID;
+      437     9916    4            CASE(%M_INT#);
+      438     9917    4   INT:       ;
+      439     9918    4              ES$SECLOG.TSLINE.FEX=JIT$->B$JIT.TSLINE.FEX;
+      440     9919    4              ES$SECLOG.TSLINE.PORT=JIT$->B$JIT.TSLINE.PORT;
+      441     9920    4              ES$SECLOG.TSLINE.LEV=JIT$->B$JIT.TSLINE.LEV;
+      442     9921    4              ES$SECLOG.TSLINE.SUBDEVICE=JIT$->B$JIT.TSLINE.SUBDEVICE;
+      443     9922    4              ES$SECLOG.TSLINE.SUBSUBDEVICE=JIT$->B$JIT.TSLINE.SUBSUBDEVICE;
+      444     9923    4            END;
+      445     9924    3           CALL FMO$GETDOMAIN(WSR);
+      446     9925    3           ES$SECLOG.DOMAYN=WSR;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:16   
+      447     9926    4           DO CASE(WSR);
+      448     9927    4            CASE(%CPWSR,%DBWSR,%ASLWSR);
+      449     9928    4              ES$SECLOG.PROC_ACCT=':SYS';
+      450     9929    4              ES$SECLOG.PROC_PSN='SYS';
+      451     9930    4              IF WSR=%CPWSR THEN
+      452     9931    4                 ES$SECLOG.PROC_NAME=B$P$->B$P.NAME(S$CU$->B$U.ACP);
+      453     9932    4              ELSE IF WSR=%DBWSR THEN
+      454     9933    4                    ES$SECLOG.PROC_NAME=B$P$->B$P.NAME(S$CU$->B$U.DB);
+      455     9934    4                 ELSE
+      456     9935    4                    ES$SECLOG.PROC_NAME=B$P$->B$P.NAME(S$CU$->B$U.ASL);
+      457     9936    4            CASE(ELSE);
+      458     9937    4              LMDCB$=DCBADDR(%M$LM#);
+      459     9938    4              IF LMDCB$->F$DCB.DCBNAME.N~='M$LM' THEN
+      460     9939    4                 LMDCB$=DCBADDR(%M$DRIBBLE2#); /* M$LM dcbnum is -3              */
+      461     9940    5              IF LMDCB$->F$DCB.FCD THEN DO;
+      462     9941    5                 ES$SECLOG.PROC_NAME=LMDCB$->F$DCB.NAME;
+      463     9942    5                 ES$SECLOG.PROC_ACCT=LMDCB$->F$DCB.ACCT;
+      464     9943    5                 IF ES$SECLOG.PROC_ACCT=' ' THEN
+      465     9944    5                    ES$SECLOG.PROC_ACCT=JIT$->B$JIT.FACCN;
+      466     9945    5                 ES$SECLOG.PROC_PSN=LMDCB$->F$DCB.PSN;
+      467     9946    5                 END;
+      468     9947    4            END;                           /* End Do Case(WSR)                   */
+      469     9948    3           RETURN;
+      470     9949    3   END SECLOG_COMMON;
+      471     9950    2   END MAKE_SECLOG_REC;
+      472     9951    1   END ELA$SYSLOG;
+      473     9952        %EOD;
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:17   
+--  Include file information  --
+
+   FM$SET.:E05TOU  is referenced.
+   FM$CFU.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+   KC$CP6V_C.:E05TOU  is referenced.
+   KQ_MAC_C.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+   B$P.:E05TOU  cannot be made into a system file and is referenced.
+   ES_SUBS_E.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   F$DCB.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+   B$JIT.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   I_SUBS_C.:E05TOU  is referenced.
+   UM_CP6.:E05TOU  is referenced.
+   JG_GHOSTS_C.:E05TOU  is referenced.
+   B_MAGIC_C.:E05TOU  is referenced.
+   PC_SUBS_C.:E05TOU  is referenced.
+   EL_SUBS_C.:E05TOU  is referenced.
+   EL$TABLES.:E05TOU  is referenced.
+   EL_ERRORS_C.:E05TOU  is referenced.
+   EL_DATA_C.:E05TOU  is referenced.
+   ES_TABLES_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure ELA$SYSLOG.
+
+   Procedure ELA$SYSLOG requires 796 words for executable code.
+   Procedure ELA$SYSLOG requires 34 words of local(AUTO) storage.
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:18   
+
+ Object Unit name= ELA$SYSLOG                                 File name= ELA$SYSLOG.:E05TOU
+ UTS= JUL 29 '97 15:17:24.44 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Data  even  none    12     14  ELA$SYSLOG
+    1  RoData even  UTS     52     64  ELA$SYSLOG
+    2   Proc  even  none   796   1434  ELA$SYSLOG
+    3  RoData even  none    14     16  ELA$SYSLOG
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes    yes     yes      Std        6  ELA$SYSLOG
+
+  ****  Data defs  ****
+
+ Sect OctLoc  Name                           Sect OctLoc  Name
+    0      1  EL_BUSY                            0      3  EL_NUMPGS
+    0      4  EL_FULLBUFS                        0      5  EL_MAXPGS
+    0      6  EL_FIRSTBUF                        0      7  EL_CURBUF
+    0     10  EL_LOGERRS                         0     11  EL_GJOBUN
+    0     12  EL_ERRCT                           0     13  EL_KICKFLG
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:19   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 HFC$LOCK
+         yes           Std       0 SSS$CACHEBP
+         yes           Std       1 HFC$UNLOCK
+ yes     yes           Std       3 SSR$REG
+         yes           Std       0 SSS$CACHE
+         yes           Std       1 SSS$SYSTIME
+         yes           Std       3 SSC$MONTIMR
+ yes     yes           Std       4 MME$CVM
+         yes           Std       0 ELA$KICKELF
+ yes     yes           Std       2 MMD$STLPP
+         yes           Std       1 FMO$GETDOMAIN
+                       nStd      0 X66_AUTO_N
+                       nStd      0 X66_ARET
+                       nStd      0 X66_AALT
+                       Std       0 B_CONSPOOL_D
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     B_MPT                                 B$WINDOW$                             B$USRT$
+     ES_LOGSYSEXIT                         ES_LOGSYSACC                          B_SITEINFO
+     IT_CLOCKOK                            B$JIT$                                B$P$
+r    F$CFU$                                S$CU$                                 B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ROSID                                 ISSID
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:20   
+
+
+        1        1        /*M* ELA$SYSLOG - SYSTEM LOGGING ROUTINE */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* */
+        8        8        /*D*  NAME:   ELA$SYSLOG
+        9        9              CALL:   CALL ELA$SYSLOG(TYPE,INFO,SIZE,MMINHIB,FILE,ERRCD) ALTRET(ERR);
+       10       10              INTERFACE:  SSS$SYSTIME,SSR$RUE,SSS$BLOCK,MME$CVM,MMD$STLPP
+       11       11              ENVIRONMENT:    Master mode
+       12       12              INPUT:  TYPE        The type code to be placed in the header.
+       13       13                      INFO        The variable format information to be placed
+       14       14                                  in the entry.
+       15       15                      SIZE        Size of info in words.
+       16       16                      MMINHIB     Set to '1'b to inhibit page stealing for buffers.
+       17       17                      FILE        Number of the file to which the record is
+       18       18                                  to be written.
+       19       19                      ERRCD       Error code on ALTRETURN.
+       20       20              DESCRIPTION:  ELA$SYSLOG provides a means to write records to
+       21       21              disk files in instances where it is difficult or impossible to
+       22       22              open a file, such as the monitor running at interrupt level.
+       23       23              Records written may have a maximum size of 1000 words.  The
+       24       24              file to be written is specified by a file number in the range
+       25       25              1 to 99, where the numbers 1 through 3 are reserved for special
+       26       26              system files.
+       27       27
+       28       28              File number one, the error log, and file number three, the
+       29       29              security log, are indexed files. The keys for error log and
+       30       30              security log records are the concatenation of the UTS and CNTR
+       31       31              fields of the record header.  This header is described in the
+       32       32              EL$ENTRY structure in the include file EL$TABLES.  All records
+       33       33              written to any file will have this header appended.  A record
+       34       34              written to file number two is processed by the ELF routine
+       35       35              AZC$ACCTNG and may or may not be written to the accounting log,
+       36       36              depending on the TYPE code in the record. Currently, all other
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:21   
+       37       37              files are consecutive and have the name :ELFnn where nn is the
+       38       38              file number.
+       39       39
+       40       40              If for any reason an entry cannot be made in the syslog buffers
+       41       41              when a call to ELA$SYSLOG is made, then the ALTRETURN is taken
+       42       42              with the error code returned in ERRCD.
+       43       43
+       44       44              ELA$SYSLOG may also be called from outside the monitor with
+       45       45              the M$WRSYSLOG service.  Error returns are made with the code
+       46       46              TDP-ERRCD-4 when M$WRSYSLOG is used.
+       47       47
+       48       48              Further documentation is contained in the ELF modules and
+       49       49              TD_CP6_C.
+       50       50                                                                           */
+       51       51        ELA$SYSLOG: PROC(TYPE,INFO,SIZE,MMINHIB,FILE,ERRCD) ALTRET;
+
+     51  2 000000   000000 700200 xent  ELA$SYSLOG   TSX0  ! X66_AUTO_N
+         2 000001   000042 000006                    ZERO    34,6
+
+       52       52        /* PARAMETERS */
+       53       53    1   DCL INFO CHAR(SIZE4);
+       54       54        %INCLUDE ES_TABLES_M;
+       55      448        %ES$SECLOG (STCLASS=REDEF INFO);
+       56      725    1   DCL TYPE UBIN;
+       57      726    1   DCL SIZE SBIN;
+       58      727    1   DCL MMINHIB BIT(1) ALIGNED;
+       59      728    1   DCL FILE UBIN;
+       60      729    1   DCL ERRCD UBIN;
+       61      730        /* EXTERNAL SUBROUTINES */
+       62      731    1   DCL MME$CVM ENTRY(4) ALTRET;
+       63      732    1   DCL MMD$STLPP ENTRY(2) ALTRET;
+       64      733    1   DCL SSS$SYSTIME ENTRY(1);
+       65      734    1   DCL SSS$CACHE ENTRY;
+       66      735    1   DCL SSS$CACHEBP ENTRY;
+       67      736    1   DCL SSS$BLOCKM ENTRY;
+       68      737    1   DCL SSC$MONTIMR ENTRY(3);
+       69      738    1   DCL SSR$REG ENTRY(3) ALTRET;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:22   
+       70      739    1   DCL ELA$KICKELF ENTRY;
+       71      740        /* INTERNAL DATA */
+       72      741        %INCLUDE EL_DATA_C;
+       73      753        %INCLUDE EL_ERRORS_C;
+       74      764    1   DCL CVMPG UBIN(36);
+       75      765    1   DCL BP$ PTR;
+       76      766    1   DCL TEMP  UBIN(36);
+       77      767    1   DCL SIZE4 SBIN;
+       78      768    1   DCL SSSIZE4 SBIN;
+       79      769    1   DCL HRSIZE4 SBIN;
+       80      770    1   DCL BUF$ PTR;
+       81      771    1   DCL FILEX UBIN WORD;
+       82      772    1   DCL KICK BIT(1) ALIGNED;
+       83      773    1   DCL LOST_ENTRIES UBIN(36) STATIC INIT(0);
+       84      774    1   DCL NXTWD UBIN WORD;
+       85      775        %SUB WORDS_PER_BUF = 1022;
+       86      776    1   DCL 1 SIZE_PROCERR BASED,
+       87      777    1         2 SIZE UBIN,
+       88      778    1         2 * UBIN,
+       89      779    1         2 HR CHAR(HRSIZE4);
+       90      780    1   DCL SSFRAME CHAR(SSSIZE4) BASED;
+       91      781        /* GLOBAL DATA */
+       92      782        %INCLUDE EL$TABLES;
+       93     1105        %EL$ENTRY (NAME=HDR,INFOSZ=SIZE4,STCLASS="BASED(BP$)");
+       94     1109        %EL$BUF(NAME=BUF,STCLASS="BASED(BUF$)");
+       95     1112        %EL$PROCERR (HRSIZE4=HRSIZE4);
+       96     1122        %INCLUDE EL_SUBS_C;
+       97     1206        %INCLUDE PC_SUBS_C;
+       98     1538        %INCLUDE B_MAGIC_C;
+       99     1656        %B_MPT (FPTN=B_MPT,STCLASS=SYMREF);
+      100     1749        %ES$SECLOG(NAME=ES$SECLOG_INIT,STCLASS=CONSTANT);
+      101     2026    1   DCL 1 EL_BUSY STATIC SYMDEF ALIGNED,
+      102     2027    1         2 LOCK SBIN INIT(1),
+      103     2028    1         2 WHO SBIN INIT(0);
+      104     2029    1   DCL EL_NUMPGS SBIN WORD STATIC SYMDEF INIT(0);
+      105     2030    1   DCL EL_FULLBUFS SBIN WORD STATIC SYMDEF INIT(0);
+      106     2031    1   DCL EL_MAXPGS SBIN WORD STATIC SYMDEF INIT(MAXPAGES#);
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:23   
+      107     2032    1   DCL EL_FIRSTBUF UBIN STATIC SYMDEF INIT(0);
+      108     2033    1   DCL EL_CURBUF UBIN STATIC SYMDEF INIT(0);
+      109     2034    1   DCL EL_LOGERRS BIT(1) STATIC SYMDEF INIT('0'B);
+      110     2035        %INCLUDE JG_GHOSTS_C;
+      111     2125    1   DCL EL_GJOBUN UBIN BYTE STATIC SYMDEF ALIGNED INIT(JG_ELF#);
+      112     2126    1   DCL EL_ERRCT SBIN STATIC SYMDEF INIT(0);
+      113     2127    1   DCL EL_KICKFLG BIT(1) STATIC SYMDEF ALIGNED INIT('0'B);
+      114     2128    1   DCL B$WINDOW$ PTR SYMREF;
+      115     2129    1   DCL B$USRT$ PTR SYMREF;
+      116     2130    1   DCL ES_LOGSYSEXIT UBIN WORD SYMREF;     /* SYMDEFed in ES_CNTRL_D             */
+      117     2131    1   DCL ES_LOGSYSACC UBIN WORD SYMREF;      /* SYMDEFed in ES_CNTRL_D             */
+      118     2132        %INCLUDE UM_CP6;
+      119     2984        %VLR_SITEINFO (FPTN=B_SITEINFO,STCLASS=SYMREF);
+      120     3003    1   DCL IT_CLOCKOK BIT(1) ALIGNED SYMREF;
+      121     3004    1   DCL IT_BOOTFLAG SBIN SYMREF;
+      122     3005        %INCLUDE I_SUBS_C;
+      123     3029        %INCLUDE B_STRINGS_C;
+      124     3158        %INCLUDE M_INFO_C;
+      125     3298        %INCLUDE HF_LOCK_C;
+      126     3312        %INCLUDE B$USER;
+      127     3528        %INCLUDE SS_SCHED_C;
+      128     3761        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:24   
+      129     3762    2           DO INHIBIT ;
+
+      130     3763    2              IF NOT EL_LOGERRS            /* Can we ERRLOG yet?                 */
+
+   3763  2 000002   000010 234200 0                  SZN   ! EL_LOGERRS
+         2 000003   000006 605200 2                  TPL   ! s:3766
+         2 000004   000000 234200 xsym               SZN   ! IT_CLOCKOK
+         2 000005   000007 604200 2                  TMI   ! s:3768
+
+      131     3764    2                OR NOT IT_CLOCKOK          /* Clock garbage still.               */
+      132     3765    2              THEN
+      133     3766    2                 RETURN ;
+
+   3766  2 000006   000000 702200 xent               TSX2  ! X66_ARET
+
+      134     3767
+      135     3768    2              IF SIZE > MAXSIZE#
+
+   3768  2 000007   200005 470700                    LDP0  ! @SIZE,,AUTO
+         2 000010   000000 235300                    LDA   ! 0,,PR0
+         2 000011   001750 115207                    CMPA  ! 1000,DL
+         2 000012   000017 604600 2                  TMOZ  ! s:3774
+
+      136     3769    3              THEN DO ;
+
+      137     3770    3                 ERRCD = %E$NTRY2BIG ;
+
+   3770  2 000013   001750 236207                    LDQ   ! 1000,DL
+         2 000014   200010 471700                    LDP1  ! @ERRCD,,AUTO
+         2 000015   100000 756300                    STQ   ! 0,,PR1
+
+      138     3771    3                 ALTRETURN ;
+
+   3771  2 000016   000000 702200 xent               TSX2  ! X66_AALT
+
+      139     3772    3                 END ;
+      140     3773
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:25   
+      141     3774    2              IF ADDR(FILE) = ADDR(NIL)
+
+   3774  2 000017   200007 236300                    LDQ   ! @FILE,,AUTO
+         2 000020   000001 116200 xsym               CMPQ  ! B_VECTNIL+1
+         2 000021   000025 601200 2                  TNZ   ! s:3778
+
+      142     3775    2              THEN
+      143     3776    2                 FILEX = 1 ;
+
+   3776  2 000022   000001 235207                    LDA   ! 1,DL
+         2 000023   200020 755300                    STA   ! FILEX,,AUTO
+         2 000024   000030 710200 2                  TRA   ! s:3780
+
+      144     3777    2              ELSE
+      145     3778    2                 FILEX = FILE ;
+
+   3778  2 000025   200007 471700                    LDP1  ! @FILE,,AUTO
+         2 000026   100000 235300                    LDA   ! 0,,PR1
+         2 000027   200020 755300                    STA   ! FILEX,,AUTO
+
+      146     3779
+      147     3780    2              IF FILEX > MAXFILE#
+
+   3780  2 000030   000144 115207                    CMPA  ! 100,DL
+         2 000031   000036 602200 2                  TNC   ! s:3786
+
+      148     3781    3              THEN DO ;
+
+      149     3782    3                 ERRCD = %E$SLFILE ;
+
+   3782  2 000032   001753 235207                    LDA   ! 1003,DL
+         2 000033   200010 471700                    LDP1  ! @ERRCD,,AUTO
+         2 000034   100000 755300                    STA   ! 0,,PR1
+
+      150     3783    3                 ALTRETURN ;
+
+   3783  2 000035   000000 702200 xent               TSX2  ! X66_AALT
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:26   
+
+      151     3784    3                 END ;
+      152     3785
+      153     3786    2              IF FILEX = EL_SEC
+
+   3786  2 000036   000003 115207                    CMPA  ! 3,DL
+         2 000037   000061 601200 2                  TNZ   ! LOGAGIN
+
+      154     3787    3              THEN DO ;
+
+      155     3788                    /* Check to see if we really want to log this system exit
+      156     3789                       or logoff. It's easier to do here than in AZA$LOGOFF
+      157     3790                       since it's too much trouble to look at Control values
+      158     3791                       there.                                               */
+      159     3792    3                 IF ( TYPE = EL_SYS_EXIT
+
+   3792  2 000040   200003 471700                    LDP1  ! @TYPE,,AUTO
+         2 000041   100000 235300                    LDA   ! 0,,PR1
+         2 000042   000771 115207                    CMPA  ! 505,DL
+         2 000043   000046 601200 2                  TNZ   ! s:3792+6
+         2 000044   000000 235200 xsym               LDA   ! ES_LOGSYSEXIT
+         2 000045   000060 600200 2                  TZE   ! s:3799
+         2 000046   100000 235300                    LDA   ! 0,,PR1
+         2 000047   000770 115207                    CMPA  ! 504,DL
+         2 000050   000061 601200 2                  TNZ   ! LOGAGIN
+         2 000051   200004 473700                    LDP3  ! @INFO,,AUTO
+         2 000052   300000 236300                    LDQ   ! 0,,PR3
+         2 000053   000033 772200                    QRL   ! 27
+         2 000054   000002 036207                    ADLQ  ! 2,DL
+         2 000055   000003 376207                    ANQ   ! 3,DL
+         2 000056   000000 116200 xsym               CMPQ  ! ES_LOGSYSACC
+         2 000057   000061 602200 2                  TNC   ! LOGAGIN
+
+      160     3793    3                   AND ES_LOGSYSEXIT = %PC_ES_NONE# )
+      161     3794                    /* Also check system accesses, since except for SLUG and PRESCAN,
+      162     3795                       its too much trouble for XSL$CHAM to check, either. */
+      163     3796    3                   OR ( TYPE = EL_SYS_ACCESS
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:27   
+      164     3797    3                   AND MOD ( ES$SECLOG.REASON+2, 4 ) >= ES_LOGSYSACC )
+      165     3798    3                 THEN
+      166     3799    3                    RETURN ;
+
+   3799  2 000060   000000 702200 xent               TSX2  ! X66_ARET
+
+      167     3800    3                 END ;
+      168     3801    2              END /* INHIBIT */;
+
+      169     3802    1   LOGAGIN:
+      170     3803                %LOCK (G#=EL_BUSY);
+
+   3804  2 000061   000000 630400 3     LOGAGIN      EPPR0   0
+         2 000062   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         2 000063   000000 701000 xent               TSX1    HFC$LOCK
+         2 000064   000000 011000                    NOP     0
+
+      171     3806    1           CALL SSS$CACHEBP;
+
+   3806  2 000065   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000066   000000 701000 xent               TSX1    SSS$CACHEBP
+         2 000067   000000 011000                    NOP     0
+
+      172     3807    1           IF EL_CURBUF=0 THEN CALL GETNEWBUF ALTRET(LOSTERRU);
+
+   3807  2 000070   000007 235000 0                  LDA     EL_CURBUF
+         2 000071   000075 601000 2                  TNZ     s:3809
+
+   3807  2 000072   000433 701000 2                  TSX1    GETNEWBUF
+         2 000073   000376 702000 2                  TSX2    LOSTERRU
+         2 000074   000116 710000 2                  TRA     s:3818
+
+      173     3808    2           ELSE DO;
+
+      174     3809    2              CVMPG=EL_CURBUF;
+
+   3809  2 000075   200011 755100                    STA     CVMPG,,AUTO
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:28   
+
+      175     3810    2              CALL SSS$CACHE;
+
+   3810  2 000076   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000077   000000 701000 xent               TSX1    SSS$CACHE
+         2 000100   000000 011000                    NOP     0
+
+      176     3811    2              CALL MME$CVM(%MONWSQ,%WINDOWHI,CVMPG,ERRCD) ALTRET(BADCVM);
+
+   3811  2 000101   200010 236100                    LDQ     @ERRCD,,AUTO
+         2 000102   200041 756100                    STQ     WSR+5,,AUTO
+         2 000103   200011 630500                    EPPR0   CVMPG,,AUTO
+         2 000104   200040 450500                    STP0    WSR+4,,AUTO
+         2 000105   000002 237000 3                  LDAQ    2
+         2 000106   200036 757100                    STAQ    WSR+2,,AUTO
+         2 000107   200036 630500                    EPPR0   WSR+2,,AUTO
+         2 000110   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         2 000111   000000 701000 xent               TSX1    MME$CVM
+         2 000112   000426 702000 2                  TSX2    BADCVM
+
+      177     3812    2              BUF$=PINCRW(B$WINDOW$,(%WINDOWHI-%WINDOWLO)*1024);
+
+   3812  2 000113   000000 236000 xsym               LDQ     B$WINDOW$
+         2 000114   022000 036003                    ADLQ    9216,DU
+         2 000115   200017 756100                    STQ     BUF$,,AUTO
+
+      178     3813    2              END;
+
+      179     3814                /* Prescan and Slug (EL_SYS_ACCESS) will send the whole
+      180     3815                   security record ready made. Otherwise, entry information
+      181     3816                   needs to be copied to the security record and common stuff
+      182     3817                   filled in from the JIT and maybe DCBs.                */
+      183     3818    2           IF FILEX=EL_SEC AND TYPE~=EL_SYS_ACCESS THEN DO;
+
+   3818  2 000116   200020 235100                    LDA     FILEX,,AUTO
+         2 000117   000003 115007                    CMPA    3,DL
+         2 000120   000132 601000 2                  TNZ     s:3823
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:29   
+         2 000121   200003 470500                    LDP0    @TYPE,,AUTO
+         2 000122   000000 235100                    LDA     0,,PR0
+         2 000123   000770 115007                    CMPA    504,DL
+         2 000124   000132 600000 2                  TZE     s:3823
+
+      184     3819    2              CALL MAKE_SECLOG_REC ALTRET(LOSTERRU);
+
+   3819  2 000125   000561 701000 2                  TSX1    MAKE_SECLOG_REC
+         2 000126   000376 702000 2                  TSX2    LOSTERRU
+
+      185     3820    2              SIZE4=SIZEW(ES$SECLOG_INIT)+HDRWDS#;
+
+   3820  2 000127   000066 235007                    LDA     54,DL
+         2 000130   200014 755100                    STA     SIZE4,,AUTO
+
+      186     3821    2              END;
+
+   3821  2 000131   000242 710000 2                  TRA     s:3844
+
+      187     3822    2           ELSE DO;
+
+      188     3823    2              IF SIZE+HDRWDS#>BUF.WDSLFT THEN CALL GETNEWBUF ALTRET(LOSTERRU);
+
+   3823  2 000132   200005 470500                    LDP0    @SIZE,,AUTO
+         2 000133   000000 235100                    LDA     0,,PR0
+         2 000134   000005 035007                    ADLA    5,DL
+         2 000135   200036 755100                    STA     WSR+2,,AUTO
+         2 000136   200017 471500                    LDP1    BUF$,,AUTO
+         2 000137   100001 236100                    LDQ     1,,PR1
+         2 000140   777777 376007                    ANQ     -1,DL
+         2 000141   200036 116100                    CMPQ    WSR+2,,AUTO
+         2 000142   000145 605000 2                  TPL     s:3824
+
+   3823  2 000143   000433 701000 2                  TSX1    GETNEWBUF
+         2 000144   000376 702000 2                  TSX2    LOSTERRU
+
+      189     3824    2              NXTWD = WORDS_PER_BUF - BUF.WDSLFT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:30   
+
+   3824  2 000145   200017 470500                    LDP0    BUF$,,AUTO
+         2 000146   000001 236100                    LDQ     1,,PR0
+         2 000147   777777 376007                    ANQ     -1,DL
+         2 000150   000027 676000 xsym               ERQ     B_VECTNIL+23
+         2 000151   001777 036007                    ADLQ    1023,DL
+         2 000152   200022 756100                    STQ     NXTWD,,AUTO
+
+      190     3825    2              BP$=ADDR(BUF.INFO(NXTWD));
+
+   3825  2 000153   000022 736000                    QLS     18
+         2 000154   000002 036003                    ADLQ    2,DU
+         2 000155   200017 036100                    ADLQ    BUF$,,AUTO
+         2 000156   200012 756100                    STQ     BP$,,AUTO
+
+      191     3826    2              SSSIZE4 = 0;
+
+   3826  2 000157   200015 450100                    STZ     SSSIZE4,,AUTO
+
+      192     3827    2              HRSIZE4 = 0;
+
+   3827  2 000160   200016 450100                    STZ     HRSIZE4,,AUTO
+
+      193     3828    2              IF TYPE = EL_PROCERR
+
+   3828  2 000161   200003 471500                    LDP1    @TYPE,,AUTO
+         2 000162   100000 235100                    LDA     0,,PR1
+         2 000163   000314 115007                    CMPA    204,DL
+         2 000164   000176 601000 2                  TNZ     s:3833
+
+      194     3829    3              THEN DO;
+
+      195     3830    3                 SSSIZE4 = 4 * ADDR(INFO)->EL$PROCERR.SSSIZE;
+
+   3830  2 000165   200004 473500                    LDP3    @INFO,,AUTO
+         2 000166   300011 236100                    LDQ     9,,PR3
+         2 000167   000020 772000                    QRL     16
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:31   
+         2 000170   000004 376000 3                  ANQ     4
+         2 000171   200015 756100                    STQ     SSSIZE4,,AUTO
+
+      196     3831    3                 HRSIZE4 = 4 * ADDR(INFO)->EL$PROCERR.HRSIZE;
+
+   3831  2 000172   300011 236100                    LDQ     9,,PR3
+         2 000173   000002 736000                    QLS     2
+         2 000174   000004 376000 3                  ANQ     4
+         2 000175   200016 756100                    STQ     HRSIZE4,,AUTO
+
+      197     3832    3                 END;
+
+      198     3833    2              SIZE4 = 4*SIZE - HRSIZE4 -SSSIZE4;
+
+   3833  2 000176   200005 473500                    LDP3    @SIZE,,AUTO
+         2 000177   300000 336100                    LCQ     0,,PR3
+         2 000200   000002 736000                    QLS     2
+         2 000201   200016 036100                    ADLQ    HRSIZE4,,AUTO
+         2 000202   200015 036100                    ADLQ    SSSIZE4,,AUTO
+         2 000203   000027 676000 xsym               ERQ     B_VECTNIL+23
+         2 000204   000001 036007                    ADLQ    1,DL
+         2 000205   200014 756100                    STQ     SIZE4,,AUTO
+
+      199     3834    2              HDR.INFO = INFO;
+
+   3834  2 000206   200004 474500                    LDP4    @INFO,,AUTO
+         2 000207   000000 620006                    EAX0    0,QL
+         2 000210   200012 475500                    LDP5    BP$,,AUTO
+         2 000211   200014 721100                    LXL1    SIZE4,,AUTO
+         2 000212   040140 100540                    MLR     fill='040'O
+         2 000213   400000 000010                    ADSC9   0,,PR4                   cn=0,n=*X0
+         2 000214   500005 000011                    ADSC9   5,,PR5                   cn=0,n=*X1
+
+      200     3835    2              IF SSSIZE4 > 0
+
+   3835  2 000215   200015 235100                    LDA     SSSIZE4,,AUTO
+         2 000216   000237 604400 2                  TMOZ    s:3842
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:32   
+
+      201     3836    3              THEN DO;
+
+      202     3837    3                 SUBSTR(HDR.INFO,SIZE4,SSSIZE4) = B_MPT.SS$->SSFRAME;
+
+   3837  2 000217   000000 476400 xsym               LDP6    B_MPT
+         2 000220   000000 620005                    EAX0    0,AL
+         2 000221   200015 721100                    LXL1    SSSIZE4,,AUTO
+         2 000222   200014 235100                    LDA     SIZE4,,AUTO
+         2 000223   040145 100540                    MLR     fill='040'O
+         2 000224   600000 000010                    ADSC9   0,,PR6                   cn=0,n=*X0
+         2 000225   500005 000011                    ADSC9   5,A,PR5                  cn=0,n=*X1
+
+      203     3838    3                 IF HRSIZE4 > 0
+
+   3838  2 000226   200016 235100                    LDA     HRSIZE4,,AUTO
+         2 000227   000237 604400 2                  TMOZ    s:3842
+
+      204     3839    3                 THEN SUBSTR(HDR.INFO,SIZE4+SSSIZE4,HRSIZE4) =
+
+   3839  2 000230   200014 236100                    LDQ     SIZE4,,AUTO
+         2 000231   200015 036100                    ADLQ    SSSIZE4,,AUTO
+         2 000232   000000 620005                    EAX0    0,AL
+         2 000233   200016 722100                    LXL2    HRSIZE4,,AUTO
+         2 000234   040146 100540                    MLR     fill='040'O
+         2 000235   300002 000010                    ADSC9   2,,PR3                   cn=0,n=*X0
+         2 000236   500005 000012                    ADSC9   5,Q,PR5                  cn=0,n=*X2
+
+      205     3840    3                      ADDR(SIZE)->SIZE_PROCERR.HR;
+      206     3841    3                 END;
+
+      207     3842    2              SIZE4=SIZE+HDRWDS#;
+
+   3842  2 000237   300000 235100                    LDA     0,,PR3
+         2 000240   000005 035007                    ADLA    5,DL
+         2 000241   200014 755100                    STA     SIZE4,,AUTO
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:33   
+      208     3843    2              END;
+
+      209     3844    1           HDR.TYPE=TYPE;
+
+   3844  2 000242   200003 470500                    LDP0    @TYPE,,AUTO
+         2 000243   200012 471500                    LDP1    BP$,,AUTO
+         2 000244   000000 236100                    LDQ     0,,PR0
+         2 000245   000033 736000                    QLS     27
+         2 000246   100000 552140                    STBQ    0,'40'O,PR1
+
+      210     3845    1           HDR.SIZE=SIZE4;
+
+   3845  2 000247   200014 236100                    LDQ     SIZE4,,AUTO
+         2 000250   000011 736000                    QLS     9
+         2 000251   100000 552130                    STBQ    0,'30'O,PR1
+
+      211     3846    1           HDR.FILE=FILEX;
+
+   3846  2 000252   200020 720100                    LXL0    FILEX,,AUTO
+         2 000253   100004 440100                    SXL0    4,,PR1
+
+      212     3847    1           CALL SSS$SYSTIME(TEMP);
+
+   3847  2 000254   200013 633500                    EPPR3   TEMP,,AUTO
+         2 000255   200036 453500                    STP3    WSR+2,,AUTO
+         2 000256   200036 630500                    EPPR0   WSR+2,,AUTO
+         2 000257   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         2 000260   000000 701000 xent               TSX1    SSS$SYSTIME
+         2 000261   000000 011000                    NOP     0
+
+      213     3848    1           HDR.UTS=TEMP;
+
+   3848  2 000262   200012 470500                    LDP0    BP$,,AUTO
+         2 000263   000100 100500                    MLR     fill='000'O
+         2 000264   200013 000004                    ADSC9   TEMP,,AUTO               cn=0,n=4
+         2 000265   000000 600004                    ADSC9   0,,PR0                   cn=3,n=4
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:34   
+      214     3849    1           HDR.SITE_ID=B_SITEINFO.SITE_ID#;
+
+   3849  2 000266   040100 100400                    MLR     fill='040'O
+         2 000267   000066 000006 xsym               ADSC9   B_SITEINFO+54            cn=0,n=6
+         2 000270   000002 000006                    ADSC9   2,,PR0                   cn=0,n=6
+
+      215     3850    1           BUF.WDSLFT=BUF.WDSLFT-SIZE4;
+
+   3850  2 000271   200017 471500                    LDP1    BUF$,,AUTO
+         2 000272   100001 236100                    LDQ     1,,PR1
+         2 000273   777777 376007                    ANQ     -1,DL
+         2 000274   200014 136100                    SBLQ    SIZE4,,AUTO
+         2 000275   000000 620006                    EAX0    0,QL
+         2 000276   100001 440100                    SXL0    1,,PR1
+
+      216     3851    1           BUF.COUNT=BUF.COUNT+1;
+
+   3851  2 000277   100001 236100                    LDQ     1,,PR1
+         2 000300   001000 036003                    ADLQ    512,DU
+         2 000301   100001 552140                    STBQ    1,'40'O,PR1
+
+      217     3852    1           CALL SSS$CACHEBP;
+
+   3852  2 000302   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000303   000000 701000 xent               TSX1    SSS$CACHEBP
+         2 000304   000000 011000                    NOP     0
+
+      218     3853    1           HDR.LOST=LOST_ENTRIES;
+
+   3853  2 000305   000000 720000 0                  LXL0    LOST_ENTRIES
+         2 000306   200012 470500                    LDP0    BP$,,AUTO
+         2 000307   000004 740100                    STX0    4,,PR0
+
+      219     3854    1           LOST_ENTRIES=0;
+
+   3854  2 000310   000000 450000 0                  STZ     LOST_ENTRIES
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:35   
+      220     3855    1           EL_ERRCT=EL_ERRCT+1;
+
+   3855  2 000311   000012 054000 0                  AOS     EL_ERRCT
+
+      221     3856    1           CALL SSS$CACHE;
+
+   3856  2 000312   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000313   000000 701000 xent               TSX1    SSS$CACHE
+         2 000314   000000 011000                    NOP     0
+
+      222     3857    1           CALL MME$CVM(%MONWSQ,%WINDOWHI,-1,SIZE4);
+
+   3857  2 000315   200014 630500                    EPPR0   SIZE4,,AUTO
+         2 000316   200041 450500                    STP0    WSR+5,,AUTO
+         2 000317   000005 236000 3                  LDQ     5
+         2 000320   200040 756100                    STQ     WSR+4,,AUTO
+         2 000321   000002 237000 3                  LDAQ    2
+         2 000322   200036 757100                    STAQ    WSR+2,,AUTO
+         2 000323   200036 630500                    EPPR0   WSR+2,,AUTO
+         2 000324   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         2 000325   000000 701000 xent               TSX1    MME$CVM
+         2 000326   000000 011000                    NOP     0
+
+      223     3858    1           IF (MOD(EL_ERRCT,10)=1 OR FILEX=EL_ACCT OR FILEX=EL_SEC OR HRSIZE4>0)
+
+   3858  2 000327   000012 236000 0                  LDQ     EL_ERRCT
+         2 000330   000012 506007                    DIV     10,DL
+         2 000331   000044 733000                    LRS     36
+         2 000332   000001 116007                    CMPQ    1,DL
+         2 000333   000343 600000 2                  TZE     s:3858+12
+         2 000334   200020 235100                    LDA     FILEX,,AUTO
+         2 000335   000002 115007                    CMPA    2,DL
+         2 000336   000343 600000 2                  TZE     s:3858+12
+         2 000337   000003 115007                    CMPA    3,DL
+         2 000340   000343 600000 2                  TZE     s:3858+12
+         2 000341   200016 236100                    LDQ     HRSIZE4,,AUTO
+         2 000342   000350 604400 2                  TMOZ    s:3861
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:36   
+         2 000343   000013 234000 0                  SZN     EL_KICKFLG
+         2 000344   000350 604000 2                  TMI     s:3861
+
+      224     3859    1             AND NOT EL_KICKFLG
+      225     3860    1           THEN KICK='1'B;
+
+   3860  2 000345   400000 236003                    LDQ     -131072,DU
+         2 000346   200021 756100                    STQ     KICK,,AUTO
+         2 000347   000351 710000 2                  TRA     s:3862
+
+      226     3861    1           ELSE KICK='0'B;
+
+   3861  2 000350   200021 450100                    STZ     KICK,,AUTO
+
+      227     3862    1           IF KICK
+
+   3862  2 000351   200021 234100                    SZN     KICK,,AUTO
+         2 000352   000371 605000 2                  TPL     s:3868
+
+      228     3863    2           THEN DO;
+
+      229     3864    2              EL_KICKFLG='1'B;
+
+   3864  2 000353   400000 236003                    LDQ     -131072,DU
+         2 000354   000013 756000 0                  STQ     EL_KICKFLG
+
+      230     3865    2              CALL SSC$MONTIMR(20,ENTADDR(ELA$KICKELF),0);
+
+   3865  2 000355   000000 636000 xent               EAQ     ELA$KICKELF
+         2 000356   200036 756100                    STQ     WSR+2,,AUTO
+         2 000357   000007 236000 3                  LDQ     7
+         2 000360   200041 756100                    STQ     WSR+5,,AUTO
+         2 000361   200036 630500                    EPPR0   WSR+2,,AUTO
+         2 000362   200040 450500                    STP0    WSR+4,,AUTO
+         2 000363   000010 236000 3                  LDQ     8
+         2 000364   200037 756100                    STQ     WSR+3,,AUTO
+         2 000365   200037 630500                    EPPR0   WSR+3,,AUTO
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:37   
+         2 000366   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         2 000367   000000 701000 xent               TSX1    SSC$MONTIMR
+         2 000370   000000 011000                    NOP     0
+
+      231     3866    2              END;
+
+      232     3867                %UNLOCK (G#=EL_BUSY);
+
+   3868  2 000371   000000 630400 3                  EPPR0   0
+         2 000372   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         2 000373   000000 701000 xent               TSX1    HFC$UNLOCK
+         2 000374   000000 011000                    NOP     0
+
+      233     3870    1           RETURN;
+
+   3870  2 000375   000000 702200 xent               TSX2  ! X66_ARET
+
+   3862  2 000376                       LOSTERRU     null
+      234     3871    1   LOSTERRU:;
+      235     3872                %UNLOCK (G#=EL_BUSY);
+
+   3873  2 000376   000000 630400 3                  EPPR0   0
+         2 000377   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         2 000400   000000 701000 xent               TSX1    HFC$UNLOCK
+         2 000401   000000 011000                    NOP     0
+
+      236     3875    1           IF FILEX = EL_SEC
+
+   3875  2 000402   200020 235100                    LDA     FILEX,,AUTO
+         2 000403   000003 115007                    CMPA    3,DL
+         2 000404   000417 601000 2                  TNZ     LOSTERR
+
+      237     3876    2           THEN DO;
+
+      238     3877    2              CALL SSR$REG (%SS_SL,,1);
+
+   3877  2 000405   000002 236000 3                  LDQ     2
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:38   
+         2 000406   200040 756100                    STQ     WSR+4,,AUTO
+         2 000407   000001 236000 xsym               LDQ     B_VECTNIL+1
+         2 000410   000012 235000 3                  LDA     10
+         2 000411   200036 757100                    STAQ    WSR+2,,AUTO
+         2 000412   200036 630500                    EPPR0   WSR+2,,AUTO
+         2 000413   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         2 000414   000000 701000 xent               TSX1    SSR$REG
+         2 000415   000000 011000                    NOP     0
+
+      239     3878    2              GOTO LOGAGIN;
+
+   3878  2 000416   000061 710000 2                  TRA     LOGAGIN
+
+      240     3879    2              END;
+      241     3880    1   LOSTERR: LOST_ENTRIES=LOST_ENTRIES+1;
+
+   3880  2 000417   000000 236000 0     LOSTERR      LDQ     LOST_ENTRIES
+         2 000420   000001 036007                    ADLQ    1,DL
+         2 000421   000000 756000 0                  STQ     LOST_ENTRIES
+
+      242     3881    1           CALL SSS$CACHE;
+
+   3881  2 000422   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000423   000000 701000 xent               TSX1    SSS$CACHE
+         2 000424   000000 011000                    NOP     0
+
+      243     3882    1           ALTRETURN;
+
+   3882  2 000425   000000 702200 xent               TSX2  ! X66_AALT
+
+   3875  2 000426                       BADCVM       null
+      244     3883    1   BADCVM: ;
+      245     3884                %UNLOCK (G#=EL_BUSY);
+
+   3885  2 000426   000000 630400 3                  EPPR0   0
+         2 000427   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         2 000430   000000 701000 xent               TSX1    HFC$UNLOCK
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:39   
+         2 000431   000000 011000                    NOP     0
+
+      246     3887    1           ALTRETURN;
+
+   3887  2 000432   000000 702200 xent               TSX2  ! X66_AALT
+
+      247     3888        /**/
+      248     3889        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:40   
+      249     3890    1   GETNEWBUF: PROC ALTRET;
+
+   3890  2 000433   200034 741300       GETNEWBUF    STX1  ! LMDCB$+1,,AUTO
+
+      250     3891    2           CALL SSS$CACHEBP;
+
+   3891  2 000434   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000435   000000 701000 xent               TSX1    SSS$CACHEBP
+         2 000436   000000 011000                    NOP     0
+
+      251     3892    2           IF (MMINHIB OR EL_NUMPGS>=EL_MAXPGS) AND
+
+   3892  2 000437   200006 470500                    LDP0    @MMINHIB,,AUTO
+         2 000440   000000 234100                    SZN     0,,PR0
+         2 000441   000445 604000 2                  TMI     s:3892+6
+         2 000442   000003 236000 0                  LDQ     EL_NUMPGS
+         2 000443   000005 116000 0                  CMPQ    EL_MAXPGS
+         2 000444   000457 604000 2                  TMI     s:3897
+         2 000445   000000 471400 xsym               LDP1    B$USRT$
+         2 000446   100151 236100                    LDQ     105,,PR1
+         2 000447   770000 376003                    ANQ     -4096,DU
+         2 000450   300000 116003                    CMPQ    98304,DU
+         2 000451   000457 600000 2                  TZE     s:3897
+
+      252     3893    3             (B$USRT$->B$USER.US(JG_ELF#) ~= %SS_SNULL) THEN DO;
+
+      253     3894    3              ERRCD=%E$NEEDPAGE;
+
+   3894  2 000452   001752 235007                    LDA     1002,DL
+         2 000453   200010 473500                    LDP3    @ERRCD,,AUTO
+         2 000454   300000 755100                    STA     0,,PR3
+
+      254     3895    3              ALTRETURN;
+
+   3895  2 000455   200034 221300                    LDX1  ! LMDCB$+1,,AUTO
+         2 000456   000000 702211                    TSX2  ! 0,X1
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:41   
+      255     3896    3              END;
+      256     3897    2           CALL SSS$CACHE;
+
+   3897  2 000457   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000460   000000 701000 xent               TSX1    SSS$CACHE
+         2 000461   000000 011000                    NOP     0
+
+      257     3898    2           CALL MMD$STLPP(CVMPG,%MONWSQ) ALTRET(MMALT);
+
+   3898  2 000462   000002 236000 3                  LDQ     2
+         2 000463   200037 756100                    STQ     WSR+3,,AUTO
+         2 000464   200011 630500                    EPPR0   CVMPG,,AUTO
+         2 000465   200036 450500                    STP0    WSR+2,,AUTO
+         2 000466   200036 630500                    EPPR0   WSR+2,,AUTO
+         2 000467   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         2 000470   000000 701000 xent               TSX1    MMD$STLPP
+         2 000471   000551 702000 2                  TSX2    MMALT
+
+      258     3899    2           CALL SSS$CACHEBP;
+
+   3899  2 000472   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000473   000000 701000 xent               TSX1    SSS$CACHEBP
+         2 000474   000000 011000                    NOP     0
+
+      259     3900    2           IF EL_CURBUF~=0 THEN BUF.NXTBUF=CVMPG;
+
+   3900  2 000475   000007 235000 0                  LDA     EL_CURBUF
+         2 000476   000502 600000 2                  TZE     s:3901
+
+   3900  2 000477   200017 470500                    LDP0    BUF$,,AUTO
+         2 000500   200011 236100                    LDQ     CVMPG,,AUTO
+         2 000501   000000 756100                    STQ     0,,PR0
+
+      260     3901    2           CALL SSS$CACHE;
+
+   3901  2 000502   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000503   000000 701000 xent               TSX1    SSS$CACHE
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:42   
+         2 000504   000000 011000                    NOP     0
+
+      261     3902    2           CALL MME$CVM(%MONWSQ,%WINDOWHI,CVMPG,ERRCD) ALTRET(MMALT);
+
+   3902  2 000505   200010 236100                    LDQ     @ERRCD,,AUTO
+         2 000506   200041 756100                    STQ     WSR+5,,AUTO
+         2 000507   200011 630500                    EPPR0   CVMPG,,AUTO
+         2 000510   200040 450500                    STP0    WSR+4,,AUTO
+         2 000511   000002 237000 3                  LDAQ    2
+         2 000512   200036 757100                    STAQ    WSR+2,,AUTO
+         2 000513   200036 630500                    EPPR0   WSR+2,,AUTO
+         2 000514   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         2 000515   000000 701000 xent               TSX1    MME$CVM
+         2 000516   000551 702000 2                  TSX2    MMALT
+
+      262     3903    2           BUF$=PINCRW(B$WINDOW$,(%WINDOWHI-%WINDOWLO)*1024);
+
+   3903  2 000517   000000 236000 xsym               LDQ     B$WINDOW$
+         2 000520   022000 036003                    ADLQ    9216,DU
+         2 000521   200017 756100                    STQ     BUF$,,AUTO
+
+      263     3904    2           BUF='0'B;
+
+   3904  2 000522   200017 470500                    LDP0    BUF$,,AUTO
+         2 000523   010000 220003                    LDX0    4096,DU
+         2 000524   000140 100400                    MLR     fill='000'O
+         2 000525   000002 000001 xsym               ADSC9   B_VECTNIL+2              cn=0,n=1
+         2 000526   000000 000010                    ADSC9   0,,PR0                   cn=0,n=*X0
+
+      264     3905    2           BUF.WDSLFT=1024-2;
+
+   3905  2 000527   001776 221003                    LDX1    1022,DU
+         2 000530   000001 441100                    SXL1    1,,PR0
+
+      265     3906    2           CALL SSS$CACHEBP;
+
+   3906  2 000531   000002 631400 xsym               EPPR1   B_VECTNIL+2
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:43   
+         2 000532   000000 701000 xent               TSX1    SSS$CACHEBP
+         2 000533   000000 011000                    NOP     0
+
+      266     3907    2           EL_CURBUF=CVMPG;
+
+   3907  2 000534   200011 235100                    LDA     CVMPG,,AUTO
+         2 000535   000007 755000 0                  STA     EL_CURBUF
+
+      267     3908    2           IF EL_FIRSTBUF=0 THEN EL_FIRSTBUF=CVMPG;
+
+   3908  2 000536   000006 236000 0                  LDQ     EL_FIRSTBUF
+         2 000537   000542 601000 2                  TNZ     s:3909
+
+   3908  2 000540   000006 755000 0                  STA     EL_FIRSTBUF
+         2 000541   000543 710000 2                  TRA     s:3910
+
+      268     3909    2           ELSE EL_FULLBUFS=EL_FULLBUFS+1;
+
+   3909  2 000542   000004 054000 0                  AOS     EL_FULLBUFS
+
+      269     3910    2           EL_NUMPGS=EL_NUMPGS+1;
+
+   3910  2 000543   000003 054000 0                  AOS     EL_NUMPGS
+
+      270     3911    2           CALL SSS$CACHE;
+
+   3911  2 000544   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         2 000545   000000 701000 xent               TSX1    SSS$CACHE
+         2 000546   000000 011000                    NOP     0
+
+      271     3912    2           RETURN;
+
+   3912  2 000547   200034 221300                    LDX1  ! LMDCB$+1,,AUTO
+         2 000550   000001 702211                    TSX2  ! 1,X1
+
+      272     3913    2   MMALT:  CALL SSS$CACHEBP;
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:44   
+   3913  2 000551   000002 631400 xsym  MMALT        EPPR1   B_VECTNIL+2
+         2 000552   000000 701000 xent               TSX1    SSS$CACHEBP
+         2 000553   000000 011000                    NOP     0
+
+      273     3914    2           ERRCD = %E$NEEDPAGE;
+
+   3914  2 000554   001752 235007                    LDA     1002,DL
+         2 000555   200010 470500                    LDP0    @ERRCD,,AUTO
+         2 000556   000000 755100                    STA     0,,PR0
+
+      274     3915    2           ALTRETURN;
+
+   3915  2 000557   200034 221300                    LDX1  ! LMDCB$+1,,AUTO
+         2 000560   000000 702211                    TSX2  ! 0,X1
+
+      275     3916    2   END GETNEWBUF;
+      276     3917        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:45   
+      277     3918    1   MAKE_SECLOG_REC: PROC ALTRET;
+
+   3918  2 000561   200024 741300       MAKE_SECLOG* STX1  ! NXTWD+2,,AUTO
+
+      278     3919
+      279     3920    2   DCL JDCB$ PTR;
+      280     3921    2   DCL SECLOG$ PTR;
+      281     3922    2   DCL INFO$ PTR;
+      282     3923    2   DCL JIT$ PTR;
+      283     3924    2   DCL NAMELEN UBIN;
+      284     3925    2   DCL FILENAME CHAR(NAMELEN) BASED;
+      285     3926
+      286     3927        %INCLUDE B$JIT;
+      287     4530        %INCLUDE F$DCB;
+      288     4579    2   DCL B$JIT$ PTR SYMREF;
+      289     4580
+      290     4581        %INCLUDE CP_6_SUBS;
+      291     5121        %INCLUDE ES_SUBS_E;
+      292     5147        %ES$SECLOG(NAME=ES$SECLOG,STCLASS="BASED(SECLOG$)");
+      293     5424        %ES$FILE_ACCESS(NAME=ES$FILE_ACCESS,STCLASS="BASED(INFO$)");
+      294     5438        %ES$PRIV_CHANGE(NAME=ES$PRIV_CHANGE,STCLASS="BASED(INFO$)");
+      295     5452        %ES$MON_SRV(NAME=ES$MON_SRV,STCLASS="BASED(INFO$)");
+      296     5467        %ES$SYS_EXIT(NAME=ES$SYS_EXIT,STCLASS="BASED(INFO$)");
+      297     5481        %ES$ARES_BYPASS(NAME=ES$ARES_BYPASS,STCLASS="BASED(INFO$)");
+      298     5497        /**/
+      299     5498    2           CALL SECLOG_REC_INIT ALTRET(LOST_ENTRY);
+
+   5498  2 000562   001023 701000 2                  TSX1    SECLOG_REC_INIT
+         2 000563   001021 702000 2                  TSX2    LOST_ENTRY
+
+      300     5499    2           SIZE4=4*SIZE;
+
+   5499  2 000564   200005 470500                    LDP0    @SIZE,,AUTO
+         2 000565   000000 235100                    LDA     0,,PR0
+         2 000566   000002 735000                    ALS     2
+         2 000567   200014 755100                    STA     SIZE4,,AUTO
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:46   
+      301     5500    2           INFO$=ADDR(INFO);
+
+   5500  2 000570   200004 236100                    LDQ     @INFO,,AUTO
+         2 000571   200027 756100                    STQ     INFO$,,AUTO
+
+      302     5501    2           CALL SECLOG_COMMON;
+
+   5501  2 000572   001056 701000 2                  TSX1    SECLOG_COMMON
+         2 000573   000000 011000                    NOP     0
+
+      303     5502    3           DO CASE(TYPE);
+
+   5502  2 000574   200003 470500                    LDP0    @TYPE,,AUTO
+         2 000575   000000 235100                    LDA     0,,PR0
+         2 000576   000765 135007                    SBLA    501,DL
+         2 000577   000006 115007                    CMPA    6,DL
+         2 000600   000602 602005 2                  TNC     s:5502+6,AL
+         2 000601   001005 710000 2                  TRA     s:5549
+         2 000602   000610 710000 2                  TRA     s:5504
+         2 000603   000675 710000 2                  TRA     s:5522
+         2 000604   000717 710000 2                  TRA     s:5528
+         2 000605   001005 710000 2                  TRA     s:5549
+         2 000606   000743 710000 2                  TRA     s:5535
+         2 000607   000751 710000 2                  TRA     s:5538
+
+      304     5503    3            CASE(EL_FILE_ACCESS);
+
+      305     5504    3              ES$SECLOG.REASON=ES$FILE_ACCESS.REASON#;
+
+   5504  2 000610   200027 471500                    LDP1    INFO$,,AUTO
+         2 000611   200026 473500                    LDP3    SECLOG$,,AUTO
+         2 000612   100000 236100                    LDQ     0,,PR1
+         2 000613   300000 552140                    STBQ    0,'40'O,PR3
+
+      306     5505    3              ES$SECLOG.GRANTED=ES$FILE_ACCESS.GRANTED#;
+
+   5505  2 000614   100000 236100                    LDQ     0,,PR1
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:47   
+         2 000615   300000 676100                    ERQ     0,,PR3
+         2 000616   000400 376003                    ANQ     256,DU
+         2 000617   300000 656100                    ERSQ    0,,PR3
+
+      307     5506    3              JDCB$=JIT$->B$JIT.DCB$;
+
+   5506  2 000620   200030 474500                    LDP4    JIT$,,AUTO
+         2 000621   400232 236100                    LDQ     154,,PR4
+         2 000622   200025 756100                    STQ     JDCB$,,AUTO
+
+      308     5507    3              ES$SECLOG.FILE.FUN=JDCB$->F$DCB.FUN;
+
+   5507  2 000623   200025 475500                    LDP5    JDCB$,,AUTO
+         2 000624   500032 236100                    LDQ     26,,PR5
+         2 000625   000011 736000                    QLS     9
+         2 000626   300043 552140                    STBQ    35,'40'O,PR3
+
+      309     5508    3              ES$SECLOG.FILE.ASN=JDCB$->F$DCB.ASN;
+
+   5508  2 000627   500032 236100                    LDQ     26,,PR5
+         2 000630   000011 736000                    QLS     9
+         2 000631   300043 552120                    STBQ    35,'20'O,PR3
+
+      310     5509    3              ES$SECLOG.FILE.FFLG=JDCB$->F$DCB.FFLG;
+
+   5509  2 000632   500004 220100                    LDX0    4,,PR5
+         2 000633   300043 440100                    SXL0    35,,PR3
+
+      311     5510    3              ES$SECLOG.FILE.RES=JDCB$->F$DCB.RES;
+
+   5510  2 000634   500026 236100                    LDQ     22,,PR5
+         2 000635   300046 756100                    STQ     38,,PR3
+
+      312     5511    3              ES$SECLOG.FILE.SN=JDCB$->F$DCB.PSN;
+
+   5511  2 000636   040100 100500                    MLR     fill='040'O
+         2 000637   500024 000006                    ADSC9   20,,PR5                  cn=0,n=6
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:48   
+         2 000640   300044 400006                    ADSC9   36,,PR3                  cn=2,n=6
+
+      313     5512    3              ES$SECLOG.FILE.ACCT=JDCB$->F$DCB.ACCT;
+
+   5512  2 000641   500020 237100                    LDAQ    16,,PR5
+         2 000642   300047 755100                    STA     39,,PR3
+         2 000643   300050 756100                    STQ     40,,PR3
+
+      314     5513    3              IF ES$SECLOG.FILE.ACCT=' ' THEN
+
+   5513  2 000644   040000 106500                    CMPC    fill='040'O
+         2 000645   300047 000010                    ADSC9   39,,PR3                  cn=0,n=8
+         2 000646   000035 000001 xsym               ADSC9   B_VECTNIL+29             cn=0,n=1
+         2 000647   000653 601000 2                  TNZ     s:5515
+
+      315     5514    3                 ES$SECLOG.FILE.ACCT=JIT$->B$JIT.FACCN;
+
+   5514  2 000650   400006 237100                    LDAQ    6,,PR4
+         2 000651   300047 755100                    STA     39,,PR3
+         2 000652   300050 756100                    STQ     40,,PR3
+
+      316     5515    3              NAMELEN=JDCB$->F$DCB.NAME.L;
+
+   5515  2 000653   500010 236100                    LDQ     8,,PR5
+         2 000654   000033 772000                    QRL     27
+         2 000655   200031 756100                    STQ     NAMELEN,,AUTO
+
+      317     5516    3              ES$SECLOG.FILE.NAME#.L=NAMELEN;
+
+   5516  2 000656   000033 736000                    QLS     27
+         2 000657   300051 552140                    STBQ    41,'40'O,PR3
+
+      318     5517    3              ES$SECLOG.FILE.NAME#.C=ADDR(JDCB$->F$DCB.NAME.C)->FILENAME;
+
+   5517  2 000660   200031 721100                    LXL1    NAMELEN,,AUTO
+         2 000661   040100 100540                    MLR     fill='040'O
+         2 000662   500010 200011                    ADSC9   8,,PR5                   cn=1,n=*X1
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:49   
+         2 000663   300051 200037                    ADSC9   41,,PR3                  cn=1,n=31
+
+      319     5518    3              IF ES$SECLOG.REASON=%ES_ACS_DENIED# THEN
+
+   5518  2 000664   300000 236100                    LDQ     0,,PR3
+         2 000665   777000 376003                    ANQ     -512,DU
+         2 000666   001000 116003                    CMPQ    512,DU
+         2 000667   000672 601000 2                  TNZ     s:5520
+
+      320     5519    3                 ES$SECLOG.ERR=JIT$->B$JIT.ERR;
+
+   5519  2 000670   400012 236100                    LDQ     10,,PR4
+         2 000671   300013 756100                    STQ     11,,PR3
+
+      321     5520    3              JDCB$->F$DCB.LOGSEC='1'B;    /* Mark it logged in DCB              */
+
+   5520  2 000672   400000 236003                    LDQ     -131072,DU
+         2 000673   500102 256100                    ORSQ    66,,PR5
+         2 000674   001017 710000 2                  TRA     s:5553
+
+      322     5521    3            CASE(EL_PRIV_CHANGE);
+
+      323     5522    3              ES$SECLOG.REASON=ES$PRIV_CHANGE.REASON#;
+
+   5522  2 000675   200027 471500                    LDP1    INFO$,,AUTO
+         2 000676   200026 473500                    LDP3    SECLOG$,,AUTO
+         2 000677   100000 236100                    LDQ     0,,PR1
+         2 000700   300000 552140                    STBQ    0,'40'O,PR3
+
+      324     5523    3              ES$SECLOG.GRANTED=ES$PRIV_CHANGE.GRANTED#;
+
+   5523  2 000701   100000 236100                    LDQ     0,,PR1
+         2 000702   300000 676100                    ERQ     0,,PR3
+         2 000703   000400 376003                    ANQ     256,DU
+         2 000704   300000 656100                    ERSQ    0,,PR3
+
+      325     5524    3              ES$SECLOG.PRIVS_REQUIRED=ES$PRIV_CHANGE.PRIV#;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:50   
+
+   5524  2 000705   100001 236100                    LDQ     1,,PR1
+         2 000706   300041 756100                    STQ     33,,PR3
+
+      326     5525    3              IF ES$SECLOG.REASON=%ES_PRIV_CHNG_DENIED# THEN
+
+   5525  2 000707   300000 236100                    LDQ     0,,PR3
+         2 000710   777000 376003                    ANQ     -512,DU
+         2 000711   001000 116003                    CMPQ    512,DU
+         2 000712   001017 601000 2                  TNZ     s:5553
+
+      327     5526    3                 ES$SECLOG.ERR=JIT$->B$JIT.ERR;
+
+   5526  2 000713   200030 474500                    LDP4    JIT$,,AUTO
+         2 000714   400012 236100                    LDQ     10,,PR4
+         2 000715   300013 756100                    STQ     11,,PR3
+         2 000716   001017 710000 2                  TRA     s:5553
+
+      328     5527    3            CASE(EL_MON_SRV);
+
+      329     5528    3              ES$SECLOG.REASON=ES$MON_SRV.REASON#;
+
+   5528  2 000717   200027 471500                    LDP1    INFO$,,AUTO
+         2 000720   200026 473500                    LDP3    SECLOG$,,AUTO
+         2 000721   100000 236100                    LDQ     0,,PR1
+         2 000722   300000 552140                    STBQ    0,'40'O,PR3
+
+      330     5529    3              ES$SECLOG.GRANTED=ES$MON_SRV.GRANTED#;
+
+   5529  2 000723   100000 236100                    LDQ     0,,PR1
+         2 000724   300000 676100                    ERQ     0,,PR3
+         2 000725   000400 376003                    ANQ     256,DU
+         2 000726   300000 656100                    ERSQ    0,,PR3
+
+      331     5530    3              ES$SECLOG.PMME_TYPE=ES$MON_SRV.PMME_TYPE#;
+
+   5530  2 000727   100001 220100                    LDX0    1,,PR1
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:51   
+         2 000730   300042 740100                    STX0    34,,PR3
+
+      332     5531    3              ES$SECLOG.PRIVS_REQUIRED=ES$MON_SRV.PRIV#;
+
+   5531  2 000731   100002 236100                    LDQ     2,,PR1
+         2 000732   300041 756100                    STQ     33,,PR3
+
+      333     5532    3              IF ES$SECLOG.REASON=%ES_MON_SRV_DENIED# THEN
+
+   5532  2 000733   300000 236100                    LDQ     0,,PR3
+         2 000734   777000 376003                    ANQ     -512,DU
+         2 000735   001000 116003                    CMPQ    512,DU
+         2 000736   001017 601000 2                  TNZ     s:5553
+
+      334     5533    3                 ES$SECLOG.ERR=JIT$->B$JIT.ERR;
+
+   5533  2 000737   200030 474500                    LDP4    JIT$,,AUTO
+         2 000740   400012 236100                    LDQ     10,,PR4
+         2 000741   300013 756100                    STQ     11,,PR3
+         2 000742   001017 710000 2                  TRA     s:5553
+
+      335     5534    3            CASE(EL_SYS_EXIT);
+
+      336     5535    3              ES$SECLOG.REASON=%ES_LOG_ALL#;
+
+   5535  2 000743   200026 471500                    LDP1    SECLOG$,,AUTO
+         2 000744   001000 236003                    LDQ     512,DU
+         2 000745   100000 552140                    STBQ    0,'40'O,PR1
+
+      337     5536    3              ES$SECLOG.GRANTED='1'B;
+
+   5536  2 000746   000400 236003                    LDQ     256,DU
+         2 000747   100000 256100                    ORSQ    0,,PR1
+         2 000750   001017 710000 2                  TRA     s:5553
+
+      338     5537    3            CASE(EL_ARES_BYPASS);
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:52   
+      339     5538    3              IF ES$ARES_BYPASS.REASON#=0 THEN
+
+   5538  2 000751   200027 471500                    LDP1    INFO$,,AUTO
+         2 000752   100000 236100                    LDQ     0,,PR1
+         2 000753   777000 316003                    CANQ    -512,DU
+         2 000754   000761 601000 2                  TNZ     s:5540
+
+      340     5539    3                 ES$SECLOG.REASON=%ES_PRIV_USER#;
+
+   5539  2 000755   200026 473500                    LDP3    SECLOG$,,AUTO
+         2 000756   002000 236003                    LDQ     1024,DU
+         2 000757   300000 552140                    STBQ    0,'40'O,PR3
+         2 000760   000763 710000 2                  TRA     s:5541
+
+      341     5540    3              ELSE ES$SECLOG.REASON=ES$ARES_BYPASS.REASON#;
+
+   5540  2 000761   200026 473500                    LDP3    SECLOG$,,AUTO
+         2 000762   300000 552140                    STBQ    0,'40'O,PR3
+
+      342     5541    3              ES$SECLOG.GRANTED=ES$ARES_BYPASS.GRANTED#;
+
+   5541  2 000763   100000 236100                    LDQ     0,,PR1
+         2 000764   300000 676100                    ERQ     0,,PR3
+         2 000765   000400 376003                    ANQ     256,DU
+         2 000766   300000 656100                    ERSQ    0,,PR3
+
+      343     5542    3              ES$SECLOG.FILE.FUN=%UPDATE#;
+
+   5542  2 000767   001000 236003                    LDQ     512,DU
+         2 000770   300043 552140                    STBQ    35,'40'O,PR3
+
+      344     5543    3              ES$SECLOG.FILE.ASN=%FILE#;
+
+   5543  2 000771   000001 236003                    LDQ     1,DU
+         2 000772   300043 552120                    STBQ    35,'20'O,PR3
+
+      345     5544    3              ES$SECLOG.FILE.SN=ES$ARES_BYPASS.PSN#;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:53   
+
+   5544  2 000773   040100 100500                    MLR     fill='040'O
+         2 000774   100000 400006                    ADSC9   0,,PR1                   cn=2,n=6
+         2 000775   300044 400006                    ADSC9   36,,PR3                  cn=2,n=6
+
+      346     5545    3              ES$SECLOG.FILE.ACCT=ES$ARES_BYPASS.ACCT#;
+
+   5545  2 000776   100002 237100                    LDAQ    2,,PR1
+         2 000777   300047 755100                    STA     39,,PR3
+         2 001000   300050 756100                    STQ     40,,PR3
+
+      347     5546    3              ES$SECLOG.FILE.NAME#=ES$ARES_BYPASS.MODEL_NAME;
+
+   5546  2 001001   000100 100500                    MLR     fill='000'O
+         2 001002   100004 000040                    ADSC9   4,,PR1                   cn=0,n=32
+         2 001003   300051 000040                    ADSC9   41,,PR3                  cn=0,n=32
+         2 001004   001017 710000 2                  TRA     s:5553
+
+      348     5547    3            CASE(ELSE);
+
+      349     5548                            /* No idea what this is, so just write it as it came.     */
+      350     5549    3              ES$SECLOG='0'B;
+
+   5549  2 001005   200026 471500                    LDP1    SECLOG$,,AUTO
+         2 001006   000100 100400                    MLR     fill='000'O
+         2 001007   000002 000001 xsym               ADSC9   B_VECTNIL+2              cn=0,n=1
+         2 001010   100000 000304                    ADSC9   0,,PR1                   cn=0,n=196
+
+      351     5550    3              HDR.INFO=INFO;
+
+   5550  2 001011   200004 473500                    LDP3    @INFO,,AUTO
+         2 001012   200014 720100                    LXL0    SIZE4,,AUTO
+         2 001013   200012 474500                    LDP4    BP$,,AUTO
+         2 001014   040140 100540                    MLR     fill='040'O
+         2 001015   300000 000010                    ADSC9   0,,PR3                   cn=0,n=*X0
+         2 001016   400005 000010                    ADSC9   5,,PR4                   cn=0,n=*X0
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:54   
+      352     5551    3            END;
+
+      353     5552
+      354     5553    2           RETURN;
+
+   5553  2 001017   200024 221300                    LDX1  ! NXTWD+2,,AUTO
+         2 001020   000001 702211                    TSX2  ! 1,X1
+
+   5553  2 001021                       LOST_ENTRY   null
+      355     5554    2   LOST_ENTRY:;
+      356     5555    2           ALTRETURN;
+
+   5555  2 001021   200024 221300                    LDX1  ! NXTWD+2,,AUTO
+         2 001022   000000 702211                    TSX2  ! 0,X1
+
+      357     5556        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:55   
+      358     5557    2   SECLOG_REC_INIT: PROC ALTRET;
+
+   5557  2 001023   200032 741300       SECLOG_REC_* STX1  ! NAMELEN+1,,AUTO
+
+      359     5558        /**/
+      360     5559    3           IF SIZEW(ES$SECLOG_INIT) + HDRWDS# > BUF.WDSLFT THEN
+
+   5559  2 001024   200017 470500                    LDP0    BUF$,,AUTO
+         2 001025   000001 720100                    LXL0    1,,PR0
+         2 001026   000066 100003                    CMPX0   54,DU
+         2 001027   001032 603000 2                  TRC     s:5561
+
+      361     5560    3              CALL GETNEWBUF ALTRET(LOST_IT);
+
+   5560  2 001030   000433 701000 2                  TSX1    GETNEWBUF
+         2 001031   001054 702000 2                  TSX2    LOST_IT
+
+      362     5561    3           NXTWD=WORDS_PER_BUF - BUF.WDSLFT;
+
+   5561  2 001032   200017 470500                    LDP0    BUF$,,AUTO
+         2 001033   000001 236100                    LDQ     1,,PR0
+         2 001034   777777 376007                    ANQ     -1,DL
+         2 001035   000027 676000 xsym               ERQ     B_VECTNIL+23
+         2 001036   001777 036007                    ADLQ    1023,DL
+         2 001037   200022 756100                    STQ     NXTWD,,AUTO
+
+      363     5562    3           BP$=ADDR(BUF.INFO(NXTWD));
+
+   5562  2 001040   000022 736000                    QLS     18
+         2 001041   000002 036003                    ADLQ    2,DU
+         2 001042   200017 036100                    ADLQ    BUF$,,AUTO
+         2 001043   200012 756100                    STQ     BP$,,AUTO
+
+      364     5563    3           SECLOG$=PINCRW(BP$,HDRWDS#);
+
+   5563  2 001044   000005 036003                    ADLQ    5,DU
+         2 001045   200026 756100                    STQ     SECLOG$,,AUTO
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:56   
+
+      365     5564    3           SECLOG$->ES$SECLOG=ES$SECLOG_INIT;
+
+   5564  2 001046   200026 471500                    LDP1    SECLOG$,,AUTO
+         2 001047   000100 100400                    MLR     fill='000'O
+         2 001050   000000 000304 1                  ADSC9   ES$SECLOG_INIT           cn=0,n=196
+         2 001051   100000 000304                    ADSC9   0,,PR1                   cn=0,n=196
+
+      366     5565    3           RETURN;
+
+   5565  2 001052   200032 221300                    LDX1  ! NAMELEN+1,,AUTO
+         2 001053   000001 702211                    TSX2  ! 1,X1
+
+   5564  2 001054                       LOST_IT      null
+      367     5566
+      368     5567    3   LOST_IT:;
+      369     5568    3           ALTRETURN;
+
+   5568  2 001054   200032 221300                    LDX1  ! NAMELEN+1,,AUTO
+         2 001055   000000 702211                    TSX2  ! 0,X1
+
+      370     5569
+      371     5570    3   END SECLOG_REC_INIT;
+      372     5571        %EJECT;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:57   
+      373     5572    2   SECLOG_COMMON: PROC;
+
+   5572  2 001056   200032 741300       SECLOG_COMM* STX1  ! NAMELEN+1,,AUTO
+
+      374     5573        /**/
+      375     5574        %INCLUDE B$P;
+      376     5658        %INCLUDE NK$LDCT;
+      377     5760        %NK$LDCT (STCLASS="BASED(JIT$)");
+      378     5806        %INCLUDE KQ_MAC_C;
+      379     8356        %INCLUDE KC$CP6V_C;
+      380     8476        %INCLUDE KC_CP6;
+      381     9036        %KQ_CG (STCLASS=BASED);
+      382     9775        %INCLUDE FM$CFU;
+      383     9820        %INCLUDE FM$SET;
+      384     9847        %FM$CFU(BASED="BASED(JIT$)");
+      385     9853        %FM$CFUA(BASED="BASED(JIT$)");
+      386     9859        %FM$SET(BASED="BASED(F$CFU$)");
+      387     9864        %FM$CFUN;
+      388     9867    3   DCL F$CFU$ PTR SYMREF READONLY;
+      389     9868
+      390     9869    3   DCL S$CU$ PTR SYMREF;
+      391     9870
+      392     9871    3   DCL FMO$GETDOMAIN ENTRY(1);
+      393     9872
+      394     9873    3   DCL LMDCB$ PTR;
+      395     9874    3   DCL WSR SBIN;
+      396     9875    3   DCL CHAR40 CHAR(40) BASED;
+      397     9876        /**/
+      398     9877    3           IF TYPE=EL_SYS_EXIT THEN
+
+   9877  2 001057   200003 470500                    LDP0    @TYPE,,AUTO
+         2 001060   000000 235100                    LDA     0,,PR0
+         2 001061   000771 115007                    CMPA    505,DL
+         2 001062   001202 601000 2                  TNZ     s:9901
+
+      399     9878    3              IF ES$SYS_EXIT.REASON#~=0 THEN
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:58   
+   9878  2 001063   200027 471500                    LDP1    INFO$,,AUTO
+         2 001064   100000 236100                    LDQ     0,,PR1
+         2 001065   777000 316003                    CANQ    -512,DU
+         2 001066   001072 600000 2                  TZE     s:9881
+
+      400     9879    3                 JIT$=INFO$;               /* first byte of a jit is nonzero.    */
+
+   9879  2 001067   200027 236100                    LDQ     INFO$,,AUTO
+         2 001070   200030 756100                    STQ     JIT$,,AUTO
+         2 001071   001204 710000 2                  TRA     s:9902
+
+      401     9880    4              ELSE DO;                /* KIA calls with a pointer to the LDCT    */
+
+      402     9881    4                 JIT$=ES$SYS_EXIT.JIT$;    /* gather whatever we can from there  */
+
+   9881  2 001072   100001 236100                    LDQ     1,,PR1
+         2 001073   200030 756100                    STQ     JIT$,,AUTO
+
+      403     9882    4                 ES$SECLOG.MODE=%M_TP#;
+
+   9882  2 001074   200026 473500                    LDP3    SECLOG$,,AUTO
+         2 001075   300001 236100                    LDQ     1,,PR3
+         2 001076   000013 376000 3                  ANQ     11
+         2 001077   200000 276003                    ORQ     65536,DU
+         2 001100   300001 756100                    STQ     1,,PR3
+
+      404     9883    4                 ES$SECLOG.ACCN=NK$LDCT.DEVNM;
+
+   9883  2 001101   200030 474500                    LDP4    JIT$,,AUTO
+         2 001102   400002 237100                    LDAQ    2,,PR4
+         2 001103   300002 755100                    STA     2,,PR3
+         2 001104   300003 756100                    STQ     3,,PR3
+
+      405     9884    4                 ES$SECLOG.UNAME=NK$LDCT.LOGON_ACCT;
+
+   9884  2 001105   040100 100500                    MLR     fill='040'O
+         2 001106   400024 000010                    ADSC9   20,,PR4                  cn=0,n=8
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:59   
+         2 001107   300004 000014                    ADSC9   4,,PR3                   cn=0,n=12
+
+      406     9885    4                 ES$SECLOG.TSLINE.FEX=NK$LDCT.RLCID.NODE;
+
+   9885  2 001110   400015 236100                    LDQ     13,,PR4
+         2 001111   300034 552140                    STBQ    28,'40'O,PR3
+
+      407     9886    4                 ES$SECLOG.TSLINE.PORT=BITBIN(NK$LDCT.TERMID.CHAN);
+
+   9886  2 001112   400022 236100                    LDQ     18,,PR4
+         2 001113   777777 376007                    ANQ     -1,DL
+         2 001114   000011 736000                    QLS     9
+         2 001115   300034 552130                    STBQ    28,'30'O,PR3
+
+      408     9887    4                 ES$SECLOG.TSLINE.LEV=NK$LDCT.TERMID.LEV;
+
+   9887  2 001116   400022 236100                    LDQ     18,,PR4
+         2 001117   000033 772000                    QRL     27
+         2 001120   300034 552104                    STBQ    28,'04'O,PR3
+
+      409     9888    4                 ES$SECLOG.TSLINE.SUBDEVICE=BITBIN(NK$LDCT.TERMID.SUB);
+
+   9888  2 001121   400023 236100                    LDQ     19,,PR4
+         2 001122   000022 772000                    QRL     18
+         2 001123   000000 620006                    EAX0    0,QL
+         2 001124   300035 740100                    STX0    29,,PR3
+
+      410     9889    4                 ES$SECLOG.TSLINE.SUBSUBDEVICE=BITBIN(NK$LDCT.TERMID.SUBSUB);
+
+   9889  2 001125   400023 236100                    LDQ     19,,PR4
+         2 001126   777777 376007                    ANQ     -1,DL
+         2 001127   000000 621006                    EAX1    0,QL
+         2 001130   300035 441100                    SXL1    29,,PR3
+
+      411     9890    5                 IF NK$LDCT.CG$~=ADDR(NIL) THEN DO;
+
+   9890  2 001131   400027 236100                    LDQ     23,,PR4
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:60   
+         2 001132   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         2 001133   001200 600000 2                  TZE     s:9899
+
+      412     9891    5                    JIT$=NK$LDCT.CG$->KQ_CG.CFU$;
+
+   9891  2 001134   400027 475500                    LDP5    23,,PR4
+         2 001135   500214 236100                    LDQ     140,,PR5
+         2 001136   200030 756100                    STQ     JIT$,,AUTO
+
+      413     9892    5                    IF JIT$=ADDR(NIL) THEN EXIT;
+
+   9892  2 001137   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         2 001140   001200 600000 2                  TZE     s:9899
+
+      414     9893    5                    ES$SECLOG.PROC_NAME.C=PINCRC(F$CFU$,FM$CFU.NAMEX)->FM$CFUN.C;
+
+   9893  2 001141   200030 474500                    LDP4    JIT$,,AUTO
+         2 001142   400002 236100                    LDQ     2,,PR4
+         2 001143   777777 376007                    ANQ     -1,DL
+         2 001144   000000 475400 xsym               LDP5    F$CFU$
+         2 001145   000100 101506                    MRL     fill='000'O
+         2 001146   500000 400001                    ADSC9   0,Q,PR5                  cn=2,n=1
+         2 001147   200036 000002                    ADSC9   WSR+2,,AUTO              cn=0,n=2
+         2 001150   200036 220100                    LDX0    WSR+2,,AUTO
+         2 001151   040100 100546                    MLR     fill='040'O
+         2 001152   500000 600010                    ADSC9   0,Q,PR5                  cn=3,n=*X0
+         2 001153   300020 200037                    ADSC9   16,,PR3                  cn=1,n=31
+
+      415     9894    5                    ES$SECLOG.PROC_NAME.L=PINCRC(F$CFU$,FM$CFU.NAMEX)->FM$CFUN.L;
+
+   9894  2 001154   400002 236100                    LDQ     2,,PR4
+         2 001155   777777 376007                    ANQ     -1,DL
+         2 001156   000100 100506                    MLR     fill='000'O
+         2 001157   500000 400001                    ADSC9   0,Q,PR5                  cn=2,n=1
+         2 001160   300020 000001                    ADSC9   16,,PR3                  cn=0,n=1
+
+      416     9895    5                    JIT$=PINCRW(F$CFU$,FM$CFU.ACCTX);
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:61   
+
+   9895  2 001161   400002 220100                    LDX0    2,,PR4
+         2 001162   000000 636010                    EAQ     0,X0
+         2 001163   000000 036000 xsym               ADLQ    F$CFU$
+         2 001164   200030 756100                    STQ     JIT$,,AUTO
+
+      417     9896    5                    ES$SECLOG.PROC_ACCT=FM$CFUA.ACCT;
+
+   9896  2 001165   200030 474500                    LDP4    JIT$,,AUTO
+         2 001166   040100 100500                    MLR     fill='040'O
+         2 001167   400001 000010                    ADSC9   1,,PR4                   cn=0,n=8
+         2 001170   300030 000010                    ADSC9   24,,PR3                  cn=0,n=8
+
+      418     9897    5                    ES$SECLOG.PROC_PSN=FM$SET.PSN(FM$CFUA.SETX);
+
+   9897  2 001171   400000 236100                    LDQ     0,,PR4
+         2 001172   000017 772000                    QRL     15
+         2 001173   000014 376000 3                  ANQ     12
+         2 001174   000002 736000                    QLS     2
+         2 001175   040100 100506                    MLR     fill='040'O
+         2 001176   500000 400006                    ADSC9   0,Q,PR5                  cn=2,n=6
+         2 001177   300032 000006                    ADSC9   26,,PR3                  cn=0,n=6
+
+      419     9898    5                    END;
+
+      420     9899    4                 RETURN;
+
+   9899  2 001200   200032 221300                    LDX1  ! NAMELEN+1,,AUTO
+         2 001201   000001 702211                    TSX2  ! 1,X1
+
+      421     9900    4                 END;
+      422     9901    3           ELSE JIT$=B$JIT$;
+
+   9901  2 001202   000000 236000 xsym               LDQ     B$JIT$
+         2 001203   200030 756100                    STQ     JIT$,,AUTO
+
+      423     9902    3           ADDR(ES$SECLOG.MODE)->CHAR40=JIT$->CHAR40;
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:62   
+
+   9902  2 001204   200030 471500                    LDP1    JIT$,,AUTO
+         2 001205   200026 473500                    LDP3    SECLOG$,,AUTO
+         2 001206   040100 100500                    MLR     fill='040'O
+         2 001207   100000 000050                    ADSC9   0,,PR1                   cn=0,n=40
+         2 001210   300001 000050                    ADSC9   1,,PR3                   cn=0,n=40
+
+      424     9903    3           ES$SECLOG.PRIV_ACTIVE=JIT$->B$JIT.PRIV.ACTIVE;
+
+   9903  2 001211   100013 236100                    LDQ     11,,PR1
+         2 001212   300016 756100                    STQ     14,,PR3
+
+      425     9904    3           ES$SECLOG.PRIV=JIT$->B$JIT.PRIV.AUTH;
+
+   9904  2 001213   100014 236100                    LDQ     12,,PR1
+         2 001214   300014 756100                    STQ     12,,PR3
+
+      426     9905    3           ES$SECLOG.PRIV_PRC=JIT$->B$JIT.PRIV.PRC;
+
+   9905  2 001215   100016 236100                    LDQ     14,,PR1
+         2 001216   300017 756100                    STQ     15,,PR3
+
+      427     9906    3           ES$SECLOG.PPRIV=JIT$->B$JIT.PPRIV;
+
+   9906  2 001217   100020 236100                    LDQ     16,,PR1
+         2 001220   300015 756100                    STQ     13,,PR3
+
+      428     9907    3           IF JIT$->B$JIT.MODE = %M_INT# THEN
+
+   9907  2 001221   100000 236100                    LDQ     0,,PR1
+         2 001222   740000 376003                    ANQ     -16384,DU
+         2 001223   140000 116003                    CMPQ    49152,DU
+         2 001224   001253 600000 2                  TZE     INT
+
+      429     9908    3              GOTO INT;                    /* Current guy is the originator      */
+      430     9909    3           ES$SECLOG.ORIG_MODE=JIT$->B$JIT.ORIGINATOR_MODE;
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:63   
+   9909  2 001225   100325 236100                    LDQ     213,,PR1
+         2 001226   000017 376003                    ANQ     15,DU
+         2 001227   000011 772000                    QRL     9
+         2 001230   300042 552110                    STBQ    34,'10'O,PR3
+
+      431     9910    4           DO CASE(JIT$->B$JIT.ORIGINATOR_MODE);
+
+   9910  2 001231   100325 220100                    LDX0    213,,PR1
+         2 001232   000017 360003                    ANX0    15,DU
+         2 001233   000004 100003                    CMPX0   4,DU
+         2 001234   001236 602010 2                  TNC     s:9910+5,X0
+         2 001235   001267 710000 2                  TRA     s:9924
+         2 001236   001267 710000 2                  TRA     s:9924
+         2 001237   001242 710000 2                  TRA     s:9912
+         2 001240   001250 710000 2                  TRA     s:9915
+         2 001241   001253 710000 2                  TRA     INT
+
+      432     9911    4            CASE(%M_BATCH#);
+
+      433     9912    4              ES$SECLOG.DEVICE=JIT$->B$JIT.ORIGINATOR_PORT.FROM_CR.DEVICE;
+
+   9912  2 001242   100337 236100                    LDQ     223,,PR1
+         2 001243   300036 756100                    STQ     30,,PR3
+
+      434     9913    4              ES$SECLOG.DEVICE_TNAME=JIT$->B$JIT.ORIGINATOR_PORT.FROM_CR.TNAME;
+
+   9913  2 001244   100340 237100                    LDAQ    224,,PR1
+         2 001245   300037 755100                    STA     31,,PR3
+         2 001246   300040 756100                    STQ     32,,PR3
+         2 001247   001267 710000 2                  TRA     s:9924
+
+      435     9914    4            CASE(%M_GHOST#);
+
+      436     9915    4              ES$SECLOG.ORIG_SYSID=JIT$->B$JIT.ORIGINATOR_PORT.FROM_GHOST.SYSID;
+
+   9915  2 001250   100337 221100                    LDX1    223,,PR1
+         2 001251   300033 441100                    SXL1    27,,PR3
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:64   
+         2 001252   001267 710000 2                  TRA     s:9924
+
+      437     9916    4            CASE(%M_INT#);
+
+   9915  2 001253                       INT          null
+      438     9917    4   INT:       ;
+      439     9918    4              ES$SECLOG.TSLINE.FEX=JIT$->B$JIT.TSLINE.FEX;
+
+   9918  2 001253   100337 236100                    LDQ     223,,PR1
+         2 001254   300034 552140                    STBQ    28,'40'O,PR3
+
+      440     9919    4              ES$SECLOG.TSLINE.PORT=JIT$->B$JIT.TSLINE.PORT;
+
+   9919  2 001255   100337 236100                    LDQ     223,,PR1
+         2 001256   000011 736000                    QLS     9
+         2 001257   300034 552130                    STBQ    28,'30'O,PR3
+
+      441     9920    4              ES$SECLOG.TSLINE.LEV=JIT$->B$JIT.TSLINE.LEV;
+
+   9920  2 001260   100340 236100                    LDQ     224,,PR1
+         2 001261   000033 772000                    QRL     27
+         2 001262   300034 552104                    STBQ    28,'04'O,PR3
+
+      442     9921    4              ES$SECLOG.TSLINE.SUBDEVICE=JIT$->B$JIT.TSLINE.SUBDEVICE;
+
+   9921  2 001263   100340 720100                    LXL0    224,,PR1
+         2 001264   300035 740100                    STX0    29,,PR3
+
+      443     9922    4              ES$SECLOG.TSLINE.SUBSUBDEVICE=JIT$->B$JIT.TSLINE.SUBSUBDEVICE;
+
+   9922  2 001265   100341 221100                    LDX1    225,,PR1
+         2 001266   300035 441100                    SXL1    29,,PR3
+
+      444     9923    4            END;
+
+      445     9924    3           CALL FMO$GETDOMAIN(WSR);
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:65   
+   9924  2 001267   200034 634500                    EPPR4   WSR,,AUTO
+         2 001270   200036 454500                    STP4    WSR+2,,AUTO
+         2 001271   200036 630500                    EPPR0   WSR+2,,AUTO
+         2 001272   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         2 001273   000000 701000 xent               TSX1    FMO$GETDOMAIN
+         2 001274   000000 011000                    NOP     0
+
+      446     9925    3           ES$SECLOG.DOMAYN=WSR;
+
+   9925  2 001275   200026 470500                    LDP0    SECLOG$,,AUTO
+         2 001276   200034 236100                    LDQ     WSR,,AUTO
+         2 001277   000033 736000                    QLS     27
+         2 001300   000001 676100                    ERQ     1,,PR0
+         2 001301   037000 376003                    ANQ     15872,DU
+         2 001302   000001 656100                    ERSQ    1,,PR0
+
+      447     9926    4           DO CASE(WSR);
+
+   9926  2 001303   200034 235100                    LDA     WSR,,AUTO
+         2 001304   000004 135007                    SBLA    4,DL
+         2 001305   000003 115007                    CMPA    3,DL
+         2 001306   001310 602005 2                  TNC     s:9926+5,AL
+         2 001307   001366 710000 2                  TRA     s:9937
+         2 001310   001313 710000 2                  TRA     s:9928
+         2 001311   001313 710000 2                  TRA     s:9928
+         2 001312   001313 710000 2                  TRA     s:9928
+
+      448     9927    4            CASE(%CPWSR,%DBWSR,%ASLWSR);
+
+      449     9928    4              ES$SECLOG.PROC_ACCT=':SYS';
+
+   9928  2 001313   040100 100400                    MLR     fill='040'O
+         2 001314   000061 000004 1                  ADSC9   ES$SECLOG_INIT+49        cn=0,n=4
+         2 001315   000030 000010                    ADSC9   24,,PR0                  cn=0,n=8
+
+      450     9929    4              ES$SECLOG.PROC_PSN='SYS';
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:66   
+   9929  2 001316   040100 100400                    MLR     fill='040'O
+         2 001317   000062 000003 1                  ADSC9   ES$SECLOG_INIT+50        cn=0,n=3
+         2 001320   000032 000006                    ADSC9   26,,PR0                  cn=0,n=6
+
+      451     9930    4              IF WSR=%CPWSR THEN
+
+   9930  2 001321   200034 235100                    LDA     WSR,,AUTO
+         2 001322   000004 115007                    CMPA    4,DL
+         2 001323   001337 601000 2                  TNZ     s:9932
+
+      452     9931    4                 ES$SECLOG.PROC_NAME=B$P$->B$P.NAME(S$CU$->B$U.ACP);
+
+   9931  2 001324   000000 471400 xsym               LDP1    S$CU$
+         2 001325   100006 236100                    LDQ     6,,PR1
+         2 001326   000022 772000                    QRL     18
+         2 001327   000777 376007                    ANQ     511,DL
+         2 001330   000021 402007                    MPY     17,DL
+         2 001331   000003 736000                    QLS     3
+         2 001332   000000 473400 xsym               LDP3    B$P$
+         2 001333   000100 100506                    MLR     fill='000'O
+         2 001334   300032 000040                    ADSC9   26,Q,PR3                 cn=0,n=32
+         2 001335   000020 000040                    ADSC9   16,,PR0                  cn=0,n=32
+         2 001336   001432 710000 2                  TRA     s:9948
+
+      453     9932    4              ELSE IF WSR=%DBWSR THEN
+
+   9932  2 001337   000005 115007                    CMPA    5,DL
+         2 001340   001354 601000 2                  TNZ     s:9935
+
+      454     9933    4                    ES$SECLOG.PROC_NAME=B$P$->B$P.NAME(S$CU$->B$U.DB);
+
+   9933  2 001341   000000 471400 xsym               LDP1    S$CU$
+         2 001342   100006 236100                    LDQ     6,,PR1
+         2 001343   000011 772000                    QRL     9
+         2 001344   000777 376007                    ANQ     511,DL
+         2 001345   000021 402007                    MPY     17,DL
+         2 001346   000003 736000                    QLS     3
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:67   
+         2 001347   000000 473400 xsym               LDP3    B$P$
+         2 001350   000100 100506                    MLR     fill='000'O
+         2 001351   300032 000040                    ADSC9   26,Q,PR3                 cn=0,n=32
+         2 001352   000020 000040                    ADSC9   16,,PR0                  cn=0,n=32
+         2 001353   001432 710000 2                  TRA     s:9948
+
+      455     9934    4                 ELSE
+      456     9935    4                    ES$SECLOG.PROC_NAME=B$P$->B$P.NAME(S$CU$->B$U.ASL);
+
+   9935  2 001354   000000 471400 xsym               LDP1    S$CU$
+         2 001355   100006 236100                    LDQ     6,,PR1
+         2 001356   000777 376007                    ANQ     511,DL
+         2 001357   000021 402007                    MPY     17,DL
+         2 001360   000003 736000                    QLS     3
+         2 001361   000000 473400 xsym               LDP3    B$P$
+         2 001362   000100 100506                    MLR     fill='000'O
+         2 001363   300032 000040                    ADSC9   26,Q,PR3                 cn=0,n=32
+         2 001364   000020 000040                    ADSC9   16,,PR0                  cn=0,n=32
+         2 001365   001432 710000 2                  TRA     s:9948
+
+      457     9936    4            CASE(ELSE);
+
+      458     9937    4              LMDCB$=DCBADDR(%M$LM#);
+
+   9937  2 001366   000015 471400 3                  LDP1    13
+         2 001367   100000 473500                    LDP3    0,,PR1
+         2 001370   300002 236100                    LDQ     2,,PR3
+         2 001371   200033 756100                    STQ     LMDCB$,,AUTO
+
+      459     9938    4              IF LMDCB$->F$DCB.DCBNAME.N~='M$LM' THEN
+
+   9938  2 001372   200033 474500                    LDP4    LMDCB$,,AUTO
+         2 001373   400140 236100                    LDQ     96,,PR4
+         2 001374   000033 772000                    QRL     27
+         2 001375   000037 376007                    ANQ     31,DL
+         2 001376   000000 620006                    EAX0    0,QL
+         2 001377   040000 106540                    CMPC    fill='040'O
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:68   
+         2 001400   400140 200010                    ADSC9   96,,PR4                  cn=1,n=*X0
+         2 001401   000063 000004 1                  ADSC9   ES$SECLOG_INIT+51        cn=0,n=4
+         2 001402   001405 600000 2                  TZE     s:9940
+
+      460     9939    4                 LMDCB$=DCBADDR(%M$DRIBBLE2#); /* M$LM dcbnum is -3              */
+
+   9939  2 001403   377775 236100                    LDQ     -3,,PR3
+         2 001404   200033 756100                    STQ     LMDCB$,,AUTO
+
+      461     9940    5              IF LMDCB$->F$DCB.FCD THEN DO;
+
+   9940  2 001405   200033 474500                    LDP4    LMDCB$,,AUTO
+         2 001406   400031 236100                    LDQ     25,,PR4
+         2 001407   020000 316007                    CANQ    8192,DL
+         2 001410   001432 600000 2                  TZE     s:9948
+
+      462     9941    5                 ES$SECLOG.PROC_NAME=LMDCB$->F$DCB.NAME;
+
+   9941  2 001411   000100 100500                    MLR     fill='000'O
+         2 001412   400010 000040                    ADSC9   8,,PR4                   cn=0,n=32
+         2 001413   000020 000040                    ADSC9   16,,PR0                  cn=0,n=32
+
+      463     9942    5                 ES$SECLOG.PROC_ACCT=LMDCB$->F$DCB.ACCT;
+
+   9942  2 001414   400020 237100                    LDAQ    16,,PR4
+         2 001415   000030 755100                    STA     24,,PR0
+         2 001416   000031 756100                    STQ     25,,PR0
+
+      464     9943    5                 IF ES$SECLOG.PROC_ACCT=' ' THEN
+
+   9943  2 001417   040000 106500                    CMPC    fill='040'O
+         2 001420   000030 000010                    ADSC9   24,,PR0                  cn=0,n=8
+         2 001421   000035 000001 xsym               ADSC9   B_VECTNIL+29             cn=0,n=1
+         2 001422   001427 601000 2                  TNZ     s:9945
+
+      465     9944    5                    ES$SECLOG.PROC_ACCT=JIT$->B$JIT.FACCN;
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:69   
+   9944  2 001423   200030 475500                    LDP5    JIT$,,AUTO
+         2 001424   500006 237100                    LDAQ    6,,PR5
+         2 001425   000030 755100                    STA     24,,PR0
+         2 001426   000031 756100                    STQ     25,,PR0
+
+      466     9945    5                 ES$SECLOG.PROC_PSN=LMDCB$->F$DCB.PSN;
+
+   9945  2 001427   040100 100500                    MLR     fill='040'O
+         2 001430   400024 000006                    ADSC9   20,,PR4                  cn=0,n=6
+         2 001431   000032 000006                    ADSC9   26,,PR0                  cn=0,n=6
+
+      467     9946    5                 END;
+
+      468     9947    4            END;                           /* End Do Case(WSR)                   */
+
+      469     9948    3           RETURN;
+
+   9948  2 001432   200032 221300                    LDX1  ! NAMELEN+1,,AUTO
+         2 001433   000001 702211                    TSX2  ! 1,X1
+
+LOST_ENTRIES
+ Sect OctLoc
+   0     000   000000 000000                                                    ....
+
+EL_BUSY
+ Sect OctLoc
+   0     001   000000 000001   000000 000000                                    ........
+
+EL_NUMPGS
+ Sect OctLoc
+   0     003   000000 000000                                                    ....
+
+EL_FULLBUFS
+ Sect OctLoc
+   0     004   000000 000000                                                    ....
+
+EL_MAXPGS
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:70   
+ Sect OctLoc
+   0     005   000000 000005                                                    ....
+
+EL_FIRSTBUF
+ Sect OctLoc
+   0     006   000000 000000                                                    ....
+
+EL_CURBUF
+ Sect OctLoc
+   0     007   000000 000000                                                    ....
+
+EL_LOGERRS
+ Sect OctLoc
+   0     010   0***** ******                                                    ....
+
+(unnamed)
+ Sect OctLoc
+   0     011   006*** ******                                                    ....
+
+EL_ERRCT
+ Sect OctLoc
+   0     012   000000 000000                                                    ....
+
+EL_KICKFLG
+ Sect OctLoc
+   0     013   0***** ******                                                    ....
+
+ES$SECLOG_INIT
+ Sect OctLoc
+   1     000   000000 000000   000000 000000   040040 040040   040040 040040    ........
+   1     004   040040 040040   040040 040040   040040 040040   040040 040040
+   1     010   040040 040040   040040 040040   040040 040040   000000 000000                ....
+   1     014   000000 000000   000000 000000   000000 000000   000000 000000    ................
+   1     020   000040 040040   040040 040040   040040 040040   040040 040040    .
+   1     024   040040 040040   040040 040040   040040 040040   040040 040040
+   1     030   040040 040040   040040 040040   040040 040040   040040 000000                  ..
+   1     034   000000 000000   000000 000000   040040 040040   040040 040040    ........
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:71   
+   1     040   040040 040040   000000 000000   000000 000000   000000 000000        ............
+   1     044   000000 040040   040040 040040   040040 040040   040040 040040    ..
+   1     050   040040 040040   000040 040040   040040 040040   040040 040040        .
+   1     054   040040 040040   040040 040040   040040 040040   040040 040040
+   1     060   040040 040040
+
+(unnamed)
+ Sect OctLoc
+   1     061   072123 131123   123131 123040   115044 114115                    :SYSSYS M$LM
+
+(unnamed)
+ Sect OctLoc
+   3     000   000001 006000   000000 000074   000003 006000   000001 006000    .......<........
+   3     004   000003 777774   000027 006000   000000 000024   000002 006000    ................
+   3     010   000006 006000   000000 000031   000011 006000   037777 777777    ................
+   3     014   000007 777770   000000 006003                                    ........
+      470     9949    3   END SECLOG_COMMON;
+      471     9950    2   END MAKE_SECLOG_REC;
+      472     9951    1   END ELA$SYSLOG;
+      473     9952        %EOD;
+
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:72   
+--  Include file information  --
+
+   FM$SET.:E05TOU  is referenced.
+   FM$CFU.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+   KC$CP6V_C.:E05TOU  is referenced.
+   KQ_MAC_C.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+   B$P.:E05TOU  cannot be made into a system file and is referenced.
+   ES_SUBS_E.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   F$DCB.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+   B$JIT.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   I_SUBS_C.:E05TOU  is referenced.
+   UM_CP6.:E05TOU  is referenced.
+   JG_GHOSTS_C.:E05TOU  is referenced.
+   B_MAGIC_C.:E05TOU  is referenced.
+   PC_SUBS_C.:E05TOU  is referenced.
+   EL_SUBS_C.:E05TOU  is referenced.
+   EL$TABLES.:E05TOU  is referenced.
+   EL_ERRORS_C.:E05TOU  is referenced.
+   EL_DATA_C.:E05TOU  is referenced.
+   ES_TABLES_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure ELA$SYSLOG.
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:73   
+
+ **** Variables and constants ****
+
+  ****  Section 000  Data  ELA$SYSLOG
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     1-0-0/w STRC(72)    r     1 EL_BUSY                    7-0-0/w UBIN        r     1 EL_CURBUF
+    12-0-0/w SBIN        r     1 EL_ERRCT                   6-0-0/w UBIN        r     1 EL_FIRSTBUF
+     4-0-0/w SBIN        r     1 EL_FULLBUFS               13-0-0/w BIT         r     1 EL_KICKFLG
+    10-0-0/b BIT         r     1 EL_LOGERRS                 5-0-0/w SBIN        r     1 EL_MAXPGS
+     3-0-0/w SBIN        r     1 EL_NUMPGS                  0-0-0/w UBIN        r     1 LOST_ENTRIES
+
+  ****  Section 001 RoData ELA$SYSLOG
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(1764)  r     1 ES$SECLOG_INIT
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    10-0-0/w PTR         r     1 @ERRCD                     7-0-0/w PTR         r     1 @FILE
+     4-0-0/w PTR         r     1 @INFO                      6-0-0/w PTR         r     1 @MMINHIB
+     5-0-0/w PTR         r     1 @SIZE                      3-0-0/w PTR         r     1 @TYPE
+    12-0-0/w PTR         r     1 BP$                       17-0-0/w PTR         r     1 BUF$
+    11-0-0/w UBIN        r     1 CVMPG                     *0-0-0/w UBIN        r     1 ERRCD
+    *0-0-0/w STRC(1764)  r     1 ES$SECLOG                 *0-0-0/w UBIN        r     1 FILE
+    20-0-0/w UBIN        r     1 FILEX                     16-0-0/w SBIN        r     1 HRSIZE4
+    *0-0-0/w ACHR        r     1 INFO                      27-0-0/w PTR         r     1 INFO$
+    25-0-0/w PTR         r     1 JDCB$                     30-0-0/w PTR         r     1 JIT$
+    21-0-0/w BIT         r     1 KICK                      33-0-0/w PTR         r     1 LMDCB$
+    *0-0-0/w BIT         r     1 MMINHIB                   31-0-0/w UBIN        r     1 NAMELEN
+    22-0-0/w UBIN        r     1 NXTWD                     26-0-0/w PTR         r     1 SECLOG$
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:74   
+    *0-0-0/w SBIN        r     1 SIZE                      14-0-0/w SBIN        r     1 SIZE4
+    15-0-0/w SBIN        r     1 SSSIZE4                   13-0-0/w UBIN        r     1 TEMP
+    *0-0-0/w UBIN        r     1 TYPE                      34-0-0/w SBIN        r     1 WSR
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$JIT$                     0-0-0/w PTR         r     1 B$P$
+     0-0-0/w PTR         r     1 B$USRT$                    0-0-0/w PTR         r     1 B$WINDOW$
+     0-0-0/d STRC(432)   r     1 B_MPT                      0-0-0/d STRC(2232)  r     1 B_SITEINFO
+     0-0-0/w UBIN        r     1 ES_LOGSYSACC               0-0-0/w UBIN        r     1 ES_LOGSYSEXIT
+     0-0-0/w PTR         r     1 F$CFU$                     0-0-0/w BIT         r     1 IT_CLOCKOK
+     0-0-0/w PTR         r     1 S$CU$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(8856)  r     1 B$JIT                      0-0-0/d STRC(1224)  r     1 B$P(0:0)
+     0-0-0/d STRC(576)   r     1 B$U                        0-0-0/w STRC(576)   r     1 B$USER(0:0)
+     0-0-0/w STRC(36864) r     1 BUF                        0-0-0/c CHAR(40)    r     1 CHAR40
+     0-0-0/w ASTR(2664)  r     1 EL$PROCERR                 0-0-0/d STRC(432)   r     1 ES$ARES_BYPASS
+     0-0-0/w STRC        r     1 ES$FILE_ACCESS             0-0-0/w STRC(108)   r     1 ES$MON_SRV
+     0-0-0/w STRC(72)    r     1 ES$PRIV_CHANGE             0-0-0/w STRC(1764)  r     1 ES$SECLOG
+     0-0-0/w STRC(72)    r     1 ES$SYS_EXIT                0-0-0/d ASTR(3528)  r     1 F$DCB
+     0-0-0/c ACHR        r     1 FILENAME                   0-0-0/w STRC(288)   r     1 FM$CFU
+     0-0-0/w STRC(288)   r     1 FM$CFUA                    0-0-0/c ASTR(27)    r     1 FM$CFUN
+     0-0-0/w STRC(288)   r     1 FM$SET(0:0)                0-0-0/w ASTR(180)   r     1 HDR
+     0-0-0/d STRC(6516)  r     1 KQ_CG                      0-0-0/d STRC(864)   r     1 NK$LDCT
+     0-0-0/w ASTR(72)    r     1 SIZE_PROCERR               0-0-0/c ACHR        r     1 SSFRAME
+
+
+   Procedure ELA$SYSLOG requires 796 words for executable code.
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:75   
+   Procedure ELA$SYSLOG requires 34 words of local(AUTO) storage.
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:76   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:77   
+          MINI XREF LISTING
+
+B$DO.ECCINFO
+      3463**DCL      3464--REDEF
+B$JIT.CPFLAGS1.SLEAZE IN PROCEDURE MAKE_SECLOG_REC
+      4348**DCL      4348--REDEF
+B$JIT.DCB$ IN PROCEDURE MAKE_SECLOG_REC
+      4422**DCL      5506>>ASSIGN
+B$JIT.ERR IN PROCEDURE MAKE_SECLOG_REC
+      4254**DCL      5519>>ASSIGN   5526>>ASSIGN   5533>>ASSIGN
+B$JIT.ERR.MID IN PROCEDURE MAKE_SECLOG_REC
+      4255**DCL      4255--REDEF
+B$JIT.FACCN IN PROCEDURE MAKE_SECLOG_REC
+      4254**DCL      5514>>ASSIGN   9944>>ASSIGN
+B$JIT.JRESPEAK IN PROCEDURE MAKE_SECLOG_REC
+      4416**DCL      4417--REDEF
+B$JIT.MODE IN PROCEDURE MAKE_SECLOG_REC
+      4249**DCL      9907>>IF
+B$JIT.ORIGINATOR_MODE IN PROCEDURE MAKE_SECLOG_REC
+      4521**DCL      9909>>ASSIGN   9910>>DOCASE
+B$JIT.ORIGINATOR_PORT.FROM_CR IN PROCEDURE MAKE_SECLOG_REC
+      4525**DCL      4525--REDEF    4526--REDEF
+B$JIT.ORIGINATOR_PORT.FROM_CR.DEVICE IN PROCEDURE MAKE_SECLOG_REC
+      4525**DCL      9912>>ASSIGN
+B$JIT.ORIGINATOR_PORT.FROM_CR.TNAME IN PROCEDURE MAKE_SECLOG_REC
+      4525**DCL      9913>>ASSIGN
+B$JIT.ORIGINATOR_PORT.FROM_GHOST.SYSID IN PROCEDURE MAKE_SECLOG_REC
+      4525**DCL      9915>>ASSIGN
+B$JIT.PNR IN PROCEDURE MAKE_SECLOG_REC
+      4429**DCL      4429--REDEF
+B$JIT.PPRIV IN PROCEDURE MAKE_SECLOG_REC
+      4310**DCL      9906>>ASSIGN
+B$JIT.PRIV.ACTIVE IN PROCEDURE MAKE_SECLOG_REC
+      4255**DCL      9903>>ASSIGN
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:78   
+B$JIT.PRIV.AUTH IN PROCEDURE MAKE_SECLOG_REC
+      4295**DCL      9904>>ASSIGN
+B$JIT.PRIV.PRC IN PROCEDURE MAKE_SECLOG_REC
+      4302**DCL      9905>>ASSIGN
+B$JIT.TSLINE IN PROCEDURE MAKE_SECLOG_REC
+      4523**DCL      4524--REDEF
+B$JIT.TSLINE.FEX IN PROCEDURE MAKE_SECLOG_REC
+      4523**DCL      9918>>ASSIGN
+B$JIT.TSLINE.LEV IN PROCEDURE MAKE_SECLOG_REC
+      4524**DCL      9920>>ASSIGN
+B$JIT.TSLINE.PORT IN PROCEDURE MAKE_SECLOG_REC
+      4523**DCL      9919>>ASSIGN
+B$JIT.TSLINE.SUBDEVICE IN PROCEDURE MAKE_SECLOG_REC
+      4524**DCL      9921>>ASSIGN
+B$JIT.TSLINE.SUBSUBDEVICE IN PROCEDURE MAKE_SECLOG_REC
+      4524**DCL      9922>>ASSIGN
+B$JIT$ IN PROCEDURE MAKE_SECLOG_REC
+      4579**DCL      4249--IMP-PTR  9901>>ASSIGN
+B$P.NAME IN PROCEDURE SECLOG_COMMON
+      5606**DCL      9931>>ASSIGN   9933>>ASSIGN   9935>>ASSIGN
+B$P$ IN PROCEDURE SECLOG_COMMON
+      5636**DCL      9931>>ASSIGN   9933>>ASSIGN   9935>>ASSIGN
+B$U.ACP
+      3419**DCL      9931>>ASSIGN
+B$U.ASL
+      3421**DCL      9935>>ASSIGN
+B$U.DB
+      3420**DCL      9933>>ASSIGN
+B$U.MISC
+      3442**DCL      3443--REDEF
+B$USER.MISC
+      3518**DCL      3519--REDEF
+B$USER.US
+      3505**DCL      3892>>IF
+B$USRT$
+      2129**DCL      3892>>IF
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:79   
+B$WINDOW$
+      2128**DCL      3812>>ASSIGN   3903>>ASSIGN
+BADCVM
+      3875**LABEL    3811--CALLALT
+BP$
+       765**DCL      1106--IMP-PTR  3825<<ASSIGN   3834>>ASSIGN   3837>>ASSIGN   3839>>ASSIGN   3844>>ASSIGN
+      3845>>ASSIGN   3846>>ASSIGN   3848>>ASSIGN   3849>>ASSIGN   3853>>ASSIGN   5550>>ASSIGN   5562<<ASSIGN
+      5563>>ASSIGN
+BUF
+      1110**DCL      3904<<ASSIGN
+BUF.COUNT
+      1110**DCL      3851<<ASSIGN   3851>>ASSIGN
+BUF.INFO
+      1110**DCL      3825--ASSIGN   5562--ASSIGN
+BUF.NXTBUF
+      1110**DCL      3900<<ASSIGN
+BUF.WDSLFT
+      1110**DCL      3823>>IF       3824>>ASSIGN   3850<<ASSIGN   3850>>ASSIGN   3905<<ASSIGN   5559>>IF
+      5561>>ASSIGN
+BUF$
+       770**DCL      1110--IMP-PTR  3812<<ASSIGN   3823>>IF       3824>>ASSIGN   3825>>ASSIGN   3850>>ASSIGN
+      3850>>ASSIGN   3851>>ASSIGN   3851>>ASSIGN   3900>>ASSIGN   3903<<ASSIGN   3904>>ASSIGN   3905>>ASSIGN
+      5559>>IF       5561>>ASSIGN   5562>>ASSIGN
+B_MPT.AS
+      1692**DCL      1695--REDEF
+B_MPT.ASDESC
+      1724**DCL      1728--REDEF
+B_MPT.ECCB
+      1707**DCL      1710--REDEF
+B_MPT.ECCBDESC
+      1742**DCL      1746--REDEF
+B_MPT.LS
+      1687**DCL      1690--REDEF
+B_MPT.LSDESC
+      1718**DCL      1722--REDEF
+B_MPT.PS
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:80   
+      1697**DCL      1700--REDEF
+B_MPT.PSDESC
+      1730**DCL      1734--REDEF
+B_MPT.SS
+      1682**DCL      1685--REDEF
+B_MPT.SS$
+      1685**DCL      3837>>ASSIGN
+B_MPT.SSDESC
+      1712**DCL      1716--REDEF
+B_MPT.TCB
+      1702**DCL      1705--REDEF
+B_MPT.TCBDESC
+      1736**DCL      1740--REDEF
+B_SITEINFO.SITE_ID#
+      2999**DCL      3849>>ASSIGN
+CHAR40 IN PROCEDURE SECLOG_COMMON
+      9875**DCL      9902<<ASSIGN   9902>>ASSIGN
+CVMPG
+       764**DCL      3809<<ASSIGN   3811<>CALL     3898<>CALL     3900>>ASSIGN   3902<>CALL     3907>>ASSIGN
+      3908>>ASSIGN
+EL$PROCERR.HRSIZE
+      1116**DCL      3831>>ASSIGN
+EL$PROCERR.SSSIZE
+      1114**DCL      3830>>ASSIGN
+ELA$KICKELF
+       739**DCL-ENT  3865--CALL
+EL_BUSY
+      2026**DCL      3804<>CALL     3868<>CALL     3873<>CALL     3885<>CALL
+EL_CURBUF
+      2033**DCL      3807>>IF       3809>>ASSIGN   3900>>IF       3907<<ASSIGN
+EL_ERRCT
+      2126**DCL      3855<<ASSIGN   3855>>ASSIGN   3858>>IF
+EL_FIRSTBUF
+      2032**DCL      3908>>IF       3908<<ASSIGN
+EL_FULLBUFS
+      2030**DCL      3909<<ASSIGN   3909>>ASSIGN
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:81   
+EL_KICKFLG
+      2127**DCL      3858>>IF       3864<<ASSIGN
+EL_LOGERRS
+      2034**DCL      3763>>IF
+EL_MAXPGS
+      2031**DCL      3892>>IF
+EL_NUMPGS
+      2029**DCL      3892>>IF       3910<<ASSIGN   3910>>ASSIGN
+ERRCD
+       729**DCL        51--PROC     3770<<ASSIGN   3782<<ASSIGN   3811<>CALL     3894<<ASSIGN   3902<>CALL
+      3914<<ASSIGN
+ES$ARES_BYPASS.ACCT# IN PROCEDURE MAKE_SECLOG_REC
+      5493**DCL      5545>>ASSIGN
+ES$ARES_BYPASS.GRANTED# IN PROCEDURE MAKE_SECLOG_REC
+      5492**DCL      5541>>ASSIGN
+ES$ARES_BYPASS.MODEL_NAME IN PROCEDURE MAKE_SECLOG_REC
+      5494**DCL      5546>>ASSIGN
+ES$ARES_BYPASS.PSN# IN PROCEDURE MAKE_SECLOG_REC
+      5493**DCL      5544>>ASSIGN
+ES$ARES_BYPASS.REASON# IN PROCEDURE MAKE_SECLOG_REC
+      5492**DCL      5538>>IF       5540>>ASSIGN
+ES$FILE_ACCESS.GRANTED# IN PROCEDURE MAKE_SECLOG_REC
+      5435**DCL      5505>>ASSIGN
+ES$FILE_ACCESS.REASON# IN PROCEDURE MAKE_SECLOG_REC
+      5435**DCL      5504>>ASSIGN
+ES$MON_SRV.GRANTED# IN PROCEDURE MAKE_SECLOG_REC
+      5463**DCL      5529>>ASSIGN
+ES$MON_SRV.PMME_TYPE# IN PROCEDURE MAKE_SECLOG_REC
+      5464**DCL      5530>>ASSIGN
+ES$MON_SRV.PRIV# IN PROCEDURE MAKE_SECLOG_REC
+      5465**DCL      5531>>ASSIGN
+ES$MON_SRV.REASON# IN PROCEDURE MAKE_SECLOG_REC
+      5463**DCL      5528>>ASSIGN
+ES$PRIV_CHANGE.GRANTED# IN PROCEDURE MAKE_SECLOG_REC
+      5449**DCL      5523>>ASSIGN
+ES$PRIV_CHANGE.PRIV# IN PROCEDURE MAKE_SECLOG_REC
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:82   
+      5450**DCL      5524>>ASSIGN
+ES$PRIV_CHANGE.REASON# IN PROCEDURE MAKE_SECLOG_REC
+      5449**DCL      5522>>ASSIGN
+ES$SECLOG.FACCN
+       503**DCL       507--REDEF
+ES$SECLOG.FILE
+       663**DCL       694--REDEF
+ES$SECLOG.LOGON
+       552**DCL       564--REDEF
+ES$SECLOG.REASON
+       464**DCL      3792>>IF
+ES$SECLOG IN PROCEDURE MAKE_SECLOG_REC
+      5161**DCL      5549<<ASSIGN   5564<<ASSIGN
+ES$SECLOG.ACCN IN PROCEDURE MAKE_SECLOG_REC
+      5194**DCL      9883<<ASSIGN
+ES$SECLOG.DEVICE IN PROCEDURE MAKE_SECLOG_REC
+      5318**DCL      9912<<ASSIGN
+ES$SECLOG.DEVICE_TNAME IN PROCEDURE MAKE_SECLOG_REC
+      5323**DCL      9913<<ASSIGN
+ES$SECLOG.DOMAYN IN PROCEDURE MAKE_SECLOG_REC
+      5178**DCL      9925<<ASSIGN
+ES$SECLOG.ERR IN PROCEDURE MAKE_SECLOG_REC
+      5215**DCL      5519<<ASSIGN   5526<<ASSIGN   5533<<ASSIGN
+ES$SECLOG.FACCN IN PROCEDURE MAKE_SECLOG_REC
+      5202**DCL      5206--REDEF
+ES$SECLOG.FILE IN PROCEDURE MAKE_SECLOG_REC
+      5362**DCL      5393--REDEF
+ES$SECLOG.FILE.ACCT IN PROCEDURE MAKE_SECLOG_REC
+      5380**DCL      5512<<ASSIGN   5513>>IF       5514<<ASSIGN   5545<<ASSIGN
+ES$SECLOG.FILE.ASN IN PROCEDURE MAKE_SECLOG_REC
+      5370**DCL      5508<<ASSIGN   5543<<ASSIGN
+ES$SECLOG.FILE.FFLG IN PROCEDURE MAKE_SECLOG_REC
+      5372**DCL      5509<<ASSIGN
+ES$SECLOG.FILE.FUN IN PROCEDURE MAKE_SECLOG_REC
+      5368**DCL      5507<<ASSIGN   5542<<ASSIGN
+ES$SECLOG.FILE.NAME# IN PROCEDURE MAKE_SECLOG_REC
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:83   
+      5384**DCL      5546<<ASSIGN
+ES$SECLOG.FILE.NAME#.C IN PROCEDURE MAKE_SECLOG_REC
+      5390**DCL      5517<<ASSIGN
+ES$SECLOG.FILE.NAME#.L IN PROCEDURE MAKE_SECLOG_REC
+      5387**DCL      5516<<ASSIGN
+ES$SECLOG.FILE.RES IN PROCEDURE MAKE_SECLOG_REC
+      5378**DCL      5510<<ASSIGN
+ES$SECLOG.FILE.SN IN PROCEDURE MAKE_SECLOG_REC
+      5376**DCL      5511<<ASSIGN   5544<<ASSIGN
+ES$SECLOG.GRANTED IN PROCEDURE MAKE_SECLOG_REC
+      5168**DCL      5505<<ASSIGN   5523<<ASSIGN   5529<<ASSIGN   5536<<ASSIGN   5541<<ASSIGN
+ES$SECLOG.LOGON IN PROCEDURE MAKE_SECLOG_REC
+      5251**DCL      5263--REDEF
+ES$SECLOG.MODE IN PROCEDURE MAKE_SECLOG_REC
+      5172**DCL      9882<<ASSIGN   9902--ASSIGN
+ES$SECLOG.ORIG_MODE IN PROCEDURE MAKE_SECLOG_REC
+      5355**DCL      9909<<ASSIGN
+ES$SECLOG.ORIG_SYSID IN PROCEDURE MAKE_SECLOG_REC
+      5286**DCL      9915<<ASSIGN
+ES$SECLOG.PMME_TYPE IN PROCEDURE MAKE_SECLOG_REC
+      5349**DCL      5530<<ASSIGN
+ES$SECLOG.PPRIV IN PROCEDURE MAKE_SECLOG_REC
+      5237**DCL      9906<<ASSIGN
+ES$SECLOG.PRIV IN PROCEDURE MAKE_SECLOG_REC
+      5230**DCL      9904<<ASSIGN
+ES$SECLOG.PRIVS_REQUIRED IN PROCEDURE MAKE_SECLOG_REC
+      5328**DCL      5524<<ASSIGN   5531<<ASSIGN
+ES$SECLOG.PRIV_ACTIVE IN PROCEDURE MAKE_SECLOG_REC
+      5244**DCL      9903<<ASSIGN
+ES$SECLOG.PRIV_PRC IN PROCEDURE MAKE_SECLOG_REC
+      5248**DCL      9905<<ASSIGN
+ES$SECLOG.PROC_ACCT IN PROCEDURE MAKE_SECLOG_REC
+      5275**DCL      9896<<ASSIGN   9928<<ASSIGN   9942<<ASSIGN   9943>>IF       9944<<ASSIGN
+ES$SECLOG.PROC_NAME IN PROCEDURE MAKE_SECLOG_REC
+      5263**DCL      9931<<ASSIGN   9933<<ASSIGN   9935<<ASSIGN   9941<<ASSIGN
+ES$SECLOG.PROC_NAME.C IN PROCEDURE MAKE_SECLOG_REC
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:84   
+      5272**DCL      9893<<ASSIGN
+ES$SECLOG.PROC_NAME.L IN PROCEDURE MAKE_SECLOG_REC
+      5269**DCL      9894<<ASSIGN
+ES$SECLOG.PROC_PSN IN PROCEDURE MAKE_SECLOG_REC
+      5280**DCL      9897<<ASSIGN   9929<<ASSIGN   9945<<ASSIGN
+ES$SECLOG.REASON IN PROCEDURE MAKE_SECLOG_REC
+      5163**DCL      5504<<ASSIGN   5518>>IF       5522<<ASSIGN   5525>>IF       5528<<ASSIGN   5532>>IF
+      5535<<ASSIGN   5539<<ASSIGN   5540<<ASSIGN
+ES$SECLOG.TSLINE.FEX IN PROCEDURE MAKE_SECLOG_REC
+      5303**DCL      9885<<ASSIGN   9918<<ASSIGN
+ES$SECLOG.TSLINE.LEV IN PROCEDURE MAKE_SECLOG_REC
+      5309**DCL      9887<<ASSIGN   9920<<ASSIGN
+ES$SECLOG.TSLINE.PORT IN PROCEDURE MAKE_SECLOG_REC
+      5306**DCL      9886<<ASSIGN   9919<<ASSIGN
+ES$SECLOG.TSLINE.SUBDEVICE IN PROCEDURE MAKE_SECLOG_REC
+      5312**DCL      9888<<ASSIGN   9921<<ASSIGN
+ES$SECLOG.TSLINE.SUBSUBDEVICE IN PROCEDURE MAKE_SECLOG_REC
+      5315**DCL      9889<<ASSIGN   9922<<ASSIGN
+ES$SECLOG.UNAME IN PROCEDURE MAKE_SECLOG_REC
+      5198**DCL      9884<<ASSIGN
+ES$SECLOG_INIT
+      1763**DCL      3820--ASSIGN   5559--IF       5564>>ASSIGN
+ES$SECLOG_INIT.FACCN
+      1804**DCL      1808--REDEF
+ES$SECLOG_INIT.FILE
+      1964**DCL      1995--REDEF
+ES$SECLOG_INIT.LOGON
+      1853**DCL      1865--REDEF
+ES$SYS_EXIT.JIT$ IN PROCEDURE MAKE_SECLOG_REC
+      5478**DCL      9881>>ASSIGN
+ES$SYS_EXIT.REASON# IN PROCEDURE MAKE_SECLOG_REC
+      5478**DCL      9878>>IF
+ES_LOGSYSACC
+      2131**DCL      3792>>IF
+ES_LOGSYSEXIT
+      2130**DCL      3792>>IF
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:85   
+F$CFU$ IN PROCEDURE SECLOG_COMMON
+      9867**DCL      9860--IMP-PTR  9893>>ASSIGN   9893>>ASSIGN   9894>>ASSIGN   9895>>ASSIGN   9897>>ASSIGN
+F$DCB.ACCT IN PROCEDURE MAKE_SECLOG_REC
+      4541**DCL      5512>>ASSIGN   9942>>ASSIGN
+F$DCB.ACTPOS IN PROCEDURE MAKE_SECLOG_REC
+      4556**DCL      4556--REDEF
+F$DCB.ARS IN PROCEDURE MAKE_SECLOG_REC
+      4531**DCL      4531--REDEF
+F$DCB.ASN IN PROCEDURE MAKE_SECLOG_REC
+      4546**DCL      5508>>ASSIGN
+F$DCB.ATTR IN PROCEDURE MAKE_SECLOG_REC
+      4549**DCL      4550--REDEF
+F$DCB.BORROW IN PROCEDURE MAKE_SECLOG_REC
+      4564**DCL      4564--REDEF    4564--REDEF    4564--REDEF
+F$DCB.DCBNAME.L IN PROCEDURE MAKE_SECLOG_REC
+      4578**DCL      4578--IMP-SIZ  9938>>IF
+F$DCB.DCBNAME.N IN PROCEDURE MAKE_SECLOG_REC
+      4578**DCL      9938>>IF
+F$DCB.EOMCHAR IN PROCEDURE MAKE_SECLOG_REC
+      4535**DCL      4535--REDEF
+F$DCB.FCD IN PROCEDURE MAKE_SECLOG_REC
+      4544**DCL      9940>>IF
+F$DCB.FFLG IN PROCEDURE MAKE_SECLOG_REC
+      4535**DCL      5509>>ASSIGN
+F$DCB.FLDID IN PROCEDURE MAKE_SECLOG_REC
+      4559**DCL      4559--REDEF
+F$DCB.FORM$ IN PROCEDURE MAKE_SECLOG_REC
+      4553**DCL      4553--REDEF
+F$DCB.FSECT IN PROCEDURE MAKE_SECLOG_REC
+      4569**DCL      4569--REDEF
+F$DCB.FSN IN PROCEDURE MAKE_SECLOG_REC
+      4546**DCL      4546--REDEF    4546--REDEF    4547--REDEF
+F$DCB.FUN IN PROCEDURE MAKE_SECLOG_REC
+      4545**DCL      5507>>ASSIGN
+F$DCB.HEADER$ IN PROCEDURE MAKE_SECLOG_REC
+      4552**DCL      4552--REDEF
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:86   
+F$DCB.IXTNSIZE IN PROCEDURE MAKE_SECLOG_REC
+      4550**DCL      4550--REDEF
+F$DCB.LASTSTA$ IN PROCEDURE MAKE_SECLOG_REC
+      4540**DCL      4540--REDEF
+F$DCB.LOGSEC IN PROCEDURE MAKE_SECLOG_REC
+      4570**DCL      5520<<ASSIGN
+F$DCB.LVL IN PROCEDURE MAKE_SECLOG_REC
+      4565**DCL      4565--REDEF
+F$DCB.NAME IN PROCEDURE MAKE_SECLOG_REC
+      4540**DCL      9941>>ASSIGN
+F$DCB.NAME.C IN PROCEDURE MAKE_SECLOG_REC
+      4540**DCL      4540--REDEF    5517--ASSIGN
+F$DCB.NAME.L IN PROCEDURE MAKE_SECLOG_REC
+      4540**DCL      5515>>ASSIGN
+F$DCB.NOEOF IN PROCEDURE MAKE_SECLOG_REC
+      4561**DCL      4561--REDEF
+F$DCB.NRECS IN PROCEDURE MAKE_SECLOG_REC
+      4551**DCL      4551--REDEF
+F$DCB.NRECX IN PROCEDURE MAKE_SECLOG_REC
+      4570**DCL      4570--REDEF
+F$DCB.OHDR IN PROCEDURE MAKE_SECLOG_REC
+      4562**DCL      4562--REDEF
+F$DCB.ORG IN PROCEDURE MAKE_SECLOG_REC
+      4545**DCL      4545--REDEF
+F$DCB.PRECNO IN PROCEDURE MAKE_SECLOG_REC
+      4568**DCL      4568--REDEF
+F$DCB.PSN IN PROCEDURE MAKE_SECLOG_REC
+      4541**DCL      5511>>ASSIGN   9945>>ASSIGN
+F$DCB.RCSZ IN PROCEDURE MAKE_SECLOG_REC
+      4573**DCL      4573--REDEF
+F$DCB.RES IN PROCEDURE MAKE_SECLOG_REC
+      4541**DCL      4541--REDEF    5510>>ASSIGN
+F$DCB.SETX IN PROCEDURE MAKE_SECLOG_REC
+      4553**DCL      4553--REDEF
+F$DCB.TAB$ IN PROCEDURE MAKE_SECLOG_REC
+      4552**DCL      4553--REDEF
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:87   
+F$DCB.TDA IN PROCEDURE MAKE_SECLOG_REC
+      4567**DCL      4567--REDEF
+F$DCB.WSN IN PROCEDURE MAKE_SECLOG_REC
+      4542**DCL      4542--REDEF
+FILE
+       728**DCL        51--PROC     3774--IF       3778>>ASSIGN
+FILENAME IN PROCEDURE MAKE_SECLOG_REC
+      3925**DCL      5517>>ASSIGN
+FILEX
+       771**DCL      3776<<ASSIGN   3778<<ASSIGN   3780>>IF       3786>>IF       3818>>IF       3846>>ASSIGN
+      3858>>IF       3858>>IF       3875>>IF
+FM$CFU.ACCTX IN PROCEDURE SECLOG_COMMON
+      9849**DCL      9849--REDEF    9895>>ASSIGN
+FM$CFU.NAMEX IN PROCEDURE SECLOG_COMMON
+      9849**DCL      9893>>ASSIGN   9893>>ASSIGN   9894>>ASSIGN
+FM$CFUA.ACCT IN PROCEDURE SECLOG_COMMON
+      9854**DCL      9896>>ASSIGN
+FM$CFUA.SETX IN PROCEDURE SECLOG_COMMON
+      9854**DCL      9897>>ASSIGN
+FM$CFUN.C IN PROCEDURE SECLOG_COMMON
+      9865**DCL      9893>>ASSIGN
+FM$CFUN.L IN PROCEDURE SECLOG_COMMON
+      9865**DCL      9865--IMP-SIZ  9893>>ASSIGN   9894>>ASSIGN
+FM$SET.PSN IN PROCEDURE SECLOG_COMMON
+      9860**DCL      9897>>ASSIGN
+FM$SET.USERLIST IN PROCEDURE SECLOG_COMMON
+      9861**DCL      9861--REDEF
+FMO$GETDOMAIN IN PROCEDURE SECLOG_COMMON
+      9871**DCL-ENT  9924--CALL
+GETNEWBUF
+      3890**PROC     3807--CALL     3823--CALL     5560--CALL
+HDR.FILE
+      1107**DCL      3846<<ASSIGN
+HDR.INFO
+      1107**DCL      3834<<ASSIGN   3837<<ASSIGN   3839<<ASSIGN   5550<<ASSIGN
+HDR.LOST
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:88   
+      1107**DCL      3853<<ASSIGN
+HDR.SITE_ID
+      1106**DCL      3849<<ASSIGN
+HDR.SIZE
+      1106**DCL      3845<<ASSIGN
+HDR.TYPE
+      1106**DCL      1106--REDEF    3844<<ASSIGN
+HDR.UTS
+      1106**DCL      3848<<ASSIGN
+HFC$LOCK
+      3311**DCL-ENT  3804--CALL
+HFC$UNLOCK
+      3311**DCL-ENT  3868--CALL     3873--CALL     3885--CALL
+HRSIZE4
+       769**DCL       779--IMP-SIZ  1117--IMP-SIZ  3827<<ASSIGN   3831<<ASSIGN   3833>>ASSIGN   3838>>IF
+      3839>>ASSIGN   3839>>ASSIGN   3858>>IF
+INFO
+        53**DCL        51--PROC      462--REDEF    3830--ASSIGN   3831--ASSIGN   3834>>ASSIGN   5500--ASSIGN
+      5550>>ASSIGN
+INFO$ IN PROCEDURE MAKE_SECLOG_REC
+      3922**DCL      5435--IMP-PTR  5449--IMP-PTR  5463--IMP-PTR  5478--IMP-PTR  5492--IMP-PTR  5500<<ASSIGN
+      5504>>ASSIGN   5505>>ASSIGN   5522>>ASSIGN   5523>>ASSIGN   5524>>ASSIGN   5528>>ASSIGN   5529>>ASSIGN
+      5530>>ASSIGN   5531>>ASSIGN   5538>>IF       5540>>ASSIGN   5541>>ASSIGN   5544>>ASSIGN   5545>>ASSIGN
+      5546>>ASSIGN   9878>>IF       9879>>ASSIGN   9881>>ASSIGN
+INT IN PROCEDURE SECLOG_COMMON
+      9915**LABEL    9908--GOTO
+IT_CLOCKOK
+      3003**DCL      3763>>IF
+JDCB$ IN PROCEDURE MAKE_SECLOG_REC
+      3920**DCL      5506<<ASSIGN   5507>>ASSIGN   5508>>ASSIGN   5509>>ASSIGN   5510>>ASSIGN   5511>>ASSIGN
+      5512>>ASSIGN   5515>>ASSIGN   5517>>ASSIGN   5520>>ASSIGN
+JIT$ IN PROCEDURE MAKE_SECLOG_REC
+      3923**DCL      5506>>ASSIGN   5514>>ASSIGN   5519>>ASSIGN   5526>>ASSIGN   5533>>ASSIGN   5773--IMP-PTR
+      9848--IMP-PTR  9854--IMP-PTR  9879<<ASSIGN   9881<<ASSIGN   9883>>ASSIGN   9884>>ASSIGN   9885>>ASSIGN
+      9886>>ASSIGN   9887>>ASSIGN   9888>>ASSIGN   9889>>ASSIGN   9890>>IF       9891<<ASSIGN   9891>>ASSIGN
+      9892>>IF       9893>>ASSIGN   9893>>ASSIGN   9894>>ASSIGN   9895<<ASSIGN   9895>>ASSIGN   9896>>ASSIGN
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:89   
+      9897>>ASSIGN   9901<<ASSIGN   9902>>ASSIGN   9903>>ASSIGN   9904>>ASSIGN   9905>>ASSIGN   9906>>ASSIGN
+      9907>>IF       9909>>ASSIGN   9910>>DOCASE   9912>>ASSIGN   9913>>ASSIGN   9915>>ASSIGN   9918>>ASSIGN
+      9919>>ASSIGN   9920>>ASSIGN   9921>>ASSIGN   9922>>ASSIGN   9944>>ASSIGN
+KICK
+       772**DCL      3860<<ASSIGN   3861<<ASSIGN   3862>>IF
+KQ_CG.AUCTL.DVBYTE.REREAD IN PROCEDURE SECLOG_COMMON
+      9494**DCL      9495--REDEF
+KQ_CG.CFU$ IN PROCEDURE SECLOG_COMMON
+      9562**DCL      9891>>ASSIGN
+LMDCB$ IN PROCEDURE SECLOG_COMMON
+      9873**DCL      9937<<ASSIGN   9938>>IF       9938>>IF       9939<<ASSIGN   9940>>IF       9941>>ASSIGN
+      9942>>ASSIGN   9945>>ASSIGN
+LOGAGIN
+      3804**LABEL    3878--GOTO
+LOSTERRU
+      3862**LABEL    3807--CALLALT  3819--CALLALT  3823--CALLALT
+LOST_ENTRIES
+       773**DCL      3853>>ASSIGN   3854<<ASSIGN   3880<<ASSIGN   3880>>ASSIGN
+LOST_ENTRY IN PROCEDURE MAKE_SECLOG_REC
+      5553**LABEL    5498--CALLALT
+LOST_IT IN PROCEDURE SECLOG_REC_INIT
+      5564**LABEL    5560--CALLALT
+MAKE_SECLOG_REC
+      3918**PROC     3819--CALL
+MMALT IN PROCEDURE GETNEWBUF
+      3913**LABEL    3898--CALLALT  3902--CALLALT
+MMD$STLPP
+       732**DCL-ENT  3898--CALL
+MME$CVM
+       731**DCL-ENT  3811--CALL     3857--CALL     3902--CALL
+MMINHIB
+       727**DCL        51--PROC     3892>>IF
+NAMELEN IN PROCEDURE MAKE_SECLOG_REC
+      3924**DCL      3925--IMP-SIZ  5515<<ASSIGN   5516>>ASSIGN   5517>>ASSIGN
+NK$LDCT.CG$ IN PROCEDURE SECLOG_COMMON
+      5804**DCL      9890>>IF       9891>>ASSIGN
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:90   
+NK$LDCT.DDT$ IN PROCEDURE SECLOG_COMMON
+      5775**DCL      5775--REDEF
+NK$LDCT.DEVNM IN PROCEDURE SECLOG_COMMON
+      5775**DCL      9883>>ASSIGN
+NK$LDCT.IOQ$ IN PROCEDURE SECLOG_COMMON
+      5774**DCL      5775--REDEF
+NK$LDCT.LDCTX IN PROCEDURE SECLOG_COMMON
+      5776**DCL      5776--REDEF
+NK$LDCT.LKFLG.ABORTED IN PROCEDURE SECLOG_COMMON
+      5788**DCL      5789--REDEF
+NK$LDCT.LOGON_ACCT IN PROCEDURE SECLOG_COMMON
+      5803**DCL      9884>>ASSIGN
+NK$LDCT.RLCID.LDCTX IN PROCEDURE SECLOG_COMMON
+      5798**DCL      5798--REDEF
+NK$LDCT.RLCID.NODE IN PROCEDURE SECLOG_COMMON
+      5797**DCL      9885>>ASSIGN
+NK$LDCT.STA$ IN PROCEDURE SECLOG_COMMON
+      5794**DCL      5795--REDEF
+NK$LDCT.SYMB$ IN PROCEDURE SECLOG_COMMON
+      5773**DCL      5773--REDEF    5773--REDEF    5774--REDEF
+NK$LDCT.TERMID.CHAN IN PROCEDURE SECLOG_COMMON
+      5802**DCL      9886>>ASSIGN
+NK$LDCT.TERMID.LEV IN PROCEDURE SECLOG_COMMON
+      5801**DCL      9887>>ASSIGN
+NK$LDCT.TERMID.SUB IN PROCEDURE SECLOG_COMMON
+      5802**DCL      9888>>ASSIGN
+NK$LDCT.TERMID.SUBSUB IN PROCEDURE SECLOG_COMMON
+      5802**DCL      9889>>ASSIGN
+NXTWD
+       774**DCL      3824<<ASSIGN   3825>>ASSIGN   5561<<ASSIGN   5562>>ASSIGN
+S$CU$ IN PROCEDURE SECLOG_COMMON
+      9869**DCL      9931>>ASSIGN   9933>>ASSIGN   9935>>ASSIGN
+SECLOG$ IN PROCEDURE MAKE_SECLOG_REC
+      3921**DCL      5161--IMP-PTR  5504>>ASSIGN   5505>>ASSIGN   5507>>ASSIGN   5508>>ASSIGN   5509>>ASSIGN
+      5510>>ASSIGN   5511>>ASSIGN   5512>>ASSIGN   5513>>IF       5514>>ASSIGN   5516>>ASSIGN   5517>>ASSIGN
+      5518>>IF       5519>>ASSIGN   5522>>ASSIGN   5523>>ASSIGN   5524>>ASSIGN   5525>>IF       5526>>ASSIGN
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:91   
+      5528>>ASSIGN   5529>>ASSIGN   5530>>ASSIGN   5531>>ASSIGN   5532>>IF       5533>>ASSIGN   5535>>ASSIGN
+      5536>>ASSIGN   5539>>ASSIGN   5540>>ASSIGN   5541>>ASSIGN   5542>>ASSIGN   5543>>ASSIGN   5544>>ASSIGN
+      5545>>ASSIGN   5546>>ASSIGN   5549>>ASSIGN   5563<<ASSIGN   5564>>ASSIGN   9882>>ASSIGN   9883>>ASSIGN
+      9884>>ASSIGN   9885>>ASSIGN   9886>>ASSIGN   9887>>ASSIGN   9888>>ASSIGN   9889>>ASSIGN   9893>>ASSIGN
+      9894>>ASSIGN   9896>>ASSIGN   9897>>ASSIGN   9902>>ASSIGN   9903>>ASSIGN   9904>>ASSIGN   9905>>ASSIGN
+      9906>>ASSIGN   9909>>ASSIGN   9912>>ASSIGN   9913>>ASSIGN   9915>>ASSIGN   9918>>ASSIGN   9919>>ASSIGN
+      9920>>ASSIGN   9921>>ASSIGN   9922>>ASSIGN   9925>>ASSIGN   9928>>ASSIGN   9929>>ASSIGN   9931>>ASSIGN
+      9933>>ASSIGN   9935>>ASSIGN   9941>>ASSIGN   9942>>ASSIGN   9943>>IF       9944>>ASSIGN   9945>>ASSIGN
+SECLOG_COMMON IN PROCEDURE MAKE_SECLOG_REC
+      5572**PROC     5501--CALL
+SECLOG_REC_INIT IN PROCEDURE MAKE_SECLOG_REC
+      5557**PROC     5498--CALL
+SIZE
+       726**DCL        51--PROC     3768>>IF       3823>>IF       3833>>ASSIGN   3839--ASSIGN   3842>>ASSIGN
+      5499>>ASSIGN
+SIZE4
+       767**DCL        53--IMP-SIZ  1107--IMP-SIZ  3820<<ASSIGN   3833<<ASSIGN   3834>>ASSIGN   3834>>ASSIGN
+      3837>>ASSIGN   3837>>ASSIGN   3839>>ASSIGN   3839>>ASSIGN   3842<<ASSIGN   3845>>ASSIGN   3850>>ASSIGN
+      3857<>CALL     5499<<ASSIGN   5550>>ASSIGN   5550>>ASSIGN
+SIZE_PROCERR.HR
+       779**DCL      3839>>ASSIGN
+SSC$MONTIMR
+       737**DCL-ENT  3865--CALL
+SSFRAME
+       780**DCL      3837>>ASSIGN
+SSR$REG
+       738**DCL-ENT  3877--CALL
+SSS$CACHE
+       734**DCL-ENT  3810--CALL     3856--CALL     3881--CALL     3897--CALL     3901--CALL     3911--CALL
+SSS$CACHEBP
+       735**DCL-ENT  3806--CALL     3852--CALL     3891--CALL     3899--CALL     3906--CALL     3913--CALL
+SSS$SYSTIME
+       733**DCL-ENT  3847--CALL
+SSSIZE4
+       768**DCL       780--IMP-SIZ  3826<<ASSIGN   3830<<ASSIGN   3833>>ASSIGN   3835>>IF       3837>>ASSIGN
+      3837>>ASSIGN   3839>>ASSIGN
+PL6.E3A0      #001=ELA$SYSLOG File=ELA$SYSLOG.:E05TSI                            TUE 07/29/97 15:17 Page:92   
+TEMP
+       766**DCL      3847<>CALL     3848>>ASSIGN
+TYPE
+       725**DCL        51--PROC     3792>>IF       3792>>IF       3818>>IF       3828>>IF       3844>>ASSIGN
+      5502>>DOCASE   9877>>IF
+WSR IN PROCEDURE SECLOG_COMMON
+      9874**DCL      9924<>CALL     9925>>ASSIGN   9926>>DOCASE   9930>>IF       9932>>IF
+
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:93   
+      474        1        /*T***********************************************************/
+      475        2        /*T*                                                         */
+      476        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      477        4        /*T*                                                         */
+      478        5        /*T***********************************************************/
+      479        6        ELA$KICKELF: PROC;
+      480        7        /**/
+      481        8        %INCLUDE B$USER;
+      482      224        %INCLUDE HF_LOCK_C;
+      483      238        %INCLUDE SS_SCHED_C;
+      484      471    1   DCL EL_BUSY BIT(72) SYMREF ALIGNED;
+      485      472    1   DCL EL_GJOBUN UBIN BYTE ALIGNED SYMREF;
+      486      473    1   DCL EL_KICKFLG BIT(1) ALIGNED SYMREF;
+      487      474    1   DCL B$USRT$ PTR SYMREF;
+      488      475    1   DCL SSC$MONTIMR ENTRY(3);
+      489      476    1   DCL SSR$RUE ENTRY(4);
+      490      477        /**/
+      491      478                %LOCK (G#=EL_BUSY);
+      492      481    2           IF B$USRT$->B$USER.US(EL_GJOBUN)=%SS_SW THEN DO;
+      493      482    2              CALL SSR$RUE(%SS_WU,EL_GJOBUN);
+      494      483    2              EL_KICKFLG='0'B;
+      495      484    2              END;
+      496      485    1           ELSE CALL SSC$MONTIMR(20,ENTADDR(ELA$KICKELF),0);
+      497      486                %UNLOCK (G#=EL_BUSY);
+      498      489    1           RETURN;
+      499      490    1   END ELA$KICKELF;
+
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:94   
+--  Include file information  --
+
+   SS_SCHED_C.:E05TOU  is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure ELA$KICKELF.
+
+   Procedure ELA$KICKELF requires 37 words for executable code.
+   Procedure ELA$KICKELF requires 8 words of local(AUTO) storage.
+
+    No errors detected in file ELA$SYSLOG.:E05TSI    .
+
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:95   
+
+ Object Unit name= ELA$KICKELF                                File name= ELA$SYSLOG.:E05TOU
+ UTS= JUL 29 '97 15:17:56.32 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none    37     45  ELA$KICKELF
+    1  RoData even  none     7      7  ELA$KICKELF
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        0  ELA$KICKELF
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 HFC$LOCK
+         yes           Std       3 SSC$MONTIMR
+         yes           Std       1 HFC$UNLOCK
+         yes           Std       4 SSR$RUE
+         yes           Std       0 ELA$KICKELF
+                       nStd      0 X66_AUTO_0
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:96   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     EL_BUSY                               EL_GJOBUN                             EL_KICKFLG
+     B$USRT$                               B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:97   
+
+
+      474        1        /*T***********************************************************/
+      475        2        /*T*                                                         */
+      476        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      477        4        /*T*                                                         */
+      478        5        /*T***********************************************************/
+      479        6        ELA$KICKELF: PROC;
+
+      6  0 000000   000000 700200 xent  ELA$KICKELF  TSX0  ! X66_AUTO_0
+         0 000001   000010 000000                    ZERO    8,0
+
+      480        7        /**/
+      481        8        %INCLUDE B$USER;
+      482      224        %INCLUDE HF_LOCK_C;
+      483      238        %INCLUDE SS_SCHED_C;
+      484      471    1   DCL EL_BUSY BIT(72) SYMREF ALIGNED;
+      485      472    1   DCL EL_GJOBUN UBIN BYTE ALIGNED SYMREF;
+      486      473    1   DCL EL_KICKFLG BIT(1) ALIGNED SYMREF;
+      487      474    1   DCL B$USRT$ PTR SYMREF;
+      488      475    1   DCL SSC$MONTIMR ENTRY(3);
+      489      476    1   DCL SSR$RUE ENTRY(4);
+      490      477        /**/
+      491      478                %LOCK (G#=EL_BUSY);
+
+    479  0 000002   000000 630400 1                  EPPR0   0
+         0 000003   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000004   000000 701000 xent               TSX1    HFC$LOCK
+         0 000005   000000 011000                    NOP     0
+
+      492      481    2           IF B$USRT$->B$USER.US(EL_GJOBUN)=%SS_SW THEN DO;
+
+    481  0 000006   000000 236000 xsym               LDQ     EL_GJOBUN
+         0 000007   000027 772000                    QRL     23
+         0 000010   017760 376007                    ANQ     8176,DL
+         0 000011   000000 470400 xsym               LDP0    B$USRT$
+         0 000012   000011 236106                    LDQ     9,QL,PR0
+         0 000013   770000 376003                    ANQ     -4096,DU
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:98   
+         0 000014   210000 116003                    CMPQ    69632,DU
+         0 000015   000024 601000 0                  TNZ     s:485
+
+      493      482    2              CALL SSR$RUE(%SS_WU,EL_GJOBUN);
+
+    482  0 000016   000002 630400 1                  EPPR0   2
+         0 000017   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000020   000000 701000 xent               TSX1    SSR$RUE
+         0 000021   000000 011000                    NOP     0
+
+      494      483    2              EL_KICKFLG='0'B;
+
+    483  0 000022   000000 450000 xsym               STZ     EL_KICKFLG
+
+      495      484    2              END;
+
+    484  0 000023   000040 710000 0                  TRA     s:487
+
+      496      485    1           ELSE CALL SSC$MONTIMR(20,ENTADDR(ELA$KICKELF),0);
+
+    485  0 000024   000000 636000 0                  EAQ     s:6
+         0 000025   200004 756100                    STQ     4,,AUTO
+         0 000026   000005 236000 1                  LDQ     5
+         0 000027   200007 756100                    STQ     7,,AUTO
+         0 000030   200004 631500                    EPPR1   4,,AUTO
+         0 000031   200006 451500                    STP1    6,,AUTO
+         0 000032   000006 236000 1                  LDQ     6
+         0 000033   200005 756100                    STQ     5,,AUTO
+         0 000034   200005 630500                    EPPR0   5,,AUTO
+         0 000035   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000036   000000 701000 xent               TSX1    SSC$MONTIMR
+         0 000037   000000 011000                    NOP     0
+
+      497      486                %UNLOCK (G#=EL_BUSY);
+
+    487  0 000040   000000 630400 1                  EPPR0   0
+         0 000041   000017 631400 xsym               EPPR1   B_VECTNIL+15
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:99   
+         0 000042   000000 701000 xent               TSX1    HFC$UNLOCK
+         0 000043   000000 011000                    NOP     0
+
+      498      489    1           RETURN;
+
+    489  0 000044   000000 702200 xent               TSX2  ! X66_ARET
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 006000   000000 000027   000001 006000   000000 006000    ................
+   1     004   000000 000024   000002 006000   000004 006000                    ............
+      499      490    1   END ELA$KICKELF;
+
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:100  
+--  Include file information  --
+
+   SS_SCHED_C.:E05TOU  is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure ELA$KICKELF.
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:101  
+
+ **** Variables and constants ****
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$USRT$                    0-0-0/w BIT (72)    r     1 EL_BUSY
+     0-0-0/w UBIN(9)     r     1 EL_GJOBUN                  0-0-0/w BIT         r     1 EL_KICKFLG
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(576)   r     1 B$USER(0:0)
+
+
+   Procedure ELA$KICKELF requires 37 words for executable code.
+   Procedure ELA$KICKELF requires 8 words of local(AUTO) storage.
+
+    No errors detected in file ELA$SYSLOG.:E05TSI    .
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:102  
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=ELA$KICKELF File=ELA$SYSLOG.:E05TSI                           TUE 07/29/97 15:17 Page:103  
+          MINI XREF LISTING
+
+B$DO.ECCINFO
+       159**DCL       160--REDEF
+B$U.MISC
+       138**DCL       139--REDEF
+B$USER.MISC
+       214**DCL       215--REDEF
+B$USER.US
+       201**DCL       481>>IF
+B$USRT$
+       474**DCL       481>>IF
+ELA$KICKELF
+         6**PROC      485--CALL
+EL_BUSY
+       471**DCL       479<>CALL      487<>CALL
+EL_GJOBUN
+       472**DCL       481>>IF        482<>CALL
+EL_KICKFLG
+       473**DCL       483<<ASSIGN
+HFC$LOCK
+       237**DCL-ENT   479--CALL
+HFC$UNLOCK
+       237**DCL-ENT   487--CALL
+SSC$MONTIMR
+       475**DCL-ENT   485--CALL
+SSR$RUE
+       476**DCL-ENT   482--CALL

@@ -1,0 +1,584 @@
+
+
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: cf.c,v 1.5 87/03/10 10:44:39 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /*  C O N T R O L   F L O W
+        7         7              *
+        8         8              *  M A I N   R O U T I N E
+        9         9              */
+       10        10
+       11        11             #include <stdio:h>
+       12        12             #include "types:h"
+       13        13             #include "debug:h"
+       14        14             #include "map:h"
+       15        15             #include "files:h"
+       16        16             #include "global:h"
+       17        17             #include "alloc:h"
+       18        18             #include "lset:h"
+       19        19             #include "cset:h"
+       20        20             #include "get:h"
+       21        21             #include "put:h"
+       22        22             #include "em_mnem:h"
+       23        23             #include "em_pseu:h"
+       24        24             #include "em_spec:h"
+       25        25             #include "em_flag:h"
+       26        26             #include "def:h"
+       27        27             #include "cf:h"
+       28        28             #include "cf_succ:h"
+       29        29             #include "cf_idom:h"
+       30        30             #include "cf_loop:h"
+       31        31
+       32        32             #define newcfbx()  (bext_p) newstruct(bext_cf)
+       33        33             #define oldcfbx(x) oldstruct(bext_cf,x)
+       34        34
+       35        35             extern char em_flag[];
+       36        36             extern line_p get_next_line();
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=2  
+       37        37
+       38        38             STATIC cset  lpi_set; /* set of procedures used in LPI instruction */
+       39        39             STATIC cset  cai_set; /* set of all procedures doing a CAI */
+       40        40
+       41        41
+       42        42             /* The procedure getbblocks reads the EM textfile and
+       43        43              * partitions every procedure into a number of basic blocks.
+       44        44              */
+       45        45
+       46        46             #define LABEL0     0
+       47        47             #define LABEL      1
+       48        48             #define NORMAL     2
+       49        49             #define JUMP    3
+       50        50             #define END     4
+       51        51             #define AFTERPRO   5
+       52        52             #define INIT    6
+       53        53
+       54        54
+       55        55             /* These global variables are used by getbblocks and nextblock. */
+       56        56
+       57        57             STATIC bblock_p b, *bp;  /* b is the current basic block, bp is
+       58        58                      * the address where the next block has
+       59        59                      * to be linked.
+       60        60                      */
+       61        61             STATIC line_p   lnp, *lp; /* lnp is the current line, lp is
+       62        62                       * the address where the next line
+       63        63                       * has to be linked.
+       64        64                       */
+       65        65             STATIC short state;   /* We use a finite state machine with the
+       66        66                     * following states:
+       67        67                     *  LABEL0: after the first (successive)
+       68        68                     *     instruction label.
+       69        69                     *  LABEL1:  after at least two successive
+       70        70                     *     instruction labels.
+       71        71                     *  NORMAL: after a normal instruction.
+       72        72                     *  JUMP:   after a branch (conditional,
+       73        73                     *     unconditional or CSA/CSB).
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=3  
+       74        74                     *  END:    after an END pseudo
+       75        75                     *  AFTERPRO: after we've read a PRO pseudo
+       76        76                     *  INIT:   initial state
+       77        77                     */
+       78        78
+       79        79
+       80        80             STATIC nextblock()
+       81        81             {
+       82        82    1         /* allocate a new basic block structure and
+       83        83    1          * set b, bp and lp.
+       84        84    1          */
+       85        85    1
+       86        86    1         b = *bp = freshblock();
+       87        87    1         bp = &b->b_next;
+       88        88    1          b->b_next = NULL ;
+       89        89    1          b->b_loops = Lempty_set() ;
+       90        90    1         b->b_start = lnp;
+       91        91    1         b->b_succ = Lempty_set();
+       92        92    1         b->b_pred = Lempty_set();
+       93        93    1         b->b_extend = newcfbx(); /* basic block extension for CF */
+       94        94    1         b->b_extend->bx_cf.bx_bucket = Lempty_set();
+       95        95    1         b->b_extend->bx_cf.bx_semi = 0;
+       96        96    1         lp = &lnp->l_next;
+       97        97    1        #ifdef TRACE
+       98        98   *S*        fprintf(stderr,"new basic block, id = %d\n",lastbid);
+       99        99   *S*       #endif
+      100       100    1        }
+      101       101
+      102       102
+      103       103             STATIC short kind(lnp)
+      104       104              line_p lnp;
+      105       105             {
+      106       106    1         /* determine if lnp is a label, branch, end or otherwise */
+      107       107    1
+      108       108    1         short instr;
+      109       109    1         byte  flow;
+      110       110    1
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=4  
+      111       111    1         if ((instr = INSTR(lnp)) == op_lab) return (short) LABEL;
+      112       112    1         if (instr == ps_end) return (short) END;
+      113       113    1         if (instr > sp_lmnem) return (short) NORMAL; /* pseudo */
+      114       114    1         if ((flow = (em_flag[instr-sp_fmnem] & EM_FLO)) == FLO_C ||
+      115       115    1              flow == FLO_T) return (short) JUMP; /* conditional/uncond. jump */
+      116       116    1         return (short) NORMAL;
+      117       117    1        }
+      118       118
+      119       119
+      120       120
+      121       121             STATIC bool getbblocks(kind_out,n_out,g_out,l_out)
+      122       122              short *kind_out;
+      123       123              short *n_out;
+      124       124              bblock_p *g_out;
+      125       125              line_p *l_out;
+      126       126             {
+      127       127    1         bblock_p head = (bblock_p) 0;
+      128       128    1         line_p headl = (line_p) 0;
+      129       129    1
+      130       130    1         curproc = (proc_p) 0;
+      131       131    1         /* curproc will get a value when we encounter a PRO pseudo.
+      132       132    1          * If there is no such pseudo, we're reading only data
+      133       133    1          * declarations or messages (outside any proc.).
+      134       134    1          */
+      135       135    1         lastbid = (block_id) 0;  /* block identier */
+      136       136    1         state = INIT;  /* initial state */
+      137       137    1         bp = &head;
+      138       138    1
+      139       139    1         for (;;) {
+      140       140    2        #ifdef TRACE
+      141       141   *S*           fprintf(stderr,"state = %d\n",state);
+      142       142   *S*       #endif
+      143       143    2            switch(state) {
+      144       144    3               case LABEL0:
+      145       145    3                  nextblock();
+      146       146    3            if (lnp->l_prev != (line_p) 0) {
+      147       147    4              lnp->l_prev->l_next = (line_p) 0;
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=5  
+      148       148    4              lnp->l_prev = (line_p) 0; }
+      149       149    3                  /* Fall through !! */
+      150       150    3               case LABEL:
+      151       151    3                  lbmap[INSTRLAB(lnp)] = b;
+      152       152    3                  /* The lbmap table contains for each
+      153       153    3                   * label_id the basic block of that label.
+      154       154    3                   */
+      155       155    3                  lnp = get_next_line(&curproc);
+      156       156    3                  state = kind(lnp);
+      157       157    3                  if (state != END) {
+      158       158    4                     *lp = lnp;
+      159       159    4                     lp = &lnp->l_next;
+      160       160    4                  }
+      161       161    3                  break;
+      162       162    3               case NORMAL:
+      163       163    3                  lnp = get_next_line(&curproc);
+      164       164    3                  if ( (state = kind(lnp)) == LABEL) {
+      165       165    4                     /* If we come accross a label
+      166       166    4                      * here, it must be the beginning
+      167       167    4                      * of a new basic block.
+      168       168    4                      */
+      169       169    4                     state = LABEL0;
+      170       170    4                  } else {
+      171       171    4                     if (state != END) {
+      172       172    5                        *lp = lnp;
+      173       173    5                        lp = &lnp->l_next;
+      174       174    5                     }
+      175       175    4                  }
+      176       176    3                  break;
+      177       177    3               case JUMP:
+      178       178    3                  lnp = get_next_line(&curproc);
+      179       179    3                  /* fall through ... */
+      180       180    3               case AFTERPRO:
+      181       181    3                  switch(state = kind(lnp)) {
+      182       182    4                     case LABEL:
+      183       183    4                        state = LABEL0;
+      184       184    4                        break;
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=6  
+      185       185    4                     case JUMP:
+      186       186    4                     case NORMAL:
+      187       187    4                        nextblock();
+      188       188    4              if (lnp->l_prev != (line_p) 0) {
+      189       189    5                lnp->l_prev->l_next = (line_p) 0;
+      190       190    5                lnp->l_prev = (line_p) 0; }
+      191       191    4                        break;
+      192       192    4                  }
+      193       193    3                  break;
+      194       194    3               case END:
+      195       195    3                  *lp = lnp;
+      196       196    3        #ifdef TRACE
+      197       197   *S*                 fprintf(stderr,"at end of proc, %d blocks\n",lastbid);
+      198       198   *S*       #endif
+      199       199    3                  if (head == (bblock_p) 0) {
+      200       200    4                     *kind_out = LDATA;
+      201       201    4                     *l_out = headl;
+      202       202    4                  } else {
+      203       203    4                     *kind_out = LTEXT;
+      204       204    4                     *g_out = head;
+      205       205    4                     *n_out = (short) lastbid;
+      206       206    4                     /* number of basic blocks */
+      207       207    4                  }
+      208       208    3                  return TRUE;
+      209       209    3               case INIT:
+      210       210    3                  lnp = get_next_line(&curproc);
+      211       211    3            if (lnp == (line_p) 0) return FALSE;
+      212       212    3                  if (INSTR(lnp) == ps_pro) {
+      213       213    4                     state = AFTERPRO;
+      214       214    4                  } else {
+      215       215    4                     state = NORMAL;
+      216       216    4                     headl = lnp;
+      217       217    4                     lp = &lnp->l_next;
+      218       218    4                  }
+      219       219    3                  break;
+      220       220    3            }
+      221       221    2         }
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=7  
+      222       222    1        }
+      223       223
+      224       224
+      225       225             STATIC interproc_analysis(p)
+      226       226              proc_p p;
+      227       227             {
+      228       228    1         /* Interprocedural analysis of a procedure p determines:
+      229       229    1          *  - all procedures called by p (the 'call graph')
+      230       230    1          *  - the set of objects changed by p (directly)
+      231       231    1          *  - whether p does a load-indirect (loi,lof etc.)
+      232       232    1          *  - whether p does a store-indirect (sti, stf etc.)
+      233       233    1          * The changed/used variables information will be
+      234       234    1          * transitively closed, i.e. if P calls Q and Q changes
+      235       235    1          * a variable X, the P changes X too.
+      236       236    1          * (The same applies for used variables and for use/store
+      237       237    1          * indirect).
+      238       238    1          * The transitive closure will be computed by main
+      239       239    1          * after all procedures have been processed.
+      240       240    1          */
+      241       241    1
+      242       242    1         bblock_p b;
+      243       243    1         line_p   lnp;
+      244       244    1         bool inloop;
+      245       245    1
+      246       246    1         /* Allocate memory for structs and sets */
+      247       247    1
+      248       248    1         p->p_use = newuse();
+      249       249    1         p->p_change = newchange();
+      250       250    1         p->p_change->c_ext = Cempty_set(olength);
+      251       251    1         p->p_calling = Cempty_set(plength);
+      252       252    1
+      253       253    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      254       254    2            inloop = (Lnrelems(b->b_loops) > 0);
+      255       255    2            for (lnp = b->b_start; lnp != (line_p) 0; lnp = lnp->l_next) {
+      256       256    3            /* for all instructions of p do */
+      257       257    3            switch(INSTR(lnp)) {
+      258       258    4               case op_cal:
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=8  
+      259       259    4               Cadd(PROC(lnp)->p_id, &p->p_calling);
+      260       260    4               /* add called proc to p_calling */
+      261       261    4               if (inloop) {
+      262       262    5                  CALLED_IN_LOOP(PROC(lnp));
+      263       263    5               }
+      264       264    4               break;
+      265       265    4               case op_cai:
+      266       266    4               Cadd(p->p_id,&cai_set);
+      267       267    4               break;
+      268       268    4               case op_lpi:
+      269       269    4               Cadd(PROC(lnp)->p_id, &lpi_set);
+      270       270    4               /* All procedures that have their names used
+      271       271    4                * in an lpi instruction, may be called via
+      272       272    4                * a cai instruction.
+      273       273    4                */
+      274       274    4               PROC(lnp)->p_flags1 |= PF_LPI;
+      275       275    4               break;
+      276       276    4               case op_ste:
+      277       277    4               case op_sde:
+      278       278    4               case op_ine:
+      279       279    4               case op_dee:
+      280       280    4               case op_zre:
+      281       281    4               Cadd(OBJ(lnp)->o_id, &p->p_change->c_ext);
+      282       282    4               /* Add changed object to c_ext */
+      283       283    4               break;
+      284       284    4               case op_lil:
+      285       285    4               case op_lof:
+      286       286    4               case op_loi:
+      287       287    4               case op_los:
+      288       288    4               case op_lar:
+      289       289    4               p->p_use->u_flags |= UF_INDIR;
+      290       290    4               /* p does a load-indirect */
+      291       291    4               break;
+      292       292    4               case op_sil:
+      293       293    4               case op_stf:
+      294       294    4               case op_sti:
+      295       295    4               case op_sts:
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=9  
+      296       296    4               case op_sar:
+      297       297    4               p->p_change->c_flags |= CF_INDIR;
+      298       298    4               /* p does a store-indirect */
+      299       299    4               break;
+      300       300    4               case op_blm:
+      301       301    4               case op_bls:
+      302       302    4               p->p_use->u_flags |= UF_INDIR;
+      303       303    4               p->p_change->c_flags |= CF_INDIR;
+      304       304    4               /* p does both */
+      305       305    4               break;
+      306       306    4               case op_mon:
+      307       307    4        /* printf("mon not yet implemented\n");   - mon now used for builtins */
+      308       308    4               break;
+      309       309    4               case op_lxl:
+      310       310    4               case op_lxa:
+      311       311    4               curproc->p_flags1 |= PF_ENVIRON;
+      312       312    4               break;
+      313       313    4            }
+      314       314    3            }
+      315       315    2         }
+      316       316    1        }
+      317       317
+      318       318
+      319       319             STATIC cf_cleanproc(p)
+      320       320              proc_p p;
+      321       321             {
+      322       322    1         /* Remove the extended data structures of p */
+      323       323    1
+      324       324    1         register bblock_p b;
+      325       325    1         register Lindex pi;
+"zbe$cf:c.:ZBC3TSI", line 325: (warning) identifier "pi" is not used
+      326       326    1         loop_p lp;
+"zbe$cf:c.:ZBC3TSI", line 326: (warning) identifier "lp" is not used
+      327       327    1
+      328       328    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      329       329    2            oldcfbx(b->b_extend);
+      330       330    2          b->b_extend = (bext_p) 0;
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=10 
+      331       331    2         }
+      332       332    1        }
+      333       333
+      334       334
+      335       335
+      336       336             #define CHANGE_INDIR(ch) ((ch->c_flags & CF_INDIR) != 0)
+      337       337             #define USE_INDIR(us)    ((us->u_flags & UF_INDIR) != 0)
+      338       338             #define CALLS_UNKNOWN(p) (p->p_flags1 & (byte) PF_CALUNKNOWN)
+      339       339             #define BODY_KNOWN(p)    (p->p_flags1 & (byte) PF_BODYSEEN)
+      340       340             #define ENVIRON(p)    (p->p_flags1 & (byte) PF_ENVIRON)
+      341       341
+      342       342
+      343       343             STATIC bool add_info(q,p)
+      344       344              proc_p q,p;
+      345       345             {
+      346       346    1         /* Determine the consequences for used/changed variables info
+      347       347    1          * of the fact that p calls q. If e.g. q changes a variable X
+      348       348    1          * then p changes this variable too. This routine is an
+      349       349    1          * auxiliary routine of the transitive closure process.
+      350       350    1          * The returned value indicates if there was any change in
+      351       351    1          * the information of p.
+      352       352    1          */
+      353       353    1
+      354       354    1         change_p chp, chq;
+      355       355    1         use_p    usp, usq;
+      356       356    1         bool     diff = FALSE;
+      357       357    1
+      358       358    1         chp = p->p_change;
+      359       359    1         chq = q->p_change;
+      360       360    1         usp = p->p_use;
+      361       361    1         usq = q->p_use;
+      362       362    1
+      363       363    1         if (!BODY_KNOWN(q)) {
+      364       364    2            /* q is a procedure of which the body is not available
+      365       365    2             * as EM text.
+      366       366    2             */
+      367       367    2            if (CALLS_UNKNOWN(p)) {
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=11 
+      368       368    3               return FALSE;
+      369       369    3               /* p already called an unknown procedure */
+      370       370    3            } else {
+      371       371    3               p->p_flags1 |= PF_CALUNKNOWN;
+      372       372    3               return TRUE;
+      373       373    3            }
+      374       374    2         }
+      375       375    1         if (CALLS_UNKNOWN(q)) {
+      376       376    2            /* q calls a procedure of which the body is not available
+      377       377    2             * as EM text.
+      378       378    2             */
+      379       379    2            if (!CALLS_UNKNOWN(p)) {
+      380       380    3               p->p_flags1 |= PF_CALUNKNOWN;
+      381       381    3               diff = TRUE;
+      382       382    3            }
+      383       383    2         }
+      384       384    1         if (IS_CALLED_IN_LOOP(p) && !IS_CALLED_IN_LOOP(q)) {
+      385       385    2            CALLED_IN_LOOP(q);
+      386       386    2            diff = TRUE;
+      387       387    2         }
+      388       388    1         if (!Cis_subset(chq->c_ext, chp->c_ext)) {
+      389       389    2            /* q changes global variables (objects) that
+      390       390    2            * p did not (yet) change. Add all variables
+      391       391    2            * changed by q to the c_ext set of p.
+      392       392    2            */
+      393       393    2            Cjoin(chq->c_ext, &chp->c_ext);
+      394       394    2            diff = TRUE;
+      395       395    2         }
+      396       396    1         if (CHANGE_INDIR(chq) && !CHANGE_INDIR(chp)) {
+      397       397    2            /* q does a change-indirect (sil etc.)
+      398       398    2             * and p did not (yet).
+      399       399    2             */
+      400       400    2            chp->c_flags |= CF_INDIR;
+      401       401    2            diff = TRUE;
+      402       402    2         }
+      403       403    1         if (USE_INDIR(usq) && !USE_INDIR(usp)) {
+      404       404    2            /* q does a use-indirect (lil etc.)
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=12 
+      405       405    2             * and p dis not (yet).
+      406       406    2             */
+      407       407    2            usp->u_flags |= UF_INDIR;
+      408       408    2            diff = TRUE;
+      409       409    2         }
+      410       410    1         if (ENVIRON(q) && !ENVIRON(p)) {
+      411       411    2            /* q uses or changes local variables in its
+      412       412    2             * environment while p does not (yet).
+      413       413    2             */
+      414       414    2            p->p_flags1 |= PF_ENVIRON;
+      415       415    2            diff = TRUE;
+      416       416    2         }
+      417       417    1         return diff;
+      418       418    1        }
+      419       419
+      420       420
+      421       421
+      422       422             STATIC trans_clos(head)
+      423       423              proc_p head;
+      424       424             {
+      425       425    1         /* Compute the transitive closure of the used/changed
+      426       426    1          * variable information.
+      427       427    1          */
+      428       428    1
+      429       429    1         register proc_p p,q;
+      430       430    1         Cindex i;
+      431       431    1         bool changes = TRUE;
+      432       432    1
+      433       433    1         while(changes) {
+      434       434    2            changes = FALSE;
+      435       435    2            for (p = head; p != (proc_p) 0; p = p->p_next) {
+      436       436    3               if (!BODY_KNOWN(p)) continue;
+      437       437    3               for (i = Cfirst(p->p_calling); i != (Cindex) 0;
+      438       438    3                        i = Cnext(i,p->p_calling)) {
+      439       439    4               q = pmap[Celem(i)];
+      440       440    4               if (add_info(q,p)) {
+      441       441    5                  changes = TRUE;
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=13 
+      442       442    5               }
+      443       443    4               }
+      444       444    3            }
+      445       445    2         }
+      446       446    1        }
+      447       447
+      448       448
+      449       449
+      450       450
+      451       451             indir_calls()
+      452       452             {
+      453       453    1         Cindex i;
+      454       454    1         proc_p p;
+      455       455    1
+      456       456    1         for (i = Cfirst(cai_set); i != (Cindex) 0; i = Cnext(i,cai_set)) {
+      457       457    2            p = pmap[Celem(i)];  /* p does a CAI */
+      458       458    2            Cjoin(lpi_set, &p->p_calling);
+      459       459    2         }
+      460       460    1         Cdeleteset(lpi_set);
+      461       461    1         Cdeleteset(cai_set);
+      462       462    1        }
+      463       463
+      464       464
+      465       465
+      466       466             cfmain(argc,argv)
+      467       467              int argc;
+"zbe$cf:c.:ZBC3TSI", line 467: (warning) identifier "argc" is not used
+"zbe$cf:c.:ZBC3TSI", line 467: (warning) identifier "argv" is not used
+      468       468              char *argv[];
+      469       469             {
+      470       470    1         bblock_p g;
+      471       471    1         short n, kind;
+      472       472    1         line_p l;
+      473       473    1         line_table_p next_lt;
+      474       474    1         bblock_p b;
+      475       475    1         Lindex pi;
+      476       476    1         int count;
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=14 
+      477       477    1
+      478       478    1         lmap = NULL ;
+      479       479    1         lbmap = NULL ;
+      480       480    1         bmap = NULL ;
+      481       481    1         lpmap = NULL ;
+      482       482    1         linecount = 0;
+      483       483    1         fproc = first_proc;
+      484       484    1         lpi_set = Cempty_set(plength);
+      485       485    1         cai_set = Cempty_set(plength);
+      486       486    1         curproc = fproc;
+      487       487    1         next_line_ptr = first_line_table->first_line;
+      488       488    1         next_lt = first_line_table;
+      489       489    1         while (getbblocks(&kind,&n,&g,&l)) {
+      490       490    2            /* read EM text of one unit and
+      491       491    2             * (if it is a procedure)
+      492       492    2             * partition it into n basic blocks.
+      493       493    2             */
+      494       494    2            if (kind == LDATA) {
+      495       495    3           put_curr_unit(LDATA, (proc_p) 0, l);
+      496       496    3           if (next_lt->lt_next != (line_table_p) 0) {
+      497       497    4              next_lt = next_lt->lt_next;
+      498       498    4              next_line_ptr = next_lt->first_line; }
+      499       499    3            } else {
+      500       500    3               curproc->p_start = g;
+      501       501    3               /* The global variable curproc points to the
+      502       502    3                * current procedure. It is set by getbblocks
+      503       503    3                */
+      504       504    3               control_flow(g); /* compute pred and succ */
+      505       505    3               dominators(g,n); /* compute immediate dominators */
+      506       506    3               loop_detection(curproc); /* compute loops */
+      507       507    3               interproc_analysis(curproc);
+      508       508    3               /* Interprocedural analysis */
+      509       509    3           count = 0;
+      510       510    3           for (b = curproc->p_start; b != (bblock_p) 0; b = b->b_next) {
+      511       511    4             count++; }
+      512       512    3           curproc->p_bblock_count = count;
+      513       513    3           count = 0;
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=15 
+      514       514    3           for(pi = Lfirst(curproc->p_loops); pi != (Lindex) 0; pi = Lnext(pi, curproc
+                               ->p_loops)) {
+      515       515    4             count++; }
+      516       516    3         curproc->p_loops_count = count;
+      517       517    3           count = 0;
+      518       518    3           for(l = curproc->p_line; l != (line_p) 0; l = l->l_next) {
+      519       519    4             count++; }
+      520       520    3           curproc->p_instrs_count = count;
+      521       521    3               cf_cleanproc(curproc);
+      522       522    3           put_curr_unit(LTEXT, curproc, (line_p) 0);
+      523       523    3           if (next_lt->lt_next != (line_table_p) 0) {
+      524       524    4              next_lt = next_lt->lt_next;
+      525       525    4              next_line_ptr = next_lt->first_line; }
+      526       526    3               /* output control flow graph + text */
+      527       527    3            }
+      528       528    2         }
+      529       529    1         indir_calls();
+      530       530    1         trans_clos(fproc);
+      531       531    1         /* Compute transitive closure of used/changed
+      532       532    1          * variables information for every procedure.
+      533       533    1          */
+      534       534    1           return ;
+      535       535    1        }
+      536       536
+---  Include file information  ---
+
+   stdio:h.:LIBRARY. is referenced
+   zbe$types:h.:ZBC3TOU. is referenced
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$map:h.:ZBC3TOU. is referenced
+   zbe$files:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$cset:h.:ZBC3TOU. is referenced
+   zbe$get:h.:ZBC3TOU. is referenced
+   zbe$put:h.:ZBC3TOU. is referenced
+CC.C03    File=zbe$cf:c.:ZBC3TSI                                                    Fri Aug 22 1997  Page=16 
+   em_mnem:h.:ZBC3TOU. is referenced
+   em_pseu:h.:ZBC3TOU. is referenced
+   em_spec:h.:ZBC3TOU. is referenced
+   em_flag:h.:ZBC3TOU. is referenced
+   zbe$def:h.:ZBC3TOU. is referenced
+   zbe$cf:h.:ZBC3TOU. is referenced
+   zbe$cf_succ:h.:ZBC3TOU. is referenced
+   zbe$cf_idom:h.:ZBC3TOU. is referenced
+   zbe$cf_loop:h.:ZBC3TOU. is referenced
+
+4 warnings were detected in the file zbe$cf:c.:ZBC3TSI

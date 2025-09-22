@@ -1,0 +1,1149 @@
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$Open:  Proc  (IOStat, Unit, Fid, DBufSize, KBufSize, Fun, Share, Exist,
+                   UnFast)
+            AltRet
+            Materialize ($PR1 in Desc$);
+/*
+       Fortran callable interface to FSFA package; this implementation allows
+         up to %Max_open# files to be open at a time.  Buffers are kept in a
+         data segment, which is managed to allow reclamation of space when a
+         Dcb is closed.  Users can specify sizes of Key and Data buffer areas
+         separately; KBufSize may be zero, in which case no key info will be
+         returned.  Files may be opened for input (Fun=0), creation (Fun=1), or
+         Update (Fun=3).  Sharing with other readers is permitted (Share=1 or
+         2); however, if Share=2(All) is specified, the XSA routines will not
+         use Fast mode.  For create opens, the Exist parameter may be
+         specified to indicate what to do if the file exists; Exist=0(error),
+         Exist=1(Newfile), and Exist=2(Oldfile) are the legal values.  Finally,
+         the UnFast param may be used to set the UnFast# bit in the XSA_Param
+         for all further operations; UnFast=0(Monitor/Continue) and UnFast=1
+         (AltRet/Error) are the legal values.
+ 
+         (For all the parameters after Fid, -1 indicates "not present"; this
+         allows specification of, say, UnFast while allowing the preceding
+         args to default.)
+ 
+       Buffer space is allocated in the next available data segment; if there
+         is any difficulty acquiring memory, the routine will return with IOStat
+         set to the error code returned by M$GDS.
+ 
+       IOStat returns any monitor errors; it also can return the following
+         error codes:
+ 
+           -1    Error returned by Find$DCB (all routines)
+           -2    DCB not open               (all except FAST$OPEN)
+           -3    DCB not in table           (all except FAST$OPEN)
+           -4    DCB already open           (FAST$OPEN only)
+           -5    DCB table full             (FAST$OPEN only)
+           -6    Data Segment full          (FAST$OPEN only)
+           -7    Invalid Fun value          (FAST$OPEN only)
+           -8    Invalid Share value        (FAST$OPEN only)
+           -9    Invalid Exist value        (FAST$OPEN only)
+          -10    Invalid Disp value         (FAST$CLOSE only)
+          -11    DBufSize < 0               (FAST$OPEN only)
+          -12    KBufSize (IXtnSize) < 0    (FAST$OPEN only)
+          -13    Invalid UnFast value       (FAST$OPEN only)
+ 
+       Andrew E. Birner, 19 Feb, '87
+*/
+ 
+%Eject;
+/********************************************************************
+*                                                                   *
+* This program  is a gratuitous contribution and  is offered as is. *
+* Zenith  makes  no  representations  or  warranties  of  any kind, *
+* express  or  implied,  relating  to  freedom  from  infringement, *
+* accuracy,  error-freedom  or   performance,  and  shall  have  no *
+* liability  or responsibility  to users  for damages  of any kind, *
+* including special, indirect or consequential damages, arising out *
+* of  or resulting  from use,  modification or  reproduction of the *
+* program.                                                          *
+*                                                                   *
+* No  warranty  is  made  by  the  contributor  as to the accuracy, *
+* maintenance, and functioning of the program and related material. *
+* No  responsibility is  assumed by  the contributor  in connection *
+* therewith.                                                        *
+*                                                                   *
+********************************************************************/
+%Eject;
+/*
+**       Parameters --
+*/
+       Dcl IOStat Param Bit (36) Aligned;  /* Error code to return */
+       Dcl Unit Param Ubin Word;           /* Unit/Dcb specifier */
+       Dcl Fid Param Char (FidSize);       /* Fid of file to open */
+         Dcl FidSize Sbin;
+       Dcl DBufSize Param Sbin Word;       /* Number of pages - Data pool */
+       Dcl KBufSize Param Sbin Word;       /* Number of pages - Key pool */
+         Dcl IXtnSize Redef KBufSize Sbin Word; /* For Create opens only */
+       Dcl Fun Param Sbin Word;            /* 0=input, 1=create             */
+       Dcl Share Param Sbin Word;          /* 0=none,  1=in                 */
+       Dcl Exist Param Sbin Word;          /* 0=error, 1=newfile, 2=oldfile */
+       Dcl UnFast Param Sbin Word;         /* 0=Continue, 1=AltRet          */
+ 
+       Dcl Desc$ Ptr Static;
+/*
+**       Include files and system macros --
+*/
+       %CP6$ENTS;
+       %Include FOXI_C62;
+       %Include XS_MACRO_C;
+       %Include B_SEGIDS_C;
+       %Include CP_6_SUBS;
+       %Include FOXI_C61;
+/*
+**       Associate Data Modules --
+*/
+       Dcl  Fast$Data@  Entry  Conv (5);
+       Dcl  B_Pointer   Entry  Conv (5);
+/*
+**       Memory management stuff --
+*/
+       %Fpt_GDS (Protection=DSWrite, Results=DSeg_);
+       %Fpt_FDS (Results=DSeg_);
+ 
+         %Vlp_Vector (Fptn=DSeg_, StClass="STATIC SYMDEF");
+ 
+       Dcl NewSegSize Ubin;
+       Dcl OldSegSize Ubin;
+ 
+       %Page_Table;
+ 
+       Dcl DBufSize_to_use Ubin;
+       Dcl KBufSize_to_use Ubin;
+%Eject;
+/*
+**       Monitor and FSFA I/O stuff --
+*/
+       Dcl M$FSFA$ Ptr Static SymDef Init (Addr (Nil));
+       %F$DCB (Dcbn=F$FSFA, StClass="Based (M$FSFA$)");
+ 
+       %Fpt_Fid (Acct=Vlp_Acct, Asn=Open_FSFA.V.Asn#, Name=Vlp_Name,
+                 Pass=Vlp_Pass, Res=Open_FSFA.V.Res#, SAcct=Yes, SName=Yes,
+                 SPass=Yes, SRes=Yes, SSN=Yes, SN=Vlp_SN);
+ 
+       %Fpt_Open (Fptn=Open_FSFA);
+ 
+       %Fpt_Open (Fptn=Open_Named,
+                  Name=Vlp_Name,
+                  Acct=Vlp_Acct,
+                  Pass=Vlp_Pass,
+                  SN=Vlp_SN,
+                  Asn=File,
+                  Org=Consec);
+ 
+         %Vlp_Name (Len=31);
+         %Vlp_Acct;
+         %Vlp_Pass;
+         %VLP_SN (N=1);
+ 
+       %Fpt_Open (Fptn=Open_Nameless,
+                  Org=Consec);
+/*
+**       Stuff for XSA params and DCB management
+*/
+       %XSA_Param (Fptn=XSA_Param_Inits,
+                   StClass="CONSTANT SYMDEF");
+ 
+       %P_Table;
+ 
+       Dcl XSA$Open Entry (2) AltRet;
+ 
+       %DCB_Table;
+/*
+**       Utility routines and Temp Variables
+*/
+       Dcl  Get_Arg_Len  Entry (4)  AltRet;
+       Dcl  Find$DCB  Entry (4)  AltRet;
+ 
+       Dcl  I  Ubin Word;
+       Dcl  DCB_Ix  Ubin Word;
+       Dcl  DCB_Numb  Sbin Word;
+       Dcl  Page_Ix  Ubin Word;
+       Dcl  NPages  Ubin Word;
+%Eject;
+Start:;
+/*
+**       Find the DCB and make sure it is closed . . .
+*/
+       Call  Find$DCB  (Unit, DCB_Numb, '1'B)  WhenAltReturn Do;
+         IOStat = BinBit (-1, 36);
+         AltReturn;
+       End;
+ 
+       M$FSFA$ = DCBAddr (DCB_Numb);
+       If  F$FSFA.FCD#  Then Do;
+         IOStat = BinBit (-4, 36);
+         AltReturn;
+       End;
+/*
+**       Parse the fid we've been passed.
+*/
+       If  Addr (Fid) ~= Addr (Nil)  then Do;
+         Call  Get_Arg_Len  (Desc$, 3, FidSize)  WhenAltReturn Do Case (-1*FidSize);
+ 
+           Case (1); /* FidSize = -1 -- Arg# is > #passed */
+             Call  M$XXX;    /* Inconsistent!  Addr~=Nil ==> 3 args! */
+ 
+           Case (2); /* FidSize = -2 -- Too few descriptor words */
+             FidSize = 80;   /* This was a COBOL74 call w/ no desc list */
+ 
+           Case (Else); /* FidSize < 0 */
+             Call  M$XXX;    /* Other unsupported conditions */
+ 
+         End;
+         Call  Index  (FidSize, ' ', Fid)  WhenAltReturn Do; End;
+        End; Else Do;
+         FidSize = 0;
+       End;
+ 
+       If  FidSize = 0  then Do;
+         Open_FSFA = Open_Nameless;
+        End; Else Do;
+         If  Fid = ' '  then Do;
+           Open_FSFA = Open_Nameless;
+          End; Else Do;
+           Open_FSFA = Open_Named;
+           Fpt_Fid.TextFid_ = Vector (Fid);
+           Call  M$Fid  (Fpt_Fid)  WhenAltReturn Do;
+             IOStat = %AltRet_Err;
+             AltReturn;
+           End;
+         End;
+       End;
+ 
+       Open_FSFA.V_ = Vector (Open_FSFA.V);
+       Open_FSFA.V.DCB# = DCB_Numb;
+%Eject;
+/*
+**       Find an unused DCB slot . . .
+*/
+       DCB_Ix = %Max_Open#;
+Find_a_Slot:
+       Do  I = 0 to %(Max_Open# - 1);
+         If  DCB_Table.DCB_Numb (I) = 0  then Do;
+           DCB_Ix = I;
+           Exit  Find_a_Slot;
+         End;
+       End  Find_a_Slot;
+ 
+       If  DCB_Ix = %Max_Open#  then Do;
+         IOStat = BinBit (-5, 36);
+         AltReturn;
+       End;
+/*
+**       Set up the function (In or Create) --
+*/
+       If  Addr (Fun) = Addr (Nil)  Then Do;
+         Open_FSFA.V.Fun# = %Ignore_BinVal#;
+        End; Else Do;
+         Do  Select  ( Fun );
+ 
+           Select ( -1 );
+             Open_FSFA.V.Fun# = %Ignore_BinVal#;
+ 
+           Select ( 0 );
+             Open_FSFA.V.Fun# = %In#;
+ 
+           Select ( 1 );
+             Open_FSFA.V.Fun# = %Create#;
+ 
+           Select ( 2 );
+             Open_FSFA.V.Fun# = %Update#; /* Won't be eligible for FSFA! */
+ 
+           Select ( Else );
+             IOStat = BinBit (-7, 36);
+             AltReturn;
+ 
+         End;
+       End;
+ 
+%Eject;
+/*
+**       Set up the Initial Extent Size; this won't hurt for non-create
+**         opens, and needs to be done in enough other cases that we might
+**         as well do it here.
+*/
+       If  Addr (IXtnSize) ~= Addr (Nil)  then Do;
+         If  IXtnSize > 0  then Do;
+           Open_FSFA.V.IXtnSize# = IXtnSize;
+          End; Else Do;
+           If  IXtnSize < -1  then Do;
+             IOStat = BinBit  (-12, 36);
+             AltReturn;
+            End; Else Do;  /* -1 or 0 */
+             Open_FSFA.V.IXtnSize# = %Ignore_BinVal#;
+           End;
+         End;
+       End;
+%Eject;
+/*
+**       Set up the share param (All, In, or None) --
+*/
+       If  Addr (Share) = Addr (Nil)  Then Do;
+         Open_FSFA.V.Share# = %Ignore_BinVal#;
+        End; Else Do;
+         Do  Select  ( Share );
+ 
+           Select ( -1 );
+             Open_FSFA.V.Share# = %Ignore_BinVal#;
+ 
+           Select ( 0 );
+             Open_FSFA.V.Share# = %None#;
+ 
+           Select ( 1 );
+             Open_FSFA.V.Share# = %In#;
+ 
+           Select ( 2 );
+             Open_FSFA.V.Share# = %All#;  /* Won't be eligible for FSFA! */
+ 
+           Select ( Else );
+             IOStat = BinBit (-8, 36);
+             AltReturn;
+ 
+         End;
+       End;
+/*
+**       Set up the exist param (error, oldfile, or newfile) --
+*/
+       If  Addr (Exist) = Addr (Nil)  Then Do;
+         Open_FSFA.V.Exist# = %Ignore_BinVal#;
+        End; Else Do;
+         Do  Select  ( Exist );
+ 
+           Select ( -1 );
+             Open_FSFA.V.Exist# = %Ignore_BinVal#;
+ 
+           Select ( 0 );
+             Open_FSFA.V.Exist# = %Error#;
+ 
+           Select ( 1 );
+             Open_FSFA.V.Exist# = %NewFile#;
+ 
+           Select ( 2 );
+             Open_FSFA.V.Exist# = %OldFile#;
+ 
+           Select ( Else );
+             IOStat = BinBit (-9, 36);
+             AltReturn;
+ 
+         End;
+       End;
+%Eject;
+/*
+**       Determine how many pages this dude wants to use.  We allocate data
+**       and key buffers in one hunk; this is not optimal, I suppose, but it
+**       is a bit easier.
+**
+**       DBufSize defaults to Default_DBufSize; KBufSize defaults to zero.
+*/
+       If  Addr (DBufSize) ~= Addr (Nil)  then Do;
+         If  DBufSize > 0  then Do;
+           DBufSize_to_use = DBufSize;
+          End; Else Do;
+           If  DBufSize = 0  or  DBufSize = -1  then Do;
+             DBufSize_to_use = %Default_DBufSize;  /* Set in FOXI_C61! */
+            End; Else Do;
+             IOStat = BinBit (-11, 36);
+             AltReturn;
+           End;
+         End;
+        End; Else Do;
+         DBufSize_to_use = %Default_DBufSize;  /* Set in FOXI_C61! */
+       End;
+ 
+       If  Addr (KBufSize) ~= Addr (Nil)  then Do;
+         If  KBufSize >= 0  then Do;
+           KBufSize_to_use = KBufSize;
+          End; Else Do;
+           If  KBufSize = -1  then Do;
+             KBufSize_to_use = 0;
+            End; Else Do;
+             IOStat = BinBit (-12, 36);
+             AltReturn;
+           End;
+         End;
+        End; Else Do;
+         KBufSize_to_use = 0;
+       End;
+ 
+       NPages = DBufSize_to_use + KBufSize_to_use;
+%Eject;
+/*
+**       The free page list is a string of bytes, each representing one page.
+**       If a page is "free", its byte will contain a zero; otherwise, it will
+**       contain the DCB_Ix number of the file to which it is allocated.  Thus,
+**       finding a block of n free pages reduces to scanning the pages string
+**       for a substring consisting of n nulls.
+*/
+       Call  Index  (Page_Ix, SubStr (Null_String, 0, NPages), Page_String)  WhenAltReturn Do;
+         IOStat = BinBit (-6, 36);
+         AltReturn;
+       End;
+/*
+**       If the block we've found is beyond the currently allocated end of the
+**       segment, we extend the segment; we never shrink it, of course.
+*/
+       If  (Page_Ix + NPages - 1) > Hi_Page#  then Do;
+         NewSegSize = (Page_Ix + NPages)*1024;
+         If  DSeg_.W2.SegId# = %NullSId  Then Do;
+           Fpt_GDS.V.SegSize# = NewSegSize;
+           Call  M$GDS  (Fpt_GDS)  WhenAltReturn Do;
+             IOStat = %AltRet_Err;
+             AltReturn;
+           End;
+          End; Else Do;
+           OldSegSize = (DSeg_.W1.VSize# + 1)/4;
+           Fpt_GDS.V.SegSize# = NewSegSize - OldSegSize;
+           Call  M$GDS  (Fpt_GDS)  WhenAltReturn Do;
+             IOStat = %AltRet_Err;
+             AltReturn;
+           End;
+         End;
+         Hi_Page# = NewSegSize/1024 - 1;
+       End;
+%Eject;
+/*
+**       Set up vectors to work area for FSFA -- use DCB_Ix as the index into
+**       an array of XSA_Param entities.
+*/
+       P_Table.XSA_Param (DCB_Ix) = XSA_Param_Inits;  /* re-init this table */
+ 
+       P_Table.XSA_Param.BBuf_.Buf$ (DCB_Ix) = PIncrW (DSeg_.Ptr$, (1024*Page_Ix));
+ 
+       P_Table.XSA_Param.BBuf_.Bound (DCB_Ix) = DBufSize_to_use*4096 - 1;
+ 
+       If  KBufSize_to_use > 0  then Do;
+         P_Table.XSA_Param.KBuf_.Buf$ (DCB_Ix) = PIncrW (DSeg_.Ptr$, (1024*(Page_Ix + DBufSize_to_use)));
+         P_Table.XSA_Param.KBuf_.Bound (DCB_Ix) = KBufSize_to_use*4096 - 1;
+        End; Else Do;
+         P_Table.XSA_Param.KBuf_.Buf$ (DCB_Ix) = Addr (Nil);
+         P_Table.XSA_Param.KBuf_.Bound (DCB_Ix) = 0;
+       End;
+/*
+**       Attempt to open the fool file -- if it works, we make permanent all of
+**       our parameters about this DCB.  No space allocation information has
+**       been saved until now, just in case we hit some other error (avoids the
+**       need to back out).
+*/
+       Call  XSA$Open  (Open_FSFA, P_Table.XSA_Param (DCB_Ix))  WhenReturn Do;
+         IOStat = BinBit (0, 36);
+         DCB_Table.DCB_Numb (DCB_Ix) = DCB_Numb;     /* what pages allocated? */
+         DCB_Table.NPages (DCB_Ix) = NPages;
+         DCB_Table.Page_Ix (DCB_Ix) = Page_Ix;
+         Do  I = Page_Ix to (Page_Ix + NPages - 1);  /* mark pages used! */
+           Page_Table (I) = DCB_Ix + 1;
+         End;
+        End;  WhenAltReturn Do;
+         IOStat = P_Table.XSA_Param.Err (DCB_Ix);
+         AltReturn;
+       End;
+ 
+%Eject;
+/*
+**       Set up the UnFast bit (AltRet or Monitor) --
+*/
+       If  Addr (UnFast) = Addr (Nil)  Then Do;
+         P_Table.XSA_Param.UnFast# (DCB_Ix) = %UnFast$Monitor#;
+        End; Else Do;
+         Do  Select  ( UnFast );
+ 
+           Select ( -1 );
+             P_Table.XSA_Param.UnFast# (DCB_Ix) = %UnFast$Monitor#;
+ 
+           Select ( 0 );
+             P_Table.XSA_Param.UnFast# (DCB_Ix) = %UnFast$Monitor#;
+ 
+           Select ( 1 );
+             P_Table.XSA_Param.UnFast# (DCB_Ix) = %UnFast$AltRet#;
+ 
+           Select ( Else );
+             IOStat = BinBit (-13, 36);
+             AltReturn;
+ 
+         End;
+       End;
+ 
+       Return;
+ 
+End    Fast$Open;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$Data@:  Proc NoAuto;
+/*
+       This routine contains the static data we need; it is referenced via a
+         Conv (5) Entry Dcl in all the other routines.  This makes sure that
+         we get our data if FOXI is used as a Library, rather than as an OU.
+*/
+/*
+**     Include files:
+*/
+%Include FOXI_C61;
+%Include XS_MACRO_C;
+/*
+**     Generate our Data:
+*/
+       %Page_Table (StClass=Static SymDef);
+       %P_Table (StClass=Static SymDef);
+       %DCB_Table (StClass=Static SymDef);
+ 
+End    Fast$Data@;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$Read: Proc (IOStat, Unit, Buffer, BLen, Ars#, DVByte, EomChar#, KBuffer, KBLen)
+           AltRet;
+/*
+       Does an XSA$READ against the currently open file.  If KBuffer and KBLen
+         are specified, we return the key of the record read.
+*/
+       Dcl IOStat Param Bit (36) Aligned;    /* Return error code */
+       Dcl Unit Param Ubin Word;             /* Which DCB to use */
+       Dcl Buffer Param Char (BLen);         /* Buffer for data record */
+       Dcl BLen Param Sbin Word;             /* Len of Buffer */
+       Dcl Ars# Param Ubin Word;             /* Count of bytes Read */
+       Dcl DVByte Param Ubin Word;           /* DVByte for record Read */
+       Dcl EomChar# Param Char (1);          /* EomChar# for record Read */
+       Dcl KBuffer Param Char (KBLen);       /* Buffer for data record key */
+       Dcl KBLen Param Sbin word;            /* Length of KBuffer */
+/*
+**       Include files and system macros --
+*/
+       %CP6$ENTS;
+       %Include XS_MACRO_C;
+       %Include B_SEGIDS_C;
+       %Include CP_6_SUBS;
+       %Include FOXI_C61;
+/*
+**       Associate Data Module:
+*/
+       Dcl  Fast$Data@  Entry  Conv (5);
+/*
+**       Monitor and FSFA I/O stuff --
+*/
+       Dcl M$FSFA$ Ptr;
+       %F$DCB (Dcbn=F$FSFA, StClass="Based (M$FSFA$)");
+ 
+       %Fpt_Read (Fptn=Read_FSFA);
+ 
+       %P_Table;
+ 
+       Dcl XSA$Read Entry (2) AltRet;
+ 
+       %DCB_Table;
+/*
+**       Utility routines and Temp Variables
+*/
+       Dcl  Find$DCB  Entry (4)  AltRet;
+ 
+       Dcl  I  Ubin Word;
+       Dcl  DCB_Ix  Ubin Word;
+       Dcl  DCB_Numb  Sbin Word;
+%Eject;
+Start:;
+/*
+**       Find the Dcb, and Check to see that it's open --
+*/
+       %Find_Correct_Slot (IO_Fpt=Read_FSFA);
+/*
+**       Set pointers to our buffers --
+*/
+       Read_FSFA.Buf_ = Vector (Buffer);
+       If  Addr (KBuffer) ~= Addr (NIL)  Then Do;
+         Read_FSFA.Key_ = Vector (KBuffer);
+         Read_FSFA.V.KeyR# = '1'B;
+        End; Else Do;
+         Read_FSFA.V.KeyR# = '0'B;
+       End;
+/*
+**       Do the read --
+*/
+       Call  XSA$Read  (Read_FSFA, P_Table.XSA_Param (DCB_Ix))  WhenReturn Do;
+         IOStat = BinBit (0, 36);
+ 
+         If  Addr (Ars#) ~= Addr (Nil)  then Do;
+           Ars# = P_Table.XSA_Param.Ars# (DCB_Ix);
+         End;
+ 
+         If  Addr (DVByte) ~= Addr (Nil)  then Do;
+           DVByte = BitBin (P_Table.XSA_Param.DVByte (DCB_Ix));
+         End;
+ 
+         If  Addr (EomChar#) ~= Addr (Nil)  then Do;
+           EomChar# = P_Table.XSA_Param.EomChar# (DCB_Ix);
+         End;
+        End; WhenAltReturn Do;
+         IOStat = P_Table.XSA_Param.Err (DCB_Ix);
+         AltReturn;
+       End;
+ 
+       Return;
+ 
+End    Fast$Read;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$Close:  Proc (IOStat, Unit, Disp#)
+             AltRet;
+/*
+       Does an XSA$CLOSE against a currently open file.
+*/
+       Dcl IOStat Param Bit (36) Aligned;     /* Return error code */
+       Dcl Unit Param Ubin Word;              /* a DCB or unit # */
+       Dcl Disp# Param Ubin Word;             /* Release=1, Save=2 */
+/*
+**       Include files and system macros --
+*/
+       %CP6$Ents;
+       %Include FOXI_C62;
+       %Include XS_MACRO_C;
+       %Include B_SEGIDS_C;
+       %Include CP_6_SUBS;
+       %Include FOXI_C61;
+/*
+**       Associate Data Module:
+*/
+       Dcl  Fast$Data@  Entry  Conv (5);
+/*
+**       Monitor and FSFA I/O stuff --
+*/
+       Dcl M$FSFA$ Ptr;
+       %F$DCB (Dcbn=F$FSFA, StClass="Based (M$FSFA$)");
+ 
+       %Fpt_Close (Fptn=Close_FSFA);
+ 
+       Dcl XSA$Close Entry (2) AltRet;
+ 
+       %P_Table;
+ 
+       %DCB_Table;
+ 
+       %Page_Table;
+/*
+**       Utility routines and Temp Variables
+*/
+       Dcl  Find$DCB  Entry (4)  AltRet;
+ 
+       Dcl  I  Ubin Word;
+       Dcl  DCB_Ix  Ubin Word;
+       Dcl  DCB_Numb  Sbin Word;
+%Eject;
+Start:;
+/*
+**       Find the Dcb, and Check to see that it's open --
+*/
+       %Find_Correct_Slot (IO_Fpt=Close_FSFA);
+/*
+**       Set the Disp param --
+*/
+       If  Addr (Disp#) = Addr (Nil)  then Do;
+         Close_FSFA.V.Disp# = %Save#;
+        End; Else  Do Case (Disp#);
+ 
+         Case (1);
+           Close_FSFA.V.Disp# = %Release#;
+ 
+         Case (2);
+           Close_FSFA.V.Disp# = %Save#;
+ 
+         Case (Else);
+           IOStat = BinBit (-10, 36);
+           AltReturn;
+ 
+       End;
+/*
+**       Do the close, and free our memory if it works --
+*/
+       Call  XSA$Close (Close_FSFA, P_Table.XSA_Param (DCB_Ix))  WhenReturn Do;
+         IOStat = BinBit (0, 36);
+         DCB_Table.DCB_Numb (DCB_Ix) = 0;
+         Do  I = DCB_Table.Page_Ix (DCB_Ix) to (DCB_Table.Page_Ix (DCB_Ix) + DCB_Table.NPages (DCB_Ix) - 1);
+           Page_Table (I) = 0;
+         End;
+         DCB_Table.Page_Ix (DCB_Ix) = 0;
+         DCB_Table.NPages (DCB_Ix) = 0;
+        End; WhenAltReturn Do;
+         IOStat = P_Table.XSA_Param.Err (DCB_Ix);
+         AltReturn;
+       End;
+ 
+       Return;
+ 
+End    Fast$Close;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$PFil: Proc (IOStat, Unit, Bof#)
+           AltRet;
+/*
+       Does an XSA$PFIL to rewind a currently open file.
+*/
+       Dcl IOStat Param Bit (36) Aligned;     /* Return error code */
+       Dcl Unit Param Ubin Word;              /* a DCB or unit # */
+       Dcl Bof# Param Bit (1) Aligned;        /* Logical value--Rewind? */
+/*
+**       Include files and system macros --
+*/
+       %CP6$Ents;
+       %Include FOXI_C62;
+       %Include XS_MACRO_C;
+       %Include B_SEGIDS_C;
+       %Include CP_6_SUBS;
+       %Include FOXI_C61;
+/*
+**       Associate Data Module:
+*/
+       Dcl  Fast$Data@  Entry  Conv (5);
+/*
+**       Monitor and FSFA I/O stuff --
+*/
+       Dcl M$FSFA$ Ptr;
+       %F$DCB (Dcbn=F$FSFA, StClass="Based (M$FSFA$)");
+ 
+       %Fpt_PFil (Fptn=PFil_FSFA,
+                  Bof=Yes);
+ 
+       Dcl XSA$PFil Entry (2) AltRet;
+ 
+       %P_Table;
+ 
+       %DCB_Table;
+/*
+**       Utility routines and Temp Variables
+*/
+       Dcl  Find$DCB  Entry (4)  AltRet;
+ 
+       Dcl  I  Ubin Word;
+       Dcl  DCB_Ix  Ubin Word;
+       Dcl  DCB_Numb  Sbin Word;
+%Eject;
+Start:;
+Fast$Rewind: Entry (IOStat, Unit);
+/*
+**       Find the Dcb, and Check to see that it's open --
+*/
+       %Find_Correct_Slot (IO_Fpt=PFil_FSFA);
+/*
+**       Set the BOF parameter --
+*/
+       If  Addr (Bof#) ~= Addr (Nil)  then Do;
+         PFil_FSFA.V.Bof# = Bof#;
+        End; Else Do;
+         PFil_FSFA.V.Bof# = %Yes#;
+       End;
+/*
+**       Try to rewind the file.
+*/
+       Call  XSA$PFil  (PFil_FSFA, P_Table.XSA_Param (DCB_Ix))  WhenReturn Do;
+         IOStat = BinBit (0, 36);
+        End; WhenAltReturn Do;
+         IOStat = P_Table.XSA_Param.Err (DCB_Ix);
+         AltReturn;
+       End;
+ 
+       Return;
+ 
+End    Fast$PFil;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$PRecord: Proc (IOStat, Unit, Count, KBuffer, KBLen)
+              AltRet;
+/*
+       Does an XSA$PRecord against the currently open file.  If KEYBUF and KLEN
+         are specified, we return the key of the record positioned to.  Count
+         may be negative or positive.
+*/
+       Dcl IOStat Param Bit (36) Aligned;    /* Return error code */
+       Dcl Unit Param Ubin Word;             /* Which DCB to use */
+       Dcl Count Param Ubin Word;            /* Count of records to position */
+       Dcl KBuffer Param Char (KBLen);       /* Buffer for data record key */
+       Dcl KBLen Param Sbin word;            /* Length of KBuffer */
+/*
+**       Include files and system macros --
+*/
+       %CP6$ENTS;
+       %Include XS_MACRO_C;
+       %Include B_SEGIDS_C;
+       %Include CP_6_SUBS;
+       %Include FOXI_C61;
+/*
+**       Associate Data Module:
+*/
+       Dcl  Fast$Data@  Entry  Conv (5);
+/*
+**       Monitor and FSFA I/O stuff --
+*/
+       Dcl M$FSFA$ Ptr;
+       %F$DCB (Dcbn=F$FSFA, StClass="Based (M$FSFA$)");
+ 
+       %Fpt_PRecord (Fptn=PRecord_FSFA);
+ 
+       %P_Table;
+ 
+       Dcl XSA$PRecord Entry (2) AltRet;
+ 
+       %DCB_Table;
+/*
+**       Utility routines and Temp Variables
+*/
+       Dcl  Find$DCB  Entry (4)  AltRet;
+ 
+       Dcl  I  Ubin Word;
+       Dcl  DCB_Ix  Ubin Word;
+       Dcl  DCB_Numb  Sbin Word;
+%Eject;
+Start:;
+/*
+**       Find the Dcb, and Check to see that it's open --
+*/
+       %Find_Correct_Slot (IO_Fpt=PRecord_FSFA);
+/*
+**       Set the count to position
+*/
+       PRecord_FSFA.V.N# = Count;
+/*
+**       Set key stuff, if present --
+*/
+       If  Addr (KBuffer) ~= Addr (NIL)  Then Do;
+         PRecord_FSFA.Key_ = Vector (KBuffer);
+         PRecord_FSFA.V.KeyR# = '1'B;
+        End; Else Do;
+         PRecord_FSFA.Key_ = Vector (Erase);
+         PRecord_FSFA.V.KeyR# = '0'B;
+       End;
+/*
+**       Postion in the file . . .
+*/
+       Call  XSA$PRecord  (PRecord_FSFA, P_Table.XSA_Param (DCB_Ix))  WhenReturn Do;
+         IOStat = BinBit (0, 36);
+        End; WhenAltReturn Do;
+         IOStat = P_Table.XSA_Param.Err (DCB_Ix);
+         AltReturn;
+       End;
+ 
+       Return;
+ 
+End    Fast$PRecord;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$Write: Proc (IOStat, Unit, Buffer, BLen, VFC#, Bin#, Trans#)
+            AltRet;
+/*
+       Does an XSA$WRITE against the currently open file.
+*/
+       Dcl IOStat Param Bit (36) Aligned;    /* Return error code */
+       Dcl Unit Param Ubin Word;             /* Which DCB to use */
+       Dcl Buffer Param Char (BLen);         /* Buffer for data record */
+       Dcl BLen Param Sbin Word;             /* Len of Buffer */
+       Dcl VFC# Param Bit (1) Aligned;       /* Write with VFC? */
+       Dcl Bin# Param Bit (1) Aligned;       /* Binary Write? */
+       Dcl Trans# Param Bit (1) Aligned;     /* Transparent Write? */
+/*
+**       Include files and system macros --
+*/
+       %CP6$ENTS;
+       %Include XS_MACRO_C;
+       %Include B_SEGIDS_C;
+       %Include CP_6_SUBS;
+       %Include FOXI_C61;
+/*
+**       Associate Data Module:
+*/
+       Dcl  Fast$Data@  Entry  Conv (5);
+/*
+**       Monitor and FSFA I/O stuff --
+*/
+       Dcl M$FSFA$ Ptr;
+       %F$DCB (Dcbn=F$FSFA, StClass="Based (M$FSFA$)");
+ 
+       %Fpt_Write (Fptn=Write_FSFA);
+ 
+       %P_Table;
+ 
+       Dcl XSA$Write Entry (2) AltRet;
+ 
+       %DCB_Table;
+/*
+**       Utility routines and Temp Variables
+*/
+       Dcl  Find$DCB  Entry (4)  AltRet;
+ 
+       Dcl  I  Ubin Word;
+       Dcl  DCB_Ix  Ubin Word;
+       Dcl  DCB_Numb  Sbin Word;
+%Eject;
+Start:;
+/*
+**       Find the Dcb, and Check to see that it's open --
+*/
+       %Find_Correct_Slot (IO_Fpt=Write_FSFA);
+/*
+**       Set pointers to our buffers --
+*/
+       If  BLen > 0  then Do;
+         Write_FSFA.Buf_ = Vector (Buffer);
+        End; Else Do;
+         Write_FSFA.Buf_ = Vector (Nil);
+       End;
+/*
+**       Set DVByte params --
+*/
+       If  Addr (VFC#) ~= Addr (Nil)  then Do;
+         Write_FSFA.V.DVByte.VFC# = VFC#;
+        End; Else Do;
+         Write_FSFA.V.DVByte.VFC# = %No#;
+       End;
+ 
+       If  Addr (Bin#) ~= Addr (Nil)  then Do;
+         Write_FSFA.V.DVByte.Bin# = Bin#;
+        End; Else Do;
+         Write_FSFA.V.DVByte.Bin# = %No#;
+       End;
+ 
+       If  Addr (Trans#) ~= Addr (Nil)  then Do;
+         Write_FSFA.V.DVByte.Trans# = Trans#;
+        End; Else Do;
+         Write_FSFA.V.DVByte.Trans# = %No#;
+       End;
+/*
+**       Do the write --
+*/
+       Call  XSA$Write  (Write_FSFA, P_Table.XSA_Param (DCB_Ix))  WhenReturn Do;
+         IOStat = BinBit (0, 36);
+        End; WhenAltReturn Do;
+         IOStat = P_Table.XSA_Param.Err (DCB_Ix);
+         AltReturn;
+       End;
+ 
+       Return;
+ 
+End    Fast$Write;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+UnFast$Error: Proc (IOStat, Unit)
+              AltRet;
+/*
+       Sets XSA_Param.UnFast# for the specified DCB
+*/
+       Dcl IOStat Param Bit (36) Aligned;     /* Return error code */
+       Dcl Unit Param Ubin Word;              /* a DCB or unit # */
+/*
+**       Include files and system macros --
+*/
+       %CP6$Ents;
+       %Include FOXI_C62;
+       %Include XS_MACRO_C;
+       %Include B_SEGIDS_C;
+       %Include CP_6_SUBS;
+       %Include FOXI_C61;
+/*
+**       Associate Data Module:
+*/
+       Dcl  Fast$Data@  Entry  Conv (5);
+/*
+**       Monitor and FSFA I/O stuff --
+*/
+       Dcl M$FSFA$ Ptr;
+       %F$DCB (Dcbn=F$FSFA, StClass="Based (M$FSFA$)");
+ 
+       %P_Table;
+ 
+       %DCB_Table;
+/*
+**       Utility routines and Temp Variables
+*/
+       Dcl  Find$DCB  Entry (4)  AltRet;
+ 
+       Dcl  I         Ubin Word;
+       Dcl  DCB_Ix    Ubin Word;
+       Dcl  DCB_Numb  Sbin Word;
+ 
+       Dcl  UnFast#   Bit (1);
+ 
+%Eject;
+Start:;
+/*
+**       Set the flag to indicate which way we go . . .
+*/
+UnFast$AltRet: Entry (IOStat, Unit);
+ 
+       UnFast# = %UnFast$AltRet#;
+       GoTo Do_Real_Work;
+ 
+UnFast$Continue: Entry (IOStat, Unit);
+UnFast$Monitor:  Entry (IOStat, Unit);
+ 
+       UnFast# = %UnFast$Monitor#;
+ 
+Do_Real_Work:;
+/*
+**       Find the Dcb, and Check to see that it's open --
+*/
+       %Find_Correct_Slot;
+/*
+**       Set the UnFast# bit for this unit, as specified by the particular
+**       entry chosen; then return.
+*/
+       P_Table.XSA_Param.UnFast# (DCB_Ix) = UnFast#;
+ 
+       IOStat = BinBit (0, 36);
+ 
+       Return;
+ 
+End    UnFast$Error;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$XCon@:  Proc  Async  AltRet;
+/*
+**       This is the XCon handler for FOXI programs.  All it does is step
+**       through the DCB table and close (with save) all the DCBs that are
+**       still open.  All errors encountered are ignored, since there isn't
+**       much we can do about it at this point.  (We assume here that either
+**       the user doesn't care, or the program is aborting anyway.)
+**
+*/
+/*
+**       Include files and system macros --
+*/
+       %CP6$Ents;
+       %Include XS_MACRO_C;
+       %Include FOXI_C61;
+       %Include CP_6_SUBS;
+/*
+**       FOXI tables --
+*/
+       %DCB_Table;
+       %P_Table;
+/*
+**       XCon Stuff
+*/
+       %Fpt_XCon (Fptn=Restore_Previous_XCon,
+                  StClass=SymRef);
+/*
+**       Stuff to close DCBs with --
+*/
+       Dcl M$FSFA$ Ptr;
+       %F$Dcb (Dcbn=F$FSFA, StClass="Based (M$FSFA$)");
+ 
+       %Fpt_Close (Fptn=Close_FSFA,
+                   Disp=Save);
+ 
+       Dcl  XSA$Close  Entry (2) AltRet;
+/*
+**       Temp storage --
+*/
+       Dcl I Ubin;
+%Eject;
+Start:;
+/*
+**       Look through the DCB table and close anything that's got a DCB number
+**       in it.  If it's already closed, leave it alone; otherwise, close it
+**       with the Save option.  Since we're going away, we don't worry about
+**       reclaiming space.
+*/
+       Do  I = 0 to (%Max_Open# - 1);                     /* check all Dcbs */
+         If  DCB_Table.DCB_Numb (I) ~= 0  then Do;
+           M$FSFA$ = DcbAddr (DCB_Table.DCB_Numb (I));
+           If  F$FSFA.FCD#  then Do;                    /* only if it's open */
+             Close_FSFA.V.DCB# = DCB_Table.DCB_Numb (I);
+             Call  XSA$Close  (Close_FSFA, P_Table.XSA_Param (I));
+           End;
+         End;
+       End;
+/*
+**       Re-establish any prior XCon control, and quit.
+*/
+       Call  M$XCon  ( Restore_Previous_XCon );
+ 
+       AltReturn;
+ 
+End    Fast$XCon@;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+Fast$XCon_Set:   Proc;
+/*
+**       This routine sets up exit control, unless we've already called it.
+**       The entry point, Fast$XCon_ReSet, resets to the previous XCon entry.
+*/
+/*
+**       Monitor stuff:
+*/
+%CP6$Ents;
+%Include CP_6_SUBS;
+/*
+**       Exit control stuff --
+*/
+       Dcl We_have_XCon_Control Static Bit (1) Aligned Init (%No#);
+       Dcl Fast$XCon@ Entry Async;
+ 
+       %Fpt_XCon (Fptn=Set_up_XCon,
+                  UEntry=Fast$XCon@,
+                  PXCon=Restore_Previous_XCon.V.UEntry#);
+ 
+       %Fpt_XCon (Fptn=Restore_Previous_XCon,
+                  StClass="STATIC SYMDEF");
+ 
+ 
+ 
+Start:;
+/*
+**       Set up XCon if we haven't already
+*/
+       If  ~We_have_XCon_Control  then Do;
+         Call  M$XCon  ( Set_up_XCon );
+         We_have_XCon_Control = %Yes#;
+       End;
+ 
+       Return;
+ 
+ 
+Fast$XCon_ReSet: Entry;
+/*
+**       Reset XCon control, if we've taken it.
+*/
+       If  We_have_XCon_Control  then Do;
+         Call  M$XCon  ( Restore_Previous_XCon );
+         Restore_Previous_XCon.V.UEntry# = EntAddr (Nil);
+         We_have_XCon_Control = %No#;
+       End;
+ 
+       Return;
+ 
+End    Fast$XCon_Set;

@@ -1,0 +1,1614 @@
+VERSION E05
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:1    
+        1        1        /*M*   NIQ$GET - Subroutines to get and free queue packets                   */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR */
+        8        8        /*P*   NAME: NIQ$GET                                                         *
+        9        9         *     PURPOSE: Routines to allocate and return queue packets                *
+       10       10         *     DESCRIPTION:  Maintains a list of free queue packets                  *
+       11       11         *                                                                           *
+       12       12         *                  When a packet is requested and is available,             *
+       13       13         *                  the pointer to it is returned and the count of           *
+       14       14         *                  free list is decremented.                                *
+       15       15         *                                                                           *
+       16       16         *                  When a packet is not available, if this is a             *
+       17       17         *                  user associated request (S_TIMR~=2)
+       18       18         *                  then a counter is incremented and the user is
+       19       19         *                     REG'd.  Upon release from the REG the
+       20       20         *                     counter is decremented.
+       21       21         *                  else we ALTRETURN.
+       22       22         *                                                                           *
+       23       23         *                  whenever a packet is returned, if the count of           *
+       24       24         *                  REG'd users is non-zero, the queue-packet-available      *
+       25       25         *                  event is reported to the scheduler to unblock            *
+       26       26         *                  all users blocked on queue packets.                      */
+       27       27        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:2    
+       28       28        /*F*   NAME: NIQ$GET
+       29       29         *     purpose:  Called to get a IOQ queue packet for I/O                    *
+       30       30         *                                                                           */
+       31       31        /*D*   NAME: NIQ$GET                                                         *
+       32       32         *     CALL: CALL NIQ$GET(Q$);                                               *
+       33       33         *     INTERFACE: SSR$REG,SSR$RUE                                            *
+       34       34         *     OUTPUT: Q$ - Pointer to packet                                        *
+       35       35         *     DESCRIPTION: Checks count of non-zero packets, if non-zero            *
+       36       36         *                  then N$FQ.HD$ is set to flink of first packet,           *
+       37       37         *                       pointing to previous head.                          *
+       38       38         *                  else if this is a user request                           *
+       39       39         *                       then N$FQ.NQP is incremented and the user           *
+       40       40         *                            is REG'd.                                      *
+       41       41         *                       else NIQ$GETS ALTRETURNs.                           */
+       42       42        /**/
+       43       43        NIQ$GETNR: PROC(Q$) ALTRET MATERIALIZE ($PR2 IN PR2$) ;
+       44       44        /*
+       45       45                Includes
+       46       46        */
+       47       47        %INCLUDE HF_DATA_R ;
+       48       90        %INCLUDE HF_LOCK_C ;
+       49      104        %INCLUDE NI_DATA_C ;
+       50      217        %INCLUDE NI_DATA_R ;
+       51      654        %INCLUDE NI_MACROS_C ;
+       52      921        %INCLUDE P_PMDAT_R ;
+       53     1229        %INCLUDE SS_SCHED_C ;
+       54     1462        /*
+       55     1463                Parameters
+       56     1464        */
+       57     1465    1   DCL 1 Q$                PTR PARAM ;
+       58     1466        /*
+       59     1467                ENTRYs
+       60     1468        */
+       61     1469    1   DCL 1 NIA$RELERR        ENTRY(1) ;
+       62     1470    1   DCL 1 NIC$NOPKTS        ENTRY(1) ;
+       63     1471    1   DCL 1 SC_NIQBADIOQ      ENTRY CONV(2,0) ;
+       64     1472    1   DCL 1 SSR$REG           ENTRY(3) ALTRET ;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:3    
+       65     1473    1   DCL 1 SSR$RUE           ENTRY(4) ;
+       66     1474        /*
+       67     1475                Symrefs
+       68     1476        */
+       69     1477    1   DCL 1 S_CUN             UBIN SYMREF ;
+       70     1478    1   DCL 1 S_TIMR            UBIN SYMREF ;
+       71     1479        /*
+       72     1480                Auto
+       73     1481        */
+       74     1482    1   DCL 1 I                 SBIN WORD ALIGNED AUTO ;
+       75     1483    1   DCL 1 IOSBIT            BIT(1) ALIGNED AUTO ;
+       76     1484    1   DCL 1 NOREG             BIT(1) ALIGNED AUTO ;
+       77     1485    1   DCL 1 PR2$              PTR ALIGNED AUTO ;
+       78     1486    1   DCL 1 R$                PTR ALIGNED AUTO ;
+       79     1487        /*
+       80     1488                Based
+       81     1489        */
+       82     1490        %N$REQ                  ( NAME = N$REQ,     STCLASS = "BASED(Q$)" ) ;
+       83     1548        %NI$IMXMBX              ( NAME = NI$IMXMBX, STCLASS = BASED ) ;
+       84     1569        %NI$REQ                 ( NAME = NI$REQ,    STCLASS = "BASED(Q$)" ) ;
+       85     1594    1   DCL 1 X1                UBIN(18) HALIGNED BASED ;
+       86     1595        /*
+       87     1596                Constants
+       88     1597        */
+       89     1598    1   DCL 1 IOQMSG ALIGNED CONSTANT,
+       90     1599    1         2 T CHAR(0) INIT('**** SYSTEM HAS RUN OUT OF IOQ PACKETS ****'),
+       91     1600    1         2 * CHAR(3) INIT('   ');
+       92     1601    1   DCL 1 IOSMSG ALIGNED CONSTANT,
+       93     1602    1         2 T CHAR(0) INIT('**** SYSTEM HAS RUN OUT OF IOS PACKETS ****'),
+       94     1603    1         2 * CHAR(3) INIT('   ');
+       95     1604        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:4    
+       96     1605    1           NOREG='1'B;
+       97     1606    1           GOTO GETCONT;
+       98     1607    1   NIQ$GET: ENTRY(Q$) ALTRET;
+       99     1608    1           NOREG='0'B;
+      100     1609    1   GETCONT:;
+      101     1610                %LOCK(G#=N$FQ.GATE);
+      102     1613    1   RETRY:
+      103     1614                %DEQUEUE(P#=Q$,Q#=N$FQ.HD$,A#=NOIOQPKTS);
+      104     1621    1           IF N$REQ.IOQFLG THEN
+      105     1622        /*S* SCREECH_CODE:  NIQ-S$BADIOQ-7
+      106     1623             TYPE:          SCREECH
+      107     1624             MESSAGE:       Incorrect IOQ processing within IO system.
+      108     1625             DESCRIPTION:   The IO system detected an incorrect processing
+      109     1626                            sequence on an IOQ packet.  To be allocated,
+      110     1627                            an IOQ packet must not be in use and must not
+      111     1628                            be scheduled for an IO.  To be released, an
+      112     1629                            IOQ packet must be in use and must not be
+      113     1630                            scheduled for an IO.
+      114     1631        */
+      115     1632    1              CALL SC_NIQBADIOQ ;
+      116     1633    1           N$FQ.REQID=N$FQ.REQID+1;
+      117     1634    1           IOSBIT=N$REQ.IOFLG.IOS;
+      118     1635    1           R$=N$REQ.IOS$;
+      119     1636    1           N$REQ = N$REQ_INIT ;
+      120     1637    1           N$REQ.IOQFLG.INUSE = '1'B ;
+      121     1638    1           N$REQ.GET.UNO = S_CUN ;
+      122     1639    1           N$REQ.GET.X1 = PR2$->X1 - 1 ;
+      123     1640    1           N$REQ.IOS$=R$;
+      124     1641    1           N$REQ.IOFLG.IOS=IOSBIT;
+      125     1642    1           N$REQ.REQID=N$FQ.REQID;
+      126     1643                %INC_COUNTER(ITEM=NREQCT);
+      127     1649                %UNLOCK(G#=N$FQ.GATE);
+      128     1652    1           RETURN;
+      129     1653        /*
+      130     1654            No packets available, if user REG, otherwise ALTRETURN.
+      131     1655        */
+      132     1656    1   NOIOQPKTS:
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:5    
+      133     1657    1           CALL NIC$NOPKTS(VECTOR(IOQMSG.T));
+      134     1658    2           IF S_TIMR=2 OR NOREG THEN DO;
+      135     1659                   %UNLOCK(G#=N$FQ.GATE);
+      136     1662    2              ALTRETURN;
+      137     1663    2              END;
+      138     1664    1           N$FQ.NQP = N$FQ.NQP + 1;
+      139     1665                %UNLOCK(G#=N$FQ.GATE);
+      140     1668    1           CALL SSR$REG(%SS_NQP/*%SS_NQP*/);
+      141     1669                %LOCK(G#=N$FQ.GATE);
+      142     1672    1           N$FQ.NQP = N$FQ.NQP - 1;
+      143     1673    1           GOTO RETRY;
+      144     1674        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:6    
+      145     1675        /* ASSIGN NEW REQID TO Q$->N$REQ
+      146     1676        */
+      147     1677    1   NIQ$GETID: ENTRY(Q$) ALTRET;
+      148     1678        /**/
+      149     1679                %LOCK(G#=N$FQ.GATE);
+      150     1682    1           N$FQ.REQID=N$FQ.REQID+1;
+      151     1683    1           N$REQ.REQID=N$FQ.REQID;
+      152     1684                %UNLOCK(G#=N$FQ.GATE);
+      153     1687    1           RETURN;
+      154     1688        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:7    
+      155     1689        /*F*  NAME: NIQ$REL                                                          *
+      156     1690         *    PURPOSE: Called to return an IOQ packet to the free queue              *
+      157     1691         *                                                                           */
+      158     1692        /*D*  NAME: NIQ$REL                                                          *
+      159     1693         *    CALL: CALL NIQ$REL(Q$);                                                *
+      160     1694         *    INTERFACE: SSR$RUE                                                     *
+      161     1695         *    INPUT: Q$ - Pointer to packet to be freed                              *
+      162     1696         *    DESCRIPTION: Puts packet pointed to by Q$ at                           *
+      163     1697         *                 head of free list,                                        *
+      164     1698         *                 and if number of users's                                  *
+      165     1699         *                 waiting for a packet is non-zero, calls                   *
+      166     1700         *                 scheduler to report IOQ queue packet available            *
+      167     1701         *                 event.                                                    *
+      168     1702         *                                                                           */
+      169     1703    1   NIQ$REL: ENTRY(Q$) ALTRET;
+      170     1704    1           IF Q$=ADDR(NIL) THEN RETURN;
+      171     1705    1           IF NOT N$REQ.IOQFLG.INUSE OR N$REQ.IOQFLG.IOQUED THEN
+      172     1706    1              CALL SC_NIQBADIOQ ;
+      173     1707    1           IF N$REQ.ERR$~=ADDR(NIL) THEN CALL NIA$RELERR(N$REQ);
+      174     1708    2           IF N$REQ.IOFLG.IOS THEN DO;
+      175     1709    3              IF NI_RELIOS THEN DO;
+      176     1710    3                 N$REQ.IOFLG.IOS='0'B;
+      177     1711    3                 CALL NIQ$RELS(N$REQ.IOS$);
+      178     1712    3                 END;
+      179     1713    3              ELSE IF N$REQ.IOS$->NI$REQ.FL$~=ADDR(NIL) THEN DO;
+      180     1714    3                    CALL NIQ$RELS(N$REQ.IOS$->NI$REQ.FL$);
+      181     1715    3                    END;
+      182     1716    2              END;
+      183     1717    1           N$REQ.IOQFLG.INUSE = '0'B ;
+      184     1718    1           N$REQ.REL.UNO = S_CUN ;
+      185     1719    1           N$REQ.REL.X1 = PR2$->X1 - 1 ;
+      186     1720                %LOCK(G#=N$FQ.GATE);
+      187     1723                %DEC_COUNTER(ITEM=NREQCT);
+      188     1729                %ENQUEUE(P#=N$REQ,Q#=N$FQ.HD$);
+      189     1732                %UNLOCK(G#=N$FQ.GATE);
+      190     1735    1           Q$ = ADDR(NIL);
+      191     1736    1           IF N$FQ.NQP > 0
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:8    
+      192     1737    1           THEN CALL SSR$RUE(%SS_QPA/*%SS_QPA*/);
+      193     1738    1           RETURN;
+      194     1739        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:9    
+      195     1740        /*F*   NAME: NIQ$GETS                                                        *
+      196     1741         *     purpose:  Called to get a IOS queue packet for I/O                    *
+      197     1742         *                                                                           */
+      198     1743        /*D*   NAME: NIQ$GETS                                                        *
+      199     1744         *     CALL: CALL NIQ$GETS(Q$);                                              *
+      200     1745         *     INTERFACE: SSR$REG,SSR$RUE                                            *
+      201     1746         *     OUTPUT: Q$ - Pointer to packet                                        *
+      202     1747         *     DESCRIPTION: Checks count of non-zero packets, if non-zero            *
+      203     1748         *                  then NI$FQ.HD$ is set to flink of first packet,          *
+      204     1749         *                       pointing to previous head.                          *
+      205     1750         *                  else if this is a user request                           *
+      206     1751         *                       then NI$FQ.NQP is incremented and the user          *
+      207     1752         *                            is REG'd.                                      *
+      208     1753         *                       else NIQ$GET ALTRETURNs.                            */
+      209     1754    1   NIQ$GETSNR: ENTRY (Q$) ALTRET;
+      210     1755    1           NOREG='1'B;
+      211     1756    1           GOTO IOSCONT;
+      212     1757    1   NIQ$GETS: ENTRY (Q$) ALTRET;
+      213     1758    1           NOREG='0'B;
+      214     1759    1   IOSCONT:
+      215     1760                %LOCK(G#=NI$FQ.GATE);
+      216     1763    1   RETRYS:
+      217     1764                %DEQUEUE(P#=Q$,Q#=NI$FQ.HD$,A#=NOIOSPKTS);
+      218     1771                %INC_COUNTER(ITEM=NIREQCT);
+      219     1777                %UNLOCK(G#=NI$FQ.GATE);
+      220     1780    1           NI$REQ = NI$REQ_INIT ;
+      221     1781    2           IF HW_IMX THEN DO;
+      222     1782    2              R$=PINCRW(Q$,%IMX_MBX_OFFSET);
+      223     1783    2              R$->NI$IMXMBX = NI$IMXMBX_INIT ;
+      224     1784    2              END;
+      225     1785    1           RETURN;
+      226     1786        /*
+      227     1787            No packets available, if user REG, otherwise ALTRETURN.
+      228     1788        */
+      229     1789    1   NOIOSPKTS:
+      230     1790    1           CALL NIC$NOPKTS(VECTOR(IOSMSG.T));
+      231     1791    2           IF (S_TIMR=2) OR NOREG THEN DO;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:10   
+      232     1792                   %UNLOCK(G#=NI$FQ.GATE);
+      233     1795    2              ALTRETURN;
+      234     1796    2              END;
+      235     1797    1           NI$FQ.NQP = NI$FQ.NQP + 1;
+      236     1798                %UNLOCK(G#=NI$FQ.GATE);
+      237     1801    1           CALL SSR$REG(%SS_NQP/*%SS_NQP*/);
+      238     1802                %LOCK(G#=NI$FQ.GATE);
+      239     1805    1           NI$FQ.NQP = NI$FQ.NQP - 1;
+      240     1806    1           GOTO RETRYS;
+      241     1807        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:11   
+      242     1808        /*F*  NAME: NIQ$RELS                                                         *
+      243     1809         *    PURPOSE: Called to return an IOS packet to the free queue              *
+      244     1810         *                                                                           */
+      245     1811        /*D*  NAME: NIQ$RELS                                                         *
+      246     1812         *    CALL: CALL NIQ$RELS(Q$);                                               *
+      247     1813         *    INTERFACE: SSR$RUE                                                     *
+      248     1814         *    INPUT: Q$ - Pointer to packet to be freed                              *
+      249     1815         *    DESCRIPTION: Puts packet string pointed to by Q$ at                    *
+      250     1816         *                 tail of free list,                                        *
+      251     1817         *                 and if number of users's                                  *
+      252     1818         *                 waiting for a packet is non-zero, calls                   *
+      253     1819         *                 scheduler to report IOS queue packet available            *
+      254     1820         *                 event.                                                    *
+      255     1821         *                                                                           */
+      256     1822    1   NIQ$RELS: ENTRY(Q$) ALTRET;
+      257     1823    1           R$=Q$;
+      258     1824    1           IF R$=ADDR(NIL) THEN RETURN;
+      259     1825    1           I=1;
+      260     1826    2           DO WHILE (R$->NI$REQ.FL$~=ADDR(NIL));
+      261     1827    2              R$=R$->NI$REQ.FL$;
+      262     1828    2              I=I+1;
+      263     1829    2              END;
+      264     1830                %LOCK(G#=NI$FQ.GATE);
+      265     1833                %DEC_COUNTER(ITEM=NIREQCT,VALUE=I);
+      266     1839    1           IF NI$FQ.HD$=ADDR(NIL) THEN R$->NI$REQ.FL$=Q$;
+      267     1840    2           ELSE DO;
+      268     1841    2              R$->NI$REQ.FL$=NI$FQ.HD$->NI$REQ.FL$;
+      269     1842    2              NI$FQ.HD$->NI$REQ.FL$=Q$;
+      270     1843    2              END;
+      271     1844    1           NI$FQ.HD$=R$;
+      272     1845                %UNLOCK(G#=NI$FQ.GATE);
+      273     1848    1           Q$ = ADDR(NIL);
+      274     1849    1           IF NI$FQ.NQP > 0
+      275     1850    1           THEN CALL SSR$RUE(%SS_QPA/*%SS_QPA*/);
+      276     1851    1           RETURN;
+      277     1852    1   END NIQ$GETNR;
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:12   
+--  Include file information  --
+
+   SS_SCHED_C.:E05TOU  is referenced.
+   P_PMDAT_C.:E05TOU  is referenced.
+   P_PMDAT_R.:E05TOU  cannot be made into a system file and is referenced.
+   NI_MACROS_C.:E05TOU  cannot be made into a system file and is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   NI_DATA_C.:E05TOU  is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   HF_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure NIQ$GETNR.
+
+   Procedure NIQ$GETNR requires 390 words for executable code.
+   Procedure NIQ$GETNR requires 12 words of local(AUTO) storage.
+
+    No errors detected in file NIQ$GET.:E05TSI    .
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:13   
+
+ Object Unit name= NIQ$GETNR                                  File name= NIQ$GET.:E05TOU
+ UTS= JUL 30 '97 03:35:25.32 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS     24     30  NIQ$GETNR
+    1   Proc  even  none   390    606  NIQ$GETNR
+    2  RoData even  none    11     13  NIQ$GETNR
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes    yes     yes      Std        1  NIQ$GETNR
+     1      6          yes     yes      Std        1  NIQ$GET
+     1    165          yes     yes      Std        1  NIQ$GETID
+     1    211          yes     yes      Std        1  NIQ$REL
+     1    362          yes     yes      Std        1  NIQ$GETSNR
+     1    370          yes     yes      Std        1  NIQ$GETS
+     1    503          yes     yes      Std        1  NIQ$RELS
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:14   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 HFC$LOCK
+ yes     yes           Std       2 NIM$DEQUEUE
+ yes     yes           Std       3 SSR$REG
+         yes           Std       1 HFC$UNLOCK
+         yes           Std       1 NIA$RELERR
+         yes           Std       1 NIC$NOPKTS
+         yes           Std       2 NIM$ENQUEUE
+         yes           Std       4 SSR$RUE
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+                       nStd      0 X66_AALT
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_NIQBADIOQ                          HW_IMX                                N$DCT$$
+     N$FQ$                            r    N$REQ_INIT                            NI$FQ$
+     NI$IBUF$                         r    NI$IMXMBX_INIT                   r    NI$REQ_INIT
+     NI$RP$                                NI_RELIOS                             P_RESOURCE$
+     P_UPTIME                              P_NSCPU                               S_CUN
+     S_TIMR                                B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ASLENTSID                             ISSID
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:15   
+
+
+        1        1        /*M*   NIQ$GET - Subroutines to get and free queue packets                   */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMR */
+        8        8        /*P*   NAME: NIQ$GET                                                         *
+        9        9         *     PURPOSE: Routines to allocate and return queue packets                *
+       10       10         *     DESCRIPTION:  Maintains a list of free queue packets                  *
+       11       11         *                                                                           *
+       12       12         *                  When a packet is requested and is available,             *
+       13       13         *                  the pointer to it is returned and the count of           *
+       14       14         *                  free list is decremented.                                *
+       15       15         *                                                                           *
+       16       16         *                  When a packet is not available, if this is a             *
+       17       17         *                  user associated request (S_TIMR~=2)
+       18       18         *                  then a counter is incremented and the user is
+       19       19         *                     REG'd.  Upon release from the REG the
+       20       20         *                     counter is decremented.
+       21       21         *                  else we ALTRETURN.
+       22       22         *                                                                           *
+       23       23         *                  whenever a packet is returned, if the count of           *
+       24       24         *                  REG'd users is non-zero, the queue-packet-available      *
+       25       25         *                  event is reported to the scheduler to unblock            *
+       26       26         *                  all users blocked on queue packets.                      */
+       27       27        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:16   
+       28       28        /*F*   NAME: NIQ$GET
+       29       29         *     purpose:  Called to get a IOQ queue packet for I/O                    *
+       30       30         *                                                                           */
+       31       31        /*D*   NAME: NIQ$GET                                                         *
+       32       32         *     CALL: CALL NIQ$GET(Q$);                                               *
+       33       33         *     INTERFACE: SSR$REG,SSR$RUE                                            *
+       34       34         *     OUTPUT: Q$ - Pointer to packet                                        *
+       35       35         *     DESCRIPTION: Checks count of non-zero packets, if non-zero            *
+       36       36         *                  then N$FQ.HD$ is set to flink of first packet,           *
+       37       37         *                       pointing to previous head.                          *
+       38       38         *                  else if this is a user request                           *
+       39       39         *                       then N$FQ.NQP is incremented and the user           *
+       40       40         *                            is REG'd.                                      *
+       41       41         *                       else NIQ$GETS ALTRETURNs.                           */
+       42       42        /**/
+       43       43        NIQ$GETNR: PROC(Q$) ALTRET MATERIALIZE ($PR2 IN PR2$) ;
+
+     43  1 000000   000000 700200 xent  NIQ$GETNR    TSX0  ! X66_AUTO_1
+         1 000001   000014 000001                    ZERO    12,1
+         1 000002   200007 452700                    STP2  ! PR2$,,AUTO
+
+       44       44        /*
+       45       45                Includes
+       46       46        */
+       47       47        %INCLUDE HF_DATA_R ;
+       48       90        %INCLUDE HF_LOCK_C ;
+       49      104        %INCLUDE NI_DATA_C ;
+       50      217        %INCLUDE NI_DATA_R ;
+       51      654        %INCLUDE NI_MACROS_C ;
+       52      921        %INCLUDE P_PMDAT_R ;
+       53     1229        %INCLUDE SS_SCHED_C ;
+       54     1462        /*
+       55     1463                Parameters
+       56     1464        */
+       57     1465    1   DCL 1 Q$                PTR PARAM ;
+       58     1466        /*
+       59     1467                ENTRYs
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:17   
+       60     1468        */
+       61     1469    1   DCL 1 NIA$RELERR        ENTRY(1) ;
+       62     1470    1   DCL 1 NIC$NOPKTS        ENTRY(1) ;
+       63     1471    1   DCL 1 SC_NIQBADIOQ      ENTRY CONV(2,0) ;
+       64     1472    1   DCL 1 SSR$REG           ENTRY(3) ALTRET ;
+       65     1473    1   DCL 1 SSR$RUE           ENTRY(4) ;
+       66     1474        /*
+       67     1475                Symrefs
+       68     1476        */
+       69     1477    1   DCL 1 S_CUN             UBIN SYMREF ;
+       70     1478    1   DCL 1 S_TIMR            UBIN SYMREF ;
+       71     1479        /*
+       72     1480                Auto
+       73     1481        */
+       74     1482    1   DCL 1 I                 SBIN WORD ALIGNED AUTO ;
+       75     1483    1   DCL 1 IOSBIT            BIT(1) ALIGNED AUTO ;
+       76     1484    1   DCL 1 NOREG             BIT(1) ALIGNED AUTO ;
+       77     1485    1   DCL 1 PR2$              PTR ALIGNED AUTO ;
+       78     1486    1   DCL 1 R$                PTR ALIGNED AUTO ;
+       79     1487        /*
+       80     1488                Based
+       81     1489        */
+       82     1490        %N$REQ                  ( NAME = N$REQ,     STCLASS = "BASED(Q$)" ) ;
+       83     1548        %NI$IMXMBX              ( NAME = NI$IMXMBX, STCLASS = BASED ) ;
+       84     1569        %NI$REQ                 ( NAME = NI$REQ,    STCLASS = "BASED(Q$)" ) ;
+       85     1594    1   DCL 1 X1                UBIN(18) HALIGNED BASED ;
+       86     1595        /*
+       87     1596                Constants
+       88     1597        */
+       89     1598    1   DCL 1 IOQMSG ALIGNED CONSTANT,
+       90     1599    1         2 T CHAR(0) INIT('**** SYSTEM HAS RUN OUT OF IOQ PACKETS ****'),
+       91     1600    1         2 * CHAR(3) INIT('   ');
+       92     1601    1   DCL 1 IOSMSG ALIGNED CONSTANT,
+       93     1602    1         2 T CHAR(0) INIT('**** SYSTEM HAS RUN OUT OF IOS PACKETS ****'),
+       94     1603    1         2 * CHAR(3) INIT('   ');
+       95     1604        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:18   
+       96     1605    1           NOREG='1'B;
+
+   1605  1 000003   400000 236003                    LDQ     -131072,DU
+         1 000004   200006 756100                    STQ     NOREG,,AUTO
+
+       97     1606    1           GOTO GETCONT;
+
+   1606  1 000005   000012 710000 1                  TRA     GETCONT
+
+       98     1607    1   NIQ$GET: ENTRY(Q$) ALTRET;
+
+   1607  1 000006   000000 700200 xent  NIQ$GET      TSX0  ! X66_AUTO_1
+         1 000007   000014 000001                    ZERO    12,1
+         1 000010   200007 452700                    STP2  ! PR2$,,AUTO
+
+       99     1608    1           NOREG='0'B;
+
+   1608  1 000011   200006 450100                    STZ     NOREG,,AUTO
+
+   1608  1 000012                       GETCONT      null
+      100     1609    1   GETCONT:;
+      101     1610                %LOCK(G#=N$FQ.GATE);
+
+   1611  1 000012   000000 630400 xsym               EPPR0   N$FQ$
+         1 000013   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000014   000000 701000 xent               TSX1    HFC$LOCK
+         1 000015   000000 011000                    NOP     0
+
+      102     1613    1   RETRY:
+      103     1614                %DEQUEUE(P#=Q$,Q#=N$FQ.HD$,A#=NOIOQPKTS);
+
+   1616  1 000016   000000 236000 xsym  RETRY        LDQ     N$FQ$
+         1 000017   000002 036003                    ADLQ    2,DU
+         1 000020   200003 235100                    LDA     @Q$,,AUTO
+         1 000021   200012 757100                    STAQ    R$+2,,AUTO
+         1 000022   200012 630500                    EPPR0   R$+2,,AUTO
+         1 000023   000020 631400 xsym               EPPR1   B_VECTNIL+16
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:19   
+         1 000024   000000 701000 xent               TSX1    NIM$DEQUEUE
+         1 000025   000125 702000 1                  TSX2    NOIOQPKTS
+
+      104     1621    1           IF N$REQ.IOQFLG THEN
+
+   1621  1 000026   200003 470500                    LDP0    @Q$,,AUTO
+         1 000027   000000 471500                    LDP1    0,,PR0
+         1 000030   100033 236100                    LDQ     27,,PR1
+         1 000031   600000 316003                    CANQ    -65536,DU
+         1 000032   000035 600000 1                  TZE     s:1633
+
+      105     1622        /*S* SCREECH_CODE:  NIQ-S$BADIOQ-7
+      106     1623             TYPE:          SCREECH
+      107     1624             MESSAGE:       Incorrect IOQ processing within IO system.
+      108     1625             DESCRIPTION:   The IO system detected an incorrect processing
+      109     1626                            sequence on an IOQ packet.  To be allocated,
+      110     1627                            an IOQ packet must not be in use and must not
+      111     1628                            be scheduled for an IO.  To be released, an
+      112     1629                            IOQ packet must be in use and must not be
+      113     1630                            scheduled for an IO.
+      114     1631        */
+      115     1632    1              CALL SC_NIQBADIOQ ;
+
+   1632  1 000033   000000 713400 xsym               CLIMB   SC_NIQBADIOQ
+         1 000034   000000 600000 xsid               climb   nvectors=         0
+
+      116     1633    1           N$FQ.REQID=N$FQ.REQID+1;
+
+   1633  1 000035   000000 470400 xsym               LDP0    N$FQ$
+         1 000036   000004 235100                    LDA     4,,PR0
+         1 000037   000001 035007                    ADLA    1,DL
+         1 000040   000004 755100                    STA     4,,PR0
+
+      117     1634    1           IOSBIT=N$REQ.IOFLG.IOS;
+
+   1634  1 000041   200003 471500                    LDP1    @Q$,,AUTO
+         1 000042   100000 473500                    LDP3    0,,PR1
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:20   
+         1 000043   300004 236100                    LDQ     4,,PR3
+         1 000044   000025 736000                    QLS     21
+         1 000045   400000 376003                    ANQ     -131072,DU
+         1 000046   200005 756100                    STQ     IOSBIT,,AUTO
+
+      118     1635    1           R$=N$REQ.IOS$;
+
+   1635  1 000047   300012 236100                    LDQ     10,,PR3
+         1 000050   200010 756100                    STQ     R$,,AUTO
+
+      119     1636    1           N$REQ = N$REQ_INIT ;
+
+   1636  1 000051   000100 100400                    MLR     fill='000'O
+         1 000052   000000 000170 xsym               ADSC9   N$REQ_INIT               cn=0,n=120
+         1 000053   300000 000170                    ADSC9   0,,PR3                   cn=0,n=120
+
+      120     1637    1           N$REQ.IOQFLG.INUSE = '1'B ;
+
+   1637  1 000054   100000 470500                    LDP0    0,,PR1
+         1 000055   400000 236003                    LDQ     -131072,DU
+         1 000056   000033 256100                    ORSQ    27,,PR0
+
+      121     1638    1           N$REQ.GET.UNO = S_CUN ;
+
+   1638  1 000057   100000 470500                    LDP0    0,,PR1
+         1 000060   000000 236000 xsym               LDQ     S_CUN
+         1 000061   000022 736000                    QLS     18
+         1 000062   000033 552120                    STBQ    27,'20'O,PR0
+
+      122     1639    1           N$REQ.GET.X1 = PR2$->X1 - 1 ;
+
+   1639  1 000063   100000 470500                    LDP0    0,,PR1
+         1 000064   200007 473500                    LDP3    PR2$,,AUTO
+         1 000065   000100 100500                    MLR     fill='000'O
+         1 000066   300000 000002                    ADSC9   0,,PR3                   cn=0,n=2
+         1 000067   200012 000004                    ADSC9   R$+2,,AUTO               cn=0,n=4
+         1 000070   200012 220100                    LDX0    R$+2,,AUTO
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:21   
+         1 000071   777777 621010                    EAX1    -1,X0
+         1 000072   000033 441100                    SXL1    27,,PR0
+
+      123     1640    1           N$REQ.IOS$=R$;
+
+   1640  1 000073   100000 470500                    LDP0    0,,PR1
+         1 000074   200010 236100                    LDQ     R$,,AUTO
+         1 000075   000012 756100                    STQ     10,,PR0
+
+      124     1641    1           N$REQ.IOFLG.IOS=IOSBIT;
+
+   1641  1 000076   100000 470500                    LDP0    0,,PR1
+         1 000077   200005 236100                    LDQ     IOSBIT,,AUTO
+         1 000100   000025 772000                    QRL     21
+         1 000101   000004 676100                    ERQ     4,,PR0
+         1 000102   040000 376007                    ANQ     16384,DL
+         1 000103   000004 656100                    ERSQ    4,,PR0
+
+      125     1642    1           N$REQ.REQID=N$FQ.REQID;
+
+   1642  1 000104   100000 470500                    LDP0    0,,PR1
+         1 000105   000000 474400 xsym               LDP4    N$FQ$
+         1 000106   400004 720100                    LXL0    4,,PR4
+         1 000107   000010 740100                    STX0    8,,PR0
+
+      126     1643                %INC_COUNTER(ITEM=NREQCT);
+
+   1644  1 000110   000000 470400 xsym               LDP0    P_RESOURCE$
+         1 000111   000041 235100                    LDA     33,,PR0
+         1 000112   000001 035007                    ADLA    1,DL
+         1 000113   000041 755100                    STA     33,,PR0
+
+   1645  1 000114   000042 236100                    LDQ     34,,PR0
+         1 000115   000041 116100                    CMPQ    33,,PR0
+         1 000116   000120 603000 1                  TRC     s:1650
+
+   1647  1 000117   000042 755100                    STA     34,,PR0
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:22   
+
+      127     1649                %UNLOCK(G#=N$FQ.GATE);
+
+   1650  1 000120   000000 630400 xsym               EPPR0   N$FQ$
+         1 000121   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000122   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000123   000000 011000                    NOP     0
+
+      128     1652    1           RETURN;
+
+   1652  1 000124   000000 702200 xent               TSX2  ! X66_ARET
+
+      129     1653        /*
+      130     1654            No packets available, if user REG, otherwise ALTRETURN.
+      131     1655        */
+      132     1656    1   NOIOQPKTS:
+      133     1657    1           CALL NIC$NOPKTS(VECTOR(IOQMSG.T));
+
+   1657  1 000125   000002 630400 2     NOIOQPKTS    EPPR0   2
+         1 000126   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000127   000000 701000 xent               TSX1    NIC$NOPKTS
+         1 000130   000000 011000                    NOP     0
+
+      134     1658    2           IF S_TIMR=2 OR NOREG THEN DO;
+
+   1658  1 000131   000000 235000 xsym               LDA     S_TIMR
+         1 000132   000002 115007                    CMPA    2,DL
+         1 000133   000136 600000 1                  TZE     s:1660
+         1 000134   200006 234100                    SZN     NOREG,,AUTO
+         1 000135   000143 605000 1                  TPL     s:1664
+
+      135     1659                   %UNLOCK(G#=N$FQ.GATE);
+
+   1660  1 000136   000000 630400 xsym               EPPR0   N$FQ$
+         1 000137   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000140   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000141   000000 011000                    NOP     0
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:23   
+
+      136     1662    2              ALTRETURN;
+
+   1662  1 000142   000000 702200 xent               TSX2  ! X66_AALT
+
+      137     1663    2              END;
+      138     1664    1           N$FQ.NQP = N$FQ.NQP + 1;
+
+   1664  1 000143   000000 470400 xsym               LDP0    N$FQ$
+         1 000144   000003 054100                    AOS     3,,PR0
+
+      139     1665                %UNLOCK(G#=N$FQ.GATE);
+
+   1666  1 000145   000000 630400 xsym               EPPR0   N$FQ$
+         1 000146   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000147   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000150   000000 011000                    NOP     0
+
+      140     1668    1           CALL SSR$REG(%SS_NQP/*%SS_NQP*/);
+
+   1668  1 000151   000004 630400 2                  EPPR0   4
+         1 000152   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000153   000000 701000 xent               TSX1    SSR$REG
+         1 000154   000000 011000                    NOP     0
+
+      141     1669                %LOCK(G#=N$FQ.GATE);
+
+   1670  1 000155   000000 630400 xsym               EPPR0   N$FQ$
+         1 000156   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000157   000000 701000 xent               TSX1    HFC$LOCK
+         1 000160   000000 011000                    NOP     0
+
+      142     1672    1           N$FQ.NQP = N$FQ.NQP - 1;
+
+   1672  1 000161   000000 470400 xsym               LDP0    N$FQ$
+         1 000162   000001 336007                    LCQ     1,DL
+         1 000163   000003 056100                    ASQ     3,,PR0
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:24   
+
+      143     1673    1           GOTO RETRY;
+
+   1673  1 000164   000016 710000 1                  TRA     RETRY
+
+      144     1674        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:25   
+      145     1675        /* ASSIGN NEW REQID TO Q$->N$REQ
+      146     1676        */
+      147     1677    1   NIQ$GETID: ENTRY(Q$) ALTRET;
+
+   1677  1 000165   000000 700200 xent  NIQ$GETID    TSX0  ! X66_AUTO_1
+         1 000166   000014 000001                    ZERO    12,1
+         1 000167   200007 452700                    STP2  ! PR2$,,AUTO
+
+      148     1678        /**/
+      149     1679                %LOCK(G#=N$FQ.GATE);
+
+   1680  1 000170   000000 630400 xsym               EPPR0   N$FQ$
+         1 000171   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000172   000000 701000 xent               TSX1    HFC$LOCK
+         1 000173   000000 011000                    NOP     0
+
+      150     1682    1           N$FQ.REQID=N$FQ.REQID+1;
+
+   1682  1 000174   000000 470400 xsym               LDP0    N$FQ$
+         1 000175   000004 235100                    LDA     4,,PR0
+         1 000176   000001 035007                    ADLA    1,DL
+         1 000177   000004 755100                    STA     4,,PR0
+
+      151     1683    1           N$REQ.REQID=N$FQ.REQID;
+
+   1683  1 000200   200003 471500                    LDP1    @Q$,,AUTO
+         1 000201   100000 473500                    LDP3    0,,PR1
+         1 000202   000004 720100                    LXL0    4,,PR0
+         1 000203   300010 740100                    STX0    8,,PR3
+
+      152     1684                %UNLOCK(G#=N$FQ.GATE);
+
+   1685  1 000204   000000 630400 xsym               EPPR0   N$FQ$
+         1 000205   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000206   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000207   000000 011000                    NOP     0
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:26   
+      153     1687    1           RETURN;
+
+   1687  1 000210   000000 702200 xent               TSX2  ! X66_ARET
+
+      154     1688        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:27   
+      155     1689        /*F*  NAME: NIQ$REL                                                          *
+      156     1690         *    PURPOSE: Called to return an IOQ packet to the free queue              *
+      157     1691         *                                                                           */
+      158     1692        /*D*  NAME: NIQ$REL                                                          *
+      159     1693         *    CALL: CALL NIQ$REL(Q$);                                                *
+      160     1694         *    INTERFACE: SSR$RUE                                                     *
+      161     1695         *    INPUT: Q$ - Pointer to packet to be freed                              *
+      162     1696         *    DESCRIPTION: Puts packet pointed to by Q$ at                           *
+      163     1697         *                 head of free list,                                        *
+      164     1698         *                 and if number of users's                                  *
+      165     1699         *                 waiting for a packet is non-zero, calls                   *
+      166     1700         *                 scheduler to report IOQ queue packet available            *
+      167     1701         *                 event.                                                    *
+      168     1702         *                                                                           */
+      169     1703    1   NIQ$REL: ENTRY(Q$) ALTRET;
+
+   1703  1 000211   000000 700200 xent  NIQ$REL      TSX0  ! X66_AUTO_1
+         1 000212   000014 000001                    ZERO    12,1
+         1 000213   200007 452700                    STP2  ! PR2$,,AUTO
+
+      170     1704    1           IF Q$=ADDR(NIL) THEN RETURN;
+
+   1704  1 000214   200003 470500                    LDP0    @Q$,,AUTO
+         1 000215   000000 236100                    LDQ     0,,PR0
+         1 000216   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000217   000221 601000 1                  TNZ     s:1705
+
+   1704  1 000220   000000 702200 xent               TSX2  ! X66_ARET
+
+      171     1705    1           IF NOT N$REQ.IOQFLG.INUSE OR N$REQ.IOQFLG.IOQUED THEN
+
+   1705  1 000221   000000 471500                    LDP1    0,,PR0
+         1 000222   100033 234100                    SZN     27,,PR1
+         1 000223   000227 605000 1                  TPL     s:1706
+         1 000224   100033 236100                    LDQ     27,,PR1
+         1 000225   200000 316003                    CANQ    65536,DU
+         1 000226   000231 600000 1                  TZE     s:1707
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:28   
+
+      172     1706    1              CALL SC_NIQBADIOQ ;
+
+   1706  1 000227   000000 713400 xsym               CLIMB   SC_NIQBADIOQ
+         1 000230   000000 600000 xsid               climb   nvectors=         0
+
+      173     1707    1           IF N$REQ.ERR$~=ADDR(NIL) THEN CALL NIA$RELERR(N$REQ);
+
+   1707  1 000231   200003 470500                    LDP0    @Q$,,AUTO
+         1 000232   000000 471500                    LDP1    0,,PR0
+         1 000233   100017 236100                    LDQ     15,,PR1
+         1 000234   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000235   000243 600000 1                  TZE     s:1708
+
+   1707  1 000236   200012 451500                    STP1    R$+2,,AUTO
+         1 000237   200012 630500                    EPPR0   R$+2,,AUTO
+         1 000240   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000241   000000 701000 xent               TSX1    NIA$RELERR
+         1 000242   000000 011000                    NOP     0
+
+      174     1708    2           IF N$REQ.IOFLG.IOS THEN DO;
+
+   1708  1 000243   200003 470500                    LDP0    @Q$,,AUTO
+         1 000244   000000 471500                    LDP1    0,,PR0
+         1 000245   100004 236100                    LDQ     4,,PR1
+         1 000246   040000 316007                    CANQ    16384,DL
+         1 000247   000275 600000 1                  TZE     s:1717
+
+      175     1709    3              IF NI_RELIOS THEN DO;
+
+   1709  1 000250   000000 234000 xsym               SZN     NI_RELIOS
+         1 000251   000264 605000 1                  TPL     s:1713
+
+      176     1710    3                 N$REQ.IOFLG.IOS='0'B;
+
+   1710  1 000252   000005 236000 2                  LDQ     5
+         1 000253   100004 356100                    ANSQ    4,,PR1
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:29   
+
+      177     1711    3                 CALL NIQ$RELS(N$REQ.IOS$);
+
+   1711  1 000254   000000 471500                    LDP1    0,,PR0
+         1 000255   100012 633500                    EPPR3   10,,PR1
+         1 000256   200012 453500                    STP3    R$+2,,AUTO
+         1 000257   200012 630500                    EPPR0   R$+2,,AUTO
+         1 000260   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000261   000503 701000 1                  TSX1    s:1822
+         1 000262   000000 011000                    NOP     0
+
+      178     1712    3                 END;
+
+   1712  1 000263   000275 710000 1                  TRA     s:1717
+
+      179     1713    3              ELSE IF N$REQ.IOS$->NI$REQ.FL$~=ADDR(NIL) THEN DO;
+
+   1713  1 000264   100012 473500                    LDP3    10,,PR1
+         1 000265   300000 236100                    LDQ     0,,PR3
+         1 000266   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000267   000275 600000 1                  TZE     s:1717
+
+      180     1714    3                    CALL NIQ$RELS(N$REQ.IOS$->NI$REQ.FL$);
+
+   1714  1 000270   200012 453500                    STP3    R$+2,,AUTO
+         1 000271   200012 630500                    EPPR0   R$+2,,AUTO
+         1 000272   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000273   000503 701000 1                  TSX1    s:1822
+         1 000274   000000 011000                    NOP     0
+
+      181     1715    3                    END;
+
+      182     1716    2              END;
+
+      183     1717    1           N$REQ.IOQFLG.INUSE = '0'B ;
+
+   1717  1 000275   200003 470500                    LDP0    @Q$,,AUTO
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:30   
+         1 000276   000000 471500                    LDP1    0,,PR0
+         1 000277   000031 236000 xsym               LDQ     B_VECTNIL+25
+         1 000300   100033 356100                    ANSQ    27,,PR1
+
+      184     1718    1           N$REQ.REL.UNO = S_CUN ;
+
+   1718  1 000301   000000 471500                    LDP1    0,,PR0
+         1 000302   000000 236000 xsym               LDQ     S_CUN
+         1 000303   000022 736000                    QLS     18
+         1 000304   100034 552120                    STBQ    28,'20'O,PR1
+
+      185     1719    1           N$REQ.REL.X1 = PR2$->X1 - 1 ;
+
+   1719  1 000305   000000 471500                    LDP1    0,,PR0
+         1 000306   200007 473500                    LDP3    PR2$,,AUTO
+         1 000307   000100 100500                    MLR     fill='000'O
+         1 000310   300000 000002                    ADSC9   0,,PR3                   cn=0,n=2
+         1 000311   200012 000004                    ADSC9   R$+2,,AUTO               cn=0,n=4
+         1 000312   200012 220100                    LDX0    R$+2,,AUTO
+         1 000313   777777 621010                    EAX1    -1,X0
+         1 000314   100034 441100                    SXL1    28,,PR1
+
+      186     1720                %LOCK(G#=N$FQ.GATE);
+
+   1721  1 000315   000000 630400 xsym               EPPR0   N$FQ$
+         1 000316   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000317   000000 701000 xent               TSX1    HFC$LOCK
+         1 000320   000000 011000                    NOP     0
+
+      187     1723                %DEC_COUNTER(ITEM=NREQCT);
+
+   1724  1 000321   000000 470400 xsym               LDP0    P_RESOURCE$
+         1 000322   000041 235100                    LDA     33,,PR0
+         1 000323   000001 135007                    SBLA    1,DL
+         1 000324   000041 755100                    STA     33,,PR0
+
+   1725  1 000325   000041 236100                    LDQ     33,,PR0
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:31   
+         1 000326   000043 116100                    CMPQ    35,,PR0
+         1 000327   000331 603000 1                  TRC     s:1730
+
+   1727  1 000330   000043 756100                    STQ     35,,PR0
+
+      188     1729                %ENQUEUE(P#=N$REQ,Q#=N$FQ.HD$);
+
+   1730  1 000331   200003 471500                    LDP1    @Q$,,AUTO
+         1 000332   100000 473500                    LDP3    0,,PR1
+         1 000333   000000 236000 xsym               LDQ     N$FQ$
+         1 000334   000002 036003                    ADLQ    2,DU
+         1 000335   200013 756100                    STQ     R$+3,,AUTO
+         1 000336   200012 453500                    STP3    R$+2,,AUTO
+         1 000337   200012 630500                    EPPR0   R$+2,,AUTO
+         1 000340   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 000341   000000 701000 xent               TSX1    NIM$ENQUEUE
+         1 000342   000000 011000                    NOP     0
+
+      189     1732                %UNLOCK(G#=N$FQ.GATE);
+
+   1733  1 000343   000000 630400 xsym               EPPR0   N$FQ$
+         1 000344   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000345   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000346   000000 011000                    NOP     0
+
+      190     1735    1           Q$ = ADDR(NIL);
+
+   1735  1 000347   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000350   200003 470500                    LDP0    @Q$,,AUTO
+         1 000351   000000 756100                    STQ     0,,PR0
+
+      191     1736    1           IF N$FQ.NQP > 0
+
+   1736  1 000352   000000 471400 xsym               LDP1    N$FQ$
+         1 000353   100003 235100                    LDA     3,,PR1
+         1 000354   000361 604400 1                  TMOZ    s:1738
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:32   
+      192     1737    1           THEN CALL SSR$RUE(%SS_QPA/*%SS_QPA*/);
+
+   1737  1 000355   000007 630400 2                  EPPR0   7
+         1 000356   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000357   000000 701000 xent               TSX1    SSR$RUE
+         1 000360   000000 011000                    NOP     0
+
+      193     1738    1           RETURN;
+
+   1738  1 000361   000000 702200 xent               TSX2  ! X66_ARET
+
+      194     1739        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:33   
+      195     1740        /*F*   NAME: NIQ$GETS                                                        *
+      196     1741         *     purpose:  Called to get a IOS queue packet for I/O                    *
+      197     1742         *                                                                           */
+      198     1743        /*D*   NAME: NIQ$GETS                                                        *
+      199     1744         *     CALL: CALL NIQ$GETS(Q$);                                              *
+      200     1745         *     INTERFACE: SSR$REG,SSR$RUE                                            *
+      201     1746         *     OUTPUT: Q$ - Pointer to packet                                        *
+      202     1747         *     DESCRIPTION: Checks count of non-zero packets, if non-zero            *
+      203     1748         *                  then NI$FQ.HD$ is set to flink of first packet,          *
+      204     1749         *                       pointing to previous head.                          *
+      205     1750         *                  else if this is a user request                           *
+      206     1751         *                       then NI$FQ.NQP is incremented and the user          *
+      207     1752         *                            is REG'd.                                      *
+      208     1753         *                       else NIQ$GET ALTRETURNs.                            */
+      209     1754    1   NIQ$GETSNR: ENTRY (Q$) ALTRET;
+
+   1754  1 000362   000000 700200 xent  NIQ$GETSNR   TSX0  ! X66_AUTO_1
+         1 000363   000014 000001                    ZERO    12,1
+         1 000364   200007 452700                    STP2  ! PR2$,,AUTO
+
+      210     1755    1           NOREG='1'B;
+
+   1755  1 000365   400000 236003                    LDQ     -131072,DU
+         1 000366   200006 756100                    STQ     NOREG,,AUTO
+
+      211     1756    1           GOTO IOSCONT;
+
+   1756  1 000367   000374 710000 1                  TRA     IOSCONT
+
+      212     1757    1   NIQ$GETS: ENTRY (Q$) ALTRET;
+
+   1757  1 000370   000000 700200 xent  NIQ$GETS     TSX0  ! X66_AUTO_1
+         1 000371   000014 000001                    ZERO    12,1
+         1 000372   200007 452700                    STP2  ! PR2$,,AUTO
+
+      213     1758    1           NOREG='0'B;
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:34   
+   1758  1 000373   200006 450100                    STZ     NOREG,,AUTO
+
+      214     1759    1   IOSCONT:
+      215     1760                %LOCK(G#=NI$FQ.GATE);
+
+   1761  1 000374   000000 630400 xsym  IOSCONT      EPPR0   NI$FQ$
+         1 000375   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000376   000000 701000 xent               TSX1    HFC$LOCK
+         1 000377   000000 011000                    NOP     0
+
+      216     1763    1   RETRYS:
+      217     1764                %DEQUEUE(P#=Q$,Q#=NI$FQ.HD$,A#=NOIOSPKTS);
+
+   1766  1 000400   000000 236000 xsym  RETRYS       LDQ     NI$FQ$
+         1 000401   000002 036003                    ADLQ    2,DU
+         1 000402   200003 235100                    LDA     @Q$,,AUTO
+         1 000403   200012 757100                    STAQ    R$+2,,AUTO
+         1 000404   200012 630500                    EPPR0   R$+2,,AUTO
+         1 000405   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         1 000406   000000 701000 xent               TSX1    NIM$DEQUEUE
+         1 000407   000443 702000 1                  TSX2    NOIOSPKTS
+
+      218     1771                %INC_COUNTER(ITEM=NIREQCT);
+
+   1772  1 000410   000000 470400 xsym               LDP0    P_RESOURCE$
+         1 000411   000047 235100                    LDA     39,,PR0
+         1 000412   000001 035007                    ADLA    1,DL
+         1 000413   000047 755100                    STA     39,,PR0
+
+   1773  1 000414   000050 236100                    LDQ     40,,PR0
+         1 000415   000047 116100                    CMPQ    39,,PR0
+         1 000416   000420 603000 1                  TRC     s:1778
+
+   1775  1 000417   000050 755100                    STA     40,,PR0
+
+      219     1777                %UNLOCK(G#=NI$FQ.GATE);
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:35   
+   1778  1 000420   000000 630400 xsym               EPPR0   NI$FQ$
+         1 000421   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000422   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000423   000000 011000                    NOP     0
+
+      220     1780    1           NI$REQ = NI$REQ_INIT ;
+
+   1780  1 000424   200003 470500                    LDP0    @Q$,,AUTO
+         1 000425   000000 471500                    LDP1    0,,PR0
+         1 000426   000100 100400                    MLR     fill='000'O
+         1 000427   000000 000070 xsym               ADSC9   NI$REQ_INIT              cn=0,n=56
+         1 000430   100000 000070                    ADSC9   0,,PR1                   cn=0,n=56
+
+      221     1781    2           IF HW_IMX THEN DO;
+
+   1781  1 000431   000000 234000 xsym               SZN     HW_IMX
+         1 000432   000442 605000 1                  TPL     s:1785
+
+      222     1782    2              R$=PINCRW(Q$,%IMX_MBX_OFFSET);
+
+   1782  1 000433   000000 236100                    LDQ     0,,PR0
+         1 000434   000010 036003                    ADLQ    8,DU
+         1 000435   200010 756100                    STQ     R$,,AUTO
+
+      223     1783    2              R$->NI$IMXMBX = NI$IMXMBX_INIT ;
+
+   1783  1 000436   200010 471500                    LDP1    R$,,AUTO
+         1 000437   000100 100400                    MLR     fill='000'O
+         1 000440   000000 000140 xsym               ADSC9   NI$IMXMBX_INIT           cn=0,n=96
+         1 000441   100000 000140                    ADSC9   0,,PR1                   cn=0,n=96
+
+      224     1784    2              END;
+
+      225     1785    1           RETURN;
+
+   1785  1 000442   000000 702200 xent               TSX2  ! X66_ARET
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:36   
+      226     1786        /*
+      227     1787            No packets available, if user REG, otherwise ALTRETURN.
+      228     1788        */
+      229     1789    1   NOIOSPKTS:
+      230     1790    1           CALL NIC$NOPKTS(VECTOR(IOSMSG.T));
+
+   1790  1 000443   000012 630400 2     NOIOSPKTS    EPPR0   10
+         1 000444   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000445   000000 701000 xent               TSX1    NIC$NOPKTS
+         1 000446   000000 011000                    NOP     0
+
+      231     1791    2           IF (S_TIMR=2) OR NOREG THEN DO;
+
+   1791  1 000447   000000 235000 xsym               LDA     S_TIMR
+         1 000450   000002 115007                    CMPA    2,DL
+         1 000451   000454 600000 1                  TZE     s:1793
+         1 000452   200006 234100                    SZN     NOREG,,AUTO
+         1 000453   000461 605000 1                  TPL     s:1797
+
+      232     1792                   %UNLOCK(G#=NI$FQ.GATE);
+
+   1793  1 000454   000000 630400 xsym               EPPR0   NI$FQ$
+         1 000455   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000456   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000457   000000 011000                    NOP     0
+
+      233     1795    2              ALTRETURN;
+
+   1795  1 000460   000000 702200 xent               TSX2  ! X66_AALT
+
+      234     1796    2              END;
+      235     1797    1           NI$FQ.NQP = NI$FQ.NQP + 1;
+
+   1797  1 000461   000000 470400 xsym               LDP0    NI$FQ$
+         1 000462   000003 054100                    AOS     3,,PR0
+
+      236     1798                %UNLOCK(G#=NI$FQ.GATE);
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:37   
+
+   1799  1 000463   000000 630400 xsym               EPPR0   NI$FQ$
+         1 000464   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000465   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000466   000000 011000                    NOP     0
+
+      237     1801    1           CALL SSR$REG(%SS_NQP/*%SS_NQP*/);
+
+   1801  1 000467   000004 630400 2                  EPPR0   4
+         1 000470   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000471   000000 701000 xent               TSX1    SSR$REG
+         1 000472   000000 011000                    NOP     0
+
+      238     1802                %LOCK(G#=NI$FQ.GATE);
+
+   1803  1 000473   000000 630400 xsym               EPPR0   NI$FQ$
+         1 000474   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000475   000000 701000 xent               TSX1    HFC$LOCK
+         1 000476   000000 011000                    NOP     0
+
+      239     1805    1           NI$FQ.NQP = NI$FQ.NQP - 1;
+
+   1805  1 000477   000000 470400 xsym               LDP0    NI$FQ$
+         1 000500   000001 336007                    LCQ     1,DL
+         1 000501   000003 056100                    ASQ     3,,PR0
+
+      240     1806    1           GOTO RETRYS;
+
+   1806  1 000502   000400 710000 1                  TRA     RETRYS
+
+      241     1807        %EJECT;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:38   
+      242     1808        /*F*  NAME: NIQ$RELS                                                         *
+      243     1809         *    PURPOSE: Called to return an IOS packet to the free queue              *
+      244     1810         *                                                                           */
+      245     1811        /*D*  NAME: NIQ$RELS                                                         *
+      246     1812         *    CALL: CALL NIQ$RELS(Q$);                                               *
+      247     1813         *    INTERFACE: SSR$RUE                                                     *
+      248     1814         *    INPUT: Q$ - Pointer to packet to be freed                              *
+      249     1815         *    DESCRIPTION: Puts packet string pointed to by Q$ at                    *
+      250     1816         *                 tail of free list,                                        *
+      251     1817         *                 and if number of users's                                  *
+      252     1818         *                 waiting for a packet is non-zero, calls                   *
+      253     1819         *                 scheduler to report IOS queue packet available            *
+      254     1820         *                 event.                                                    *
+      255     1821         *                                                                           */
+      256     1822    1   NIQ$RELS: ENTRY(Q$) ALTRET;
+
+   1822  1 000503   000000 700200 xent  NIQ$RELS     TSX0  ! X66_AUTO_1
+         1 000504   000014 000001                    ZERO    12,1
+         1 000505   200007 452700                    STP2  ! PR2$,,AUTO
+
+      257     1823    1           R$=Q$;
+
+   1823  1 000506   200003 470500                    LDP0    @Q$,,AUTO
+         1 000507   000000 236100                    LDQ     0,,PR0
+         1 000510   200010 756100                    STQ     R$,,AUTO
+
+      258     1824    1           IF R$=ADDR(NIL) THEN RETURN;
+
+   1824  1 000511   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000512   000514 601000 1                  TNZ     s:1825
+
+   1824  1 000513   000000 702200 xent               TSX2  ! X66_ARET
+
+      259     1825    1           I=1;
+
+   1825  1 000514   000001 235007                    LDA     1,DL
+         1 000515   200004 755100                    STA     I,,AUTO
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:39   
+
+      260     1826    2           DO WHILE (R$->NI$REQ.FL$~=ADDR(NIL));
+
+   1826  1 000516   000523 710000 1                  TRA     s:1829
+
+      261     1827    2              R$=R$->NI$REQ.FL$;
+
+   1827  1 000517   200010 470500                    LDP0    R$,,AUTO
+         1 000520   000000 236100                    LDQ     0,,PR0
+         1 000521   200010 756100                    STQ     R$,,AUTO
+
+      262     1828    2              I=I+1;
+
+   1828  1 000522   200004 054100                    AOS     I,,AUTO
+
+      263     1829    2              END;
+
+   1829  1 000523   200010 470500                    LDP0    R$,,AUTO
+         1 000524   000000 236100                    LDQ     0,,PR0
+         1 000525   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000526   000517 601000 1                  TNZ     s:1827
+
+      264     1830                %LOCK(G#=NI$FQ.GATE);
+
+   1831  1 000527   000000 630400 xsym               EPPR0   NI$FQ$
+         1 000530   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000531   000000 701000 xent               TSX1    HFC$LOCK
+         1 000532   000000 011000                    NOP     0
+
+      265     1833                %DEC_COUNTER(ITEM=NIREQCT,VALUE=I);
+
+   1834  1 000533   000000 470400 xsym               LDP0    P_RESOURCE$
+         1 000534   000047 236100                    LDQ     39,,PR0
+         1 000535   200004 136100                    SBLQ    I,,AUTO
+         1 000536   000047 756100                    STQ     39,,PR0
+
+   1835  1 000537   000051 116100                    CMPQ    41,,PR0
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:40   
+         1 000540   000542 603000 1                  TRC     s:1839
+
+   1837  1 000541   000051 756100                    STQ     41,,PR0
+
+      266     1839    1           IF NI$FQ.HD$=ADDR(NIL) THEN R$->NI$REQ.FL$=Q$;
+
+   1839  1 000542   000000 471400 xsym               LDP1    NI$FQ$
+         1 000543   100002 236100                    LDQ     2,,PR1
+         1 000544   000001 116000 xsym               CMPQ    B_VECTNIL+1
+         1 000545   000553 601000 1                  TNZ     s:1841
+
+   1839  1 000546   200003 473500                    LDP3    @Q$,,AUTO
+         1 000547   300000 236100                    LDQ     0,,PR3
+         1 000550   200010 474500                    LDP4    R$,,AUTO
+         1 000551   400000 756100                    STQ     0,,PR4
+         1 000552   000564 710000 1                  TRA     s:1844
+
+      267     1840    2           ELSE DO;
+
+      268     1841    2              R$->NI$REQ.FL$=NI$FQ.HD$->NI$REQ.FL$;
+
+   1841  1 000553   100002 473500                    LDP3    2,,PR1
+         1 000554   300000 236100                    LDQ     0,,PR3
+         1 000555   200010 474500                    LDP4    R$,,AUTO
+         1 000556   400000 756100                    STQ     0,,PR4
+
+      269     1842    2              NI$FQ.HD$->NI$REQ.FL$=Q$;
+
+   1842  1 000557   000000 470400 xsym               LDP0    NI$FQ$
+         1 000560   000002 471500                    LDP1    2,,PR0
+         1 000561   200003 473500                    LDP3    @Q$,,AUTO
+         1 000562   300000 236100                    LDQ     0,,PR3
+         1 000563   100000 756100                    STQ     0,,PR1
+
+      270     1843    2              END;
+
+      271     1844    1           NI$FQ.HD$=R$;
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:41   
+
+   1844  1 000564   200010 236100                    LDQ     R$,,AUTO
+         1 000565   000000 470400 xsym               LDP0    NI$FQ$
+         1 000566   000002 756100                    STQ     2,,PR0
+
+      272     1845                %UNLOCK(G#=NI$FQ.GATE);
+
+   1846  1 000567   000000 630400 xsym               EPPR0   NI$FQ$
+         1 000570   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000571   000000 701000 xent               TSX1    HFC$UNLOCK
+         1 000572   000000 011000                    NOP     0
+
+      273     1848    1           Q$ = ADDR(NIL);
+
+   1848  1 000573   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000574   200003 470500                    LDP0    @Q$,,AUTO
+         1 000575   000000 756100                    STQ     0,,PR0
+
+      274     1849    1           IF NI$FQ.NQP > 0
+
+   1849  1 000576   000000 471400 xsym               LDP1    NI$FQ$
+         1 000577   100003 235100                    LDA     3,,PR1
+         1 000600   000605 604400 1                  TMOZ    s:1851
+
+      275     1850    1           THEN CALL SSR$RUE(%SS_QPA/*%SS_QPA*/);
+
+   1850  1 000601   000007 630400 2                  EPPR0   7
+         1 000602   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000603   000000 701000 xent               TSX1    SSR$RUE
+         1 000604   000000 011000                    NOP     0
+
+      276     1851    1           RETURN;
+
+   1851  1 000605   000000 702200 xent               TSX2  ! X66_ARET
+
+IOQMSG
+ Sect OctLoc
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:42   
+   0     000   052052 052052   040123 131123   124105 115040   110101 123040    **** SYSTEM HAS
+   0     004   122125 116040   117125 124040   117106 040111   117121 040120    RUN OUT OF IOQ P
+   0     010   101103 113105   124123 040052   052052 052040   040040 ******    ACKETS ****   ..
+
+IOSMSG
+ Sect OctLoc
+   0     014   052052 052052   040123 131123   124105 115040   110101 123040    **** SYSTEM HAS
+   0     020   122125 116040   117125 124040   117106 040111   117123 040120    RUN OUT OF IOS P
+   0     024   101103 113105   124123 040052   052052 052040   040040 ******    ACKETS ****   ..
+
+(unnamed)
+ Sect OctLoc
+   2     000   000012 577640   000000 006000   000000 006000   000000 000104    ...............D
+   2     004   000003 006000   777777 737777   000000 000105   000006 006000    ...........E....
+   2     010   000012 577640   000014 006000   000010 006000                    ............
+      277     1852    1   END NIQ$GETNR;
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:43   
+--  Include file information  --
+
+   SS_SCHED_C.:E05TOU  is referenced.
+   P_PMDAT_C.:E05TOU  is referenced.
+   P_PMDAT_R.:E05TOU  cannot be made into a system file and is referenced.
+   NI_MACROS_C.:E05TOU  cannot be made into a system file and is referenced.
+   NI$TABLES.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   NI_DATA_C.:E05TOU  is referenced.
+   HF_LOCK_C.:E05TOU  cannot be made into a system file and is referenced.
+   HF_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure NIQ$GETNR.
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:44   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData NIQ$GETNR
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(414)   r     1 IOQMSG                    14-0-0/w STRC(414)   r     1 IOSMSG
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @Q$                        4-0-0/w SBIN        r     1 I
+     5-0-0/w BIT         r     1 IOSBIT                     6-0-0/w BIT         r     1 NOREG
+     7-0-0/w PTR         r     1 PR2$                      *0-0-0/w PTR         r     1 Q$
+    10-0-0/w PTR         r     1 R$
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w BIT         r     1 HW_IMX                     0-0-0/w PTR         r     1 N$DCT$$
+     0-0-0/w PTR         r     1 N$FQ$                      0-0-0/d STRC(1080)  r     1 N$REQ_INIT
+     0-0-0/w PTR         r     1 NI$FQ$                     0-0-0/w PTR         r     1 NI$IBUF$
+     0-0-0/d STRC(864)   r     1 NI$IMXMBX_INIT             0-0-0/d STRC(504)   r     1 NI$REQ_INIT
+     0-0-0/w PTR         r     1 NI$RP$                     0-0-0/w BIT         r     1 NI_RELIOS
+     0-0-0/w PTR         r     1 P_RESOURCE$                0-0-0/w UBIN        r     1 S_CUN
+     0-0-0/w UBIN        r     1 S_TIMR
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:45   
+     0-0-0/w STRC(180)   r     1 N$FQ                       0-0-0/d STRC(1080)  r     1 N$REQ
+     0-0-0/w STRC(144)   r     1 NI$FQ                      0-0-0/d STRC(864)   r     1 NI$IMXMBX
+     0-0-0/d STRC(504)   r     1 NI$REQ                     0-0-0/w STRC(2268)  r     1 P_RESOURCE
+     0-0-0/h UBIN(18)    r     1 X1
+
+
+   Procedure NIQ$GETNR requires 390 words for executable code.
+   Procedure NIQ$GETNR requires 12 words of local(AUTO) storage.
+
+    No errors detected in file NIQ$GET.:E05TSI    .
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:46   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:47   
+          MINI XREF LISTING
+
+GETCONT
+      1608**LABEL    1606--GOTO
+HFC$LOCK
+       103**DCL-ENT  1611--CALL     1670--CALL     1680--CALL     1721--CALL     1761--CALL     1803--CALL
+      1831--CALL
+HFC$UNLOCK
+       103**DCL-ENT  1650--CALL     1660--CALL     1666--CALL     1685--CALL     1733--CALL     1778--CALL
+      1793--CALL     1799--CALL     1846--CALL
+HW_IMX
+        89**DCL      1781>>IF
+I
+      1482**DCL      1825<<ASSIGN   1828<<ASSIGN   1828>>ASSIGN   1834>>ASSIGN
+IOQMSG.T
+      1599**DCL      1657--CALL
+IOSBIT
+      1483**DCL      1634<<ASSIGN   1641>>ASSIGN
+IOSCONT
+      1761**LABEL    1756--GOTO
+IOSMSG.T
+      1602**DCL      1790--CALL
+N$DCT$$
+       515**DCL       649--IMP-PTR
+N$FQ.GATE
+       650**DCL      1611<>CALL     1650<>CALL     1660<>CALL     1666<>CALL     1670<>CALL     1680<>CALL
+      1685<>CALL     1721<>CALL     1733<>CALL
+N$FQ.HD$
+       650**DCL      1616<>CALL     1730<>CALL
+N$FQ.NQP
+       650**DCL      1664<<ASSIGN   1664>>ASSIGN   1672<<ASSIGN   1672>>ASSIGN   1736>>IF
+N$FQ.REQID
+       651**DCL      1633<<ASSIGN   1633>>ASSIGN   1642>>ASSIGN   1682<<ASSIGN   1682>>ASSIGN   1683>>ASSIGN
+N$FQ$
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:48   
+       515**DCL       650--IMP-PTR  1611>>CALL     1616>>CALL     1633>>ASSIGN   1633>>ASSIGN   1642>>ASSIGN
+      1650>>CALL     1660>>CALL     1664>>ASSIGN   1664>>ASSIGN   1666>>CALL     1670>>CALL     1672>>ASSIGN
+      1672>>ASSIGN   1680>>CALL     1682>>ASSIGN   1682>>ASSIGN   1683>>ASSIGN   1685>>CALL     1721>>CALL
+      1730>>CALL     1733>>CALL     1736>>IF
+N$REQ
+      1499**DCL      1636<<ASSIGN   1707<>CALL     1730<>CALL
+N$REQ.BUFADDR
+      1508**DCL      1509--REDEF    1509--REDEF
+N$REQ.DLA.DRELADDR
+      1500**DCL      1500--REDEF
+N$REQ.DVE.EOMCHAR
+      1537**DCL      1538--REDEF
+N$REQ.EAINFO
+      1531**DCL      1531--REDEF
+N$REQ.EAINFOX
+      1531**DCL      1532--REDEF
+N$REQ.ERR$
+      1521**DCL      1707>>IF
+N$REQ.EVNTINFO
+      1532**DCL      1532--REDEF
+N$REQ.GET.UNO
+      1543**DCL      1638<<ASSIGN
+N$REQ.GET.X1
+      1543**DCL      1639<<ASSIGN
+N$REQ.IOFLG.IOS
+      1503**DCL      1634>>ASSIGN   1641<<ASSIGN   1708>>IF       1710<<ASSIGN
+N$REQ.IOQFLG
+      1541**DCL      1621>>IF
+N$REQ.IOQFLG.INUSE
+      1542**DCL      1637<<ASSIGN   1705>>IF       1717<<ASSIGN
+N$REQ.IOQFLG.IOQUED
+      1542**DCL      1705>>IF
+N$REQ.IOS$
+      1512**DCL      1635>>ASSIGN   1640<<ASSIGN   1711<>CALL     1713>>IF       1714>>CALL
+N$REQ.REL.UNO
+      1545**DCL      1718<<ASSIGN
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:49   
+N$REQ.REL.X1
+      1545**DCL      1719<<ASSIGN
+N$REQ.REQID
+      1510**DCL      1642<<ASSIGN   1683<<ASSIGN
+N$REQ.STATUS
+      1513**DCL      1519--REDEF
+N$REQ_INIT
+       525**DCL      1636>>ASSIGN
+N$REQ_INIT.BUFADDR
+       534**DCL       535--REDEF     535--REDEF
+N$REQ_INIT.DLA.DRELADDR
+       526**DCL       526--REDEF
+N$REQ_INIT.DVE.EOMCHAR
+       563**DCL       564--REDEF
+N$REQ_INIT.EAINFO
+       557**DCL       557--REDEF
+N$REQ_INIT.EAINFOX
+       557**DCL       558--REDEF
+N$REQ_INIT.EVNTINFO
+       558**DCL       558--REDEF
+N$REQ_INIT.STATUS
+       539**DCL       545--REDEF
+NI$FQ.GATE
+       651**DCL      1761<>CALL     1778<>CALL     1793<>CALL     1799<>CALL     1803<>CALL     1831<>CALL
+      1846<>CALL
+NI$FQ.HD$
+       651**DCL      1766<>CALL     1839>>IF       1841>>ASSIGN   1842>>ASSIGN   1844<<ASSIGN
+NI$FQ.NQP
+       651**DCL      1797<<ASSIGN   1797>>ASSIGN   1805<<ASSIGN   1805>>ASSIGN   1849>>IF
+NI$FQ$
+       575**DCL       651--IMP-PTR  1761>>CALL     1766>>CALL     1778>>CALL     1793>>CALL     1797>>ASSIGN
+      1797>>ASSIGN   1799>>CALL     1803>>CALL     1805>>ASSIGN   1805>>ASSIGN   1831>>CALL     1839>>IF
+      1841>>ASSIGN   1842>>ASSIGN   1844>>ASSIGN   1846>>CALL     1849>>IF
+NI$IBUF$
+       575**DCL       651--IMP-PTR
+NI$IMXMBX
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:50   
+      1557**DCL      1783<<ASSIGN
+NI$IMXMBX.PAGED_BASE
+      1557**DCL      1558--REDEF    1558--REDEF
+NI$IMXMBX.SIZE
+      1559**DCL      1559--REDEF
+NI$IMXMBX_INIT
+       585**DCL      1783>>ASSIGN
+NI$IMXMBX_INIT.PAGED_BASE
+       585**DCL       586--REDEF     586--REDEF
+NI$IMXMBX_INIT.SIZE
+       587**DCL       587--REDEF
+NI$REQ
+      1578**DCL      1780<<ASSIGN
+NI$REQ.DCW
+      1580**DCL      1583--REDEF
+NI$REQ.DCW.TALLY
+      1581**DCL      1581--REDEF
+NI$REQ.FL$
+      1578**DCL      1713>>IF       1714<>CALL     1826>>DOWHILE  1827>>ASSIGN   1839<<ASSIGN   1841<<ASSIGN
+      1841>>ASSIGN   1842<<ASSIGN
+NI$REQ.IDCW.EXTA
+      1583**DCL      1583--REDEF
+NI$REQ.PCW
+      1585**DCL      1589--REDEF
+NI$REQ.SEEK
+      1590**DCL      1591--REDEF    1592--REDEF
+NI$REQ_INIT
+       607**DCL      1780>>ASSIGN
+NI$REQ_INIT.DCW
+       609**DCL       612--REDEF
+NI$REQ_INIT.DCW.TALLY
+       610**DCL       610--REDEF
+NI$REQ_INIT.IDCW.EXTA
+       612**DCL       612--REDEF
+NI$REQ_INIT.PCW
+       614**DCL       618--REDEF
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:51   
+NI$REQ_INIT.SEEK
+       619**DCL       620--REDEF     621--REDEF
+NI$RP$
+       623**DCL       653--IMP-PTR
+NIA$RELERR
+      1469**DCL-ENT  1707--CALL
+NIC$NOPKTS
+      1470**DCL-ENT  1657--CALL     1790--CALL
+NIM$DEQUEUE
+       678**DCL-ENT  1616--CALL     1766--CALL
+NIM$ENQUEUE
+       679**DCL-ENT  1730--CALL
+NIQ$RELS
+      1822**ENTRY    1711--CALL     1714--CALL
+NI_MBX_INIT.DCW.CONTROL.AE
+       645**DCL       645--REDEF
+NI_MBX_INIT.LPW.CONTROL.AE
+       641**DCL       641--REDEF
+NI_RELIOS
+       649**DCL      1709>>IF
+NOIOQPKTS
+      1657**LABEL    1616--CALLALT
+NOIOSPKTS
+      1790**LABEL    1766--CALLALT
+NOREG
+      1484**DCL      1605<<ASSIGN   1608<<ASSIGN   1658>>IF       1755<<ASSIGN   1758<<ASSIGN   1791>>IF
+PR2$
+      1485**DCL        43--MATRLIZ  1639>>ASSIGN   1719>>ASSIGN
+P_NSCPU
+      1209**DCL      1210--REDEF
+P_RESOURCE.RES
+      1082**DCL      1149--REDEF
+P_RESOURCE.RES.NIREQCT.CURRENT
+      1098**DCL      1772<<ASSIGN   1772>>ASSIGN   1773>>IF       1775>>ASSIGN   1834<<ASSIGN   1834>>ASSIGN
+      1835>>IF       1837>>ASSIGN
+P_RESOURCE.RES.NIREQCT.MIN
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:52   
+      1100**DCL      1835>>IF       1837<<ASSIGN
+P_RESOURCE.RES.NIREQCT.PEAK
+      1099**DCL      1773>>IF       1775<<ASSIGN
+P_RESOURCE.RES.NREQCT.CURRENT
+      1085**DCL      1644<<ASSIGN   1644>>ASSIGN   1645>>IF       1647>>ASSIGN   1724<<ASSIGN   1724>>ASSIGN
+      1725>>IF       1727>>ASSIGN
+P_RESOURCE.RES.NREQCT.MIN
+      1087**DCL      1725>>IF       1727<<ASSIGN
+P_RESOURCE.RES.NREQCT.PEAK
+      1086**DCL      1645>>IF       1647<<ASSIGN
+P_RESOURCE$
+      1162**DCL      1050--IMP-PTR  1644>>ASSIGN   1644>>ASSIGN   1645>>IF       1645>>IF       1647>>ASSIGN
+      1647>>ASSIGN   1724>>ASSIGN   1724>>ASSIGN   1725>>IF       1725>>IF       1727>>ASSIGN   1727>>ASSIGN
+      1772>>ASSIGN   1772>>ASSIGN   1773>>IF       1773>>IF       1775>>ASSIGN   1775>>ASSIGN   1834>>ASSIGN
+      1834>>ASSIGN   1835>>IF       1835>>IF       1837>>ASSIGN   1837>>ASSIGN
+P_UPTIME
+      1198**DCL      1199--REDEF
+Q$
+      1465**DCL        43--PROC     1499--IMP-PTR  1578--IMP-PTR  1607--ENTRY    1616<>CALL     1621>>IF
+      1634>>ASSIGN   1635>>ASSIGN   1636>>ASSIGN   1637>>ASSIGN   1638>>ASSIGN   1639>>ASSIGN   1640>>ASSIGN
+      1641>>ASSIGN   1642>>ASSIGN   1677--ENTRY    1683>>ASSIGN   1703--ENTRY    1704>>IF       1705>>IF
+      1705>>IF       1707>>IF       1707>>CALL     1708>>IF       1710>>ASSIGN   1711>>CALL     1713>>IF
+      1714>>CALL     1717>>ASSIGN   1718>>ASSIGN   1719>>ASSIGN   1730>>CALL     1735<<ASSIGN   1754--ENTRY
+      1757--ENTRY    1766<>CALL     1780>>ASSIGN   1782>>ASSIGN   1822--ENTRY    1823>>ASSIGN   1839>>ASSIGN
+      1842>>ASSIGN   1848<<ASSIGN
+R$
+      1486**DCL      1635<<ASSIGN   1640>>ASSIGN   1782<<ASSIGN   1783>>ASSIGN   1823<<ASSIGN   1824>>IF
+      1826>>DOWHILE  1827<<ASSIGN   1827>>ASSIGN   1839>>ASSIGN   1841>>ASSIGN   1844>>ASSIGN
+RETRY
+      1616**LABEL    1673--GOTO
+RETRYS
+      1766**LABEL    1806--GOTO
+SC_NIQBADIOQ
+      1471**DCL-ENT  1632--CALL     1706--CALL
+SSR$REG
+      1472**DCL-ENT  1668--CALL     1801--CALL
+PL6.E3A0      #001=NIQ$GETNR File=NIQ$GET.:E05TSI                                WED 07/30/97 03:35 Page:53   
+SSR$RUE
+      1473**DCL-ENT  1737--CALL     1850--CALL
+S_CUN
+      1477**DCL      1638>>ASSIGN   1718>>ASSIGN
+S_TIMR
+      1478**DCL      1658>>IF       1791>>IF
+X1
+      1594**DCL      1639>>ASSIGN   1719>>ASSIGN

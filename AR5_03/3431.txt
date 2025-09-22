@@ -1,0 +1,218 @@
+
+
+CC.C03    File=zbe$il3_subst:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: il3_subst.c,v 1.4 87/03/10 11:17:33 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /*  I N L I N E   S U B S T I T U T I O N
+        7         7              *
+        8         8              *  I L 3 _ S U B S T . C
+        9         9              */
+       10        10
+       11        11             #include <stdio:h>
+       12        12             #include "types:h"
+       13        13             #include "il:h"
+       14        14             #include "debug:h"
+       15        15             #include "alloc:h"
+       16        16             #include "global:h"
+       17        17             #include "lset:h"
+       18        18             #include "get:h"
+       19        19             #include "em_mnem:h"
+       20        20             #include "em_pseu:h"
+       21        21             #include "il_aux:h"
+       22        22             #include "il3_aux:h"
+       23        23             #include "il3_change:h"
+       24        24             #include "il3_subst:h"
+       25        25
+       26        26
+       27        27             bblock_p scan_b,scan_bb;
+       28        28             static line_p ll;
+       29        29
+       30        30             extern int simple_scan;
+       31        31
+       32        32             STATIC line_p fetch_text(c)
+       33        33              call_p c;
+       34        34             {
+       35        35    1         /* Read the EM text of the called procedure.
+       36        36    1          * We use random access I/O here.
+CC.C03    File=zbe$il3_subst:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=2  
+       37        37    1          */
+       38        38    1
+       39        39    1         line_p l;
+       40        40    1         proc_p p;
+       41        41    1         lset   savmes;
+       42        42    1
+       43        43    1         savmes = mesregs;
+       44        44    1         mesregs = Lempty_set();
+       45        45    1         next_line_ptr = c->cl_proc->P_LADDR;
+       46        46    1         l = get_text_new(&p);
+       47        47    1         assert (p == c->cl_proc);
+       48        48    1         Ldeleteset(mesregs);
+       49        49    1         mesregs = savmes;
+       50        50    1         return l;
+       51        51    1        }
+       52        52
+       53        53
+       54        54
+       55        55
+       56        56             line_p scan_to_cal(lines,n)
+       57        57              line_p lines;
+       58        58              short  n;
+       59        59             {
+       60        60    1         /* Find the n-th CAL instruction */
+       61        61    1
+       62        62    1         register line_p l;
+       63        63    1         if (simple_scan != 0 ) {
+       64        64    2           scan_bb = curproc->p_start; }
+       65        65    1         else {
+       66        66    2           scan_bb = scan_b; }
+       67        67    1
+       68        68    1         if (curproc->p_start == (bblock_p) 0 || simple_scan == 0) {
+       69        69    2           for (l = lines; l != (line_p) 0; l = l->l_next) {
+       70        70    3            if (INSTR(l) == op_cal) {
+       71        71    4             if (--n == 0) return l;
+       72        72    4            }
+       73        73    3           }
+CC.C03    File=zbe$il3_subst:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=3  
+       74        74    2           if (curproc->p_start == (bblock_p) 0 || scan_bb == (bblock_p) 0 ||
+       75        75    2              scan_bb->b_next == (bblock_p) 0) return (line_p) 0;
+       76        76    2           scan_bb = scan_bb->b_next;
+       77        77    2           goto resume_loop;
+       78        78    2         } else {
+       79        79    2        resume_loop: ;
+       80        80    2           for (scan_b = scan_bb ; scan_b != (bblock_p) 0; scan_b = scan_b->b_next) {
+       81        81    3              for (ll = scan_b->b_start; ll != (line_p) 0; ll = ll->l_next) {
+       82        82    4                if (INSTR(ll) == op_cal) {
+       83        83    5                  if (--n == 0) return ll; }
+       84        84    4              }
+       85        85    3           }
+       86        86    2         }
+       87        87    1
+       88        88    1         return (line_p) 0; /* CAL not found */
+       89        89    1        }
+       90        90
+       91        91
+       92        92
+       93        93             substitute(c,cal,firstline)
+       94        94              call_p c;
+       95        95              line_p cal,firstline;
+       96        96             {
+       97        97    1         /* Perform in line substitution of the call described
+       98        98    1          * by c. The EM text of the called routine is fetched
+       99        99    1          * and modified, the calling sequence is changed,
+      100       100    1          * the modified routine is put at the place of the call
+      101       101    1          * and all global information (proctable etc.) is kept
+      102       102    1          * up to date.
+      103       103    1          */
+      104       104    1
+      105       105    1         line_p l, text, lab;
+      106       106    1         offset ab_off, lb_off;
+      107       107    1         line_p startscan, ncal;
+      108       108    1         short lastcid;
+      109       109    1         call_p nc;
+      110       110    1
+CC.C03    File=zbe$il3_subst:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=4  
+      111       111    1         Ssubst++;
+      112       112    1         ab_off = - curproc->p_localbytes;
+      113       113    1         /* offset of temporaries for parameters
+      114       114    1          * that are not expanded in line.
+      115       115    1          */
+      116       116    1         chg_callseq(c,cal,&l);
+      117       117    1         /* Change the calling sequence; l points to the place
+      118       118    1          * where the expanded text must be put
+      119       119    1          */
+      120       120    1         text = fetch_text(c);   /* fetch EM text of called routine */
+      121       121    1         prune_struct_ret (text); /* chk for sstruct ret - delete if found.*/
+      122       122    1
+      123       123    1         lb_off = - curproc->p_localbytes;
+      124       124    1         /* offset of temps. for locals of called proc. */
+      125       125    1         curproc->p_localbytes += c->cl_proc->P_ORGLOCALS;
+      126       126    1         /* locals of called routine are put in stack frame of caller */
+      127       127    1         if (!FALLTHROUGH(c->cl_proc)) {
+      128       128    2            /* The called proc contains one or more RETurns
+      129       129    2             * somewhere in the middle of its text; these
+      130       130    2             * should be changed into a jump to the end
+      131       131    2             * of the text. We create a label for this
+      132       132    2             * purpose (if there was no one already).
+      133       133    2             */
+      134       134    2            lab = make_label(l,curproc);
+      135       135    2         }
+      136       136    1         modify(text,c,lab,ab_off,lb_off,curproc->p_nrlabels);
+      137       137    1         curproc->p_nrlabels += c->cl_proc->p_nrlabels;
+      138       138    1         insert(text,l,firstline);
+      139       139    1         /* insert text; instructions are put after l, pseudos
+      140       140    1          * are put at beginning of caller.
+      141       141    1          */
+      142       142    1         /* Now take care of the nested calls */
+      143       143    1         startscan = l->l_next;
+      144       144    1         lastcid = 0;
+      145       145    1         simple_scan = 0;
+      146       146    1         if (c->cl_proc->p_flags2 & PF_FUNCINLINDED)  {
+      147       147    2           for (nc = c->cl_car; nc != (call_p) 0; nc = nc->cl_cdr) {
+CC.C03    File=zbe$il3_subst:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=5  
+      148       148    3             curproc->p_localbytes += nc->cl_proc->P_ORGLOCALS;
+      149       149    3             curproc->p_nrlabels += nc->cl_proc->P_ORGLABELS;
+      150       150    3           }
+      151       151    2           return;
+      152       152    2         }
+      153       153    1         for (nc = c->cl_car; nc != (call_p) 0; nc = nc->cl_cdr) {
+      154       154    2            mod_actuals(nc,c,lab,ab_off,lb_off,curproc->p_nrlabels);
+      155       155    2            ncal = scan_to_cal(startscan,nc->cl_id - lastcid);
+      156       156    2            assert(ncal != (line_p) 0);
+      157       157    2            startscan = scan_to_cal(ncal->l_next,1);
+      158       158    2            lastcid = nc->cl_id;
+      159       159    2            substitute(nc,ncal,firstline);
+      160       160    2         }
+      161       161    1        }
+      162       162
+      163       163             /*i*
+      164       164                   name: prune_struct_ret
+      165       165                   purpose: This routine gets rid of the structure return from
+      166       166                   the inserted procedure. Not needed, and causes errors.
+      167       167             */
+      168       168             prune_struct_ret(l) line_p l; {
+      169       169    1        line_p l1,l2,l3;
+      170       170    1
+      171       171    1              for (l1=l; l1 != (line_p) 0 && INSTR(l1) != op_ret; l1 = l1->l_next) {}
+      172       172    1
+      173       173    1              if (l1 == (line_p) 0) return;
+      174       174    1
+      175       175    1              if (SHORT(l1) == 4 && INSTR(PREV(l1)) == op_lol && SHORT(PREV(l1)) == 12
+                               ) {
+      176       176    2                l2 = PREV(l1); l2 = PREV(l2); /* point to instr ahead of lol. */
+      177       177    2                while (INSTR(l2) == op_lin || INSTR(l2) == op_lni || INSTR(l2) == ps_m
+                               es) {
+      178       178    3                  l2 = PREV(l2); }
+      179       179    2                if (INSTR(l2) == op_sti && INSTR(PREV(l2)) == op_lol && SHORT(PREV(l2)
+                               ) == 12) {
+      180       180    3                  l3 = PREV(l2); l3 = PREV(l3); /* get inst prev to lol. */
+      181       181    3                  if (INSTR(l3) == op_loi) { /* can now delete the l0i -> 2ns lol */
+CC.C03    File=zbe$il3_subst:c.:ZBC3TSI                                             Fri Aug 22 1997  Page=6  
+      182       182    4                    l2 = PREV(l1);
+      183       183    4                    rem_text (l3, l2); /* remove loi -> 2nd lol includsive. */
+      184       184    4                  }
+      185       185    3                }
+      186       186    2              }
+      187       187    1
+      188       188    1        }
+---  Include file information  ---
+
+   stdio:h.:LIBRARY. is referenced
+   zbe$types:h.:ZBC3TOU. is referenced
+   zbe$il:h.:ZBC3TOU. is referenced
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$get:h.:ZBC3TOU. is referenced
+   em_mnem:h.:ZBC3TOU. is referenced
+   em_pseu:h.:ZBC3TOU. is referenced
+   zbe$il_aux:h.:ZBC3TOU. is referenced
+   zbe$il3_aux:h.:ZBC3TOU. is referenced
+   zbe$il3_change:h.:ZBC3TOU. is referenced
+   zbe$il3_subst:h.:ZBC3TOU. is referenced
+
+No diagnostics were issued in the file zbe$il3_subst:c.:ZBC3TSI

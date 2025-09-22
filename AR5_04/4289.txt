@@ -1,0 +1,2399 @@
+/*M* CALENDAR_SI62    GROUP CALENDAR PROCESSING ROUTINES */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+ 
+ 
+/********************************************************************/
+ 
+/*P*    NAME:   CALENDAR_SI62
+ 
+        PURPOSE:
+ 
+        This module contains all logic necessary to support group calendars.
+        In addition to execution of group calendar commands, it contains
+        housekeeping procedures to open, close, and update all group
+        calendars attached to the user's personal calendar.
+ 
+        DESCRIPTION:
+ 
+        A group calendar is a "shadow" file that contains an entry for
+        each event scheduled in the personal calendars of all users
+        attached to the group. Group calendars are manipulated by the
+        following commands:
+ 
+        CREATE      Creates a new group calendar and attaches the users
+                    calendar to it.
+        ATTACH      Attaches the user's calendar to an existing group calendar.
+        DETACH      Detaches the user's calendar from a group.
+        GROUP       Displays the contents of a group calendar.
+        MEMBERS     Lists the members of a group calendar.
+ 
+        Users can be attached to more than one group. When CALENDAR is
+        started, all attached group calendars are opened. When the
+        user adds, cancels, or changes an entry in his personal calendar,
+        corresponding changes are made to all group calendars.
+ 
+        Each member of a group is known by an alias within the group.
+        The alias is supplied when the user is attached to the group,
+        and is used when displaying a group schedule. The group
+        calendar itself can also be referenced by a symbolic name
+        assigned when the group is created, or the group FID may be
+        used to refer to the group.
+ 
+        A personal calendar contains an "alias control record" for each
+        attached group calendar. These contain the group calendar FID
+        and the user's alias in the group, and are used primarily to
+        determine what groups the user is attached to when CALENDAR
+        is started. A timestamp value of zero in the record key identifies
+        a record as a control record.
+ 
+        Group calendar records have a key consisting of the timestamp
+        for the event followed by the user's alias. Records for schedule
+        entries consist only of the key. A group calendar also contains
+        a "member control record" for each member of the group, which
+        has a record body consisting of the account name of the member's
+        :CALENDAR file. There is also a "group calendar ID" record in
+        each group file whose record body contains the group's symbolic
+        name. Both types of control records are identified by a zero
+        timestamp in the key. The group ID record is distinguished by
+        a alias of "**GROUPCALENDAR" in the key.
+ 
+ 
+*********************************************************************/
+%EJECT;
+/********************************************************************/
+ 
+/*D*    NAME:   SCH$GROUP
+ 
+        PURPOSE: Perform a group calendar function. All group calendar
+                processing is done by this procedure; a function code
+                determines the task performed. The following functions
+                can be specified:
+ 
+                OPEN        Opens all groups attached to the user's calendar
+                            calendar.
+                CLOSE       Deletes expired entries and closes all
+                            attached group calendars.
+                CREATE      Executes a CREATE command.
+                ATTACH      Exexutes an ATTACH command.
+                DETACH      Executes a DETACH command.
+                DISPLAY     Executes a GROUP command.
+                MEMBERS     Executes a MEMBERS command.
+                ADD         Add a schedule entry to all attached group
+                            calendars.
+                DELETE      Deletes a schedule entry from all attached
+                            group calendars.
+ 
+        CALL:   CALL SCH$GROUP (CODE[,PTR$]);
+                where
+                    CODE - function code (equates for all function codes
+                            are defined in CALENDAR_C1)
+                    PTR$ - pointer to argument whose value depends on the
+                            function code.
+                            For functions to execute group commands,
+                            points to top node of parsed command.
+                            For ADD and DELETE, points to key of the
+                            personal calendar record for the entry.
+                            For OPEN and CLOSE, not used.
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+SCH$GROUP: PROC(CODE,PTR$);
+ 
+DCL CODE UBIN WORD;
+DCL PTR$ PTR;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+/********** SYSTEM DATA DEFINITIONS */
+%INCLUDE CP_6;
+%INCLUDE B_ERRORS_C;
+%INCLUDE XUH_MACRO_C;
+%INCLUDE XU_MACRO_C;
+%INCLUDE B$JIT_C;
+%INCLUDE XUD_UTS_M;
+  %XUD$UTS_ENTRIES;
+  %XUD_UTS_EQU;
+ 
+%B$TCB;
+%B$ALT;
+%B$JIT0;
+    2 * BIT(1); /* DUMMY STRUCTURE TERMINATOR */
+ 
+DCL B$TCB$ PTR SYMREF;
+DCL B$JIT$ PTR SYMREF;
+ 
+%PARSE$OUT (STCLASS="BASED(PTR$)");
+%PARSE$SYM (STCLASS=BASED);
+ 
+ 
+/********** CALENDAR DATA DEFINITIONS */
+%INCLUDE CALENDAR_C1;
+%INCLUDE CALENDAR_C2;
+ 
+DCL INPUT_PLACE SBIN SYMREF;
+ 
+/********** EXTERNAL PROCEDURES */
+DCL XUR$ERRMSG ENTRY(7) ALTRET;
+DCL XUR$MOREMSG ENTRY(1) ALTRET;
+DCL XUR$ALLMSG ENTRY(1) ALTRET;
+DCL XUR$GETCMD ENTRY(6) ALTRET;
+DCL DATE_TYPE ENTRY(4) ALTRET;
+ 
+/********** DCB'S */
+DCL M$CALENDAR DCB;
+DCL M$UPDATE DCB;
+ 
+/********** GROUP CALENDAR TABLE */
+%EQU MAX_GROUPS = 9;
+%EQU NO_GROUPS = -1;
+%EQU GRPKEY_LEN = 20;
+%EQU NAME_LEN = 15;
+%EQU ALIAS_LEN = 15;
+/**/
+DCL GRPCNT          SBIN(9) STATIC      INIT(%NO_GROUPS);
+/**/
+DCL 1 GRPTABLE(0:%MAX_GROUPS)       STATIC,
+        2 DCB_NUM   UBIN(18) HALIGNED   INIT(0*0),
+        2 FID,
+            3 LEN   UBIN(9) CALIGNED    INIT(0*0),
+            3 TEXT  CHAR(63)            INIT(' '*0),
+        2 ALIAS,
+            3 LEN   UBIN(9) CALIGNED    INIT(0*0),
+            3 TEXT  CHAR(%ALIAS_LEN)    INIT(' '*0),
+        2 NAME,
+            3 LEN   UBIN(9) CALIGNED    INIT(0*0),
+            3 TEXT  CHAR(%NAME_LEN)     INIT(' '*0);
+ 
+/********** GROUP FILE BUFFERS */
+DCL 1 GRPKEY        STATIC,
+        2 LEN       UBIN BYTE UNAL      INIT(%GRPKEY_LEN),
+        2 TIME      UBIN WORD UNAL      INIT(0),
+        2 ALIAS,
+            3 LEN   UBIN BYTE UNAL      INIT(0),
+            3 TEXT  CHAR(%ALIAS_LEN)    INIT(' ');
+/**/
+DCL 1 GRPCTL_RECORD STATIC,
+        2 LEN       UBIN(9) CALIGNED    INIT(0),
+        2 TEXT      CHAR(%NAME_LEN)     INIT(' ');
+ 
+DCL 1 GROUPID       CONSTANT,
+        2 *         UBIN(9) CALIGNED    INIT(15),
+        2 *         CHAR(%NAME_LEN)     INIT('**GROUPCALENDAR');
+ 
+/********** CALENDAR FILE BUFFERS */
+DCL 1 CALENDAR_KEY          STATIC,
+        2 LEN       UBIN BYTE UNAL  INIT(5),
+        2 TIME      UBIN WORD UNAL  INIT(0),
+        2 CNT       UBIN BYTE UNAL  INIT(0);
+/**/
+DCL 1 CALENDAR_CONTROL      STATIC,
+        2 FID,
+            3 LEN   UBIN(9) CALIGNED    INIT(0),
+            3 TEXT  CHAR(63)            INIT(' '),
+        2 ALIAS,
+            3 LEN   UBIN(9) CALIGNED    INIT(0),
+            3 TEXT  CHAR(%ALIAS_LEN)    INIT(' ');
+ 
+/********** GROUP FILE DCBNAME BUILD AREA */
+DCL DCBCNT UBIN(9) STATIC INIT(0);
+DCL DIGITS CHAR(10) STATIC UNAL INIT('0123456789');
+DCL GRPDCB_DIGIT(0:9) REDEF DIGITS CHAR(1);
+ 
+/********** LOCAL DATA */
+DCL START_TIME UBIN WORD;
+DCL END_TIME UBIN WORD;
+DCL ALIAS$ PTR;
+DCL CNT SBIN(9) CALIGNED;
+DCL GRPN SBIN(9) CALIGNED;
+DCL MORE_ENTRIES BIT(1);
+DCL CONTROL_RECORD BIT(1);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+DO CASE (CODE);
+ 
+/********** Open all group calendars attached to :CALENDAR file
+*/
+CASE (%GROUP_OPEN);
+    CALL GRP$OPEN;
+ 
+/********** Close all group callendars attached to :CALENDAR file
+*/
+CASE (%GROUP_CLOSE);
+    CALL GRP$CLOSE;
+ 
+/********** Add, or replace schedule entry in all group calendars
+*/
+CASE (%GROUP_ADD);
+    DO CNT = 0 TO GRPCNT;
+        CALL PUT$GROUP_ENTRY(PTR$,CNT);
+        END;
+ 
+/********** Delete schedule entry in all group calendars
+*/
+CASE (%GROUP_DELETE);
+    DO CNT = 0 TO GRPCNT;
+        CALL DELETE$GROUP_ENTRY(PTR$,CNT);
+        END;
+ 
+/********** Process CReate command
+*/
+CASE(%GROUP_CREATE);
+    CALL GRP$ALLOCATE(OUT$BLK.SUBLK$(0)->OUT$SYM.TEXTC$,
+                      OUT$BLK.SUBLK$(2)->OUT$SYM.TEXTC$,
+                      OUT$BLK.SUBLK$(1)->OUT$SYM.TEXTC$) ALTRET(SKIP_CR);
+    CALL GRP$ATTACH;
+ 
+SKIP_CR: ;
+ 
+/********** Process ATtach command
+*/
+CASE (%GROUP_ATTACH);
+    CALL GRP$ALLOCATE(OUT$BLK.SUBLK$(0)->OUT$SYM.TEXTC$,
+                      OUT$BLK.SUBLK$(1)->OUT$SYM.TEXTC$) ALTRET(SKIP_AT);
+    CALL GRP$ATTACH;
+ 
+SKIP_AT: ;
+ 
+/********** Process DEtach command
+*/
+CASE (%GROUP_DETACH);
+    IF OUT$BLK.NSUBLKS = 0
+    THEN
+        CALL GRP$FINDNAME(GRPN) ALTRET(SKIP_DE);
+    ELSE
+        CALL GRP$FINDNAME(GRPN,OUT$BLK.SUBLK$(0)) ALTRET(SKIP_DE);
+    CALL GRP$DETACH(GRPN);
+ 
+    CALL PUT$MSG(%E$TH_DETACHED,GRPN);
+    /*E* ERROR:     SCH-E$TH_DETACHED
+         MESSAGE:   Detached from %U1 group calendar.
+    */
+ 
+    CALL GRP$RELEASE(GRPN);
+ 
+SKIP_DE: ;
+ 
+/********** Process Group command
+*/
+CASE (%GROUP_DISPLAY);
+    DO CASE (OUT$BLK.NSUBLKS);
+    CASE(0);
+        CALL GRP$RESOLVE_RANGE(START_TIME,END_TIME) ALTRET(SKIP_DI);
+        CALL GRP$FINDGROUP(GRPN,ALIAS$) ALTRET(SKIP_DI);
+    CASE(1);
+        IF OUT$BLK.SUBLK$(0)->OUT$BLK.CODE = %RANGE_CLAUSE
+        THEN DO;
+            CALL GRP$RESOLVE_RANGE(START_TIME,END_TIME,
+                    OUT$BLK.SUBLK$(0)->OUT$BLK.SUBLK$(0)) ALTRET(SKIP_DI);
+            CALL GRP$FINDGROUP(GRPN,ALIAS$) ALTRET(SKIP_DI);
+            END;
+        ELSE DO;
+            CALL GRP$RESOLVE_RANGE(START_TIME,END_TIME) ALTRET(SKIP_DI);
+            CALL GRP$FINDGROUP(GRPN,ALIAS$,OUT$BLK.SUBLK$(0)) ALTRET(SKIP_DI);
+            END;
+    CASE(2);
+        CALL GRP$RESOLVE_RANGE(START_TIME,END_TIME,
+                OUT$BLK.SUBLK$(0)->OUT$BLK.SUBLK$(0)) ALTRET(SKIP_DI);
+        CALL GRP$FINDGROUP(GRPN,ALIAS$,OUT$BLK.SUBLK$(1)) ALTRET(SKIP_DI);
+        END;
+    CALL GRP$DISPLAY(GRPN,ALIAS$,START_TIME,END_TIME);
+ 
+SKIP_DI: ;
+ 
+/********** Process MEmbers command
+*/
+CASE (%GROUP_MEMBERS);
+    IF OUT$BLK.NSUBLKS = 0
+    THEN
+        CALL GRP$FINDNAME(GRPN) ALTRET(SKIP_ME);
+    ELSE
+        CALL GRP$FINDNAME(GRPN,OUT$BLK.SUBLK$(0)) ALTRET(SKIP_ME);
+    CALL GRP$MEMBERS(GRPN);
+ 
+SKIP_ME: ;
+ 
+    END;
+ 
+RETURN;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$OPEN
+ 
+        PURPOSE:
+ 
+        Called during initial housekeeping to set up for group
+        calendar processing.  Opens all group calendar files
+        attached to the user's calendar and initializes group
+        calendar table.
+ 
+        CALL:   CALL GRP$OPEN
+ 
+        INPUT: Reads group control records from :CALENDAR file.
+ 
+        OUTPUT: All group files attached to the users calendar
+                are opened, and GRPTABLE and GRPCNT are initialized.
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$OPEN: PROC;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_READ (FPTN=GET_MEMBER_REC,
+                                BUF=GRPCTL_RECORD,
+                                KEY=GRPKEY,
+                                KEYS=YES,
+                                KEYR=YES);
+%FPT_DELREC (FPTN=DELETE_CALENDAR,
+                                DCB=M$CALENDAR,
+                                KEY=CALENDAR_KEY);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+/********** Read all group calendar control records from the
+            :CALENDAR file and initialize each group calendar.
+*/
+CALL GET$1ST_CALENDAR_ALIAS;
+DO WHILE (CONTROL_RECORD);
+ 
+    /********** Allocate table entry and open the group file
+    */
+    CALL GRP$ALLOCATE(ADDR(CALENDAR_CONTROL.FID),
+                      ADDR(CALENDAR_CONTROL.ALIAS)) ALTRET(CANT_OPEN);
+ 
+    /********** Insure user is attached to the group
+    */
+    GRPKEY.ALIAS = CALENDAR_CONTROL.ALIAS;
+    GET_MEMBER_REC.V.DCB# = GRPTABLE.DCB_NUM(GRPCNT);
+    CALL M$READ(GET_MEMBER_REC) ALTRET(NOT_FOUND);
+    IF GRPKEY.ALIAS ~= CALENDAR_CONTROL.ALIAS
+    THEN
+        GOTO NOT_FOUND;
+ 
+    /********** Inform user of attached group calendar
+    */
+    CALL PUT$MSG(%E$TH_OPENED,GRPCNT);
+    /*E* ERROR:     SCH-E$TH_OPENED
+         MESSAGE:   Attached to %U1 group calendar.
+                    Group name is "%U2".  Your alias is "%U3".
+    */
+ 
+    /********** Tell the user when a group calendar can't be opened
+    */
+    DO NEVER;
+CANT_OPEN:
+        CALL PUT$MSG(%E$TH_CANT_OPEN,,CALENDAR_CONTROL.FID);
+        /*E* ERROR:     SCH-E$TH_CANT_OPEN
+             MESSAGE:   Can't access %U1  Group calendar dropped.
+             MESSAGE1:  You are detached from the group, and must re-ATTACH
+                        when the problem is resolved.
+        */
+        CALL M$DELREC(DELETE_CALENDAR);
+        END;
+    DO NEVER;
+NOT_FOUND:
+        CALL PUT$MSG(%E$TH_NOT_FOUND,GRPCNT);
+        /*E* ERROR:     SCH-E$TH_NOT_FOUND
+             MESSAGE:   Not found in %U1 group calendar. Recovery in progress.
+             MESSAGE1:  Your calendar shows you as attached to the group,
+                        but the group did not list you as a member.
+             MESSAGE2:  You have been automatically re-attached to the group.
+        */
+        CALL GRP$ATTACH;
+        END;
+ 
+    /********** Look for another control record
+    */
+    CALL GET$CALENDAR_ALIAS;
+    END;
+RETURN;
+ 
+END GRP$OPEN;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$CLOSE
+ 
+        PURPOSE:
+ 
+        Called during final housekeeping to close all group
+        calendar files attached to the user's calendar.  Also deletes
+        any entries for expired events from all group calendar files.
+ 
+        CALL:   CALL GRP$CLOSE
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$CLOSE: PROC;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_DELREC (FPTN=DELETE_GROUP_REC);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+/********** Do final processing for all entries in group table:
+            Delete all expired entries and close the group file.
+*/
+CALL GET$TODAYS_TIME(END_TIME);
+DO WHILE GRPCNT > %NO_GROUPS;
+ 
+    /********** Delete all expired records from the group
+    */
+    DELETE_GROUP_REC.V.DCB# = GRPTABLE.DCB_NUM(GRPCNT);
+    CALL GET$1ST_GROUP_ENTRY(GRPCNT);
+    DO WHILE (GRPKEY.TIME < END_TIME AND MORE_ENTRIES);
+        CALL M$DELREC(DELETE_GROUP_REC);
+        CALL GET$GROUP_ENTRY(GRPCNT);
+        END;
+ 
+    CALL GRP$RELEASE(GRPCNT);
+    END;
+ 
+RETURN;
+END GRP$CLOSE;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$FINDNAME
+ 
+        PURPOSE: Returns the group table index for a specified group
+                 GROUP display command.
+                 file name or FID.
+ 
+        CALL:   CALL GRP$FINDNAME(GRPN,[NAME$]) ALTRET(LABEL);
+                where
+                    GRPN - returns GRPTABLE index for group calendar
+                    NAME - pointer to parser symbol block containing
+                            name of desired group (if provided in command)
+ 
+        DESCRIPTION:
+ 
+        If user is attached to no groups, or if user is attached to more
+        than one group and no name is provided, issue error message and
+        take alternate return.
+        If a name is needed and none is provided, the user is prompted
+        to enter one.
+        Otherwise, locate the group table entry corresponding to the
+        specified name and return the table index to the caller.
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$FINDNAME: PROC (GRPN, NAME$) ALTRET;
+ 
+DCL NAME$ PTR;
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%PARSE$SYM (STCLASS="BASED(PTR$)");
+ 
+DCL 1 ARG       BASED,
+        2 LEN   UBIN(9) CALIGNED,
+        2 TEXT  CHAR(ARG.LEN);
+ 
+DCL PTR$ PTR;
+DCL PROMPT CONSTANT CHAR(0) INIT('GROUP NAME:');
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+GRPN = 0;
+IF GRPCNT = %NO_GROUPS
+THEN DO;
+    CALL PUT$MSG(%E$TH_NO_GROUPS);
+    /*E* ERROR:     SCH-E$TH_NO_GROUPS
+         MESSAGE:   Not attached to a group calendar.
+    */
+    ALTRETURN;
+    END;
+IF ADDR(NAME$) = ADDR(NIL)
+THEN DO;
+    IF GRPCNT > 0
+    THEN DO;
+        CALL PUT$MSG(%E$TH_NEED_NAME);
+        /*E* ERROR:     SCH-E$TH_NEED_NAME
+             MESSAGE:   Group name (IN clause) required.
+             MESSAGE1:  You must specify which group to use when you are
+                        attached to more than one group calendar.
+        */
+        CALL GET$REPLY(VECTOR(PROMPT),PTR$);
+        IF PTR$ = ADDR(NIL)
+        THEN
+            ALTRETURN;
+        END;
+    ELSE
+        RETURN;
+    END;
+ELSE
+    PTR$ = NAME$;
+ 
+/********** Look-up name in group table to find group to use
+*/
+DO WHILE (OUT$SYM.TEXTC$->ARG ~= GRPTABLE.NAME(GRPN)
+            AND
+          OUT$SYM.TEXTC$->ARG ~= GRPTABLE.FID(GRPN));
+    GRPN = GRPN + 1;
+    IF GRPN > GRPCNT
+    THEN DO;
+        CALL PUT$MSG(%E$TH_INVALID_NAME);
+        /*E* ERROR:     SCH-E$TH_INVALID_NAME
+             MESSAGE:   Incorrect group name supplied.
+             MESSAGE1:  You are not attached to a group with the name specified.
+             MESSAGE2:  All group names are displayed when CALENDAR begins.
+        */
+        ALTRETURN;
+        END;
+    END;
+RETURN;
+ 
+END GRP$FINDNAME;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$FINDGROUP
+ 
+        PURPOSE: Validate and resolve group specification from a
+ 
+        CALL:   CALL GRP$FINDGROUP(GRPN,ALIAS$[,GRP$]) ALTRET(LABEL);
+                where
+                    GRP$ - pointer to group identification clause
+                            in command
+                    GRPN - returns GRPTABLE index for group calendar
+                    ALIAS$ - returns pointer to alias list, if any
+ 
+        DESCRIPTION:
+ 
+        The group specification clause consists of two optional
+        subclauses: the IN-clause identifies the group to use and
+        the FOR-clause lists desired members within the group. If
+        both are provided, they may appear in either order.
+ 
+        The routine is passed a pointer to the parse node for the
+        group clause, if one was entered for the command being executed.
+        The parse tree is first examined in order to set pointers
+        to the IN-clause (NAME$) and FOR-clause (ALIAS$) nodes, or
+        set NIL pointers if the subclause is omitted. The ALIAS$ pointer
+        is passed directly back to the caller, but NAME$ is used to
+        locate the corresponding GRPTABLE entry, whose index value
+        is returned in lieu of the pointer to the name itself.
+ 
+        If the group name or an alias is not valid, an ALTRET exit
+        is taken after reporting the error to the user.
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$FINDGROUP: PROC(GRPN,ALIAS$,GRP$) ALTRET;
+ 
+DCL GRP$ PTR;
+DCL ALIAS$ PTR;
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+DCL NAME$ PTR;
+DCL LIMIT SBIN;
+DCL AN$ PTR;
+ 
+DCL ALIAS_BIT (0:35) BIT(1) UNAL;
+DCL ALIAS_CHECK REDEF ALIAS_BIT BIT(36);
+ 
+DCL 1 ALIAS     BASED(AN$),
+        2 LEN   UBIN(9) CALIGNED,
+        2 TEXT  CHAR(ALIAS.LEN);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+/********** Set pointers to name (NAME$) and alias (ALIAS$) clauses,
+            or set pointer to NIL if clause omitted
+*/
+NAME$ = ADDR(NIL);
+ALIAS$ = ADDR(NIL);
+IF ADDR(GRP$) ~= ADDR(NIL)
+THEN DO;
+    IF GRP$->OUT$BLK.SUBLK$(0)->OUT$BLK.CODE = %NAME_CLAUSE
+    THEN
+        NAME$ = GRP$->OUT$BLK.SUBLK$(0)->OUT$BLK.SUBLK$(0);
+    ELSE
+        ALIAS$ = GRP$->OUT$BLK.SUBLK$(0);
+    IF GRP$->OUT$BLK.NSUBLKS = 2
+    THEN
+        IF GRP$->OUT$BLK.SUBLK$(1)->OUT$BLK.CODE = %NAME_CLAUSE
+        THEN
+            NAME$ = GRP$->OUT$BLK.SUBLK$(1)->OUT$BLK.SUBLK$(0);
+        ELSE
+            ALIAS$ = GRP$->OUT$BLK.SUBLK$(1);
+    END;
+ 
+/********** Find GRPTABLE entry for proper group calendar
+*/
+IF NAME$ = ADDR(NIL)
+THEN
+    CALL GRP$FINDNAME(GRPN) ALTRET(BYPASS);
+ELSE
+    CALL GRP$FINDNAME(GRPN,NAME$) ALTRET(BYPASS);
+ 
+IF ALIAS$ ~= ADDR(NIL)
+THEN DO;
+ 
+    /********** Read member control records from group calendar and
+                verify that all aliases provided are members of the group
+    */
+    LIMIT = ALIAS$->OUT$BLK.NSUBLKS - 1;
+    ALIAS_CHECK = %FALSE;
+    DO CNT = 0 TO LIMIT;
+        ALIAS_BIT(CNT) = %TRUE;
+        END;
+    CALL GET$1ST_GROUP_MEMBER(GRPN);
+    DO WHILE (CONTROL_RECORD);
+        DO CNT = 0 TO LIMIT;
+            AN$ = ALIAS$->OUT$BLK.SUBLK$(CNT)->OUT$SYM.TEXTC$;
+            IF GRPKEY.ALIAS = ALIAS
+            THEN DO;
+                ALIAS_BIT(CNT) = %FALSE;
+                GOTO NEXTREC;
+                END;
+            END;
+NEXTREC:
+        CALL GET$GROUP_MEMBER(GRPN);
+        END;
+    IF ALIAS_CHECK = %FALSE
+    THEN
+        RETURN;
+ 
+    /********** One or more incorrect aliases in list -
+                Report them to user and take error return
+    */
+    DO CNT = 0 TO LIMIT;
+        IF ALIAS_BIT(CNT) = %TRUE
+        THEN DO;
+            AN$ = ALIAS$->OUT$BLK.SUBLK$(CNT)->OUT$SYM.TEXTC$;
+            CALL PUT$MSG(%E$TH_BAD_ALIAS,,ALIAS);
+            /*E* ERROR:     SCH-E$TH_BAD_ALIAS
+                 MESSAGE:   "%U1" is not a member of the group calendar.
+                 MESSAGE1:  Use the MEMBERS command to display all aliases for the group.
+            */
+            END;
+        END;
+    ALTRETURN;
+    END;
+ 
+RETURN;
+ 
+BYPASS: ALTRETURN;
+ 
+END GRP$FINDGROUP;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$RESOLVE_RANGE
+ 
+        PURPOSE: Resolve start- and stop-timestamp values corresponding
+                to the date range entered in a GROUP display command.
+ 
+        CALL:   CALL GRP$RESOLVE_RANGE(START_TIME,END_TIME[,RANGE$])
+                    ALTRET(LABEL);
+                where
+                    START_TIME - returns timestamp for start of display range
+                    END_TIME   - returns timestamp for end of display range
+                    RANGE$ - pointer to parse node for range clause (if any)
+                                to use to resolve times
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$RESOLVE_RANGE: PROC(START_TIME,END_TIME,RANGE$) ALTRET;
+ 
+DCL RANGE$ PTR;
+DCL START_TIME UBIN WORD;
+DCL END_TIME UBIN WORD;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%PARSE$OUT (STCLASS="BASED(RANGE$)");
+ 
+DCL INCREMENT UBIN WORD;
+DCL NUM UBIN WORD;
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+IF ADDR(RANGE$) = ADDR(NIL)
+THEN DO;
+ 
+    /********** Set range for today's date
+    */
+    CALL GET$TODAYS_TIME(START_TIME);
+    CALL XUD$UTS_ADJUST (END_TIME,START_TIME,%UTS_CSEC_DAY#);
+    END;
+ 
+ELSE DO;
+ 
+    DO CASE (OUT$BLK.CODE);
+ 
+    /********** Set range for tomorrow's date
+    */
+    CASE(%RANGE_TOMO);
+        CALL GET$TODAYS_TIME(START_TIME);
+        CALL XUD$UTS_ADJUST (START_TIME,START_TIME,%UTS_CSEC_DAY#);
+        CALL XUD$UTS_ADJUST (END_TIME,START_TIME,%UTS_CSEC_DAY#);
+ 
+    /********** Set range for specified number of days or weeks
+    */
+    CASE(%RANGE_NUM);
+        CALL GET$TODAYS_TIME(START_TIME);
+        CALL XUD$UTS_ADJUST (START_TIME,START_TIME,%UTS_CSEC_DAY#);
+        IF OUT$BLK.NSUBLKS = 2
+            AND
+           OUT$BLK.SUBLK$(1)->OUT$SYM.CODE = %WEEKS
+        THEN
+            INCREMENT = %UTS_CSEC_WEEK#;
+        ELSE
+            INCREMENT = %UTS_CSEC_DAY#;
+        CALL CHARBIN(NUM,OUT$BLK.SUBLK$(0)->OUT$SYM.TEXT);
+        END_TIME = START_TIME + (NUM * INCREMENT);
+ 
+    /********** Set specified date or date range
+    */
+    CASE(ELSE);
+        CALL DATE_TYPE(RANGE$,'00:00',START_TIME,END_TIME) ALTRET(BAD_DATE);
+        CALL XUD$UTS_ADJUST (END_TIME,END_TIME,%UTS_CSEC_DAY#);
+        DO NEVER;
+BAD_DATE:   CALL PUT$MSG(%E$TH_DATE);
+            ALTRETURN;
+            END;
+ 
+        END;
+ 
+    END;
+ 
+RETURN;
+ 
+END GRP$RESOLVE_RANGE;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$ALLOCATE
+ 
+        PURPOSE: Allocates a group table (GRPTABLE) entry, and creates
+                 or opens a group calendar file.
+ 
+        CALL:   CALL GRP$ALLOCATE(FID$,ALIAS$[,NAME$]) ALTRET;
+                where
+                    FID$ - FID for group file
+                    ALIAS$ - user's alias in group
+                    NAME$ - name for new group calendar file
+ 
+        OUTPUT: GRPCNT - group table index for new group file
+ 
+        DESCRIPTION:
+ 
+        If NAME$ is specified, the file is created and given the name
+        indicated.  Otherwise, an existing file is opened and the name
+        record is read to fill in the table entry.
+ 
+        ALTRET is taken if the group table is full, a file with the
+        same group name already is attached to the user's calendar,
+        or on error return from a Monitor Service call.  The error
+        is reported and any necessary clean-up is done before returning.
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$ALLOCATE: PROC(FID$,ALIAS$,NAME$) ALTRET;
+ 
+DCL FID$ PTR;
+DCL ALIAS$ PTR;
+DCL NAME$ PTR;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+DCL 1 ARG       BASED,
+        2 LEN   UBIN(9) CALIGNED,
+        2 TEXT  CHAR(ARG.LEN);
+ 
+DCL GRPDCB_NUM UBIN(18) HALIGNED STATIC INIT(0);
+ 
+/********** SYSTEM SERVICE MACROS */
+%FPT_GETDCB (FPTN=GET_GROUP_DCB,
+                                DCBNAME=GRPFILE_DCBN,
+                                DCBNUM=GRPDCB_NUM);
+%VLP_NAME (FPTN=GRPFILE_DCBN,
+                                NAME='GROUP ',
+                                LEN=6);
+%FPT_FID (FPTN=GROUP_FID,
+                                ASN=OPEN_GROUP_FILE.V.ASN#,
+                                ACCT=GRPFILE_ACCT,
+                                NAME=GRPFILE_NAME,
+                                SN=GRPFILE_SN,
+                                PASS=GRPFILE_PASS);
+%FPT_OPEN (FPTN=OPEN_GROUP_FILE,
+                                FUN=UPDATE,
+                                ASN=FILE,
+                                ACS=DIRECT,
+                                SHARE=ALL,
+                                ACCT=GRPFILE_ACCT,
+                                NAME=GRPFILE_NAME,
+                                SN=GRPFILE_SN,
+                                PASS=GRPFILE_PASS);
+%FPT_OPEN (FPTN=CREATE_GROUP_FILE,
+                                FUN=CREATE,
+                                EXIST=ERROR,
+                                CTG=YES,
+                                EXPIRE=NEVER,
+                                ORG=KEYED,
+                                ASN=FILE,
+                                ACS=DIRECT,
+                                SHARE=ALL,
+                                ACCT=GRPFILE_ACCT,
+                                NAME=GRPFILE_NAME,
+                                SN=GRPFILE_SN,
+                                PASS=GRPFILE_PASS);
+%VLP_ACCT (FPTN=GRPFILE_ACCT);
+%VLP_NAME (FPTN=GRPFILE_NAME);
+%VLP_SN (FPTN=GRPFILE_SN);
+%VLP_PASS (FPTN=GRPFILE_PASS);
+%FPT_READ (FPTN=READ_NAME_REC,
+                                BUF=GRPCTL_RECORD,
+                                KEY=GRPKEY,
+                                KEYR=YES,
+                                KEYS=YES);
+%FPT_WRITE (FPTN=WRITE_NAME_REC,
+                                BUF=GRPCTL_RECORD,
+                                KEY=GRPKEY);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+IF GRPCNT = %MAX_GROUPS
+THEN DO;
+    CALL PUT$MSG(%E$TH_MAX_GROUPS);
+    /*E* ERROR:     SCH-E$TH_MAX_GROUPS
+         MESSAGE:   Already attached to the maximum number of groups.
+         MESSAGE1:  You cannot be attached to more than 10 group calendars.
+    */
+    ALTRETURN;
+    END;
+ELSE DO;
+ 
+    /********** Check for alias and name length overflow
+    */
+    IF ALIAS$->ARG.LEN > %ALIAS_LEN
+    THEN DO;
+        CALL PUT$MSG(%E$TH_TRUNC_ALIAS,,ALIAS$->ARG);
+        /*E* ERROR:     SCH-E$TH_TRUNC_ALIAS
+             MESSAGE:   Alias is too long.
+        */
+        ALTRETURN;
+        END;
+    IF ADDR(NAME$) ~= ADDR(NIL)
+        AND
+       NAME$->ARG.LEN > %NAME_LEN
+    THEN DO;
+        CALL PUT$MSG(%E$TH_TRUNC_NAME,,NAME$->ARG);
+        /*E* ERROR:     SCH-E$TH_TRUNC_NAME
+             MESSAGE:   Group name is too long.
+        */
+        ALTRETURN;
+        END;
+ 
+    /********** Build a entry in GRPTABLE for the file
+    */
+    GRPCNT = GRPCNT + 1;
+    GRPTABLE.FID(GRPCNT) = FID$->ARG;
+    GRPTABLE.ALIAS(GRPCNT) = ALIAS$->ARG;
+    GRPTABLE.DCB_NUM(GRPCNT) = 0;
+ 
+    /********** Setup to open a group calendar
+    */
+    SUBSTR(GRPFILE_DCBN.NAME#,5,1) = GRPDCB_DIGIT(GRPCNT);
+    CALL M$GETDCB(GET_GROUP_DCB) ALTRET(CANT_OPEN);
+    GRPTABLE.DCB_NUM(GRPCNT) = GRPDCB_NUM;
+    GROUP_FID.TEXTFID_ = VECTOR(FID$->ARG.TEXT);
+    CALL M$FID(GROUP_FID) ALTRET(CANT_OPEN);
+    GRPKEY.TIME = 0;
+    GRPKEY.ALIAS = GROUPID;
+ 
+    IF ADDR(NAME$) = ADDR(NIL)
+    THEN DO;
+ 
+        /********** Open an existing group calendar
+        */
+        OPEN_GROUP_FILE.V.DCB# = GRPDCB_NUM;
+        CALL M$OPEN(OPEN_GROUP_FILE) ALTRET(CANT_OPEN);
+        READ_NAME_REC.V.DCB# = GRPDCB_NUM;
+        CALL M$READ(READ_NAME_REC) ALTRET(CANT_READ);
+        IF GRPKEY.ALIAS ~= GROUPID
+        THEN DO;
+CANT_READ:  CALL PUT$MSG(%E$TH_NOT_GROUP_FILE,GRPCNT);
+            /*E* ERROR:     SCH-E$TH_NOT_GROUP_FILE
+                 MESSAGE:   %U1 is not a group calendar file.
+                 MESSAGE1:  Could not read group calendar name record from file
+                 MESSAGE2:  Either you entered the wrong FID or the group
+                            calendar is destroyed and must be recreated.
+            */
+            GRPKEY.LEN = %GRPKEY_LEN;
+            CALL GRP$RELEASE(GRPCNT);
+            ALTRETURN;
+            END;
+        END;
+ 
+    ELSE DO;
+ 
+        /********** Create a new group calendar
+        */
+        CREATE_GROUP_FILE.V.DCB# = GRPDCB_NUM;
+        CALL M$OPEN(CREATE_GROUP_FILE) ALTRET(CANT_OPEN);
+        WRITE_NAME_REC.V.DCB# = GRPDCB_NUM;
+        GRPCTL_RECORD = NAME$->ARG;
+        CALL M$WRITE(WRITE_NAME_REC) ALTRET(CANT_OPEN);
+        END;
+ 
+    GRPTABLE.NAME(GRPCNT) = GRPCTL_RECORD;
+ 
+    /********** Insure group with same name not already open
+    */
+    CNT = 0;
+    DO WHILE (CNT < GRPCNT AND GRPTABLE.NAME(CNT) ~= GRPCTL_RECORD);
+        CNT = CNT + 1;
+        END;
+    IF CNT ~= GRPCNT
+    THEN DO;
+        CALL PUT$MSG(%E$TH_DUP_NAME,CNT);
+        /*E* ERROR:     SCH-E$TH_DUP_NAME
+             MESSAGE:   Already attached to a group calendar named "%U2".
+             MESSAGE1:  You are either already attached to the specified group
+                        or to another group with an identical name.
+        */
+        CALL GRP$RELEASE(GRPCNT);
+        ALTRETURN;
+        END;
+    END;
+RETURN;
+ 
+/********** Error handling
+*/
+CANT_OPEN:
+    CALL PUT$MSG;
+    CALL GRP$RELEASE(GRPCNT);
+    ALTRETURN;
+ 
+END GRP$ALLOCATE;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$ATTACH
+ 
+        PURPOSE:
+ 
+        Attaches the user's calendar to a newly allocated group calendar
+        file.  ALTRET is taken if another user with the same alias is
+        already attached to the file or on error return from a Monitor
+        Serivce call.
+ 
+        CALL:   CALL GRP$ATTACH;
+ 
+        INPUT:  GRPCNT - group table index for group file to use
+ 
+        DESCRIPTION:
+ 
+        The user's calendar is attached to the group for the last (most
+        recently added) entry in the group table, as follows:
+ 
+        1)  Read all control records from the group file and report
+            an error if the user's alias or account (but not both)
+            match that of a control record.
+        2)  Write a group control record to the user's calendar.
+        3)  Write a member control record to the group calendar file.
+        4)  Copy all schedule entries in the user's calendar into the
+            group file.
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$ATTACH: PROC;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+/********** SYSTEM SERVICE MACROS */
+%FPT_WRITE (FPTN=WRITE_ALIAS_CTLREC,
+                                DCB=M$CALENDAR,
+                                BUF=CALENDAR_CONTROL,
+                                KEY=CALENDAR_KEY);
+%FPT_WRITE (FPTN=WRITE_MEMBER_CTLREC,
+                                KEY=GRPKEY,
+                                BUF=GRPCTL_RECORD);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+/********** Check all group member records to insure no conflict with
+            existing member alias.
+*/
+CALL GET$1ST_GROUP_MEMBER(GRPCNT);
+DO WHILE (CONTROL_RECORD);
+    IF GRPKEY.ALIAS = GRPTABLE.ALIAS(GRPCNT)
+    THEN
+        IF GRPCTL_RECORD.TEXT = B$JIT$->B$JIT.FACCN
+        THEN DO;
+            CALL PUT$MSG(%E$TH_REATTACH);
+            /*E* ERROR:     SCH-E$TH_REATTACH
+                 MESSAGE:   Previously attached to group. Recovery in progress.
+            */
+            GOTO REATTACH;
+            END;
+        ELSE DO;
+            CALL PUT$MSG(%E$TH_DUP_ALIAS,GRPCNT);
+            /*E* ERROR:     SCH-E$TH_DUP_ALIAS
+                 MESSAGE:   Alias already exists.
+                 MESSAGE1:  Another member of the group has an alias of "%U3".
+                 MESSAGE2:  Re-enter the ATTACH command with another alias.
+            */
+            CALL GRP$RELEASE(GRPCNT);
+            RETURN;
+            END;
+    ELSE
+        IF GRPCTL_RECORD.TEXT = B$JIT$->B$JIT.FACCN
+        THEN DO;
+            CALL PUT$MSG(%E$TH_DUP_ACCT,,GRPKEY.ALIAS);
+            /*E* ERROR:     SCH-E$TH_DUP_ACCT
+                 MESSAGE:   Previously attached to group with alias of "%U1".
+                 MESSAGE1:  Re-enter the ATTACH command with the previous alias.
+            */
+            CALL GRP$RELEASE(GRPCNT);
+            RETURN;
+            END;
+    CALL GET$GROUP_MEMBER(GRPCNT);
+    END;
+REATTACH:
+ 
+/********** Write alias record to user's calendar file
+*/
+CNT = 0;
+CALL GET$1ST_CALENDAR_ALIAS;
+DO WHILE (CONTROL_RECORD AND CALENDAR_KEY.CNT = CNT);
+    CNT = CNT + 1;
+    CALL GET$CALENDAR_ALIAS;
+    END;
+CALENDAR_KEY.TIME = 0;
+CALENDAR_KEY.CNT = CNT;
+CALENDAR_CONTROL.FID = GRPTABLE.FID(GRPCNT);
+CALENDAR_CONTROL.ALIAS = GRPTABLE.ALIAS(GRPCNT);
+CALL M$WRITE(WRITE_ALIAS_CTLREC);
+ 
+/********** Write member record to group calendar file
+*/
+GRPKEY.TIME = 0;
+GRPKEY.ALIAS = GRPTABLE.ALIAS(GRPCNT);
+GRPCTL_RECORD.LEN = LENGTHC(B$JIT$->B$JIT.FACCN);
+GRPCTL_RECORD.TEXT = B$JIT$->B$JIT.FACCN;
+WRITE_MEMBER_CTLREC.V.DCB# = GRPTABLE.DCB_NUM(GRPCNT);
+CALL M$WRITE(WRITE_MEMBER_CTLREC);
+ 
+/********** Copy user's schedule into group calendar
+*/
+CALL GET$1ST_CALENDAR_ENTRY ALTRET(ABORT_IT);
+DO WHILE (MORE_ENTRIES);
+    CALL PUT$GROUP_ENTRY(ADDR(CALENDAR_KEY),GRPCNT) ALTRET(ABORT_IT);
+    CALL GET$CALENDAR_ENTRY ALTRET(ABORT_IT);
+    END;
+ 
+CALL PUT$MSG(%E$TH_ATTACHED,GRPCNT);
+/*E* ERROR:     SCH-E$TH_ATTACHED
+     MESSAGE:   Attached to %U1 group calendar. Name is "%U2".
+*/
+ 
+RETURN;
+ 
+    /********** Error in copying calendar entries
+    */
+ABORT_IT:
+    CALL PUT$MSG(%E$TH_ABORTED);
+    /*E* ERROR:     SCH-E$TH_ABORTED
+         MESSAGE:   Operation in progress aborted due to I/O errors.
+         MESSAGE1:  You are attached to the group calendar, but the group file
+                    may not contain all of your calendar entries.
+         MESSAGE2:  To recover, DETACH yourself from the group, then try to reATTACH.
+    */
+    RETURN;
+ 
+END GRP$ATTACH;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$DETACH
+ 
+        PURPOSE:
+ 
+        Detaches the user from the group file for a specified group
+        table entry.  The user's schedule is removed from the group
+        file, control records are deleted from the both the user's and
+        the group calendars, and the group file is closed and released.
+ 
+        CALL:   CALL GRP$DETACH(GRPN);
+                where
+                    GRPN - index for group table entry to be detached
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$DETACH: PROC(GRPN);
+ 
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_DELREC (FPTN=DELETE_KEYED,
+                                KEY=GRPKEY);
+%FPT_DELREC (FPTN=DELETE_LAST);
+ 
+    /*
+    *************** PROCEDURE BODY
+    ***************
+    */
+ 
+    /********** Delete member control record from group calendar
+    */
+    GRPKEY.TIME = 0;
+    GRPKEY.ALIAS = GRPTABLE.ALIAS(GRPN);
+    DELETE_KEYED.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$DELREC(DELETE_KEYED) ALTRET(DELERR1);
+    DO NEVER;
+DELERR1:CALL PUT$MSG;
+        END;
+ 
+    /********** Delete all group calendar entries for user's alias
+    */
+    CALL GET$1ST_GROUP_ENTRY(GRPN) ALTRET(DELERR2);
+    DO NEVER;
+DELERR2:CALL PUT$MSG;
+        END;
+    DELETE_LAST.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    DO WHILE (MORE_ENTRIES);
+        IF GRPKEY.ALIAS = GRPTABLE.ALIAS(GRPN)
+        THEN
+            CALL M$DELREC(DELETE_LAST) ALTRET(DELERR2);
+        CALL GET$GROUP_ENTRY(GRPN) ALTRET(DELERR2);
+        END;
+ 
+    /********** Delete alias record from :CALENDAR file
+    */
+    CALL GET$1ST_CALENDAR_ALIAS;
+    DO WHILE (CALENDAR_CONTROL.FID ~= GRPTABLE.FID(GRPN));
+        CALL GET$CALENDAR_ALIAS;
+        END;
+    DELETE_LAST.V.DCB# = DCBNUM(M$CALENDAR);
+    CALL M$DELREC(DELETE_LAST) ALTRET(DELERR3);
+    DO NEVER;
+DELERR3:CALL PUT$MSG;
+        END;
+ 
+    RETURN;
+ 
+END GRP$DETACH;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$RELEASE
+ 
+        PURPOSE:
+ 
+        Closes and releases the DCB corresponding to the specified
+        group table entry, and deletes the table entry.
+ 
+        CALL:   CALL GRP$RELEASE(GRPN);
+                where
+                    GRPN - GRPTABLE index for group file to release
+ 
+        DESCRIPTION:
+ 
+        Close group file for specified GRPTABLE entry, release the
+        file's DCB and the table entry.
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$RELEASE: PROC(GRPN);
+ 
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+DCL TEMP CHAR(1);
+ 
+/********** SYSTEM SERVICE MACROS */
+%FPT_CLOSE (FPTN=CLOSE_GROUP,
+                                REBLD=YES);
+%FPT_RELDCB (FPTN=RELEASE_GROUP_DCB);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+/********** Close file and release DCB if needed
+*/
+IF GRPTABLE.DCB_NUM(GRPN) ~= 0
+THEN DO;
+    CLOSE_GROUP.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$CLOSE(CLOSE_GROUP);
+ 
+    RELEASE_GROUP_DCB.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$RELDCB(RELEASE_GROUP_DCB);
+END;
+ 
+/********** Delete group table entry
+*/
+IF GRPN ~= GRPCNT
+THEN DO;
+    GRPTABLE(GRPN) = GRPTABLE(GRPCNT);
+    TEMP = GRPDCB_DIGIT(GRPN);
+    GRPDCB_DIGIT(GRPN) = GRPDCB_DIGIT(GRPCNT);
+    GRPDCB_DIGIT(GRPCNT) = TEMP;
+    END;
+GRPCNT = GRPCNT - 1;
+ 
+RETURN;
+ 
+END GRP$RELEASE;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$DISPLAY
+ 
+        PURPOSE: Displays the composite schedule for a given period
+                 from a group calendar file.
+ 
+        CALL:   CALL GRP$DISPLAY(GRPN,ALIAS$,START_TIME,END_TIME);
+                where
+                    GRPN - group table index for group calendar to display
+                    ALIAS$ - pointer to parse nodes for alias list, if any
+                    START_TIME - timestamp value for start of display
+                    END_TIME - timestamp value for end of display
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$DISPLAY: PROC(GRPN,ALIAS$,START_TIME,END_TIME);
+ 
+DCL ALIAS$ PTR;
+DCL START_TIME UBIN;
+DCL END_TIME UBIN;
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+DCL HOUR UBIN WORD;
+DCL AMPM CHAR(2);
+ 
+%FPT_TIME (FPTN=EXPAND_DATE,
+                                SOURCE=UTS,
+                                TSTAMP=GRPKEY.TIME,
+                                DEST=LOCAL,
+                                DATE=DATEBUF,
+                                TIME=TIMEBUF,
+                                DAY=DAYBUF);
+ 
+/********** DISPLAY LINE WORK AREAS */
+DCL LINEBUF CHAR(80);
+DCL 1 LINE REDEF LINEBUF,
+        2 *         CHAR(5),
+        2 DAY       CHAR(3),
+        2 *         CHAR(3),
+        2 DATE      CHAR(5),
+        2 *         CHAR(3),
+        2 TIME,
+            3 HOUR  CHAR(2),
+            3 *     CHAR(3),
+        2 AMPM      CHAR(2),
+        2 *         CHAR(3),
+        2 ALIASES   CHAR(51);
+/**/
+DCL DAYBUF  STATIC  CHAR(3) INIT(' ');
+DCL 1 DATEBUF       STATIC,
+        2 DATE      CHAR(5) INIT(' '),
+        2 *         CHAR(3) INIT(' ');
+DCL 1 TIMEBUF       STATIC,
+        2 TIME      CHAR(5) INIT(' ');
+/**/
+DCL LASTDATE        CHAR(5);
+DCL 1 LASTTIME,
+        2 TIME      CHAR(5);
+ 
+/********** DISPLAY CONSTANTS */
+DCL HEADING1 CHAR(0) CONSTANT INIT('     DAY   DATE    TIME      NAMES');
+DCL HEADING2 CHAR(0) CONSTANT INIT('     ---   -----   -------   --------------------------------------------------');
+DCL BLANK_LINE CHAR(0) CONSTANT INIT(' ');
+DCL TITLE1   CHAR(0) CONSTANT INIT('>>>> Composite schedule for ');
+DCL TITLE2   CHAR(0) CONSTANT INIT(' group calendar <<<<');
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+GRPKEY.TIME = START_TIME;
+GRPKEY.ALIAS.LEN = 0;
+CALL GET$1ST_DISPLAY_ENTRY(GRPN,END_TIME,ALIAS$) ALTRET(BYPASS);
+IF MORE_ENTRIES
+THEN DO;
+ 
+    /********** Display headings for composite schedule
+    */
+    CALL CONCAT(LINEBUF,
+                TITLE1,
+                SUBSTR(GRPTABLE.NAME.TEXT(GRPN),0,GRPTABLE.NAME.LEN(GRPN)),
+                TITLE2);
+    CALL PUT$DISPLAY_LINE(VECTOR(LINEBUF));
+    CALL PUT$DISPLAY_LINE(VECTOR(BLANK_LINE));
+    CALL PUT$DISPLAY_LINE(VECTOR(HEADING1));
+    LINEBUF = HEADING2;
+    LASTDATE = ' ';
+    LASTTIME.TIME = ' ';
+ 
+    /********** Loop to read and display all entries in the
+                specified range
+    */
+    DO WHILE (MORE_ENTRIES);
+        CALL M$TIME(EXPAND_DATE);
+        IF DATEBUF.DATE ~= LASTDATE
+        THEN DO;
+ 
+            /********** Start of display for a new day -
+                        Output current line and set up all fields for new line
+            */
+            CNT = 99; /* FORCE A NEW LINE */
+            CALL ADD_ALIAS;
+            LASTDATE = DATEBUF.DATE;
+            LASTTIME = TIMEBUF;
+            LINE.DAY = DAYBUF;
+            LINE.DATE = DATEBUF.DATE;
+            CALL FORMAT_TIME;
+            END;
+        ELSE
+            /********** Start of display for a new time -
+                        Output current line and set up new time and alias
+            */
+            IF TIMEBUF ~= LASTTIME
+            THEN DO;
+                CNT = 99; /* FORCE A NEW LINE */
+                CALL ADD_ALIAS;
+                LASTTIME = TIMEBUF;
+                CALL FORMAT_TIME;
+                END;
+            ELSE
+ 
+            /********** Same date and time as last entry -
+                        Add new alias to current line
+            */
+                CALL ADD_ALIAS;
+ 
+        CALL GET$DISPLAY_ENTRY(GRPN,END_TIME,ALIAS$) ALTRET(BYPASS1);
+        END;
+BYPASS1:
+    CALL PUT$DISPLAY_LINE(VECTOR(LINEBUF));
+    END;
+ELSE
+    CALL PUT$MSG(%E$TH_NO_DISPLAY);
+    /*E* ERROR:     SCH-E$TH_NO_DISPLAY
+         MESSAGE:   Nothing to display.
+         MESSAGE1:  No events are scheduled for the specified period.
+    */
+ 
+BYPASS: RETURN;
+ 
+/*
+*************** INTERNAL PROCEDURE
+***************
+*/
+FORMAT_TIME: PROC;
+ 
+    IF TIMEBUF.TIME ~= '00:00'
+    THEN DO;
+        LINE.TIME = TIMEBUF;
+        CALL CHARBIN(HOUR,LINE.TIME.HOUR);
+        IF HOUR < 13
+        THEN
+            LINE.AMPM = 'AM';
+        ELSE DO;
+            LINE.AMPM = 'PM';
+            HOUR = HOUR - 12;
+            CALL BINCHAR(LINE.TIME.HOUR,HOUR);
+            END;
+        IF SUBSTR(LINE.TIME.HOUR,0,1) = '0'
+        THEN
+            SUBSTR(LINE.TIME.HOUR,0,1) = ' ';
+        IF AMPM = LINE.AMPM
+        THEN
+            LINE.AMPM = ' ';
+        ELSE
+            AMPM = LINE.AMPM;
+        END;
+    RETURN;
+END FORMAT_TIME;
+ 
+/*
+*************** INTERNAL PROCEDURE
+***************
+*/
+ADD_ALIAS: PROC;
+ 
+    /********** Output current line if necessary
+    */
+    IF CNT + 2 + GRPKEY.ALIAS.LEN > 50
+    THEN DO;
+        CALL PUT$DISPLAY_LINE(VECTOR(LINEBUF));
+        LINEBUF = ' ';
+        CNT = 0;
+        IF DATEBUF.DATE ~= LASTDATE
+        THEN DO;
+            CALL PUT$DISPLAY_LINE(VECTOR(LINEBUF));
+            AMPM = ' ';
+            END;
+        END;
+ 
+    /********** Add member's alias to current line
+    */
+    IF CNT > 0
+    THEN DO;
+        SUBSTR(LINE.ALIASES,CNT,2) = ',';
+        CNT = CNT + 2;
+        END;
+    SUBSTR(LINE.ALIASES,CNT,GRPKEY.ALIAS.LEN) = GRPKEY.ALIAS.TEXT;
+    CNT = CNT + GRPKEY.ALIAS.LEN;
+ 
+    RETURN;
+ 
+END ADD_ALIAS;
+ 
+END GRP$DISPLAY;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GRP$MEMBERS
+ 
+        PURPOSE: Lists the members of a specified group calendar.
+ 
+        CALL:   CALL GRP$MEMBERS(GRPN);
+                where
+                    GRPN - group table index for group calendar to list
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GRP$MEMBERS: PROC(GRPN);
+ 
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+DCL LINEBUF CHAR(80);
+DCL 1 LINE  REDEF LINEBUF,
+        2 ALIAS(0:4)    CHAR(16);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+/********** Setup to read control records from group file
+*/
+LINEBUF = ' ';
+CNT = 0;
+CALL GET$1ST_GROUP_MEMBER(GRPN);
+ 
+/********** Loop to read all control records and display the aliases
+*/
+DO WHILE (CONTROL_RECORD);
+    LINE.ALIAS(CNT) = GRPKEY.ALIAS.TEXT;
+    CNT = CNT + 1;
+    IF CNT = 5
+    THEN DO;
+        CALL PUT$DISPLAY_LINE(VECTOR(LINEBUF));
+        LINEBUF = ' ';
+        CNT = 0;
+        END;
+    CALL GET$GROUP_MEMBER(GRPN);
+    END;
+ 
+/********** Write last partially filled alias line, if any
+*/
+IF CNT > 0
+THEN
+    CALL PUT$DISPLAY_LINE(VECTOR(LINEBUF));
+ 
+BYPASS: RETURN;
+ 
+END GRP$MEMBERS;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GET$TODAYS_TIME
+ 
+        PURPOSE: Returns timestamp value for midnight of current date.
+ 
+        CALL:   CALL GET$TODAYS_TIME(TSTAMP);
+                where
+                    TSTAMP - Word to hold returned timestamp
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GET$TODAYS_TIME: PROC(TSTAMP);
+ 
+DCL TSTAMP UBIN WORD;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+DCL UTSBUF UBIN WORD STATIC INIT(0);
+DCL DATEBUF CHAR(8) STATIC INIT(' ');
+DCL NOTIME CHAR(5) CONSTANT INIT('00:00');
+ 
+/********** SYSTEM SERVICE MACROS */
+%FPT_TIME (FPTN=GET_CURRENT_DATE,
+                                SOURCE=CLOCK,
+                                DEST=LOCAL,
+                                DATE=DATEBUF);
+%FPT_TIME (FPTN=GET_TODAYS_TIMESTAMP,
+                                SOURCE=LOCAL,
+                                DATE=DATEBUF,
+                                TIME=NOTIME,
+                                DEST=UTS,
+                                TSTAMP=UTSBUF);
+ 
+    /*
+    *************** PROCEDURE BODY
+    ***************
+    */
+ 
+    CALL M$TIME(GET_CURRENT_DATE);
+    CALL M$TIME(GET_TODAYS_TIMESTAMP);
+    TSTAMP = UTSBUF;
+    RETURN;
+ 
+END GET$TODAYS_TIME;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GET$REPLY
+ 
+        PURPOSE: Display a prompt and get a reply from the user.
+ 
+        CALL:   CALL GET$REPLY (PROMPT,NODE$);
+                where
+                    PROMPT - vector for prompt string to use
+                    NODE$  - returns pointer to parse node for reply
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GET$REPLY: PROC(PROMPT_,NODE$);
+ 
+DCL PROMPT_ BIT(72);
+DCL NODE$ PTR;
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+DO FOREVER;
+    CALL XUR$GETCMD(INPUT_PLACE,NODE$,PROMPT_) ALTRET(RETRY);
+            IF NODE$->OUT$SYM.COUNT = 0
+            THEN DO;
+                NODE$ = ADDR(NIL);
+                RETURN;
+                END;
+            ELSE
+                RETURN;
+ 
+RETRY:
+    END;
+ 
+END GET$REPLY;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GET$1ST_CALENDAR_ALIAS
+ 
+        PURPOSE: Gets first alias record from user's calendar.
+ 
+        CALL:   CALL GET$1ST_CALENDAR_ALIAS;
+ 
+        OUTPUT: CALENDAR_CONTROL - alias control record retrieved
+                CALENDAR_KEY     - key of alias record retrieved
+                CONTROL_RECORD   - set TRUE is an alias control record
+                                    was retrieved, otherwise FALSE
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GET$1ST_CALENDAR_ALIAS: PROC;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+DCL CODE UBIN;
+ 
+%FPT_PFIL (FPTN=REWIND_CALENDAR,
+                                DCB=M$CALENDAR,
+                                BOF=YES);
+%FPT_READ (FPTN=READ_CALENDAR,
+                                DCB=M$CALENDAR,
+                                KEY=CALENDAR_KEY,
+                                BUF=CALENDAR_CONTROL,
+                                KEYR=YES);
+ 
+    /*
+    *************** PROCEDURE BODY
+    ***************
+    */
+ 
+    CALL M$PFIL(REWIND_CALENDAR);
+ 
+/*********************************************************************
+ 
+        ENTRY:  GET$CALENDAR_ALIAS
+ 
+        PURPOSE: Gets next alias record from user's calendar.
+ 
+        CALL:   CALL GET$CALENDAR_ALIAS;
+ 
+*********************************************************************/
+ 
+GET$CALENDAR_ALIAS: ENTRY;
+ 
+    CALL M$READ(READ_CALENDAR) ALTRET(CHECKERR);
+    IF CALENDAR_KEY.TIME = 0
+    THEN
+        CONTROL_RECORD = %TRUE;
+    ELSE
+        CONTROL_RECORD = %FALSE;
+    RETURN;
+ 
+    /*********** Report unexpected read error to the user
+    */
+CHECKERR:
+    CODE = B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR#;
+    IF CODE ~= %E$EOF AND CODE ~= %E$LD
+    THEN DO;
+        CALL PUT$MSG;
+        CALL PUT$MSG(%E$TH_READ_CTLREC);
+        /*E* ERROR:     SCH-E$TH_READ_CTLREC
+             MESSAGE:   Error reading group alias records from your calendar.
+        */
+        END;
+    CONTROL_RECORD = %FALSE;
+    RETURN;
+ 
+END GET$1ST_CALENDAR_ALIAS;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GET$1ST_GROUP_MEMBER
+ 
+        PURPOSE: Gets first group member record from a specified
+                group calendar file.
+ 
+        CALL:   CALL GET$1ST_GROUP_MEMBER (GRPN);
+                where
+                    GRPN - GRPTABLE index for group file to read
+ 
+        OUTPUT: GRPCTL_RECORD - member control record retrieved
+                GRPKEY        - key of member record retrieved
+                CONTROL_RECORD - set TRUE is an member control record
+                                    was retrieved, otherwise FALSE
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GET$1ST_GROUP_MEMBER: PROC(GRPN);
+ 
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_PFIL (FPTN=REWIND_GROUP,
+                                BOF=YES);
+%FPT_READ (FPTN=READ_GROUP_REC,
+                                KEY=GRPKEY,
+                                BUF=GRPCTL_RECORD,
+                                KEYR=YES);
+ 
+    /*
+    *************** PROCEDURE BODY
+    ***************
+    */
+ 
+    REWIND_GROUP.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$PFIL(REWIND_GROUP);
+ 
+/*********************************************************************
+ 
+        ENTRY:  GET$GROUP_MEMBER
+ 
+        PURPOSE: Gets next member record from a group calendar.
+ 
+        CALL:   CALL GET$GROUP_MEMBER (GRPN);
+ 
+*********************************************************************/
+ 
+GET$GROUP_MEMBER: ENTRY(GRPN);
+ 
+    READ_GROUP_REC.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$READ(READ_GROUP_REC) ALTRET(CHECKERR);
+    IF GRPKEY.ALIAS = GROUPID
+    THEN
+        CALL M$READ(READ_GROUP_REC) ALTRET(CHECKERR);
+    IF GRPKEY.TIME = 0
+    THEN
+        CONTROL_RECORD = %TRUE;
+    ELSE
+        CONTROL_RECORD = %FALSE;
+    RETURN;
+ 
+    /*********** Report unexpected read error to the user
+    */
+CHECKERR:
+    IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# ~= %E$EOF
+    THEN DO;
+        CALL PUT$MSG;
+        CALL PUT$MSG(%E$TH_READ_MEMBER,GRPCNT);
+        /*E* ERROR:     SCH-E$TH_READ_MEMBER
+             MESSAGE:   Error reading member records from %U1 group calendar.
+        */
+        END;
+    CONTROL_RECORD = %FALSE;
+    RETURN;
+ 
+END GET$1ST_GROUP_MEMBER;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GET$1ST_GROUP_ENTRY
+ 
+        PURPOSE: Gets first schedule record from user's calendar.
+ 
+        CALL:   CALL GET$1ST_GROUP_ENTRY (GRPN) ALTRET(LABEL);
+                where
+                    GRPN - GRPTABLE index for group file to read
+ 
+        OUTPUT: GRPKEY       - key of group record retrieved
+                MORE_ENTRIES - set TRUE if a record was retrieved
+                                or FALSE if end of file reached
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GET$1ST_GROUP_ENTRY: PROC(GRPN) ALTRET;
+ 
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_PRECORD (FPTN=POSITION_GROUP,
+                                KEY=GRPKEY,
+                                KEYS=YES);
+%FPT_READ (FPTN=READ_GROUP,
+                                KEY=GRPKEY,
+                                KEYR=YES);
+ 
+    /*
+    *************** PROCEDURE BODY
+    ***************
+    */
+ 
+    GRPKEY.TIME = 1;
+    GRPKEY.ALIAS.LEN = 0;
+    POSITION_GROUP.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$PRECORD(POSITION_GROUP) ALTRET(CHECK1);
+    DO NEVER;
+CHECK1:
+        IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# ~= %E$NOKEY
+        THEN
+            GOTO ERRMSG;
+        END;
+ 
+/*********************************************************************
+ 
+        ENTRY:  GET$GROUP_ENTRY
+ 
+        PURPOSE: Gets next schedule record from user's calendar.
+ 
+        CALL:   CALL GET$GROUP_ENTRY (GRPN) ALTRET(LABEL);
+ 
+*********************************************************************/
+ 
+GET$GROUP_ENTRY: ENTRY(GRPN) ALTRET;
+ 
+    READ_GROUP.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$READ(READ_GROUP) ALTRET(CHECK2);
+    MORE_ENTRIES = %TRUE;
+ 
+    RETURN;
+ 
+    /*********** Report unexpected read error to the user
+    */
+CHECK2:
+    IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# ~= %E$EOF
+    THEN DO;
+ERRMSG: CALL PUT$MSG;
+        CALL PUT$MSG(%E$TH_READ_GROUP,GRPN);
+        /*E* ERROR:     SCH-E$TH_READ_GROUP
+             MESSAGE:   Error reading entries from %U1 group calendar.
+        */
+        ALTRETURN;
+        END;
+    ELSE DO;
+        MORE_ENTRIES = %FALSE;
+        RETURN;
+        END;
+ 
+END GET$1ST_GROUP_ENTRY;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GET$1ST_CALENDAR_ENTRY
+ 
+        PURPOSE: Gets first schedule record from user's calendar.
+ 
+        CALL:   CALL GET$1ST_CALENDAR_ENTRY ALTRET(LABEL);
+ 
+        OUTPUT: CALENDAR_KEY - key of group record retrieved
+                MORE_ENTRIES - set TRUE if a record was retrieved
+                                or FALSE if end of file reached
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GET$1ST_CALENDAR_ENTRY: PROC ALTRET;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_PRECORD (FPTN=POSITION_CALENDAR,
+                                DCB=M$CALENDAR,
+                                KEY=CALENDAR_KEY,
+                                KEYR=YES);
+ 
+    /*
+    *************** PROCEDURE BODY
+    ***************
+    */
+ 
+    CALENDAR_KEY.TIME = 1;
+    CALENDAR_KEY.CNT = 0;
+    POSITION_CALENDAR.V.KEYS# = %TRUE;
+    POSITION_CALENDAR.V.N# = -1;
+    CALL M$PRECORD(POSITION_CALENDAR) ALTRET(CHECK1);
+    DO NEVER;
+CHECK1:
+        IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# ~= %E$NOKEY
+        THEN
+            GOTO ERRMSG;
+        END;
+    POSITION_CALENDAR.V.KEYS# = %FALSE;
+    POSITION_CALENDAR.V.N# = 1;
+ 
+/*********************************************************************
+ 
+        ENTRY:  GET$CALENDAR_ENTRY
+ 
+        PURPOSE: Gets next schedule record from user's calendar.
+ 
+        CALL:   CALL GET$CALENDAR_ENTRY ALTRET(LABEL);
+ 
+*********************************************************************/
+ 
+GET$CALENDAR_ENTRY: ENTRY ALTRET;
+ 
+    CALL M$PRECORD(POSITION_CALENDAR) ALTRET(CHECK2);
+    DO WHILE (CALENDAR_KEY.CNT > 0);
+        CALL M$PRECORD(POSITION_CALENDAR) ALTRET(CHECK2);
+        END;
+    MORE_ENTRIES = %TRUE;
+ 
+    RETURN;
+ 
+    /*********** Report unexpected read error to the user
+    */
+CHECK2:
+    IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# ~= %E$EOF
+    THEN DO;
+ERRMSG: CALL PUT$MSG;
+        CALL PUT$MSG(%E$TH_READ_CALENDAR);
+        /*E* ERROR:     SCH-E$TH_READ_CALENDAR
+             MESSAGE:   Error reading entries from your calendar.
+        */
+        ALTRETURN;
+        END;
+    ELSE DO;
+        MORE_ENTRIES = %FALSE;
+        RETURN;
+        END;
+ 
+END GET$1ST_CALENDAR_ENTRY;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   GET$1ST_DISPLAY_ENTRY
+ 
+        PURPOSE: Gets first entry from a group calendar for a composite
+                 calendar display.
+ 
+        CALL:   CALL GET$1ST_DISPLAY_ENTRY(GRPN,LIMIT[,ALIAS$])
+                    ALTRET(LABEL);
+                where
+                    GPRN - GRPTABLE index fro group calendar to read
+                    LIMIT - timestamp for end of display range
+                    ALIAS$ - parse node pointer for list of members
+                             to be displayed, if any.
+ 
+        INPUT:  GRPKEY - must be initialized with timestamp for start
+                         of the display range.
+ 
+        OUTPUT: GRPKEY       - key of group record retrieved
+                MORE_ENTRIES - set TRUE if the record retrieved is
+                                within the display range.
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+GET$1ST_DISPLAY_ENTRY: PROC(GRPN,LIMIT,ALIAS$) ALTRET;
+ 
+DCL GRPN SBIN(9) CALIGNED;
+DCL LIMIT UBIN WORD;
+DCL ALIAS$ PTR;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_PRECORD (FPTN=POSITION_GROUP,
+                                KEY=GRPKEY,
+                                KEYS=YES);
+%FPT_READ (FPTN=READ_GROUP,
+                                KEY=GRPKEY,
+                                KEYR=YES);
+ 
+DCL ACNT UBIN;
+ 
+DCL 1 ALIAS     BASED,
+        2 LEN   UBIN(9) CALIGNED,
+        2 TEXT  CHAR(ALIAS.LEN);
+ 
+    /*
+    *************** PROCEDURE BODY
+    ***************
+    */
+ 
+    POSITION_GROUP.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$PRECORD(POSITION_GROUP) ALTRET(CHECK1);
+    DO NEVER;
+CHECK1:
+        IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# ~= %E$NOKEY
+        THEN
+            GOTO ERRMSG;
+        END;
+ 
+/*********************************************************************
+ 
+        NAME:   GET$DISPLAY_ENTRY
+ 
+        PURPOSE: Gets next entry from a group calendar for a composite
+                 calendar display.
+ 
+        CALL:   CALL GET$DISPLAY_ENTRY(GRPN,LIMIT[,ALIAS$) ALTRET(LABEL);
+ 
+*********************************************************************/
+ 
+GET$DISPLAY_ENTRY: ENTRY(GRPN,LIMIT,ALIAS$) ALTRET;
+ 
+    READ_GROUP.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$READ(READ_GROUP) ALTRET(CHECK2);
+ 
+    IF GRPKEY.TIME >= LIMIT
+    THEN
+        MORE_ENTRIES = %FALSE;
+    ELSE
+        MORE_ENTRIES = %TRUE;
+ 
+    IF ALIAS$ ~= ADDR(NIL)
+    THEN
+        DO WHILE (MORE_ENTRIES);
+            DO ACNT = 0 TO ALIAS$->OUT$BLK.NSUBLKS - 1;
+                IF GRPKEY.ALIAS = ALIAS$->OUT$BLK.SUBLK$(ACNT)->
+                                  OUT$SYM.TEXTC$->ALIAS
+                THEN
+                    RETURN;
+                END;
+            CALL M$READ(READ_GROUP) ALTRET(CHECK2);
+            IF GRPKEY.TIME >= LIMIT
+            THEN
+                MORE_ENTRIES = %FALSE;
+            END;
+    RETURN;
+ 
+    /*********** Report unexpected read error to the user
+    */
+CHECK2:
+    IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.ERR# ~= %E$EOF
+    THEN DO;
+ERRMSG: CALL PUT$MSG;
+        CALL PUT$MSG(%E$TH_READ_GROUP,GRPN);
+        ALTRETURN;
+        END;
+    ELSE DO;
+        MORE_ENTRIES = %FALSE;
+        RETURN;
+        END;
+ 
+END GET$1ST_DISPLAY_ENTRY;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   PUT$GROUP_ENTRY
+ 
+        PURPOSE: Adds or replaces a schedule entry to a given group
+                calendar.
+ 
+        CALL:   CALL PUT$GROUP_ENTRY (KEY$, GRPN) ALTRET(LABEL);
+                where
+                    KEY$ - pointer to key for calendar record to be
+                            added to the group
+                    GRPN - group table index for group file to use
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+PUT$GROUP_ENTRY: PROC(KEY$,GRPN) ALTRET;
+ 
+DCL KEY$ PTR;
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_WRITE (FPTN=WRITE_GROUP_ENTRY,
+                                KEY=GRPKEY);
+ 
+DCL 1 CAL_KEY       BASED(KEY$),
+        2 *         UBIN BYTE UNAL,
+        2 TIME      UBIN WORD UNAL,
+        2 CNT       UBIN BYTE UNAL;
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+IF CAL_KEY.CNT = 0
+THEN DO;
+    GRPKEY.TIME = CAL_KEY.TIME;
+    GRPKEY.ALIAS = GRPTABLE.ALIAS(GRPN);
+    WRITE_GROUP_ENTRY.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$WRITE(WRITE_GROUP_ENTRY);
+    END;
+ 
+RETURN;
+ 
+END PUT$GROUP_ENTRY;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   PUT$DISPLAY_LINE
+ 
+        PURPOSE: Write a line to user's terminal.
+ 
+        CALL:   CALL PUT$DISPLAY_LINE(BUF_);
+                where
+                    BUF_ - hardware vector for line to write
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+PUT$DISPLAY_LINE: PROC(BUF_);
+ 
+DCL BUF_ BIT(72);
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+%FPT_WRITE (FPTN=DISPLAY_LINE,
+                                DCB=M$UPDATE);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+DISPLAY_LINE.BUF_ = BUF_;
+CALL M$WRITE(DISPLAY_LINE);
+RETURN;
+END PUT$DISPLAY_LINE;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   PUT$MSG
+ 
+        PURPOSE: Display a message on the user's terminal.
+ 
+        CALL:   CALL PUT$MSG([CODE][,GRPN][,TEXT]);
+                where
+                    CODE - Message number
+                    GRPN - Group table index (if message applies to a
+                            group file)
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+PUT$MSG: PROC(CODE,GRPN,TEXT);
+ 
+DCL CODE UBIN;
+DCL GRPN SBIN(9) CALIGNED;
+ 
+DCL 1 TEXT,
+        2 LEN   UBIN(9) CALIGNED,
+        2 TXT   CHAR(TEXT.LEN);
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%VLP_ERRCODE (FPTN=MSGNUM);
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+IF ADDR(CODE) = ADDR(NIL)
+THEN
+    CALL XUR$ERRMSG(B$TCB$->B$TCB.ALT$->B$ALT.ERR);
+ELSE DO;
+    MSGNUM = '230310000000'O;
+    MSGNUM.ERR# = CODE;
+    IF ADDR(GRPN) = ADDR(NIL)
+    THEN
+        IF ADDR(TEXT) = ADDR(NIL)
+        THEN
+            CALL XUR$ERRMSG(MSGNUM);
+        ELSE
+            CALL XUR$ERRMSG(MSGNUM,,,VECTOR(TEXT));
+    ELSE
+        CALL XUR$ERRMSG(MSGNUM,,,
+                        VECTOR(GRPTABLE.FID(GRPN)),
+                        VECTOR(GRPTABLE.NAME(GRPN)),
+                        VECTOR(GRPTABLE.ALIAS(GRPN)));
+    END;
+ 
+RETURN;
+ 
+END PUT$MSG;
+%EJECT;
+/********************************************************************/
+ 
+/*I*    NAME:   DELETE$GROUP_ENTRY
+ 
+        PURPOSE: Deletes a schedule entry to a given group calendar.
+ 
+        CALL:   CALL DELETE$GROUP_ENTRY (KEY$, GRPN) ALTRET(LABEL);
+                where
+                    KEY$ - pointer to key for calendar record to be
+                            added to the group
+                    GRPN - group table index for group file to use
+ 
+*********************************************************************/
+ 
+/*
+*************** PROCEDURE HEADER
+***************
+*/
+DELETE$GROUP_ENTRY: PROC(KEY$,GRPN) ALTRET;
+ 
+DCL KEY$ PTR;
+DCL GRPN SBIN(9) CALIGNED;
+ 
+/*
+*************** DATA DEFINITION
+***************
+*/
+ 
+%FPT_DELREC (FPTN=DELETE_GROUP_ENTRY,
+                                KEY=GRPKEY);
+ 
+DCL 1 CAL_KEY       BASED(KEY$),
+        2 *         UBIN BYTE UNAL,
+        2 TIME      UBIN WORD UNAL,
+        2 CNT       UBIN BYTE UNAL;
+ 
+/*
+*************** PROCEDURE BODY
+***************
+*/
+ 
+IF CAL_KEY.CNT = 0
+THEN DO;
+    GRPKEY.TIME = CAL_KEY.TIME;
+    GRPKEY.ALIAS = GRPTABLE.ALIAS(GRPN);
+    DELETE_GROUP_ENTRY.V.DCB# = GRPTABLE.DCB_NUM(GRPN);
+    CALL M$DELREC(DELETE_GROUP_ENTRY) WHENALTRETURN DO; END;
+    END;
+ 
+RETURN;
+ 
+END DELETE$GROUP_ENTRY;
+ 
+END SCH$GROUP;

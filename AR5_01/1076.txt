@@ -1,0 +1,1044 @@
+VERSION E05
+
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:1    
+        1        1        /*M* JZB$MM  Memory management routines for autosave               */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* PLM=3,IND=5,ENU=0,ECU=0    */
+        8        8        JZB$GET: PROC(BLOCK$) ALTRET;
+        9        9
+       10       10        %INCLUDE JZ_DATA_R;
+       11      563        %INCLUDE B_STRINGS_C;
+       12      692        %INCLUDE M_ERRORS_C;
+       13      756
+       14      757                                                /* AUTO Storage                       */
+       15      758    1   DCL BLOCK$ PTR;
+       16      759    1   DCL 1 BLOCK REDEF BLOCK$,
+       17      760    1         2 PG# UBIN(8) UNAL,
+       18      761    1         2 * UBIN(16) UNAL,
+       19      762    1         2 SEGID BIT(12) UNAL;
+       20      763    1   DCL PREV$ PTR;
+       21      764    1   DCL NODE$ PTR;
+       22      765    1   DCL 1 NODE REDEF NODE$,
+       23      766    1         2 PG# UBIN(8) UNAL,
+       24      767    1         2 * UBIN(16) UNAL,
+       25      768    1         2 SEGID BIT(12) UNAL;
+       26      769    1   DCL I SBIN;
+       27      770    1   DCL LOCATE_FLAG BIT(1);
+       28      771    1   DCL ERR UBIN;
+       29      772
+       30      773                                                /* External Procedures                */
+       31      774    1   DCL MMH$GDS ENTRY(5) ALTRET;
+       32      775    1   DCL MMH$FDS ENTRY(4) ALTRET;
+       33      776    1   DCL SC_ASAVE ENTRY CONV(2,0);
+       34      777        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:2    
+       35      778
+       36      779        /*F*    NAME:   JZB$GET
+       37      780                PURPOSE: To allocate an autosave block from the list of
+       38      781                        available blocks. Pages of memory are acquired as
+       39      782                        needed from monitor data segment #2.
+       40      783        */
+       41      784
+       42      785
+       43      786        /* If there are no pages with free blocks, then get a new page and
+       44      787           divide it up into blocks.
+       45      788        */
+       46      789    1      IF JZ_AVAILHD.LNK.NXT_PG$ = ADDR(JZ_AVAILHD) THEN
+       47      790    2      DO;
+       48      791    2           CALL MMH$GDS(%MONWSQ,BITBIN(%DS2SID),1024,ERR) ALTRET(CANT_SAVE);
+       49      792
+       50      793        /* Set up a free page header node in the first block of the page.
+       51      794        */
+       52      795    2           JZ_PAGE$->JZ$INFO = JZ_AVAIL_INIT;
+       53      796    2           JZ_PAGE$->JZ$INFO.BLK_COUNT = 1024/SIZEW(JZ$INFO);
+       54      797    2           NODE$ = JZ_PAGE$;
+       55      798    2           PREV$ = JZ_AVAILHD.LNK.PREV_PG$;
+       56      799    2           CALL INSERT_DOUBLE(NODE$,PREV$);
+       57      800
+       58      801        /* Now, link the rest of the free blocks in the page to the header.
+       59      802        */
+       60      803    2           PREV$ = JZ_PAGE$;
+       61      804    3           DO I = 1 TO 1024/SIZEW(JZ$INFO) - 1;
+       62      805    3                PREV$ = PINCRW(PREV$,SIZEW(JZ$INFO));
+       63      806    3                PREV$->JZ$INFO = JZ_AVAIL_INIT;
+       64      807    3                CALL INSERT_SINGLE(PREV$,NODE$);
+       65      808    3                NODE$ = PREV$;
+       66      809    3                END;
+       67      810
+       68      811        /* JZ_PAGE$ must always point to the highest allocated page plus 1.
+       69      812        */
+       70      813    2           JZ_PAGE$ = PINCRW(JZ_PAGE$,1024);
+       71      814    2           END;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:3    
+       72      815
+       73      816        /* Okay, now lets allocate a block.
+       74      817        */
+       75      818    1      BLOCK$ = JZ_AVAILHD.LNK.NXT_PG$;
+       76      819    1      BLOCK$->JZ$INFO.BLK_COUNT = BLOCK$->JZ$INFO.BLK_COUNT - 1;
+       77      820
+       78      821        /* If the block count goes to zero, we're allocating the page
+       79      822           header node (last free node in page), so call "DELETE_DOUBLE".
+       80      823        */
+       81      824    1      IF BLOCK$->JZ$INFO.BLK_COUNT = 0
+       82      825    1      THEN CALL DELETE_DOUBLE(BLOCK$);
+       83      826    1      ELSE CALL DELETE_SINGLE(BLOCK$);
+       84      827    1      RETURN;
+       85      828
+       86      829        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:4    
+       87      830
+       88      831        /*F*    NAME:   JZB$FREE
+       89      832                PURPOSE: To return an autosave block to the available list.
+       90      833                        Entire pages of free blocks will be returned to the
+       91      834                        operating system.
+       92      835        */
+       93      836
+       94      837    1   JZB$FREE: ENTRY(BLOCK$) ALTRET;
+       95      838
+       96      839    1      BLOCK$->JZ$INFO = JZ_AVAIL_INIT;
+       97      840    1      LOCATE_FLAG = %TRUE;
+       98      841    1      NODE$ = JZ_AVAILHD.LNK.NXT_PG$;
+       99      842
+      100      843        /* Return the block to the sublist for the page its in.  If there
+      101      844           is currently no free page header for the page, then make this
+      102      845           node the header node.
+      103      846        */
+      104      847    2      DO WHILE (LOCATE_FLAG);
+      105      848    2           IF (NODE$ = ADDR(JZ_AVAILHD)) OR (NODE.PG# > BLOCK.PG#)
+      106      849    3           THEN DO;
+      107      850    3                NODE$ = NODE$->JZ$INFO.LNK.PREV_PG$;
+      108      851    3                BLOCK$->JZ$INFO.BLK_COUNT = 1;
+      109      852    3                CALL INSERT_DOUBLE(BLOCK$,NODE$);
+      110      853    3                LOCATE_FLAG = %FALSE;
+      111      854    3                END;
+      112      855    2           ELSE IF NODE.PG# = BLOCK.PG#
+      113      856    3                THEN DO;
+      114      857    3                     NODE$->JZ$INFO.BLK_COUNT = NODE$->JZ$INFO.BLK_COUNT + 1;
+      115      858    3                     CALL INSERT_SINGLE(BLOCK$,NODE$);
+      116      859    3                     LOCATE_FLAG = %FALSE;
+      117      860    3                     END;
+      118      861    2           NODE$ = NODE$->JZ$INFO.LNK.NXT_PG$;
+      119      862    2           END;
+      120      863
+      121      864        /* Okay, we've got it back where it belongs. Now, if the high page
+      122      865           is all free nodes, then free it.
+      123      866        */
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:5    
+      124      867    1      NODE$ = JZ_AVAILHD.LNK.PREV_PG$;
+      125      868    2      DO WHILE ((NODE$->JZ$INFO.BLK_COUNT = 1024/SIZEW(JZ$INFO)) AND
+      126      869    2        (NODE.PG# + 1 = JZ_PAGE.PG#));
+      127      870    2           CALL DELETE_DOUBLE(NODE$);
+      128      871    2           NODE$ = NODE$->JZ$INFO.LNK.PREV_PG$;
+      129      872    2           CALL MMH$FDS(%MONWSQ,BITBIN(%DS2SID),1024,ERR) ALTRET(SCREECH);
+      130      873    2           JZ_PAGE$ = PINCRW(JZ_PAGE$,-1024);
+      131      874    2           END;
+      132      875    1      RETURN;
+      133      876
+      134      877        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:6    
+      135      878    1   CANT_SAVE:;
+      136      879        /* If ERR isn't "data seg full" or "no physical page", then
+      137      880           take a snap-shot dump.
+      138      881        */
+      139      882    1      IF (ERR = %E$MONDSFULL) OR (ERR = %E$MONPP) THEN ALTRETURN;
+      140      883
+      141      884    1   SCREECH:;
+      142      885    1      CALL SC_ASAVE;
+      143      886    1      ALTRETURN;
+      144      887
+      145      888        /*S*    SCREECH_CODE: JZB-S$ASAVE                                  */
+      146      889        /*S*    TYPE:   SNAP                                               */
+      147      890        /*S*    MESSAGE: Unexpected MM error while in autosave.            */
+      148      891        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:7    
+      149      892
+      150      893        /* Delete the node following the node pointed to by NODE$
+      151      894           from the "BLOCK" chain.
+      152      895           Set NODE$ to point to the deleted node.
+      153      896        */
+      154      897    1   DELETE_SINGLE:PROC(NODE$);
+      155      898
+      156      899    2   DCL NODE$ PTR;
+      157      900    2   DCL B$ PTR;
+      158      901
+      159      902    2      B$ = NODE$->JZ$INFO.NXT_BLK$;
+      160      903    2      NODE$->JZ$INFO.NXT_BLK$ = B$->JZ$INFO.NXT_BLK$;
+      161      904    2      NODE$ = B$;
+      162      905    2      RETURN;
+      163      906    2   END DELETE_SINGLE;
+      164      907        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:8    
+      165      908        /* Insert NODE$ to the right of LOC$ in the "BLOCK" chain.
+      166      909        */
+      167      910    1   INSERT_SINGLE:PROC(NODE$,LOC$);
+      168      911
+      169      912    2   DCL NODE$ PTR;
+      170      913    2   DCL LOC$ PTR;
+      171      914
+      172      915    2      NODE$->JZ$INFO.NXT_BLK$ = LOC$->JZ$INFO.NXT_BLK$;
+      173      916    2      LOC$->JZ$INFO.NXT_BLK$ = NODE$;
+      174      917    2      RETURN;
+      175      918    2   END INSERT_SINGLE;
+      176      919        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:9    
+      177      920        /* Delete the node pointed to by NODE$ from the "PAGE" chain.
+      178      921        */
+      179      922
+      180      923    1   DELETE_DOUBLE:PROC(NODE$);
+      181      924    2   DCL NODE$ PTR;
+      182      925
+      183      926    2      NODE$->JZ$INFO.LNK.PREV_PG$->JZ$INFO.LNK.NXT_PG$ =
+      184      927    2        NODE$->JZ$INFO.LNK.NXT_PG$;
+      185      928    2      NODE$->JZ$INFO.LNK.NXT_PG$->JZ$INFO.LNK.PREV_PG$ =
+      186      929    2        NODE$->JZ$INFO.LNK.PREV_PG$;
+      187      930    2      RETURN;
+      188      931    2   END DELETE_DOUBLE;
+      189      932        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:10   
+      190      933        /* Insert NODE$ to the right of LOC$ in the "PAGE" chain.
+      191      934        */
+      192      935
+      193      936    1   INSERT_DOUBLE:PROC(NODE$,LOC$);
+      194      937
+      195      938    2   DCL NODE$ PTR;
+      196      939    2   DCL LOC$ PTR;
+      197      940
+      198      941    2      NODE$->JZ$INFO.LNK.PREV_PG$ = LOC$;
+      199      942    2      NODE$->JZ$INFO.LNK.NXT_PG$ = LOC$->JZ$INFO.LNK.NXT_PG$;
+      200      943    2      LOC$->JZ$INFO.LNK.NXT_PG$->JZ$INFO.LNK.PREV_PG$ = NODE$;
+      201      944    2      LOC$->JZ$INFO.LNK.NXT_PG$ = NODE$;
+      202      945    2      RETURN;
+      203      946    2   END INSERT_DOUBLE;
+      204      947
+      205      948
+      206      949    1   END JZB$GET;
+
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:11   
+--  Include file information  --
+
+   M_ERRORS_C.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   B_SEGIDS_C.:E05TOU  is referenced.
+   JZ_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure JZB$GET.
+
+   Procedure JZB$GET requires 240 words for executable code.
+   Procedure JZB$GET requires 18 words of local(AUTO) storage.
+
+    No errors detected in file JZB$MM.:E05TSI    .
+
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:12   
+
+ Object Unit name= JZB$GET                                    File name= JZB$MM.:E05TOU
+ UTS= JUL 29 '97 23:52:58.00 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   240    360  JZB$GET
+    1  RoData even  none     6      6  JZB$GET
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes    yes     yes      Std        1  JZB$GET
+     0    120          yes     yes      Std        1  JZB$FREE
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       5 MMH$GDS
+ yes     yes           Std       4 MMH$FDS
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+                       nStd      0 X66_AALT
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:13   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_ASAVE                              JZ_PAGE                               JZ_AVAILHD
+r    JZ_AVAIL_INIT                         B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ASLENTSID                             ISSID
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:14   
+
+
+        1        1        /*M* JZB$MM  Memory management routines for autosave               */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* PLM=3,IND=5,ENU=0,ECU=0    */
+        8        8        JZB$GET: PROC(BLOCK$) ALTRET;
+
+      8  0 000000   000000 700200 xent  JZB$GET      TSX0  ! X66_AUTO_1
+         0 000001   000022 000001                    ZERO    18,1
+
+        9        9
+       10       10        %INCLUDE JZ_DATA_R;
+       11      563        %INCLUDE B_STRINGS_C;
+       12      692        %INCLUDE M_ERRORS_C;
+       13      756
+       14      757                                                /* AUTO Storage                       */
+       15      758    1   DCL BLOCK$ PTR;
+       16      759    1   DCL 1 BLOCK REDEF BLOCK$,
+       17      760    1         2 PG# UBIN(8) UNAL,
+       18      761    1         2 * UBIN(16) UNAL,
+       19      762    1         2 SEGID BIT(12) UNAL;
+       20      763    1   DCL PREV$ PTR;
+       21      764    1   DCL NODE$ PTR;
+       22      765    1   DCL 1 NODE REDEF NODE$,
+       23      766    1         2 PG# UBIN(8) UNAL,
+       24      767    1         2 * UBIN(16) UNAL,
+       25      768    1         2 SEGID BIT(12) UNAL;
+       26      769    1   DCL I SBIN;
+       27      770    1   DCL LOCATE_FLAG BIT(1);
+       28      771    1   DCL ERR UBIN;
+       29      772
+       30      773                                                /* External Procedures                */
+       31      774    1   DCL MMH$GDS ENTRY(5) ALTRET;
+       32      775    1   DCL MMH$FDS ENTRY(4) ALTRET;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:15   
+       33      776    1   DCL SC_ASAVE ENTRY CONV(2,0);
+       34      777        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:16   
+       35      778
+       36      779        /*F*    NAME:   JZB$GET
+       37      780                PURPOSE: To allocate an autosave block from the list of
+       38      781                        available blocks. Pages of memory are acquired as
+       39      782                        needed from monitor data segment #2.
+       40      783        */
+       41      784
+       42      785
+       43      786        /* If there are no pages with free blocks, then get a new page and
+       44      787           divide it up into blocks.
+       45      788        */
+       46      789    1      IF JZ_AVAILHD.LNK.NXT_PG$ = ADDR(JZ_AVAILHD) THEN
+
+    789  0 000002   000000 236000 1                  LDQ     0
+         0 000003   000003 116000 xsym               CMPQ    JZ_AVAILHD+3
+         0 000004   000073 601000 0                  TNZ     s:818
+
+       47      790    2      DO;
+
+       48      791    2           CALL MMH$GDS(%MONWSQ,BITBIN(%DS2SID),1024,ERR) ALTRET(CANT_SAVE);
+
+    791  0 000005   200010 630500                    EPPR0   ERR,,AUTO
+         0 000006   200021 450500                    STP0    @LOC$+5,,AUTO
+         0 000007   000003 236000 1                  LDQ     3
+         0 000010   200020 756100                    STQ     @LOC$+4,,AUTO
+         0 000011   000004 237000 1                  LDAQ    4
+         0 000012   200016 757100                    STAQ    @LOC$+2,,AUTO
+         0 000013   200016 630500                    EPPR0   @LOC$+2,,AUTO
+         0 000014   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         0 000015   000000 701000 xent               TSX1    MMH$GDS
+         0 000016   000260 702000 0                  TSX2    CANT_SAVE
+
+       49      792
+       50      793        /* Set up a free page header node in the first block of the page.
+       51      794        */
+       52      795    2           JZ_PAGE$->JZ$INFO = JZ_AVAIL_INIT;
+
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:17   
+    795  0 000017   000000 470400 xsym               LDP0    JZ_PAGE
+         0 000020   000100 100400                    MLR     fill='000'O
+         0 000021   000000 000310 xsym               ADSC9   JZ_AVAIL_INIT            cn=0,n=200
+         0 000022   000000 001040                    ADSC9   0,,PR0                   cn=0,n=544
+
+       53      796    2           JZ_PAGE$->JZ$INFO.BLK_COUNT = 1024/SIZEW(JZ$INFO);
+
+    796  0 000023   000000 470400 xsym               LDP0    JZ_PAGE
+         0 000024   000007 236007                    LDQ     7,DL
+         0 000025   000002 552104                    STBQ    2,'04'O,PR0
+
+       54      797    2           NODE$ = JZ_PAGE$;
+
+    797  0 000026   000000 236000 xsym               LDQ     JZ_PAGE
+         0 000027   200005 756100                    STQ     NODE$,,AUTO
+
+       55      798    2           PREV$ = JZ_AVAILHD.LNK.PREV_PG$;
+
+    798  0 000030   000004 236000 xsym               LDQ     JZ_AVAILHD+4
+         0 000031   200004 756100                    STQ     PREV$,,AUTO
+
+       56      799    2           CALL INSERT_DOUBLE(NODE$,PREV$);
+
+    799  0 000032   200004 631500                    EPPR1   PREV$,,AUTO
+         0 000033   200014 451500                    STP1    @NODE$+1,,AUTO
+         0 000034   200005 633500                    EPPR3   NODE$,,AUTO
+         0 000035   200013 453500                    STP3    ERR+3,,AUTO
+         0 000036   000335 701000 0                  TSX1    INSERT_DOUBLE
+         0 000037   000000 011000                    NOP     0
+
+       57      800
+       58      801        /* Now, link the rest of the free blocks in the page to the header.
+       59      802        */
+       60      803    2           PREV$ = JZ_PAGE$;
+
+    803  0 000040   000000 236000 xsym               LDQ     JZ_PAGE
+         0 000041   200004 756100                    STQ     PREV$,,AUTO
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:18   
+
+       61      804    3           DO I = 1 TO 1024/SIZEW(JZ$INFO) - 1;
+
+    804  0 000042   000001 235007                    LDA     1,DL
+         0 000043   200006 755100                    STA     I,,AUTO
+         0 000044   000065 710000 0                  TRA     s:809+1
+
+       62      805    3                PREV$ = PINCRW(PREV$,SIZEW(JZ$INFO));
+
+    805  0 000045   200004 236100                    LDQ     PREV$,,AUTO
+         0 000046   000210 036003                    ADLQ    136,DU
+         0 000047   200004 756100                    STQ     PREV$,,AUTO
+
+       63      806    3                PREV$->JZ$INFO = JZ_AVAIL_INIT;
+
+    806  0 000050   200004 470500                    LDP0    PREV$,,AUTO
+         0 000051   000100 100400                    MLR     fill='000'O
+         0 000052   000000 000310 xsym               ADSC9   JZ_AVAIL_INIT            cn=0,n=200
+         0 000053   000000 001040                    ADSC9   0,,PR0                   cn=0,n=544
+
+       64      807    3                CALL INSERT_SINGLE(PREV$,NODE$);
+
+    807  0 000054   200005 630500                    EPPR0   NODE$,,AUTO
+         0 000055   200014 450500                    STP0    @NODE$+1,,AUTO
+         0 000056   200004 631500                    EPPR1   PREV$,,AUTO
+         0 000057   200013 451500                    STP1    ERR+3,,AUTO
+         0 000060   000305 701000 0                  TSX1    INSERT_SINGLE
+         0 000061   000000 011000                    NOP     0
+
+       65      808    3                NODE$ = PREV$;
+
+    808  0 000062   200004 236100                    LDQ     PREV$,,AUTO
+         0 000063   200005 756100                    STQ     NODE$,,AUTO
+
+       66      809    3                END;
+
+    809  0 000064   200006 054100                    AOS     I,,AUTO
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:19   
+         0 000065   200006 235100                    LDA     I,,AUTO
+         0 000066   000006 115007                    CMPA    6,DL
+         0 000067   000045 604400 0                  TMOZ    s:805
+
+       67      810
+       68      811        /* JZ_PAGE$ must always point to the highest allocated page plus 1.
+       69      812        */
+       70      813    2           JZ_PAGE$ = PINCRW(JZ_PAGE$,1024);
+
+    813  0 000070   000000 236000 xsym               LDQ     JZ_PAGE
+         0 000071   002000 036003                    ADLQ    1024,DU
+         0 000072   000000 756000 xsym               STQ     JZ_PAGE
+
+       71      814    2           END;
+
+       72      815
+       73      816        /* Okay, now lets allocate a block.
+       74      817        */
+       75      818    1      BLOCK$ = JZ_AVAILHD.LNK.NXT_PG$;
+
+    818  0 000073   000003 236000 xsym               LDQ     JZ_AVAILHD+3
+         0 000074   200003 470500                    LDP0    @BLOCK$,,AUTO
+         0 000075   000000 756100                    STQ     0,,PR0
+
+       76      819    1      BLOCK$->JZ$INFO.BLK_COUNT = BLOCK$->JZ$INFO.BLK_COUNT - 1;
+
+    819  0 000076   000000 471500                    LDP1    0,,PR0
+         0 000077   100002 236100                    LDQ     2,,PR1
+         0 000100   000777 036007                    ADLQ    511,DL
+         0 000101   100002 552104                    STBQ    2,'04'O,PR1
+
+       77      820
+       78      821        /* If the block count goes to zero, we're allocating the page
+       79      822           header node (last free node in page), so call "DELETE_DOUBLE".
+       80      823        */
+       81      824    1      IF BLOCK$->JZ$INFO.BLK_COUNT = 0
+
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:20   
+    824  0 000102   000000 471500                    LDP1    0,,PR0
+         0 000103   100002 236100                    LDQ     2,,PR1
+         0 000104   000777 316007                    CANQ    511,DL
+         0 000105   000113 601000 0                  TNZ     s:826
+
+       82      825    1      THEN CALL DELETE_DOUBLE(BLOCK$);
+
+    825  0 000106   200003 236100                    LDQ     @BLOCK$,,AUTO
+         0 000107   200013 756100                    STQ     ERR+3,,AUTO
+         0 000110   000321 701000 0                  TSX1    DELETE_DOUBLE
+         0 000111   000000 011000                    NOP     0
+         0 000112   000117 710000 0                  TRA     s:827
+
+       83      826    1      ELSE CALL DELETE_SINGLE(BLOCK$);
+
+    826  0 000113   200003 236100                    LDQ     @BLOCK$,,AUTO
+         0 000114   200013 756100                    STQ     ERR+3,,AUTO
+         0 000115   000271 701000 0                  TSX1    DELETE_SINGLE
+         0 000116   000000 011000                    NOP     0
+
+       84      827    1      RETURN;
+
+    827  0 000117   000000 702200 xent               TSX2  ! X66_ARET
+
+       85      828
+       86      829        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:21   
+       87      830
+       88      831        /*F*    NAME:   JZB$FREE
+       89      832                PURPOSE: To return an autosave block to the available list.
+       90      833                        Entire pages of free blocks will be returned to the
+       91      834                        operating system.
+       92      835        */
+       93      836
+       94      837    1   JZB$FREE: ENTRY(BLOCK$) ALTRET;
+
+    837  0 000120   000000 700200 xent  JZB$FREE     TSX0  ! X66_AUTO_1
+         0 000121   000022 000001                    ZERO    18,1
+
+       95      838
+       96      839    1      BLOCK$->JZ$INFO = JZ_AVAIL_INIT;
+
+    839  0 000122   200003 470500                    LDP0    @BLOCK$,,AUTO
+         0 000123   000000 471500                    LDP1    0,,PR0
+         0 000124   000100 100400                    MLR     fill='000'O
+         0 000125   000000 000310 xsym               ADSC9   JZ_AVAIL_INIT            cn=0,n=200
+         0 000126   100000 001040                    ADSC9   0,,PR1                   cn=0,n=544
+
+       97      840    1      LOCATE_FLAG = %TRUE;
+
+    840  0 000127   400000 236003                    LDQ     -131072,DU
+         0 000130   200007 756100                    STQ     LOCATE_FLAG,,AUTO
+
+       98      841    1      NODE$ = JZ_AVAILHD.LNK.NXT_PG$;
+
+    841  0 000131   000003 236000 xsym               LDQ     JZ_AVAILHD+3
+         0 000132   200005 756100                    STQ     NODE$,,AUTO
+
+       99      842
+      100      843        /* Return the block to the sublist for the page its in.  If there
+      101      844           is currently no free page header for the page, then make this
+      102      845           node the header node.
+      103      846        */
+      104      847    2      DO WHILE (LOCATE_FLAG);
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:22   
+
+    847  0 000133   200007 234100                    SZN     LOCATE_FLAG,,AUTO
+         0 000134   000213 605000 0                  TPL     s:867
+
+      105      848    2           IF (NODE$ = ADDR(JZ_AVAILHD)) OR (NODE.PG# > BLOCK.PG#)
+
+    848  0 000135   000000 236000 1                  LDQ     0
+         0 000136   200005 116100                    CMPQ    NODE$,,AUTO
+         0 000137   000150 600000 0                  TZE     s:850
+         0 000140   200005 236100                    LDQ     NODE$,,AUTO
+         0 000141   000034 772000                    QRL     28
+         0 000142   200016 756100                    STQ     @LOC$+2,,AUTO
+         0 000143   200003 470500                    LDP0    @BLOCK$,,AUTO
+         0 000144   000000 236100                    LDQ     0,,PR0
+         0 000145   000034 772000                    QRL     28
+         0 000146   200016 116100                    CMPQ    @LOC$+2,,AUTO
+         0 000147   000167 605000 0                  TPL     s:855
+
+      106      849    3           THEN DO;
+
+      107      850    3                NODE$ = NODE$->JZ$INFO.LNK.PREV_PG$;
+
+    850  0 000150   200005 470500                    LDP0    NODE$,,AUTO
+         0 000151   000004 236100                    LDQ     4,,PR0
+         0 000152   200005 756100                    STQ     NODE$,,AUTO
+
+      108      851    3                BLOCK$->JZ$INFO.BLK_COUNT = 1;
+
+    851  0 000153   200003 470500                    LDP0    @BLOCK$,,AUTO
+         0 000154   000000 471500                    LDP1    0,,PR0
+         0 000155   000001 236007                    LDQ     1,DL
+         0 000156   100002 552104                    STBQ    2,'04'O,PR1
+
+      109      852    3                CALL INSERT_DOUBLE(BLOCK$,NODE$);
+
+    852  0 000157   200005 631500                    EPPR1   NODE$,,AUTO
+         0 000160   200014 451500                    STP1    @NODE$+1,,AUTO
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:23   
+         0 000161   200003 236100                    LDQ     @BLOCK$,,AUTO
+         0 000162   200013 756100                    STQ     ERR+3,,AUTO
+         0 000163   000335 701000 0                  TSX1    INSERT_DOUBLE
+         0 000164   000000 011000                    NOP     0
+
+      110      853    3                LOCATE_FLAG = %FALSE;
+
+    853  0 000165   200007 450100                    STZ     LOCATE_FLAG,,AUTO
+
+      111      854    3                END;
+
+    854  0 000166   000206 710000 0                  TRA     s:861
+
+      112      855    2           ELSE IF NODE.PG# = BLOCK.PG#
+
+    855  0 000167   200005 236100                    LDQ     NODE$,,AUTO
+         0 000170   000000 676100                    ERQ     0,,PR0
+         0 000171   776000 376003                    ANQ     -1024,DU
+         0 000172   000206 601000 0                  TNZ     s:861
+
+      113      856    3                THEN DO;
+
+      114      857    3                     NODE$->JZ$INFO.BLK_COUNT = NODE$->JZ$INFO.BLK_COUNT + 1;
+
+    857  0 000173   200005 471500                    LDP1    NODE$,,AUTO
+         0 000174   100002 236100                    LDQ     2,,PR1
+         0 000175   000001 036007                    ADLQ    1,DL
+         0 000176   100002 552104                    STBQ    2,'04'O,PR1
+
+      115      858    3                     CALL INSERT_SINGLE(BLOCK$,NODE$);
+
+    858  0 000177   200005 631500                    EPPR1   NODE$,,AUTO
+         0 000200   200014 451500                    STP1    @NODE$+1,,AUTO
+         0 000201   200003 236100                    LDQ     @BLOCK$,,AUTO
+         0 000202   200013 756100                    STQ     ERR+3,,AUTO
+         0 000203   000305 701000 0                  TSX1    INSERT_SINGLE
+         0 000204   000000 011000                    NOP     0
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:24   
+
+      116      859    3                     LOCATE_FLAG = %FALSE;
+
+    859  0 000205   200007 450100                    STZ     LOCATE_FLAG,,AUTO
+
+      117      860    3                     END;
+
+      118      861    2           NODE$ = NODE$->JZ$INFO.LNK.NXT_PG$;
+
+    861  0 000206   200005 470500                    LDP0    NODE$,,AUTO
+         0 000207   000003 236100                    LDQ     3,,PR0
+         0 000210   200005 756100                    STQ     NODE$,,AUTO
+
+      119      862    2           END;
+
+    862  0 000211   200007 234100                    SZN     LOCATE_FLAG,,AUTO
+         0 000212   000135 604000 0                  TMI     s:848
+
+      120      863
+      121      864        /* Okay, we've got it back where it belongs. Now, if the high page
+      122      865           is all free nodes, then free it.
+      123      866        */
+      124      867    1      NODE$ = JZ_AVAILHD.LNK.PREV_PG$;
+
+    867  0 000213   000004 236000 xsym               LDQ     JZ_AVAILHD+4
+         0 000214   200005 756100                    STQ     NODE$,,AUTO
+
+      125      868    2      DO WHILE ((NODE$->JZ$INFO.BLK_COUNT = 1024/SIZEW(JZ$INFO)) AND
+
+    868  0 000215   000242 710000 0                  TRA     s:874
+
+      126      869    2        (NODE.PG# + 1 = JZ_PAGE.PG#));
+      127      870    2           CALL DELETE_DOUBLE(NODE$);
+
+    870  0 000216   200005 630500                    EPPR0   NODE$,,AUTO
+         0 000217   200013 450500                    STP0    ERR+3,,AUTO
+         0 000220   000321 701000 0                  TSX1    DELETE_DOUBLE
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:25   
+         0 000221   000000 011000                    NOP     0
+
+      128      871    2           NODE$ = NODE$->JZ$INFO.LNK.PREV_PG$;
+
+    871  0 000222   200005 470500                    LDP0    NODE$,,AUTO
+         0 000223   000004 236100                    LDQ     4,,PR0
+         0 000224   200005 756100                    STQ     NODE$,,AUTO
+
+      129      872    2           CALL MMH$FDS(%MONWSQ,BITBIN(%DS2SID),1024,ERR) ALTRET(SCREECH);
+
+    872  0 000225   200010 630500                    EPPR0   ERR,,AUTO
+         0 000226   200021 450500                    STP0    @LOC$+5,,AUTO
+         0 000227   000003 236000 1                  LDQ     3
+         0 000230   200020 756100                    STQ     @LOC$+4,,AUTO
+         0 000231   000004 237000 1                  LDAQ    4
+         0 000232   200016 757100                    STAQ    @LOC$+2,,AUTO
+         0 000233   200016 630500                    EPPR0   @LOC$+2,,AUTO
+         0 000234   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         0 000235   000000 701000 xent               TSX1    MMH$FDS
+         0 000236   000266 702000 0                  TSX2    SCREECH
+
+      130      873    2           JZ_PAGE$ = PINCRW(JZ_PAGE$,-1024);
+
+    873  0 000237   000000 236000 xsym               LDQ     JZ_PAGE
+         0 000240   776000 036003                    ADLQ    -1024,DU
+         0 000241   000000 756000 xsym               STQ     JZ_PAGE
+
+      131      874    2           END;
+
+    874  0 000242   200005 470500                    LDP0    NODE$,,AUTO
+         0 000243   000002 236100                    LDQ     2,,PR0
+         0 000244   000777 376007                    ANQ     511,DL
+         0 000245   000007 116007                    CMPQ    7,DL
+         0 000246   000257 601000 0                  TNZ     s:875
+         0 000247   000000 236000 xsym               LDQ     JZ_PAGE
+         0 000250   000034 772000                    QRL     28
+         0 000251   200016 756100                    STQ     @LOC$+2,,AUTO
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:26   
+         0 000252   200005 236100                    LDQ     NODE$,,AUTO
+         0 000253   000034 772000                    QRL     28
+         0 000254   000001 036007                    ADLQ    1,DL
+         0 000255   200016 116100                    CMPQ    @LOC$+2,,AUTO
+         0 000256   000216 600000 0                  TZE     s:870
+
+      132      875    1      RETURN;
+
+    875  0 000257   000000 702200 xent               TSX2  ! X66_ARET
+
+      133      876
+      134      877        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:27   
+      135      878    1   CANT_SAVE:;
+
+    878  0 000260                       CANT_SAVE    null
+      136      879        /* If ERR isn't "data seg full" or "no physical page", then
+      137      880           take a snap-shot dump.
+      138      881        */
+      139      882    1      IF (ERR = %E$MONDSFULL) OR (ERR = %E$MONPP) THEN ALTRETURN;
+
+    882  0 000260   200010 235100                    LDA     ERR,,AUTO
+         0 000261   001162 115007                    CMPA    626,DL
+         0 000262   000265 600000 0                  TZE     s:882
+         0 000263   001161 115007                    CMPA    625,DL
+         0 000264   000266 601000 0                  TNZ     SCREECH
+
+    882  0 000265   000000 702200 xent               TSX2  ! X66_AALT
+
+    882  0 000266                       SCREECH      null
+      140      883
+      141      884    1   SCREECH:;
+      142      885    1      CALL SC_ASAVE;
+
+    885  0 000266   000000 713400 xsym               CLIMB   SC_ASAVE
+         0 000267   000000 600000 xsid               climb   nvectors=         0
+
+      143      886    1      ALTRETURN;
+
+    886  0 000270   000000 702200 xent               TSX2  ! X66_AALT
+
+      144      887
+      145      888        /*S*    SCREECH_CODE: JZB-S$ASAVE                                  */
+      146      889        /*S*    TYPE:   SNAP                                               */
+      147      890        /*S*    MESSAGE: Unexpected MM error while in autosave.            */
+      148      891        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:28   
+      149      892
+      150      893        /* Delete the node following the node pointed to by NODE$
+      151      894           from the "BLOCK" chain.
+      152      895           Set NODE$ to point to the deleted node.
+      153      896        */
+      154      897    1   DELETE_SINGLE:PROC(NODE$);
+
+    897  0 000271   200012 741300       DELETE_SING* STX1  ! ERR+2,,AUTO
+
+      155      898
+      156      899    2   DCL NODE$ PTR;
+      157      900    2   DCL B$ PTR;
+      158      901
+      159      902    2      B$ = NODE$->JZ$INFO.NXT_BLK$;
+
+    902  0 000272   200013 470500                    LDP0    @NODE$,,AUTO
+         0 000273   000000 471500                    LDP1    0,,PR0
+         0 000274   100000 236100                    LDQ     0,,PR1
+         0 000275   200014 756100                    STQ     B$,,AUTO
+
+      160      903    2      NODE$->JZ$INFO.NXT_BLK$ = B$->JZ$INFO.NXT_BLK$;
+
+    903  0 000276   200014 473500                    LDP3    B$,,AUTO
+         0 000277   300000 236100                    LDQ     0,,PR3
+         0 000300   100000 756100                    STQ     0,,PR1
+
+      161      904    2      NODE$ = B$;
+
+    904  0 000301   200014 236100                    LDQ     B$,,AUTO
+         0 000302   000000 756100                    STQ     0,,PR0
+
+      162      905    2      RETURN;
+
+    905  0 000303   200012 221300                    LDX1  ! ERR+2,,AUTO
+         0 000304   000001 702211                    TSX2  ! 1,X1
+
+      163      906    2   END DELETE_SINGLE;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:29   
+      164      907        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:30   
+      165      908        /* Insert NODE$ to the right of LOC$ in the "BLOCK" chain.
+      166      909        */
+      167      910    1   INSERT_SINGLE:PROC(NODE$,LOC$);
+
+    910  0 000305   200012 741300       INSERT_SING* STX1  ! ERR+2,,AUTO
+
+      168      911
+      169      912    2   DCL NODE$ PTR;
+      170      913    2   DCL LOC$ PTR;
+      171      914
+      172      915    2      NODE$->JZ$INFO.NXT_BLK$ = LOC$->JZ$INFO.NXT_BLK$;
+
+    915  0 000306   200013 470500                    LDP0    @NODE$,,AUTO
+         0 000307   000000 471500                    LDP1    0,,PR0
+         0 000310   200014 473500                    LDP3    @LOC$,,AUTO
+         0 000311   300000 474500                    LDP4    0,,PR3
+         0 000312   400000 236100                    LDQ     0,,PR4
+         0 000313   100000 756100                    STQ     0,,PR1
+
+      173      916    2      LOC$->JZ$INFO.NXT_BLK$ = NODE$;
+
+    916  0 000314   300000 471500                    LDP1    0,,PR3
+         0 000315   000000 236100                    LDQ     0,,PR0
+         0 000316   100000 756100                    STQ     0,,PR1
+
+      174      917    2      RETURN;
+
+    917  0 000317   200012 221300                    LDX1  ! ERR+2,,AUTO
+         0 000320   000001 702211                    TSX2  ! 1,X1
+
+      175      918    2   END INSERT_SINGLE;
+      176      919        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:31   
+      177      920        /* Delete the node pointed to by NODE$ from the "PAGE" chain.
+      178      921        */
+      179      922
+      180      923    1   DELETE_DOUBLE:PROC(NODE$);
+
+    923  0 000321   200012 741300       DELETE_DOUB* STX1  ! ERR+2,,AUTO
+
+      181      924    2   DCL NODE$ PTR;
+      182      925
+      183      926    2      NODE$->JZ$INFO.LNK.PREV_PG$->JZ$INFO.LNK.NXT_PG$ =
+
+    926  0 000322   200013 470500                    LDP0    @NODE$,,AUTO
+         0 000323   000000 471500                    LDP1    0,,PR0
+         0 000324   100004 473500                    LDP3    4,,PR1
+         0 000325   100003 236100                    LDQ     3,,PR1
+         0 000326   300003 756100                    STQ     3,,PR3
+
+      184      927    2        NODE$->JZ$INFO.LNK.NXT_PG$;
+      185      928    2      NODE$->JZ$INFO.LNK.NXT_PG$->JZ$INFO.LNK.PREV_PG$ =
+
+    928  0 000327   000000 471500                    LDP1    0,,PR0
+         0 000330   100003 473500                    LDP3    3,,PR1
+         0 000331   100004 236100                    LDQ     4,,PR1
+         0 000332   300004 756100                    STQ     4,,PR3
+
+      186      929    2        NODE$->JZ$INFO.LNK.PREV_PG$;
+      187      930    2      RETURN;
+
+    930  0 000333   200012 221300                    LDX1  ! ERR+2,,AUTO
+         0 000334   000001 702211                    TSX2  ! 1,X1
+
+      188      931    2   END DELETE_DOUBLE;
+      189      932        %EJECT;
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:32   
+      190      933        /* Insert NODE$ to the right of LOC$ in the "PAGE" chain.
+      191      934        */
+      192      935
+      193      936    1   INSERT_DOUBLE:PROC(NODE$,LOC$);
+
+    936  0 000335   200012 741300       INSERT_DOUB* STX1  ! ERR+2,,AUTO
+
+      194      937
+      195      938    2   DCL NODE$ PTR;
+      196      939    2   DCL LOC$ PTR;
+      197      940
+      198      941    2      NODE$->JZ$INFO.LNK.PREV_PG$ = LOC$;
+
+    941  0 000336   200013 470500                    LDP0    @NODE$,,AUTO
+         0 000337   000000 471500                    LDP1    0,,PR0
+         0 000340   200014 473500                    LDP3    @LOC$,,AUTO
+         0 000341   300000 236100                    LDQ     0,,PR3
+         0 000342   100004 756100                    STQ     4,,PR1
+
+      199      942    2      NODE$->JZ$INFO.LNK.NXT_PG$ = LOC$->JZ$INFO.LNK.NXT_PG$;
+
+    942  0 000343   000000 471500                    LDP1    0,,PR0
+         0 000344   300000 474500                    LDP4    0,,PR3
+         0 000345   400003 236100                    LDQ     3,,PR4
+         0 000346   100003 756100                    STQ     3,,PR1
+
+      200      943    2      LOC$->JZ$INFO.LNK.NXT_PG$->JZ$INFO.LNK.PREV_PG$ = NODE$;
+
+    943  0 000347   300000 471500                    LDP1    0,,PR3
+         0 000350   100003 474500                    LDP4    3,,PR1
+         0 000351   000000 236100                    LDQ     0,,PR0
+         0 000352   400004 756100                    STQ     4,,PR4
+
+      201      944    2      LOC$->JZ$INFO.LNK.NXT_PG$ = NODE$;
+
+    944  0 000353   300000 471500                    LDP1    0,,PR3
+         0 000354   000000 236100                    LDQ     0,,PR0
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:33   
+         0 000355   100003 756100                    STQ     3,,PR1
+
+      202      945    2      RETURN;
+
+    945  0 000356   200012 221300                    LDX1  ! ERR+2,,AUTO
+         0 000357   000001 702211                    TSX2  ! 1,X1
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 006000   000000 006005   000000 002000   000002 006000    ................
+   1     004   000003 006000   000001 006000                                    ........
+      203      946    2   END INSERT_DOUBLE;
+      204      947
+      205      948
+      206      949    1   END JZB$GET;
+
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:34   
+--  Include file information  --
+
+   M_ERRORS_C.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   B_SEGIDS_C.:E05TOU  is referenced.
+   JZ_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure JZB$GET.
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:35   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @BLOCK$                   14-0-0/w PTR         r     1 @LOC$
+    14-0-0/w PTR         r     1 @LOC$                     13-0-0/w PTR         r     1 @NODE$
+    13-0-0/w PTR         r     1 @NODE$                    13-0-0/w PTR         r     1 @NODE$
+    13-0-0/w PTR         r     1 @NODE$                    14-0-0/w PTR         r     1 B$
+    *0-0-0/w STRC        r     1 BLOCK                     *0-0-0/w PTR         r     1 BLOCK$
+    10-0-0/w UBIN        r     1 ERR                        6-0-0/w SBIN        r     1 I
+    *0-0-0/w PTR         r     1 LOC$                      *0-0-0/w PTR         r     1 LOC$
+     7-0-0/b BIT         r     1 LOCATE_FLAG                5-0-0/w STRC        r     1 NODE
+     5-0-0/w PTR         r     1 NODE$                     *0-0-0/w PTR         r     1 NODE$
+    *0-0-0/w PTR         r     1 NODE$                     *0-0-0/w PTR         r     1 NODE$
+    *0-0-0/w PTR         r     1 NODE$                      4-0-0/w PTR         r     1 PREV$
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(180)   r     1 JZ_AVAILHD                 0-0-0/w STRC(1800)  r     1 JZ_AVAIL_INIT
+     0-0-0/b STRC        r     1 JZ_PAGE                    0-0-0/w PTR         r     1 JZ_PAGE$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(4896)  r     1 JZ$INFO
+
+
+   Procedure JZB$GET requires 240 words for executable code.
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:36   
+   Procedure JZB$GET requires 18 words of local(AUTO) storage.
+
+    No errors detected in file JZB$MM.:E05TSI    .
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:37   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:38   
+          MINI XREF LISTING
+
+B$ IN PROCEDURE DELETE_SINGLE
+       900**DCL       902<<ASSIGN    903>>ASSIGN    904>>ASSIGN
+BLOCK.PG#
+       760**DCL       848>>IF        855>>IF
+BLOCK$
+       758**DCL         8--PROC      759--REDEF     818<<ASSIGN    819>>ASSIGN    819>>ASSIGN    824>>IF
+       825<>CALL      826<>CALL      837--ENTRY     839>>ASSIGN    851>>ASSIGN    852<>CALL      858<>CALL
+CANT_SAVE
+       878**LABEL     791--CALLALT
+DELETE_DOUBLE
+       923**PROC      825--CALL      870--CALL
+DELETE_SINGLE
+       897**PROC      826--CALL
+ERR
+       771**DCL       791<>CALL      872<>CALL      882>>IF        882>>IF
+I
+       769**DCL       804<<DOINDEX
+INSERT_DOUBLE
+       936**PROC      799--CALL      852--CALL
+INSERT_SINGLE
+       910**PROC      807--CALL      858--CALL
+JZ$INFO
+       560**DCL       795<<ASSIGN    796--ASSIGN    804--DOINDEX   805--ASSIGN    806<<ASSIGN    839<<ASSIGN
+       868--DOWHILE
+JZ$INFO.ACCT
+       562**DCL       562--REDEF
+JZ$INFO.BLK_COUNT
+       561**DCL       561--REDEF     796<<ASSIGN    819<<ASSIGN    819>>ASSIGN    824>>IF        851<<ASSIGN
+       857<<ASSIGN    857>>ASSIGN    868>>DOWHILE
+JZ$INFO.LNK.NXT_PG$
+       562**DCL       861>>ASSIGN    926<<ASSIGN    926>>ASSIGN    928>>ASSIGN    942<<ASSIGN    942>>ASSIGN
+       943>>ASSIGN    944<<ASSIGN
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:39   
+JZ$INFO.LNK.PREV_PG$
+       562**DCL       850>>ASSIGN    871>>ASSIGN    926>>ASSIGN    928<<ASSIGN    928>>ASSIGN    941<<ASSIGN
+       943<<ASSIGN
+JZ$INFO.NXT_BLK$
+       560**DCL       902>>ASSIGN    903<<ASSIGN    903>>ASSIGN    915<<ASSIGN    915>>ASSIGN    916<<ASSIGN
+JZ_AVAILHD
+       557**DCL       789--IF        848--IF
+JZ_AVAILHD.LNK.NXT_PG$
+       558**DCL       789>>IF        818>>ASSIGN    841>>ASSIGN
+JZ_AVAILHD.LNK.PREV_PG$
+       558**DCL       798>>ASSIGN    867>>ASSIGN
+JZ_AVAIL_INIT
+       559**DCL       795>>ASSIGN    806>>ASSIGN    839>>ASSIGN
+JZ_PAGE
+       557**DCL       557--REDEF
+JZ_PAGE.PG#
+       557**DCL       868>>DOWHILE
+JZ_PAGE$
+       557**DCL       795>>ASSIGN    796>>ASSIGN    797>>ASSIGN    803>>ASSIGN    813<<ASSIGN    813>>ASSIGN
+       873<<ASSIGN    873>>ASSIGN
+LOC$ IN PROCEDURE INSERT_DOUBLE
+       939**DCL       936--PROC      941>>ASSIGN    942>>ASSIGN    943>>ASSIGN    944>>ASSIGN
+LOC$ IN PROCEDURE INSERT_SINGLE
+       913**DCL       910--PROC      915>>ASSIGN    916>>ASSIGN
+LOCATE_FLAG
+       770**DCL       840<<ASSIGN    847>>DOWHILE   853<<ASSIGN    859<<ASSIGN
+MMH$FDS
+       775**DCL-ENT   872--CALL
+MMH$GDS
+       774**DCL-ENT   791--CALL
+NODE.PG#
+       766**DCL       848>>IF        855>>IF        868>>DOWHILE
+NODE$
+       764**DCL       765--REDEF     797<<ASSIGN    799<>CALL      807<>CALL      808<<ASSIGN    841<<ASSIGN
+       848>>IF        850<<ASSIGN    850>>ASSIGN    852<>CALL      857>>ASSIGN    857>>ASSIGN    858<>CALL
+       861<<ASSIGN    861>>ASSIGN    867<<ASSIGN    868>>DOWHILE   870<>CALL      871<<ASSIGN    871>>ASSIGN
+PL6.E3A0      #001=JZB$GET File=JZB$MM.:E05TSI                                   TUE 07/29/97 23:52 Page:40   
+NODE$ IN PROCEDURE DELETE_DOUBLE
+       924**DCL       923--PROC      926>>ASSIGN    926>>ASSIGN    928>>ASSIGN    928>>ASSIGN
+NODE$ IN PROCEDURE DELETE_SINGLE
+       899**DCL       897--PROC      902>>ASSIGN    903>>ASSIGN    904<<ASSIGN
+NODE$ IN PROCEDURE INSERT_DOUBLE
+       938**DCL       936--PROC      941>>ASSIGN    942>>ASSIGN    943>>ASSIGN    944>>ASSIGN
+NODE$ IN PROCEDURE INSERT_SINGLE
+       912**DCL       910--PROC      915>>ASSIGN    916>>ASSIGN
+PREV$
+       763**DCL       798<<ASSIGN    799<>CALL      803<<ASSIGN    805<<ASSIGN    805>>ASSIGN    806>>ASSIGN
+       807<>CALL      808>>ASSIGN
+SCREECH
+       882**LABEL     872--CALLALT
+SC_ASAVE
+       776**DCL-ENT   885--CALL

@@ -1,0 +1,1623 @@
+VERSION E05
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:1    
+        1        1        /*M* KYI$IO - The routines that understands I/O instructions */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+        8        8               ECI=0,DIN=7,CSU=3,AND      */
+        9        9        /*
+       10       10
+       11       11          E X T E R N A L    I N T E R F A C E    D E S C R I P T I O N
+       12       12
+       13       13        This routines is invoked whenever it is decided that it is time
+       14       14        to attempt the issueing of an I/O instruction.  It understands
+       15       15        several different types of 'Generic' commands:
+       16       16            KY#INIT       - Tell the device its working interrupt level
+       17       17            KY#STOP       - Immedaitly stop any I/O in progress
+       18       18            KY#GET_STAT   - Get the hardware device status word
+       19       19            KY#DISCONNECT - Set the device interrupt level to zero
+       20       20            KY#IO         - Look in the Output Queue for the command
+       21       21                             ( Command may be elsewhere in the CR case )
+       22       22
+       23       23        It's only input comes from the 1 parameter that gives the overall
+       24       24        command, and if appropriate the structure in the queue located at
+       25       25        KY$CTX.Q.OUTPUT$.  The only output that is of interrest to the
+       26       26        calling routines is that of KY$CTX.LAST_IOSTAT, and KY$CTX.STATUSW.
+       27       27        Where Laststat is a simple ACK / NACK indication as to whether or
+       28       28        not the hardware wass willing to accept the given command.  And the
+       29       29        Statusw field is only meaningful in the event of a Get_Stat call.
+       30       30
+       31       31        */
+       32       32        %EJECT;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:2    
+       33       33        /*
+       34       34                  I N T E R N A L   O V E R V I E W
+       35       35
+       36       36        First, the basic job of this routine is to do the settup of the bit
+       37       37        patterns, and addresses that make up a device specific I/O command.
+       38       38        It is not actually responsible for issueing the command.  That will
+       39       39        be done by a routine that is written in SIL.  So even though it is
+       40       40        slow, this routine will call another PL6 routine that knows how to
+       41       41        do SIL-settup.  Then the SIL routine will do it's best to actually
+       42       42        issue the I/O command.
+       43       43
+       44       44        For documentation concerning the working of specific I/O instructions
+       45       45        see an appropriate hardware manual.
+       46       46
+       47       47        Now, to make it look like there is a lot of documentation for this
+       48       48        code;  Here is a quick description of what the following code looks
+       49       49        like.
+       50       50
+       51       51
+       52       52          DO CASE ON THE INPUT COMMAND
+       53       53          CASE KY#INIT
+       54       54           Immediatly issue an Output Interrupt Control with the indicated
+       55       55              interrupt level.
+       56       56
+       57       57          CASE KY#GET_STAT
+       58       58           As one might expect this routine issues a get-status I/O command
+       59       59              and either returns the status, or if Nack'd a return-status
+       60       60              that indicates failure.
+       61       61
+       62       62          CASE KY#DISCONNECT
+       63       63           In this case, what is really desired is to inhibit interrupts
+       64       64              from the device, so's the appropriate action would be an
+       65       65              Output Interrupt Control instruction with an interrupt level
+       66       66              of zero.  It is assumed that the I/O has been 'Stopped.'
+       67       67
+       68       68          CASE KY#STOP
+       69       69           Immediatly issue an Output Control Word with the stop I/O bit
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:3    
+       70       70              set.  This command can not be NACK'd.
+       71       71
+       72       72          CASE KY#IO
+       73       73            DO CASE ON THE DEVICE_TYPE
+       74       74            CASE KY#TYP_LP
+       75       75             O.K. First, check to see if the Top Of Form bit is set, and if
+       76       76                it is then determine if the record size is greater than 0
+       77       77                and act accordingly.  If the Top Of Form is not set then the
+       78       78                command must be a Space-N, and again actions must be take to
+       79       79                determine if there is any printing to be done.
+       80       80
+       81       81            CASE KY#TYP_CP
+       82       82             All that this code will do is the Punch type of I/O, After it
+       83       83                has place the Punch in the correct Bin/Ascii mode.
+       84       84
+       85       85            CASE KY#TYP_CR
+       86       86             I have not yet done enough thinking about this to be sure what
+       87       87                the code will look like.  But I do expect that there are
+       88       88                A) some differences between types of Readers, and that (B)
+       89       89                the I/O command itself will not come down in the form of a
+       90       90                queue'd entry.
+       91       91
+       92       92            END CASE
+       93       93          END CASE
+       94       94
+       95       95        */
+       96       96        %EJECT;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:4    
+       97       97        /*P*  NAME: KYI$IO      Handle the output device I/O scheduleing */
+       98       98        KYI$IO: PROC(KY$CTX,COMMAND) ALTRET;
+       99       99        /**/
+      100      100        %INCLUDE GH_HARDWARE_M;
+      101      198        %INCLUDE LCP_6;
+      102     4477        %INCLUDE KL_AFCN_C;
+      103     4578        %INCLUDE KL_MACRO_C;
+      104     7930        %INCLUDE K_ID_E;
+      105     7980        %K#ENTID_E;
+      106     7999        %K#LYRID_E;
+      107     8006        %INCLUDE KV_GLBCNS_E;                   /* VDI equates */
+      108     8347        %INCLUDE KV_PRMID_E;
+      109     8521        %INCLUDE KV$GLB;
+      110     8940        %INCLUDE KV$GLBCTX;
+      111     9385        %INCLUDE KV$PRM;
+      112     9598        %INCLUDE KY_URP_M;
+      113     9893        %INCLUDE KY_SUBS_C;
+      114     9982        %INCLUDE KH$STT;
+      115    10012        %INCLUDE KV_GLB_M;
+      116    10134        %INCLUDE KY_DATA_R;
+      117    10929        %INCLUDE KH$CHN;
+      118    11051        /**/
+      119    11052    1          DCL KHI$IO_OTP ENTRY(2) ALTRET;
+      120    11053    1          DCL KHI$IO_INP ENTRY(2) ALTRET;
+      121    11054    1          DCL KHI$IOLD ENTRY(2) ALTRET;
+      122    11055        /**/
+      123    11056        %KY$REC;
+      124    11095        %GH_IOLD;
+      125    11110        %GH_IO;
+      126    11126        %KY$CTX;
+      127    11303        %KH$CHN(STCLASS="BASED(CHN$)");
+      128    11427        %KV$VDI;
+      129    11498        /**/
+      130    11499        %KV_PRMID_E;
+      131    11655        /**/
+      132    11656    1          DCL COMMAND UBIN WORD;
+      133    11657    1          DCL CHN$ PTR;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:5    
+      134    11658    1          DCL DAS BIT(16);
+      135    11659    1          DCL 1 TASK REDEF DAS,
+      136    11660    1                 2 FNC UBIN(8) UNAL,
+      137    11661    1                 2 PRINT BIT(1) UNAL,
+      138    11662    1                 2 * BIT(2) UNAL,
+      139    11663    1                 2 VFU BIT(1) UNAL,
+      140    11664    1                 2 N UBIN(4) UNAL;
+      141    11665    1          DCL 1 CONFIG REDEF DAS,
+      142    11666    1                 2 NCM BIT(1) UNAL,
+      143    11667    1                 2 NORMAL BIT(1) UNAL,
+      144    11668    1                 2 * BIT(2) UNAL,
+      145    11669    1                 2 LPI BIT(1) UNAL,
+      146    11670    1                 2 * BIT(11) UNAL;
+      147    11671    1          DCL 1 CR_MODE REDEF DAS,
+      148    11672    1                 2 * BIT(1) UNAL,
+      149    11673    1                 2 EJECT BIT(1) UNAL,
+      150    11674    1                 2 * BIT(3) UNAL,
+      151    11675    1                 2 BIN BIT(1) UNAL,
+      152    11676    1                 2 * BIT(10) UNAL;
+      153    11677        %EJECT;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:6    
+      154    11678    1          GH_IO.CAS.XCHN.OUTPUT = '1'B;
+      155    11679    1          GH_IOLD.XCHN.OUTPUT = '1'B;
+      156    11680    1          CHN$ = KY$CTX.VDI$->KV$VDI.CHN$;
+      157    11681    2          DO CASE( COMMAND );
+      158    11682    2             CASE ( %KY#INIT );
+      159    11683    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_DEV_ID);
+      160    11684    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+      161    11685    2                KY$CTX.DVC_ID = GH_IO.RANGE;
+      162    11686    2                GH_IO.CAS.FNC = %BITBIN(%KY#O_INT_CONT);
+      163    11687    2                GH_IO.DAS.LCTDAT = 0;
+      164    11688    2                GH_IO.DAS.LCTADR = KY_INT_LEV + 1;
+      165    11689    2                CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+      166    11690    2                GH_IO.DAS.LCTADR = 0;
+      167    11691    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_STATUS);
+      168    11692    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+      169    11693    2                KY$CTX.STATUSW = GH_IO.RANGE;
+      170    11694    2                KY$CTX.DEFRD.STATUSW = KY$CTX.STATUSW;
+      171    11695    2                IF KY$CTX.DVCTYP = %KY#TYP_LP THEN
+      172    11696    3                   DO;
+      173    11697    3                      TASK = '0'B;
+      174    11698    3                      TASK.N = 0;
+      175    11699    3                      TASK.VFU = '0'B;
+      176    11700    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_TASK);
+      177    11701    3                      GH_IO.DAS = DAS;
+      178    11702    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+      179    11703    3                      GH_IOLD.FNC = %BITBIN(%KY#O_IOLD);
+      180    11704    3                      GH_IOLD.BUF$ = ADDR(NIL);
+      181    11705
+      182    11706    3                      GH_IOLD.BUFSIZE = 0;
+      183    11707    3                      CALL KHI$IOLD(KH$CHN,GH_IOLD) ALTRET(NAKED);
+      184    11708    3                   END;                    /* if ky$ctx = lp  */
+      185    11709    2             CASE ( %KY#GET_STAT );
+      186    11710    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_STATUS);
+      187    11711    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+      188    11712    2                KY$CTX.STATUSW = GH_IO.RANGE;
+      189    11713    2             CASE( %KY#GET_STATW2);
+      190    11714    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_STATUS_W2);
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:7    
+      191    11715    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+      192    11716    2                KY$CTX.STATUSW = GH_IO.RANGE;
+      193    11717    2             CASE (%KY#SET_LPI);
+      194    11718    2                IF KY$CTX.DVC_ID = %BITBIN('20C4'X) THEN
+      195    11719    3                   DO;
+      196    11720    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_CONF);
+      197    11721    3                      CONFIG = '0'B;
+      198    11722    3                      IF KY$CTX.LPI = '1'B THEN /* 1 = 8 lines per inch */
+      199    11723    3                         CONFIG.LPI = '1'B;
+      200    11724    3                      ELSE
+      201    11725    3                         CONFIG.LPI = '0'B;
+      202    11726    3                      GH_IO.DAS = CONFIG;
+      203    11727    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+      204    11728    3                   END;
+      205    11729    2             CASE(%KY#GET_RANGE);
+      206    11730    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_RANGE);
+      207    11731    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+      208    11732    2                KY_LAST_RANGE = GH_IO.RANGE;
+      209    11733    2             CASE(%KY#DISCONNECT);
+      210    11734    2                GH_IO.CAS.FNC = %BITBIN(%KY#O_INT_CONT);
+      211    11735    2                GH_IO.DAS.LCTDAT = 0;
+      212    11736    2                GH_IO.DAS.LCTADR = 0;
+      213    11737    2                CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+      214    11738    2             CASE(%KY#STOP);
+      215    11739    2                GH_IO.CAS.FNC = %BITBIN(%KY#O_CONTROL);
+      216    11740    2                GH_IO.DAS.LCTDAT = %BITBIN('40'X);
+      217    11741    2                GH_IO.DAS.LCTADR = 0;
+      218    11742    2                CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+      219    11743    2             CASE(%KY#IO);
+      220    11744    3                DO CASE(KY$CTX.DVCTYP);
+      221    11745    3                   CASE(%KY#TYP_LP);
+      222    11746    3                      IF (KY$CTX.Q.OUTPUT$->KY$REC.TYPE = %KY#TYPE_VFU) AND
+      223    11747    3                         ((KY$CTX.DVC_ID = %BITBIN('2001'X)) OR
+      224    11748    3                         (KY$CTX.DVC_ID = %BITBIN('2003'X))) THEN
+      225    11749    3                         GOTO ACK;
+      226    11750    3                      TASK = '0'B;
+      227    11751    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_TASK);
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:8    
+      228    11752    3                      IF KY$CTX.Q.OUTPUT$ -> KY$REC.TOF THEN
+      229    11753    4                         DO;
+      230    11754    4                            TASK.N = 0;
+      231    11755    4                            TASK.VFU = '1'B;
+      232    11756        /*
+      233    11757           If the line printer has a VFU ( determined from the device id )
+      234    11758           then change the top-of-form command into a skip-to-channel-one.
+      235    11759        */
+      236    11760    4                            IF ( KY$CTX.DVC_ID = %BITBIN('2001'X) ) OR
+      237    11761    4                               ( KY$CTX.DVC_ID = %BITBIN('2003'X) ) THEN
+      238    11762    4                               TASK.N = 1;
+      239    11763    4                            IF ( KY$CTX.DVC_ID = %BITBIN('2031'X) ) OR
+      240    11764    4                               ( KY$CTX.DVC_ID = %BITBIN('20C4'X) ) THEN
+      241    11765    4                               TASK.N = 0;
+      242    11766    4                         END;              /* IF KY$REC.TOF */
+      243    11767    3                      ELSE
+      244    11768    4                         DO;
+      245    11769    4                            TASK.N = KY$CTX.Q.OUTPUT$ -> KY$REC.SPACE_N;
+      246    11770    4                            TASK.VFU = '0'B;
+      247    11771    4                         END; /* ELSE
+      248    11772                                   */
+      249    11773    3                      IF ( KY$CTX.Q.OUTPUT$ -> KY$REC.RECSIZE > 0 ) AND
+      250    11774    3                         ( KY$CTX.Q.OUTPUT$ -> KY$REC.TYPE ~= %KY#TYPE_VFU) THEN
+      251    11775    3                         TASK.PRINT = '1'B;
+      252    11776    3                      ELSE
+      253    11777    3                         TASK.PRINT = '0'B;
+      254    11778    3                      IF KY$CTX.Q.OUTPUT$->KY$REC.TYPE = %KY#TYPE_VFU THEN
+      255    11779    4                         DO;
+      256    11780    4                            TASK.FNC = %BITBIN(%KY#O_LDVFU);
+      257    11781    4                            TASK.VFU = '1'B;
+      258    11782    4                            TASK.N = 0;
+      259    11783    4                         END;
+      260    11784    4                      ELSE DO;
+      261    11785    5                            IF TASK.VFU AND TASK.N = 0 THEN DO; /* evfu */
+      262    11786    5                                  TASK.N = 11; /* slew to channel 11 (eof) */
+      263    11787    5                                  GH_IO.DAS = DAS;
+      264    11788    5                                  CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET (NAKED);
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:9    
+      265    11789    5                                  TASK.N = 0; /* bof channel */
+      266    11790    5                               END;
+      267    11791    4                         END;              /* else type = vfu */
+      268    11792    3                      GH_IO.DAS = DAS;
+      269    11793    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+      270    11794    3                      GH_IOLD.FNC = %BITBIN(%KY#O_IOLD);
+      271    11795    3                      IF ( KY$CTX.Q.OUTPUT$ -> KY$REC.RECSIZE > 0 ) THEN
+      272    11796    4                         DO;
+      273    11797    4                            GH_IOLD.BUF$ = ADDR(KY$CTX.Q.OUTPUT$->KY$REC.TXT);
+      274    11798    4                            GH_IOLD.BUFSIZE = KY$CTX.Q.OUTPUT$ -> KY$REC.RECSIZE;
+      275    11799    4                         END;              /* IF RECSIZE > 0 */
+      276    11800    3                      ELSE
+      277    11801    4                         DO;
+      278    11802    4                            GH_IOLD.BUF$ = ADDR(NIL);
+      279    11803    4                            GH_IOLD.BUFSIZE = 0;
+      280    11804    4                         END; /* ELSE
+      281    11805                                   */
+      282    11806    3                      CALL KHI$IOLD(KH$CHN,GH_IOLD) ALTRET(NAKED);
+      283    11807    3                   CASE(%KY#TYP_CP);
+      284    11808    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_TASK);
+      285    11809    3                      CR_MODE = '0'B;
+      286    11810    3                      CR_MODE.EJECT = '1'B;
+      287    11811    3                      CR_MODE.BIN = KY$CTX.Q.OUTPUT$ -> KY$REC.BIN;
+      288    11812    3                      GH_IO.DAS = DAS;
+      289    11813    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+      290    11814    3                      GH_IOLD.BUF$ = ADDR(KY$CTX.Q.OUTPUT$->KY$REC.TXT);
+      291    11815    3                      GH_IOLD.FNC = %BITBIN(%KY#O_IOLD);
+      292    11816    3                      GH_IOLD.BUFSIZE = KY$CTX.Q.OUTPUT$ -> KY$REC.RECSIZE;
+      293    11817    3                      CALL KHI$IOLD(KH$CHN,GH_IOLD) ALTRET(NAKED);
+      294    11818    3                   CASE(%KY#TYP_CR);
+      295    11819    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_TASK);
+      296    11820    3                      CR_MODE = '0'B;
+      297    11821    3                      CR_MODE.BIN = KY$CTX.MODE.BIN_CURR;
+      298    11822    3                      GH_IO.DAS = DAS;
+      299    11823    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+      300    11824    3                      GH_IOLD.XCHN.OUTPUT = '0'B;
+      301    11825    3                      GH_IOLD.BUF$ = KY$CTX.INPUT.BUF$;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:10   
+      302    11826    3                      GH_IOLD.FNC = %BITBIN(%KY#O_IOLD);
+      303    11827    3                      GH_IOLD.BUFSIZE = KY$CTX.INPUT.BUF_SIZE;
+      304    11828    3                      CALL KHI$IOLD(KH$CHN,GH_IOLD) ALTRET(NAKED);
+      305    11829    3                END;                       /* CASE ON DEVICE TYPE */
+      306    11830    2          END;                             /* CASE ON COMMAND */
+      307    11831    1   ACK:   ;
+      308    11832    1          RETURN;
+      309    11833    1   NAKED: ;
+      310    11834    1          ALTRETURN;
+      311    11835    1   END KYI$IO;
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:11   
+--  Include file information  --
+
+   KH$CHN.:E05TOU  is referenced.
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYI$IO.
+
+   Procedure KYI$IO requires 793 words for executable code.
+   Procedure KYI$IO requires 16 words of local(AUTO) storage.
+
+    No errors detected in file KYI$IO.:E05TSI    .
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:12   
+
+ Object Unit name= KYI$IO                                     File name= KYI$IO.:E05TOU
+ UTS= JUL 30 '97 02:42:11.24 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Data  even  none     7      7  KYI$IO
+    1   Proc  even  none   793    319  KYI$IO
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes    yes     yes      Std        2  KYI$IO
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       2 KHI$IO_INP
+ yes     yes           Std       2 KHI$IO_OTP
+ yes     yes           Std       2 KHI$IOLD
+                       nStd      0 X6A_AUTO_2
+                       nStd      0 X6A_ARET
+                       nStd      0 X6A_AALT
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KY_LAST_RANGE                         KY_INT_LEV                       r    G$ROS$
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:13   
+
+
+        1        1        /*M* KYI$IO - The routines that understands I/O instructions */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+        8        8               ECI=0,DIN=7,CSU=3,AND      */
+        9        9        /*
+       10       10
+       11       11          E X T E R N A L    I N T E R F A C E    D E S C R I P T I O N
+       12       12
+       13       13        This routines is invoked whenever it is decided that it is time
+       14       14        to attempt the issueing of an I/O instruction.  It understands
+       15       15        several different types of 'Generic' commands:
+       16       16            KY#INIT       - Tell the device its working interrupt level
+       17       17            KY#STOP       - Immedaitly stop any I/O in progress
+       18       18            KY#GET_STAT   - Get the hardware device status word
+       19       19            KY#DISCONNECT - Set the device interrupt level to zero
+       20       20            KY#IO         - Look in the Output Queue for the command
+       21       21                             ( Command may be elsewhere in the CR case )
+       22       22
+       23       23        It's only input comes from the 1 parameter that gives the overall
+       24       24        command, and if appropriate the structure in the queue located at
+       25       25        KY$CTX.Q.OUTPUT$.  The only output that is of interrest to the
+       26       26        calling routines is that of KY$CTX.LAST_IOSTAT, and KY$CTX.STATUSW.
+       27       27        Where Laststat is a simple ACK / NACK indication as to whether or
+       28       28        not the hardware wass willing to accept the given command.  And the
+       29       29        Statusw field is only meaningful in the event of a Get_Stat call.
+       30       30
+       31       31        */
+       32       32        %EJECT;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:14   
+       33       33        /*
+       34       34                  I N T E R N A L   O V E R V I E W
+       35       35
+       36       36        First, the basic job of this routine is to do the settup of the bit
+       37       37        patterns, and addresses that make up a device specific I/O command.
+       38       38        It is not actually responsible for issueing the command.  That will
+       39       39        be done by a routine that is written in SIL.  So even though it is
+       40       40        slow, this routine will call another PL6 routine that knows how to
+       41       41        do SIL-settup.  Then the SIL routine will do it's best to actually
+       42       42        issue the I/O command.
+       43       43
+       44       44        For documentation concerning the working of specific I/O instructions
+       45       45        see an appropriate hardware manual.
+       46       46
+       47       47        Now, to make it look like there is a lot of documentation for this
+       48       48        code;  Here is a quick description of what the following code looks
+       49       49        like.
+       50       50
+       51       51
+       52       52          DO CASE ON THE INPUT COMMAND
+       53       53          CASE KY#INIT
+       54       54           Immediatly issue an Output Interrupt Control with the indicated
+       55       55              interrupt level.
+       56       56
+       57       57          CASE KY#GET_STAT
+       58       58           As one might expect this routine issues a get-status I/O command
+       59       59              and either returns the status, or if Nack'd a return-status
+       60       60              that indicates failure.
+       61       61
+       62       62          CASE KY#DISCONNECT
+       63       63           In this case, what is really desired is to inhibit interrupts
+       64       64              from the device, so's the appropriate action would be an
+       65       65              Output Interrupt Control instruction with an interrupt level
+       66       66              of zero.  It is assumed that the I/O has been 'Stopped.'
+       67       67
+       68       68          CASE KY#STOP
+       69       69           Immediatly issue an Output Control Word with the stop I/O bit
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:15   
+       70       70              set.  This command can not be NACK'd.
+       71       71
+       72       72          CASE KY#IO
+       73       73            DO CASE ON THE DEVICE_TYPE
+       74       74            CASE KY#TYP_LP
+       75       75             O.K. First, check to see if the Top Of Form bit is set, and if
+       76       76                it is then determine if the record size is greater than 0
+       77       77                and act accordingly.  If the Top Of Form is not set then the
+       78       78                command must be a Space-N, and again actions must be take to
+       79       79                determine if there is any printing to be done.
+       80       80
+       81       81            CASE KY#TYP_CP
+       82       82             All that this code will do is the Punch type of I/O, After it
+       83       83                has place the Punch in the correct Bin/Ascii mode.
+       84       84
+       85       85            CASE KY#TYP_CR
+       86       86             I have not yet done enough thinking about this to be sure what
+       87       87                the code will look like.  But I do expect that there are
+       88       88                A) some differences between types of Readers, and that (B)
+       89       89                the I/O command itself will not come down in the form of a
+       90       90                queue'd entry.
+       91       91
+       92       92            END CASE
+       93       93          END CASE
+       94       94
+       95       95        */
+       96       96        %EJECT;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:16   
+       97       97        /*P*  NAME: KYI$IO      Handle the output device I/O scheduleing */
+       98       98        KYI$IO: PROC(KY$CTX,COMMAND) ALTRET;
+
+     98   1 000000  D380 0000 0000  xent KYI$IO          LNJ,B5   X6A_AUTO_2
+          1 000003       0010 0002                       DC       16,2
+
+       99       99        /**/
+      100      100        %INCLUDE GH_HARDWARE_M;
+      101      198        %INCLUDE LCP_6;
+      102     4477        %INCLUDE KL_AFCN_C;
+      103     4578        %INCLUDE KL_MACRO_C;
+      104     7930        %INCLUDE K_ID_E;
+      105     7980        %K#ENTID_E;
+      106     7999        %K#LYRID_E;
+      107     8006        %INCLUDE KV_GLBCNS_E;                   /* VDI equates */
+      108     8347        %INCLUDE KV_PRMID_E;
+      109     8521        %INCLUDE KV$GLB;
+      110     8940        %INCLUDE KV$GLBCTX;
+      111     9385        %INCLUDE KV$PRM;
+      112     9598        %INCLUDE KY_URP_M;
+      113     9893        %INCLUDE KY_SUBS_C;
+      114     9982        %INCLUDE KH$STT;
+      115    10012        %INCLUDE KV_GLB_M;
+      116    10134        %INCLUDE KY_DATA_R;
+      117    10929        %INCLUDE KH$CHN;
+      118    11051        /**/
+      119    11052    1          DCL KHI$IO_OTP ENTRY(2) ALTRET;
+      120    11053    1          DCL KHI$IO_INP ENTRY(2) ALTRET;
+      121    11054    1          DCL KHI$IOLD ENTRY(2) ALTRET;
+      122    11055        /**/
+      123    11056        %KY$REC;
+      124    11095        %GH_IOLD;
+      125    11110        %GH_IO;
+      126    11126        %KY$CTX;
+      127    11303        %KH$CHN(STCLASS="BASED(CHN$)");
+      128    11427        %KV$VDI;
+      129    11498        /**/
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:17   
+      130    11499        %KV_PRMID_E;
+      131    11655        /**/
+      132    11656    1          DCL COMMAND UBIN WORD;
+      133    11657    1          DCL CHN$ PTR;
+      134    11658    1          DCL DAS BIT(16);
+      135    11659    1          DCL 1 TASK REDEF DAS,
+      136    11660    1                 2 FNC UBIN(8) UNAL,
+      137    11661    1                 2 PRINT BIT(1) UNAL,
+      138    11662    1                 2 * BIT(2) UNAL,
+      139    11663    1                 2 VFU BIT(1) UNAL,
+      140    11664    1                 2 N UBIN(4) UNAL;
+      141    11665    1          DCL 1 CONFIG REDEF DAS,
+      142    11666    1                 2 NCM BIT(1) UNAL,
+      143    11667    1                 2 NORMAL BIT(1) UNAL,
+      144    11668    1                 2 * BIT(2) UNAL,
+      145    11669    1                 2 LPI BIT(1) UNAL,
+      146    11670    1                 2 * BIT(11) UNAL;
+      147    11671    1          DCL 1 CR_MODE REDEF DAS,
+      148    11672    1                 2 * BIT(1) UNAL,
+      149    11673    1                 2 EJECT BIT(1) UNAL,
+      150    11674    1                 2 * BIT(3) UNAL,
+      151    11675    1                 2 BIN BIT(1) UNAL,
+      152    11676    1                 2 * BIT(10) UNAL;
+      153    11677        %EJECT;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:18   
+      154    11678    1          GH_IO.CAS.XCHN.OUTPUT = '1'B;
+
+  11678   1 000005  8900 0000 0005  00                   LBT,'0040'X       GH_IO
+  11678   1 000008       0040
+
+      155    11679    1          GH_IOLD.XCHN.OUTPUT = '1'B;
+
+  11679   1 000009  8900 0000 0000  00                   LBT,'0040'X       GH_IOLD
+  11679   1 00000C       0040
+
+      156    11680    1          CHN$ = KY$CTX.VDI$->KV$VDI.CHN$;
+
+  11680   1 00000D  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 00000F  DCC6 0008                            LDB,B5   8,B6
+          1 000011  CC85                                 LDB,B4   ,B5
+          1 000012  CFC7 0008                            STB,B4   CHN$,AUTO
+
+      157    11681    2          DO CASE( COMMAND );
+
+  11681   1 000014  BCC7 0006                            LDB,B3   @COMMAND,AUTO
+          1 000016  B803                                 LDR,R3   ,B3
+          1 000017  3D09                                 CMV,R3   9
+          1 000018  0281 02FA                            BGE      s:11830,PREL
+          1 00001A  A830 0000 0020  01                   LDR,R2   s:11681+12,R3
+          1 00001D  83A0 0000 0029  01                   JMP      s:11683,R2
+          1 000020       0000                            DC       s:11683,PREL
+          1 000021       014B                            DC       s:11739,PREL
+          1 000022       00A8                            DC       s:11710,PREL
+          1 000023       012E                            DC       s:11734,PREL
+          1 000024       0169                            DC       s:11744,PREL
+          1 000025       0112                            DC       s:11730,PREL
+          1 000026       02EA                            DC       s:11830,PREL
+          1 000027       00C5                            DC       s:11714,PREL
+          1 000028       00E2                            DC       s:11718,PREL
+
+      158    11682    2             CASE ( %KY#INIT );
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:19   
+      159    11683    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_DEV_ID);
+
+  11683   1 000029  6C26                                 LDV,R6   38
+          1 00002A  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 00002D       003F
+
+      160    11684    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11684   1 00002E  AB80 0000 0005  00                   LAB,B2   GH_IO
+          1 000031  AFC7 000E                            STB,B2   DAS+4,AUTO
+          1 000033  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 000035  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 000037  CBF0 0200                            LAB,B4   512,IMO
+          1 000039  E380 0000 0000  xent                 LNJ,B6   KHI$IO_INP
+          1 00003C       02DA                            DC       s:11826,PREL
+
+      161    11685    2                KY$CTX.DVC_ID = GH_IO.RANGE;
+
+  11685   1 00003D  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 00003F  E800 0000 0006  00                   LDR,R6   GH_IO+1
+          1 000042  EF46 0007                            STR,R6   7,B6
+
+      162    11686    2                GH_IO.CAS.FNC = %BITBIN(%KY#O_INT_CONT);
+
+  11686   1 000044  5C03                                 LDV,R5   3
+          1 000045  DA80 0000 0005  00                   SRM,R5,'003F'X    GH_IO
+          1 000048       003F
+
+      163    11687    2                GH_IO.DAS.LCTDAT = 0;
+
+  11687   1 000049  8780 0000 0006  00                   CLH      GH_IO+1
+
+      164    11688    2                GH_IO.DAS.LCTADR = KY_INT_LEV + 1;
+
+  11688   1 00004C  C800 0000 0000  xsym                 LDR,R4   KY_INT_LEV
+          1 00004F  4E01                                 ADV,R4   1
+          1 000050  CA80 0000 0006  00                   SRM,R4,'00FF'X    GH_IO+1
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:20   
+          1 000053       00FF
+
+      165    11689    2                CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11689   1 000054  DB80 0000 0005  00                   LAB,B5   GH_IO
+          1 000057  DFC7 000E                            STB,B5   DAS+4,AUTO
+          1 000059  CCC7 0008                            LDB,B4   CHN$,AUTO
+          1 00005B  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 00005D  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 00005F  CBF0 0200                            LAB,B4   512,IMO
+          1 000061  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 000064       02B2                            DC       s:11826,PREL
+
+      166    11690    2                GH_IO.DAS.LCTADR = 0;
+
+  11690   1 000065  8800 0000 0006  00                   LBF,'00FF'X       GH_IO+1
+  11690   1 000068       00FF
+
+      167    11691    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_STATUS);
+
+  11691   1 000069  6C18                                 LDV,R6   24
+          1 00006A  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 00006D       003F
+
+      168    11692    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11692   1 00006E  EB80 0000 0005  00                   LAB,B6   GH_IO
+          1 000071  EFC7 000E                            STB,B6   DAS+4,AUTO
+          1 000073  DCC7 0008                            LDB,B5   CHN$,AUTO
+          1 000075  DFC7 000C                            STB,B5   DAS+2,AUTO
+          1 000077  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 000079  CBF0 0200                            LAB,B4   512,IMO
+          1 00007B  E380 0000 0000  xent                 LNJ,B6   KHI$IO_INP
+          1 00007E       0298                            DC       s:11826,PREL
+
+      169    11693    2                KY$CTX.STATUSW = GH_IO.RANGE;
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:21   
+  11693   1 00007F  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 000081  E800 0000 0006  00                   LDR,R6   GH_IO+1
+          1 000084  EF46 0006                            STR,R6   6,B6
+
+      170    11694    2                KY$CTX.DEFRD.STATUSW = KY$CTX.STATUSW;
+
+  11694   1 000086  EF46 0020                            STR,R6   32,B6
+
+      171    11695    2                IF KY$CTX.DVCTYP = %KY#TYP_LP THEN
+
+  11695   1 000088  D2C6 000B                            LLH,R5   11,B6
+          1 00008A  5D01                                 CMV,R5   1
+          1 00008B  0981 0287                            BNE      s:11830,PREL
+
+      172    11696    3                   DO;
+
+      173    11697    3                      TASK = '0'B;
+
+  11697   1 00008D  8747 000A                            CL       DAS,AUTO
+
+      174    11698    3                      TASK.N = 0;
+
+  11698   1 00008F  8847 000A                            LBF,'000F'X       DAS,AUTO
+  11698   1 000091       000F
+
+      175    11699    3                      TASK.VFU = '0'B;
+
+  11699   1 000092  8847 000A                            LBF,'0010'X       DAS,AUTO
+  11699   1 000094       0010
+
+      176    11700    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_TASK);
+
+  11700   1 000095  4C07                                 LDV,R4   7
+          1 000096  CA80 0000 0005  00                   SRM,R4,'003F'X    GH_IO
+          1 000099       003F
+
+      177    11701    3                      GH_IO.DAS = DAS;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:22   
+
+  11701   1 00009A  B847 000A                            LDR,R3   DAS,AUTO
+          1 00009C  BF00 0000 0006  00                   STR,R3   GH_IO+1
+
+      178    11702    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11702   1 00009F  DB80 0000 0005  00                   LAB,B5   GH_IO
+          1 0000A2  DFC7 000E                            STB,B5   DAS+4,AUTO
+          1 0000A4  CCC7 0008                            LDB,B4   CHN$,AUTO
+          1 0000A6  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 0000A8  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 0000AA  CBF0 0200                            LAB,B4   512,IMO
+          1 0000AC  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 0000AF       0267                            DC       s:11826,PREL
+
+      179    11703    3                      GH_IOLD.FNC = %BITBIN(%KY#O_IOLD);
+
+  11703   1 0000B0  6C09                                 LDV,R6   9
+          1 0000B1  EA80 0000 0000  00                   SRM,R6,'003F'X    GH_IOLD
+          1 0000B4       003F
+
+      180    11704    3                      GH_IOLD.BUF$ = ADDR(NIL);
+
+  11704   1 0000B5  EB80 0000 0000                       LAB,B6   0
+          1 0000B8  EF80 0000 0001  00                   STB,B6   GH_IOLD+1
+
+      181    11705
+      182    11706    3                      GH_IOLD.BUFSIZE = 0;
+
+  11706   1 0000BB  8700 0000 0004  00                   CL       GH_IOLD+4
+
+      183    11707    3                      CALL KHI$IOLD(KH$CHN,GH_IOLD) ALTRET(NAKED);
+
+  11707   1 0000BE  DB80 0000 0000  00                   LAB,B5   GH_IOLD
+          1 0000C1  DFC7 000E                            STB,B5   DAS+4,AUTO
+          1 0000C3  CCC7 0008                            LDB,B4   CHN$,AUTO
+          1 0000C5  CFC7 000C                            STB,B4   DAS+2,AUTO
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:23   
+          1 0000C7  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 0000C9  CBF0 0200                            LAB,B4   512,IMO
+          1 0000CB  E380 0000 0000  xent                 LNJ,B6   KHI$IOLD
+          1 0000CE       0248                            DC       s:11826,PREL
+
+      184    11708    3                   END;                    /* if ky$ctx = lp  */
+
+  11708   1 0000CF  0F81 0243                            B        s:11830,PREL
+
+      185    11709    2             CASE ( %KY#GET_STAT );
+
+      186    11710    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_STATUS);
+
+  11710   1 0000D1  6C18                                 LDV,R6   24
+          1 0000D2  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 0000D5       003F
+
+      187    11711    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11711   1 0000D6  AB80 0000 0005  00                   LAB,B2   GH_IO
+          1 0000D9  AFC7 000E                            STB,B2   DAS+4,AUTO
+          1 0000DB  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 0000DD  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 0000DF  CBF0 0200                            LAB,B4   512,IMO
+          1 0000E1  E380 0000 0000  xent                 LNJ,B6   KHI$IO_INP
+          1 0000E4       0232                            DC       s:11826,PREL
+
+      188    11712    2                KY$CTX.STATUSW = GH_IO.RANGE;
+
+  11712   1 0000E5  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 0000E7  E800 0000 0006  00                   LDR,R6   GH_IO+1
+          1 0000EA  EF46 0006                            STR,R6   6,B6
+          1 0000EC  0F81 0226                            B        s:11830,PREL
+
+      189    11713    2             CASE( %KY#GET_STATW2);
+
+      190    11714    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_STATUS_W2);
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:24   
+
+  11714   1 0000EE  6C1A                                 LDV,R6   26
+          1 0000EF  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 0000F2       003F
+
+      191    11715    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11715   1 0000F3  AB80 0000 0005  00                   LAB,B2   GH_IO
+          1 0000F6  AFC7 000E                            STB,B2   DAS+4,AUTO
+          1 0000F8  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 0000FA  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 0000FC  CBF0 0200                            LAB,B4   512,IMO
+          1 0000FE  E380 0000 0000  xent                 LNJ,B6   KHI$IO_INP
+          1 000101       0215                            DC       s:11826,PREL
+
+      192    11716    2                KY$CTX.STATUSW = GH_IO.RANGE;
+
+  11716   1 000102  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 000104  E800 0000 0006  00                   LDR,R6   GH_IO+1
+          1 000107  EF46 0006                            STR,R6   6,B6
+          1 000109  0F81 0209                            B        s:11830,PREL
+
+      193    11717    2             CASE (%KY#SET_LPI);
+
+      194    11718    2                IF KY$CTX.DVC_ID = %BITBIN('20C4'X) THEN
+
+  11718   1 00010B  E846 0007                            LDR,R6   7,B6
+          1 00010D  E970 20C4                            CMR,R6   8388,IMO
+          1 00010F  0981 0203                            BNE      s:11830,PREL
+
+      195    11719    3                   DO;
+
+      196    11720    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_CONF);
+
+  11720   1 000111  5C11                                 LDV,R5   17
+          1 000112  DA80 0000 0005  00                   SRM,R5,'003F'X    GH_IO
+          1 000115       003F
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:25   
+
+      197    11721    3                      CONFIG = '0'B;
+
+  11721   1 000116  8747 000A                            CL       DAS,AUTO
+
+      198    11722    3                      IF KY$CTX.LPI = '1'B THEN /* 1 = 8 lines per inch */
+
+  11722   1 000118  82C6 0005                            LB,'0020'X        5,B6
+  11722   1 00011A       0020
+          1 00011B  0581 0006                            BBF      s:11725,PREL
+
+      199    11723    3                         CONFIG.LPI = '1'B;
+
+  11723   1 00011D  8947 000A                            LBT,'0800'X       DAS,AUTO
+  11723   1 00011F       0800
+          1 000120  0F81 0004                            B        s:11726,PREL
+
+      200    11724    3                      ELSE
+      201    11725    3                         CONFIG.LPI = '0'B;
+
+  11725   1 000122  8847 000A                            LBF,'0800'X       DAS,AUTO
+  11725   1 000124       0800
+
+      202    11726    3                      GH_IO.DAS = CONFIG;
+
+  11726   1 000125  C847 000A                            LDR,R4   DAS,AUTO
+          1 000127  CF00 0000 0006  00                   STR,R4   GH_IO+1
+
+      203    11727    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11727   1 00012A  AB80 0000 0005  00                   LAB,B2   GH_IO
+          1 00012D  AFC7 000E                            STB,B2   DAS+4,AUTO
+          1 00012F  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 000131  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 000133  CBF0 0200                            LAB,B4   512,IMO
+          1 000135  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 000138       01DE                            DC       s:11826,PREL
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:26   
+
+      204    11728    3                   END;
+
+  11728   1 000139  0F81 01D9                            B        s:11830,PREL
+
+      205    11729    2             CASE(%KY#GET_RANGE);
+
+      206    11730    2                GH_IO.CAS.FNC = %BITBIN(%KY#I_RANGE);
+
+  11730   1 00013B  6C0C                                 LDV,R6   12
+          1 00013C  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 00013F       003F
+
+      207    11731    2                CALL KHI$IO_INP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11731   1 000140  AB80 0000 0005  00                   LAB,B2   GH_IO
+          1 000143  AFC7 000E                            STB,B2   DAS+4,AUTO
+          1 000145  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 000147  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 000149  CBF0 0200                            LAB,B4   512,IMO
+          1 00014B  E380 0000 0000  xent                 LNJ,B6   KHI$IO_INP
+          1 00014E       01C8                            DC       s:11826,PREL
+
+      208    11732    2                KY_LAST_RANGE = GH_IO.RANGE;
+
+  11732   1 00014F  E800 0000 0006  00                   LDR,R6   GH_IO+1
+          1 000152  EF00 0000 0000  xsym                 STR,R6   KY_LAST_RANGE
+          1 000155  0F81 01BD                            B        s:11830,PREL
+
+      209    11733    2             CASE(%KY#DISCONNECT);
+
+      210    11734    2                GH_IO.CAS.FNC = %BITBIN(%KY#O_INT_CONT);
+
+  11734   1 000157  6C03                                 LDV,R6   3
+          1 000158  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 00015B       003F
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:27   
+      211    11735    2                GH_IO.DAS.LCTDAT = 0;
+
+  11735   1 00015C  8780 0000 0006  00                   CLH      GH_IO+1
+
+      212    11736    2                GH_IO.DAS.LCTADR = 0;
+
+  11736   1 00015F  8800 0000 0006  00                   LBF,'00FF'X       GH_IO+1
+  11736   1 000162       00FF
+
+      213    11737    2                CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11737   1 000163  AB80 0000 0005  00                   LAB,B2   GH_IO
+          1 000166  AFC7 000E                            STB,B2   DAS+4,AUTO
+          1 000168  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 00016A  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 00016C  CBF0 0200                            LAB,B4   512,IMO
+          1 00016E  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 000171       01A5                            DC       s:11826,PREL
+          1 000172  0F81 01A0                            B        s:11830,PREL
+
+      214    11738    2             CASE(%KY#STOP);
+
+      215    11739    2                GH_IO.CAS.FNC = %BITBIN(%KY#O_CONTROL);
+
+  11739   1 000174  6C01                                 LDV,R6   1
+          1 000175  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 000178       003F
+
+      216    11740    2                GH_IO.DAS.LCTDAT = %BITBIN('40'X);
+
+  11740   1 000179  5C40                                 LDV,R5   64
+          1 00017A  D780 0000 0006  00                   STH,R5   GH_IO+1
+
+      217    11741    2                GH_IO.DAS.LCTADR = 0;
+
+  11741   1 00017D  8800 0000 0006  00                   LBF,'00FF'X       GH_IO+1
+  11741   1 000180       00FF
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:28   
+
+      218    11742    2                CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11742   1 000181  AB80 0000 0005  00                   LAB,B2   GH_IO
+          1 000184  AFC7 000E                            STB,B2   DAS+4,AUTO
+          1 000186  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 000188  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 00018A  CBF0 0200                            LAB,B4   512,IMO
+          1 00018C  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 00018F       0187                            DC       s:11826,PREL
+          1 000190  0F81 0182                            B        s:11830,PREL
+
+      219    11743    2             CASE(%KY#IO);
+
+      220    11744    3                DO CASE(KY$CTX.DVCTYP);
+
+  11744   1 000192  92C6 000B                            LLH,R1   11,B6
+          1 000194  1D04                                 CMV,R1   4
+          1 000195  0281 017D                            BGE      s:11830,PREL
+          1 000197  B810 0000 019D  01                   LDR,R3   s:11744+11,R1
+          1 00019A  83B0 0000 01A1  01                   JMP      s:11746,R3
+          1 00019D       0172                            DC       s:11830,PREL
+          1 00019E       0000                            DC       s:11746,PREL
+          1 00019F       00DE                            DC       s:11808,PREL
+          1 0001A0       012B                            DC       s:11819,PREL
+
+      221    11745    3                   CASE(%KY#TYP_LP);
+
+      222    11746    3                      IF (KY$CTX.Q.OUTPUT$->KY$REC.TYPE = %KY#TYPE_VFU) AND
+
+  11746   1 0001A1  ACC6 0014                            LDB,B2   20,B6
+          1 0001A3  E802                                 LDR,R6   ,B2
+          1 0001A4  6048                                 SOR,R6   8
+          1 0001A5  E570 007F                            AND,R6   127,IMO
+          1 0001A7  6D03                                 CMV,R6   3
+          1 0001A8  0981 000B                            BNE      s:11750,PREL
+          1 0001AA  D846 0007                            LDR,R5   7,B6
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:29   
+          1 0001AC  D970 2001                            CMR,R5   8193,IMO
+          1 0001AE  0901 0164                            BE       s:11830,PREL
+          1 0001B0  D970 2003                            CMR,R5   8195,IMO
+          1 0001B2  0901 0160                            BE       s:11830,PREL
+
+      223    11747    3                         ((KY$CTX.DVC_ID = %BITBIN('2001'X)) OR
+      224    11748    3                         (KY$CTX.DVC_ID = %BITBIN('2003'X))) THEN
+      225    11749    3                         GOTO ACK;
+      226    11750    3                      TASK = '0'B;
+
+  11750   1 0001B4  8747 000A                            CL       DAS,AUTO
+
+      227    11751    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_TASK);
+
+  11751   1 0001B6  5C07                                 LDV,R5   7
+          1 0001B7  DA80 0000 0005  00                   SRM,R5,'003F'X    GH_IO
+          1 0001BA       003F
+
+      228    11752    3                      IF KY$CTX.Q.OUTPUT$ -> KY$REC.TOF THEN
+
+  11752   1 0001BB  82C2 0001                            LB,'2000'X        1,B2
+  11752   1 0001BD       2000
+          1 0001BE  0581 0022                            BBF      s:11769,PREL
+
+      229    11753    4                         DO;
+
+      230    11754    4                            TASK.N = 0;
+
+  11754   1 0001C0  8847 000A                            LBF,'000F'X       DAS,AUTO
+  11754   1 0001C2       000F
+
+      231    11755    4                            TASK.VFU = '1'B;
+
+  11755   1 0001C3  8947 000A                            LBT,'0010'X       DAS,AUTO
+  11755   1 0001C5       0010
+
+      232    11756        /*
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:30   
+      233    11757           If the line printer has a VFU ( determined from the device id )
+      234    11758           then change the top-of-form command into a skip-to-channel-one.
+      235    11759        */
+      236    11760    4                            IF ( KY$CTX.DVC_ID = %BITBIN('2001'X) ) OR
+
+  11760   1 0001C6  E846 0007                            LDR,R6   7,B6
+          1 0001C8  E970 2001                            CMR,R6   8193,IMO
+          1 0001CA  0901 0005                            BE       s:11762,PREL
+          1 0001CC  E970 2003                            CMR,R6   8195,IMO
+          1 0001CE  0981 0005                            BNE      s:11763,PREL
+
+      237    11761    4                               ( KY$CTX.DVC_ID = %BITBIN('2003'X) ) THEN
+      238    11762    4                               TASK.N = 1;
+
+  11762   1 0001D0  4C01                                 LDV,R4   1
+          1 0001D1  CAC7 000A                            SRM,R4,'000F'X    DAS,AUTO
+          1 0001D3       000F
+
+      239    11763    4                            IF ( KY$CTX.DVC_ID = %BITBIN('2031'X) ) OR
+
+  11763   1 0001D4  E970 2031                            CMR,R6   8241,IMO
+          1 0001D6  0901 0005                            BE       s:11765,PREL
+          1 0001D8  E970 20C4                            CMR,R6   8388,IMO
+          1 0001DA  0981 000E                            BNE      s:11773,PREL
+
+      240    11764    4                               ( KY$CTX.DVC_ID = %BITBIN('20C4'X) ) THEN
+      241    11765    4                               TASK.N = 0;
+
+  11765   1 0001DC  8847 000A                            LBF,'000F'X       DAS,AUTO
+  11765   1 0001DE       000F
+
+      242    11766    4                         END;              /* IF KY$REC.TOF */
+
+  11766   1 0001DF  0F81 0009                            B        s:11773,PREL
+
+      243    11767    3                      ELSE
+      244    11768    4                         DO;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:31   
+
+      245    11769    4                            TASK.N = KY$CTX.Q.OUTPUT$ -> KY$REC.SPACE_N;
+
+  11769   1 0001E1  E842 0001                            LDR,R6   1,B2
+          1 0001E3  EAC7 000A                            SRM,R6,'000F'X    DAS,AUTO
+          1 0001E5       000F
+
+      246    11770    4                            TASK.VFU = '0'B;
+
+  11770   1 0001E6  8847 000A                            LBF,'0010'X       DAS,AUTO
+  11770   1 0001E8       0010
+
+      247    11771    4                         END; /* ELSE
+
+      248    11772                                   */
+      249    11773    3                      IF ( KY$CTX.Q.OUTPUT$ -> KY$REC.RECSIZE > 0 ) AND
+
+  11773   1 0001E9  8282                                 LB,'00FF'X        ,B2
+  11773   1 0001EA       00FF
+          1 0001EB  0581 000D                            BBF      s:11777,PREL
+          1 0001ED  E802                                 LDR,R6   ,B2
+          1 0001EE  6048                                 SOR,R6   8
+          1 0001EF  E570 007F                            AND,R6   127,IMO
+          1 0001F1  6D03                                 CMV,R6   3
+          1 0001F2  0901 0006                            BE       s:11777,PREL
+
+      250    11774    3                         ( KY$CTX.Q.OUTPUT$ -> KY$REC.TYPE ~= %KY#TYPE_VFU) THEN
+      251    11775    3                         TASK.PRINT = '1'B;
+
+  11775   1 0001F4  8947 000A                            LBT,'0080'X       DAS,AUTO
+  11775   1 0001F6       0080
+          1 0001F7  0F81 0004                            B        s:11778,PREL
+
+      252    11776    3                      ELSE
+      253    11777    3                         TASK.PRINT = '0'B;
+
+  11777   1 0001F9  8847 000A                            LBF,'0080'X       DAS,AUTO
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:32   
+  11777   1 0001FB       0080
+
+      254    11778    3                      IF KY$CTX.Q.OUTPUT$->KY$REC.TYPE = %KY#TYPE_VFU THEN
+
+  11778   1 0001FC  E802                                 LDR,R6   ,B2
+          1 0001FD  6048                                 SOR,R6   8
+          1 0001FE  E570 007F                            AND,R6   127,IMO
+          1 000200  6D03                                 CMV,R6   3
+          1 000201  0981 000C                            BNE      s:11785,PREL
+
+      255    11779    4                         DO;
+
+      256    11780    4                            TASK.FNC = %BITBIN(%KY#O_LDVFU);
+
+  11780   1 000203  4C53                                 LDV,R4   83
+          1 000204  C7C7 000A                            STH,R4   DAS,AUTO
+
+      257    11781    4                            TASK.VFU = '1'B;
+
+  11781   1 000206  8947 000A                            LBT,'0010'X       DAS,AUTO
+  11781   1 000208       0010
+
+      258    11782    4                            TASK.N = 0;
+
+  11782   1 000209  8847 000A                            LBF,'000F'X       DAS,AUTO
+  11782   1 00020B       000F
+
+      259    11783    4                         END;
+
+  11783   1 00020C  0F81 0026                            B        s:11792,PREL
+
+      260    11784    4                      ELSE DO;
+
+      261    11785    5                            IF TASK.VFU AND TASK.N = 0 THEN DO; /* evfu */
+
+  11785   1 00020E  82C7 000A                            LB,'0010'X        DAS,AUTO
+  11785   1 000210       0010
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:33   
+          1 000211  0581 0021                            BBF      s:11792,PREL
+          1 000213  82C7 000A                            LB,'000F'X        DAS,AUTO
+          1 000215       000F
+          1 000216  0501 001C                            BBT      s:11792,PREL
+
+      262    11786    5                                  TASK.N = 11; /* slew to channel 11 (eof) */
+
+  11786   1 000218  4C0B                                 LDV,R4   11
+          1 000219  CAC7 000A                            SRM,R4,'000F'X    DAS,AUTO
+          1 00021B       000F
+
+      263    11787    5                                  GH_IO.DAS = DAS;
+
+  11787   1 00021C  A847 000A                            LDR,R2   DAS,AUTO
+          1 00021E  AF00 0000 0006  00                   STR,R2   GH_IO+1
+
+      264    11788    5                                  CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET (NAKED);
+
+  11788   1 000221  9B80 0000 0005  00                   LAB,B1   GH_IO
+          1 000224  9FC7 000E                            STB,B1   DAS+4,AUTO
+          1 000226  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 000228  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 00022A  CBF0 0200                            LAB,B4   512,IMO
+          1 00022C  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 00022F       00E7                            DC       s:11826,PREL
+
+      265    11789    5                                  TASK.N = 0; /* bof channel */
+
+  11789   1 000230  8847 000A                            LBF,'000F'X       DAS,AUTO
+  11789   1 000232       000F
+
+      266    11790    5                               END;
+
+      267    11791    4                         END;              /* else type = vfu */
+
+      268    11792    3                      GH_IO.DAS = DAS;
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:34   
+  11792   1 000233  E847 000A                            LDR,R6   DAS,AUTO
+          1 000235  EF00 0000 0006  00                   STR,R6   GH_IO+1
+
+      269    11793    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11793   1 000238  EB80 0000 0005  00                   LAB,B6   GH_IO
+          1 00023B  EFC7 000E                            STB,B6   DAS+4,AUTO
+          1 00023D  DCC7 0008                            LDB,B5   CHN$,AUTO
+          1 00023F  DFC7 000C                            STB,B5   DAS+2,AUTO
+          1 000241  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 000243  CBF0 0200                            LAB,B4   512,IMO
+          1 000245  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 000248       00CE                            DC       s:11826,PREL
+
+      270    11794    3                      GH_IOLD.FNC = %BITBIN(%KY#O_IOLD);
+
+  11794   1 000249  6C09                                 LDV,R6   9
+          1 00024A  EA80 0000 0000  00                   SRM,R6,'003F'X    GH_IOLD
+          1 00024D       003F
+
+      271    11795    3                      IF ( KY$CTX.Q.OUTPUT$ -> KY$REC.RECSIZE > 0 ) THEN
+
+  11795   1 00024E  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 000250  DCC6 0014                            LDB,B5   20,B6
+          1 000252  8285                                 LB,'00FF'X        ,B5
+          1 000253       00FF
+          1 000254  0581 000E                            BBF      s:11802,PREL
+
+      272    11796    4                         DO;
+
+      273    11797    4                            GH_IOLD.BUF$ = ADDR(KY$CTX.Q.OUTPUT$->KY$REC.TXT);
+
+  11797   1 000256  CBC5 0005                            LAB,B4   5,B5
+          1 000258  CF80 0000 0001  00                   STB,B4   GH_IOLD+1
+
+      274    11798    4                            GH_IOLD.BUFSIZE = KY$CTX.Q.OUTPUT$ -> KY$REC.RECSIZE;
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:35   
+  11798   1 00025B  D805                                 LDR,R5   ,B5
+          1 00025C  D570 00FF                            AND,R5   255,IMO
+          1 00025E  DF00 0000 0004  00                   STR,R5   GH_IOLD+4
+
+      275    11799    4                         END;              /* IF RECSIZE > 0 */
+
+  11799   1 000261  0F81 000A                            B        s:11806,PREL
+
+      276    11800    3                      ELSE
+      277    11801    4                         DO;
+
+      278    11802    4                            GH_IOLD.BUF$ = ADDR(NIL);
+
+  11802   1 000263  CB80 0000 0000                       LAB,B4   0
+          1 000266  CF80 0000 0001  00                   STB,B4   GH_IOLD+1
+
+      279    11803    4                            GH_IOLD.BUFSIZE = 0;
+
+  11803   1 000269  8700 0000 0004  00                   CL       GH_IOLD+4
+
+      280    11804    4                         END; /* ELSE
+
+      281    11805                                   */
+      282    11806    3                      CALL KHI$IOLD(KH$CHN,GH_IOLD) ALTRET(NAKED);
+
+  11806   1 00026C  BB80 0000 0000  00                   LAB,B3   GH_IOLD
+          1 00026F  BFC7 000E                            STB,B3   DAS+4,AUTO
+          1 000271  ACC7 0008                            LDB,B2   CHN$,AUTO
+          1 000273  AFC7 000C                            STB,B2   DAS+2,AUTO
+          1 000275  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 000277  CBF0 0200                            LAB,B4   512,IMO
+          1 000279  E380 0000 0000  xent                 LNJ,B6   KHI$IOLD
+          1 00027C       009A                            DC       s:11826,PREL
+          1 00027D  0F81 0095                            B        s:11830,PREL
+
+      283    11807    3                   CASE(%KY#TYP_CP);
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:36   
+      284    11808    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_TASK);
+
+  11808   1 00027F  6C07                                 LDV,R6   7
+          1 000280  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 000283       003F
+
+      285    11809    3                      CR_MODE = '0'B;
+
+  11809   1 000284  8747 000A                            CL       DAS,AUTO
+
+      286    11810    3                      CR_MODE.EJECT = '1'B;
+
+  11810   1 000286  8947 000A                            LBT,'4000'X       DAS,AUTO
+  11810   1 000288       4000
+
+      287    11811    3                      CR_MODE.BIN = KY$CTX.Q.OUTPUT$ -> KY$REC.BIN;
+
+  11811   1 000289  ACC6 0014                            LDB,B2   20,B6
+          1 00028B  D842 0001                            LDR,R5   1,B2
+          1 00028D  5044                                 SOR,R5   4
+          1 00028E  DAC7 000A                            SRM,R5,'0400'X    DAS,AUTO
+          1 000290       0400
+
+      288    11812    3                      GH_IO.DAS = DAS;
+
+  11812   1 000291  D847 000A                            LDR,R5   DAS,AUTO
+          1 000293  DF00 0000 0006  00                   STR,R5   GH_IO+1
+
+      289    11813    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11813   1 000296  9B80 0000 0005  00                   LAB,B1   GH_IO
+          1 000299  9FC7 000E                            STB,B1   DAS+4,AUTO
+          1 00029B  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 00029D  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 00029F  CBF0 0200                            LAB,B4   512,IMO
+          1 0002A1  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 0002A4       0072                            DC       s:11826,PREL
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:37   
+
+      290    11814    3                      GH_IOLD.BUF$ = ADDR(KY$CTX.Q.OUTPUT$->KY$REC.TXT);
+
+  11814   1 0002A5  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 0002A7  DCC6 0014                            LDB,B5   20,B6
+          1 0002A9  CBC5 0005                            LAB,B4   5,B5
+          1 0002AB  CF80 0000 0001  00                   STB,B4   GH_IOLD+1
+
+      291    11815    3                      GH_IOLD.FNC = %BITBIN(%KY#O_IOLD);
+
+  11815   1 0002AE  6C09                                 LDV,R6   9
+          1 0002AF  EA80 0000 0000  00                   SRM,R6,'003F'X    GH_IOLD
+          1 0002B2       003F
+
+      292    11816    3                      GH_IOLD.BUFSIZE = KY$CTX.Q.OUTPUT$ -> KY$REC.RECSIZE;
+
+  11816   1 0002B3  D805                                 LDR,R5   ,B5
+          1 0002B4  D570 00FF                            AND,R5   255,IMO
+          1 0002B6  DF00 0000 0004  00                   STR,R5   GH_IOLD+4
+
+      293    11817    3                      CALL KHI$IOLD(KH$CHN,GH_IOLD) ALTRET(NAKED);
+
+  11817   1 0002B9  BB80 0000 0000  00                   LAB,B3   GH_IOLD
+          1 0002BC  BFC7 000E                            STB,B3   DAS+4,AUTO
+          1 0002BE  ACC7 0008                            LDB,B2   CHN$,AUTO
+          1 0002C0  AFC7 000C                            STB,B2   DAS+2,AUTO
+          1 0002C2  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 0002C4  CBF0 0200                            LAB,B4   512,IMO
+          1 0002C6  E380 0000 0000  xent                 LNJ,B6   KHI$IOLD
+          1 0002C9       004D                            DC       s:11826,PREL
+          1 0002CA  0F81 0048                            B        s:11830,PREL
+
+      294    11818    3                   CASE(%KY#TYP_CR);
+
+      295    11819    3                      GH_IO.CAS.FNC = %BITBIN(%KY#O_TASK);
+
+  11819   1 0002CC  6C07                                 LDV,R6   7
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:38   
+          1 0002CD  EA80 0000 0005  00                   SRM,R6,'003F'X    GH_IO
+          1 0002D0       003F
+
+      296    11820    3                      CR_MODE = '0'B;
+
+  11820   1 0002D1  8747 000A                            CL       DAS,AUTO
+
+      297    11821    3                      CR_MODE.BIN = KY$CTX.MODE.BIN_CURR;
+
+  11821   1 0002D3  D846 000C                            LDR,R5   12,B6
+          1 0002D5  5003                                 SOL,R5   3
+          1 0002D6  DAC7 000A                            SRM,R5,'0400'X    DAS,AUTO
+          1 0002D8       0400
+
+      298    11822    3                      GH_IO.DAS = DAS;
+
+  11822   1 0002D9  D847 000A                            LDR,R5   DAS,AUTO
+          1 0002DB  DF00 0000 0006  00                   STR,R5   GH_IO+1
+
+      299    11823    3                      CALL KHI$IO_OTP(KH$CHN,GH_IO) ALTRET(NAKED);
+
+  11823   1 0002DE  AB80 0000 0005  00                   LAB,B2   GH_IO
+          1 0002E1  AFC7 000E                            STB,B2   DAS+4,AUTO
+          1 0002E3  CFC7 000C                            STB,B4   DAS+2,AUTO
+          1 0002E5  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 0002E7  CBF0 0200                            LAB,B4   512,IMO
+          1 0002E9  E380 0000 0000  xent                 LNJ,B6   KHI$IO_OTP
+          1 0002EC       002A                            DC       s:11826,PREL
+
+      300    11824    3                      GH_IOLD.XCHN.OUTPUT = '0'B;
+
+  11824   1 0002ED  8800 0000 0000  00                   LBF,'0040'X       GH_IOLD
+  11824   1 0002F0       0040
+
+      301    11825    3                      GH_IOLD.BUF$ = KY$CTX.INPUT.BUF$;
+
+  11825   1 0002F1  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:39   
+          1 0002F3  DCC6 001A                            LDB,B5   26,B6
+          1 0002F5  DF80 0000 0001  00                   STB,B5   GH_IOLD+1
+
+      302    11826    3                      GH_IOLD.FNC = %BITBIN(%KY#O_IOLD);
+
+  11826   1 0002F8  6C09                                 LDV,R6   9
+          1 0002F9  EA80 0000 0000  00                   SRM,R6,'003F'X    GH_IOLD
+          1 0002FC       003F
+
+      303    11827    3                      GH_IOLD.BUFSIZE = KY$CTX.INPUT.BUF_SIZE;
+
+  11827   1 0002FD  D846 001C                            LDR,R5   28,B6
+          1 0002FF  DF00 0000 0004  00                   STR,R5   GH_IOLD+4
+
+      304    11828    3                      CALL KHI$IOLD(KH$CHN,GH_IOLD) ALTRET(NAKED);
+
+  11828   1 000302  CB80 0000 0000  00                   LAB,B4   GH_IOLD
+          1 000305  CFC7 000E                            STB,B4   DAS+4,AUTO
+          1 000307  BCC7 0008                            LDB,B3   CHN$,AUTO
+          1 000309  BFC7 000C                            STB,B3   DAS+2,AUTO
+          1 00030B  BBC7 000C                            LAB,B3   DAS+2,AUTO
+          1 00030D  CBF0 0200                            LAB,B4   512,IMO
+          1 00030F  E380 0000 0000  xent                 LNJ,B6   KHI$IOLD
+          1 000312       0004                            DC       s:11826,PREL
+
+      305    11829    3                END;                       /* CASE ON DEVICE TYPE */
+
+      306    11830    2          END;                             /* CASE ON COMMAND */
+
+  11826   1                              ACK             null
+      307    11831    1   ACK:   ;
+      308    11832    1          RETURN;
+
+  11832   1 000313  C380 0000 0000  xent ACK             LNJ,B4   X6A_ARET
+
+  11826   1                              NAKED           null
+      309    11833    1   NAKED: ;
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:40   
+      310    11834    1          ALTRETURN;
+
+  11834   1 000316  C380 0000 0000  xent NAKED           LNJ,B4   X6A_AALT
+      311    11835    1   END KYI$IO;
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:41   
+--  Include file information  --
+
+   KH$CHN.:E05TOU  is referenced.
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYI$IO.
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:42   
+
+ **** Variables and constants ****
+
+  ****  Section 000  Data  KYI$IO
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     5-0-0/w STRC(32)    r     1 GH_IO                      0-0-0/w STRC(80)    r     1 GH_IOLD
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w PTR         r     1 @COMMAND                   4-0-0/w PTR         r     1 @KY$CTX
+     8-0-0/w PTR         r     1 CHN$                      *0-0-0/w UBIN(16)    r     1 COMMAND
+     A-0-0/b STRC(16)    r     1 CONFIG                     A-0-0/b STRC(16)    r     1 CR_MODE
+     A-0-0/b BIT (16)    r     1 DAS                       *0-0-0/w STRC(608)   r     1 KY$CTX
+     A-0-0/b STRC(16)    r     1 TASK
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w UBIN(16)    r     1 KY_INT_LEV                 0-0-0/w UBIN(16)    r     1 KY_LAST_RANGE
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(512)   r     1 KH$CHN                     0-0-0/w STRC(512)   r     1 KV$VDI
+     0-0-0/w ASTR(80)    r     1 KY$REC
+
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:43   
+
+   Procedure KYI$IO requires 793 words for executable code.
+   Procedure KYI$IO requires 16 words of local(AUTO) storage.
+
+    No errors detected in file KYI$IO.:E05TSI    .
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:44   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:45   
+          MINI XREF LISTING
+
+ACK
+     11826**LABEL   11749--GOTO
+CHN$
+     11657**DCL     11318--IMP-PTR 11680<<ASSIGN  11684>>CALL    11689>>CALL    11692>>CALL    11702>>CALL
+     11707>>CALL    11711>>CALL    11715>>CALL    11727>>CALL    11731>>CALL    11737>>CALL    11742>>CALL
+     11788>>CALL    11793>>CALL    11806>>CALL    11813>>CALL    11817>>CALL    11823>>CALL    11828>>CALL
+COMMAND
+     11656**DCL        98--PROC    11681>>DOCASE
+CONFIG
+     11665**DCL     11721<<ASSIGN  11726>>ASSIGN
+CONFIG.LPI
+     11669**DCL     11723<<ASSIGN  11725<<ASSIGN
+CR_MODE
+     11671**DCL     11809<<ASSIGN  11820<<ASSIGN
+CR_MODE.BIN
+     11675**DCL     11811<<ASSIGN  11821<<ASSIGN
+CR_MODE.EJECT
+     11673**DCL     11810<<ASSIGN
+DAS
+     11658**DCL     11659--REDEF   11665--REDEF   11671--REDEF   11701>>ASSIGN  11787>>ASSIGN  11792>>ASSIGN
+     11812>>ASSIGN  11822>>ASSIGN
+GH_IO
+     11121**DCL     11684<>CALL    11689<>CALL    11692<>CALL    11702<>CALL    11711<>CALL    11715<>CALL
+     11727<>CALL    11731<>CALL    11737<>CALL    11742<>CALL    11788<>CALL    11793<>CALL    11813<>CALL
+     11823<>CALL
+GH_IO.CAS.CHN
+     11121**DCL     11121--REDEF
+GH_IO.CAS.FNC
+     11122**DCL     11683<<ASSIGN  11686<<ASSIGN  11691<<ASSIGN  11700<<ASSIGN  11710<<ASSIGN  11714<<ASSIGN
+     11720<<ASSIGN  11730<<ASSIGN  11734<<ASSIGN  11739<<ASSIGN  11751<<ASSIGN  11808<<ASSIGN  11819<<ASSIGN
+GH_IO.CAS.XCHN.OUTPUT
+     11122**DCL     11678<<ASSIGN
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:46   
+GH_IO.DAS
+     11122**DCL     11123--REDEF   11124--REDEF   11701<<ASSIGN  11726<<ASSIGN  11787<<ASSIGN  11792<<ASSIGN
+     11812<<ASSIGN  11822<<ASSIGN
+GH_IO.DAS.LCTADR
+     11123**DCL     11688<<ASSIGN  11690<<ASSIGN  11736<<ASSIGN  11741<<ASSIGN
+GH_IO.DAS.LCTDAT
+     11122**DCL     11687<<ASSIGN  11735<<ASSIGN  11740<<ASSIGN
+GH_IO.RANGE
+     11123**DCL     11685>>ASSIGN  11693>>ASSIGN  11712>>ASSIGN  11716>>ASSIGN  11732>>ASSIGN
+GH_IOLD
+     11106**DCL     11707<>CALL    11806<>CALL    11817<>CALL    11828<>CALL
+GH_IOLD.BUF$
+     11107**DCL     11704<<ASSIGN  11797<<ASSIGN  11802<<ASSIGN  11814<<ASSIGN  11825<<ASSIGN
+GH_IOLD.BUFSIZE
+     11108**DCL     11706<<ASSIGN  11798<<ASSIGN  11803<<ASSIGN  11816<<ASSIGN  11827<<ASSIGN
+GH_IOLD.CHN
+     11106**DCL     11106--REDEF
+GH_IOLD.FNC
+     11107**DCL     11703<<ASSIGN  11794<<ASSIGN  11815<<ASSIGN  11826<<ASSIGN
+GH_IOLD.XCHN.OUTPUT
+     11107**DCL     11679<<ASSIGN  11824<<ASSIGN
+KH$CHN
+     11318**DCL     11684<>CALL    11689<>CALL    11692<>CALL    11702<>CALL    11707<>CALL    11711<>CALL
+     11715<>CALL    11727<>CALL    11731<>CALL    11737<>CALL    11742<>CALL    11788<>CALL    11793<>CALL
+     11806<>CALL    11813<>CALL    11817<>CALL    11823<>CALL    11828<>CALL
+KH$CHN.TERMID.TERM
+     11414**DCL     11423--REDEF
+KHI$IOLD
+     11054**DCL-ENT 11707--CALL    11806--CALL    11817--CALL    11828--CALL
+KHI$IO_INP
+     11053**DCL-ENT 11684--CALL    11692--CALL    11711--CALL    11715--CALL    11731--CALL
+KHI$IO_OTP
+     11052**DCL-ENT 11689--CALL    11702--CALL    11727--CALL    11737--CALL    11742--CALL    11788--CALL
+     11793--CALL    11813--CALL    11823--CALL
+KV$VDI.CHN$
+     11448**DCL     11680>>ASSIGN
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:47   
+KV_STT.REQSTATS.DSPMSK
+     10805**DCL     10811--REDEF
+KV_STT.REQSTATS.SLCMSK
+     10846**DCL     10853--REDEF
+KY$CTX
+     11137**DCL        98--PROC
+KY$CTX.DEFRD.STATUSW
+     11279**DCL     11281--REDEF   11694<<ASSIGN
+KY$CTX.DVCTYP
+     11225**DCL     11695>>IF      11744>>DOCASE
+KY$CTX.DVC_ID
+     11221**DCL     11685<<ASSIGN  11718>>IF      11746>>IF      11746>>IF      11760>>IF      11760>>IF
+     11763>>IF      11763>>IF
+KY$CTX.INPUT.BUF$
+     11258**DCL     11825>>ASSIGN
+KY$CTX.INPUT.BUF_SIZE
+     11259**DCL     11827>>ASSIGN
+KY$CTX.LPI
+     11148**DCL     11722>>IF
+KY$CTX.MODE
+     11228**DCL     11236--REDEF
+KY$CTX.MODE.BIN_CURR
+     11232**DCL     11821>>ASSIGN
+KY$CTX.Q.OUTPUT$
+     11243**DCL     11746>>IF      11752>>IF      11769>>ASSIGN  11773>>IF      11773>>IF      11778>>IF
+     11795>>IF      11797>>ASSIGN  11798>>ASSIGN  11811>>ASSIGN  11814>>ASSIGN  11816>>ASSIGN
+KY$CTX.STATUSW
+     11155**DCL     11157--REDEF   11165--REDEF   11179--REDEF   11193--REDEF   11207--REDEF   11693<<ASSIGN
+     11694>>ASSIGN  11712<<ASSIGN  11716<<ASSIGN
+KY$CTX.VDI$
+     11222**DCL     11680>>ASSIGN
+KY$CTX.VDIENB
+     11293**DCL     11299--REDEF
+KY$REC.BIN
+     11085**DCL     11811>>ASSIGN
+KY$REC.RECSIZE
+PL6.E3A0      #001=KYI$IO File=KYI$IO.:E05TSI                                    WED 07/30/97 02:42 Page:48   
+     11083**DCL     11093--IMP-SIZ 11773>>IF      11795>>IF      11798>>ASSIGN  11816>>ASSIGN
+KY$REC.SPACE_N
+     11089**DCL     11769>>ASSIGN
+KY$REC.TOF
+     11086**DCL     11752>>IF
+KY$REC.TXT
+     11093**DCL     11797--ASSIGN  11814--ASSIGN
+KY$REC.TXTARRAY
+     11092**DCL     11093--REDEF
+KY$REC.TYPE
+     11082**DCL     11746>>IF      11773>>IF      11778>>IF
+KY_INT_LEV
+     10926**DCL     11688>>ASSIGN
+KY_LAST_RANGE
+     10926**DCL     11732<<ASSIGN
+KY_STT_URP.REQSTATS.DSPMSK
+     10454**DCL     10460--REDEF
+KY_STT_URP.REQSTATS.SLCMSK
+     10495**DCL     10502--REDEF
+NAKED
+     11826**LABEL   11684--CALLALT 11689--CALLALT 11692--CALLALT 11702--CALLALT 11707--CALLALT 11711--CALLALT
+     11715--CALLALT 11727--CALLALT 11731--CALLALT 11737--CALLALT 11742--CALLALT 11788--CALLALT 11793--CALLALT
+     11806--CALLALT 11813--CALLALT 11817--CALLALT 11823--CALLALT 11828--CALLALT
+TASK
+     11659**DCL     11697<<ASSIGN  11750<<ASSIGN
+TASK.FNC
+     11660**DCL     11780<<ASSIGN
+TASK.N
+     11664**DCL     11698<<ASSIGN  11754<<ASSIGN  11762<<ASSIGN  11765<<ASSIGN  11769<<ASSIGN  11782<<ASSIGN
+     11785>>IF      11786<<ASSIGN  11789<<ASSIGN
+TASK.PRINT
+     11661**DCL     11775<<ASSIGN  11777<<ASSIGN
+TASK.VFU
+     11663**DCL     11699<<ASSIGN  11755<<ASSIGN  11770<<ASSIGN  11781<<ASSIGN  11785>>IF

@@ -1,0 +1,793 @@
+/*M* EXPORT a utility to make GCOS-type tapes */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X*   MCL=5,MOC,CLM=40,CRM=80,CCC,
+     PLM=0,IND=3,SDI=2,CTI=6,AND,DCI=6,CSU=3,ECU=3,THI=3,DTI=8,STI=3  */
+/*P*    NAME:          EXPORT
+ 
+        PURPOSE:
+ 
+    EXPORT CREATES A GCOS 8 TAPE CONSISTING OF
+    VARIOUS CP-6 SOURCE AND/OR GCOS8 OBJECT UNIT FILES.
+ 
+        DESCRIPTION:
+ 
+     EXPORT WRITES SOURCE AND GCOS8 OBJECT UNIT
+     FILES TO MAGNETIC TAPE IN A FORMAT WHICH CAN BE
+     COPIED TO A GCOS 8 SYSTEM BY THE GCOS 8 IMPORT
+     PROGRAM.
+       - SOURCE FILES MAY BE EITHER KEYED OR CONSECUTIVE.
+         THEY ARE REFORMATTED INTO GCOS STANDARD
+         SYSTEM FORMAT BLOCKS (MEDIA CODE 6).
+       - OBJECT UNIT FILES ARE RELATIVE.  THEY ARE NOT
+         REFORMATTED.
+       - EACH FILE IS IDENTIFIED ON TAPE BY THE GCOS 8
+         CATALOG/FILE DESCRIPTION OF THE FILE TO WHICH
+         IT WILL BE WRITTEN BY THE IMPORT PROGRAM ON
+         GCOS 8.
+ 
+      */
+/*D*   NAME:           EXPORT
+ 
+       CALL:
+ 
+         !SET M$SI <FID>
+         !SET M$GCOS FT#NAME
+        [!SET M$LO LISTING-FILE]
+         !EXPORT.X
+ 
+     FID           - CP-6 FILE CONTAINING THE COMMAND FILE.
+                     IF THIS IS OMITTED, THEN THE COMMANDS
+                     ARE ENTERED VIA THE TERMINAL.
+     NAME          - ANY SYMBOLIC NAME USED TO IDENTIFY
+                     THE GCOS 8 TAPE.
+     LISTING-FILE  - THE SUMMARY REPORT AND ERROR MESSAGES
+                     ARE WRITTEN TO THE IDENTIFIED FILES.  WHEN
+                     OMITTED THE MESSAGES ARE WRITTEN TO THE
+                     TERMINAL.
+ 
+     INPUT:
+        M$SI        THE COMMAND FILE
+ 
+       THE COMMANDS ON THIS FILE SPECIFY WHICH CP6
+       FILES ARE TO BE WRITTEN TO THE TAPE FILE AS WELL
+       AS THE CAT/FILE STRINGS OF THE RECIPIENT GCOS 8
+       PERMFILES.  THERE ARE TWO TYPES OF COMMANDS:
+       1.  THE CATALOG COMMAND IS OPTIONAL AND PROVIDES
+       A DEFAULT GCOS 8 USERID/SUBCATALOG STRING.
+       2.  THE COPY COMMAND IDENTIFIES THE CP-6 FILES
+       TO BE COPIED TO THE TAPE FILE.
+ 
+     OUTPUT:
+        M$GCOS     THE GCOS 8 TAPE FILE
+ 
+       THERE ARE THREE TYPES OF BLOCKS ON THIS FILE.
+          - THE IDENTIFICATION BLOCK
+            THERE IS ONE IDENTIFICATION BLOCK FOR EVERY
+            FILE ON THE TAPE.  IT CONTAINS THE CAT/FILE
+            STRING OF THE RECIPIENT GCOS 8 PERMFILE.
+            THE IDENTIFICATION BLOCK ALWAYS PRECEDES THE
+            DATA BLOCK(S).
+          - THE DATA BLOCK
+            THE ACTUAL FILE CONTENTS ARE ON DATA
+            BLOCK(S).
+          - THE TOTAL BLOCK
+            THERE IS ONE TOTAL BLOCK AT THE END OF THE
+            TAPE. IT CONTAINS AN ACCUMULATED TOTAL COUNT
+            OF THE FILES ON THE TAPE.
+ 
+        M$LO       THE REPORT FILE
+ 
+       THIS FILE WILL DEFAULT TO THE TERMINAL, HOWEVER
+       A !SET M$LO COMMAND CAN DIRECT IT TO A SPECIFIC
+       CP-6 FILE.  IT CONTAINS ALL OF THE REPORT AND ERROR
+       MESSAGES.
+ 
+     DESCRIPTION:
+ 
+      THE COMMAND FILE LISTS ALL THE FILES TO BE COPIED
+      TO THE GCOS 8 TAPE.  IT MAY ALSO INCLUDE ONE OR MORE
+      DEFAULT USERID/SUBCATALOG STRINGS FOR THE GCOS 8
+      FILENAMES.
+ 
+      COMMAND TYPES:
+ 
+      1. CATALOG (OPTIONAL)
+ 
+              CAT[ALOG] USERID/[SUBCATALOG]...
+       SPECIFIES THE DEFAULT USERID AND/OR SUBCATALOG
+       STRUCTURE FOR SUBSEQUENT COPY COMMANDS.
+ 
+       2. COPY
+ 
+              C[OPY] <FID> [TO GCOS8-FILENAME]
+       SPECIFIES A FILE TO BE WRITTEN TO THE GCOS TAPE FILE.
+       THE GCOS 8 FILENAME IS OPTIONAL.  WHEN IT IS NOT
+       EXPLICITLY STATED, THE GCOS 8 NAME IS DERIVED FROM
+       THE CP-6 FID ACCORDING TO THE FOLLOWING RULES:
+          - ANY '$' OR ':' CHARACTER IN THE CP-6 FID
+            IS REPLACED WITH '.' AND '-' RESPECTIVELY.
+          - WHEN A CATALOG COMMAND HAS SET A DEFAULT VALUE,
+            THE FILENAME IS CONCATENATED WITH THE DEFAULT
+            USERID/SUBCATALOG STRING.
+     */
+%EJECT;
+EXPORT:PROC MAIN ALTRET;
+%INCLUDE CP_6;
+%INCLUDE FM$FIT;
+%LIST;
+%MACRO PAGE(ARG= ,SPACEVALUE=1,PAGE=NO);
+%LSET LISTDIR='0'B;
+%LSET LISTMAC='1'B;
+%BANNER(ARG=ARG,SPACEVALUE=SPACEVALUE,PAGE=PAGE);
+%MEND;
+%MACRO BANNER (ARG=' ', SPACEVALUE=1, PAGE=NO);
+%LSET LISTDIR='0'B;
+%LSET LISTSUB='1'B;
+%LSET LISTEXP='1'B;
+%IF TEXTCHAR(PAGE)='YES';
+%EJECT;
+%ELSE;
+%SPACE SPACEVALUE;
+%ENDIF;
+%CHARTEXT('/*')******************************************************************************
+*                                                                              *
+*        ARG              ARG                                                  *
+*                                                                              *
+******************************************************************************%CHARTEXT('*/')
+%SPACE SPACEVALUE;
+%MEND;
+%PAGE (ARG="POINTERS,ETC",PAGE=YES);
+DCL  DATA$ STATIC PTR;
+DCL  VFC$ STATIC PTR;
+DCL  DCB$ STATIC PTR;
+DCL  BUFF$ STATIC PTR;
+DCL  REC$ STATIC PTR;
+DCL PARAM$ STATIC PTR;
+%PAGE(ARG="SSF BLOCK AND RECORD",PAGE=YES);
+DCL 1  GCOSBUFFER  STATIC ALIGNED,
+      2 FIRST_RECORD,
+        3 BSN SBIN(18) UNAL,
+        3 SIZE UBIN(18) UNAL,
+        3 FILESTRING CHAR(70),     /* The last three characters designate the
+                                          type of FILE: Seq = sequential
+                                                        ran = random          */
+        3 TOTAL_COUNT CHAR(6),
+        3 * CHAR(1968),
+      2 * CHAR(8192);
+DCL 1  SSF$BLOCK BASED(BUFF$) ALIGNED,
+      2  BSN UBIN(18) UNAL,
+      2  LENGTH UBIN(18) UNAL,
+      2  DATA CHAR(1276) UNAL;
+DCL 1  SSF$RECORD BASED (REC$) ALIGNED,
+      2  SIZE UBIN(18) UNAL,
+      2  NEXT_BYTE UBIN(2) UNAL,
+      2  EOF SBIN(4) UNAL,
+      2  * BIT(2) UNAL,
+      2  MEDIA_CODE UBIN(4) UNAL,
+      2  REPORT_CODE UBIN(6) UNAL,
+      2  DATA CHAR(ARS) UNAL;
+DCL 1  KEY_CONSEC BASED(DATA$) ALIGNED,
+      2 LINE_NO CHAR(6) UNAL,
+      2 SPACE CHAR(1) UNAL,
+      2 DATA CHAR(ARS) UNAL;
+%PAGE(ARG=TERMINAL-MESSAGE-FORMATS,PAGE=YES);
+DCL 1 TERMINAL_TITLE STATIC,
+      2 VFC_BIT CHAR(1) INIT('A'),
+      2 CP6_FILE CHAR(35) INIT
+    ('               CP6FILE    FILE TYPE'),
+      2 CP6_TOT CHAR(20) INIT
+    ('       RECORDS READ'),
+      2 GCOS_FILE CHAR(30) INIT
+    ('               GCOS 8 FILE'),
+      2 GCOS_TOT CHAR(20) INIT
+    ('     SIZE IN LLINKS');
+DCL DASH_LINE (0:95) STATIC
+   CHAR(1) INIT ('C','-'*95);
+DCL 1 FILE_NAMES STATIC,
+      2 VFC_BIT CHAR(1) INIT ('B'),
+      2 CP6_NAME CHAR(50) UNAL,
+      2 GCOS_NAME CHAR(56) UNAL;
+DCL 1 FILE_TOTAL STATIC,
+      2 VFC_BIT CHAR (1) INIT('A'),
+      2 * CHAR(38) INIT(' '*0),
+      2 CP6_TOT CHAR(7),
+      2 MSG CHAR(43) INIT(' '*0),
+      2 GCOS_TOT CHAR(7);
+DCL 1 ERROR_LINE STATIC,
+      2 VFC_BIT CHAR(1) INIT('D'),
+      2 * CHAR(10) INIT('*'*0),
+      2 CP6_NAME CHAR(38),
+      2 MESSAGE CHAR(55),
+      2 * CHAR(10) INIT('*'*0);
+%PAGE(ARG=MISCELLANEOUS,PAGE=YES);
+DCL  ARS UBIN(36) STATIC ALIGNED;
+DCL  PAL UBIN(36) STATIC ALIGNED;
+DCL CATA_SIZE UBIN(36);
+DCL NAM_COUNT STATIC UBIN;
+DCL TOT_FILE_CNT UBIN;
+DCL REC_COUNT_IN UBIN;
+DCL FILE_SIZE UBIN;
+DCL ERROR_CODE UBIN WORD;
+DCL 1 KEYIN STATIC,
+      2 L UBIN (9) UNAL,
+      2 T UBIN(27) UNAL;
+DCL TEMP UBIN WORD;
+DCL BSN UBIN;
+DCL N UBIN WORD;
+DCL NN UBIN WORD;
+DCL REC_SIZEW UBIN;
+DCL L UBIN STATIC ALIGNED;
+DCL X UBIN WORD;
+DCL 1  VEC  DALIGNED STATIC,
+      2 BOUND  UBIN(20) UNAL,
+      2 *      BIT(52) UNAL;
+DCL M$SI DCB;
+DCL M$FILE DCB;
+DCL M$GCOS DCB;
+DCL M$LO DCB;
+DCL EOF BIT(1);
+DCL CATALOG STATIC BIT(1);
+DCL MORE_CP6_FILES STATIC BIT(1) INIT('1'B);
+DCL WRITE_ERROR STATIC BIT(1);
+DCL COMMAND STATIC CHAR(8);
+DCL CATA_AREA STATIC CHAR(64);
+DCL COMMAND_REC STATIC CHAR (132);
+DCL SAVE_NAME STATIC CHAR(12);
+DCL 1 SUB_NAME STATIC,
+      2 DOT CHAR(3) INIT('...'),
+      2 NUMBER CHAR(2);
+DCL IN_REC STATIC CHAR (140);
+DCL DOT STATIC CHAR(1) INIT ('.');
+DCL SLASH STATIC CHAR(1) INIT ('/');
+DCL ACCT_TYPE STATIC CHAR(15);
+DCL TYPE  STATIC  CHAR(3);
+DCL SPACER STATIC CHAR(4) INIT(' '*0);
+DCL 1 FILENAME STATIC ,
+      2 L UBIN(9) UNAL,
+      2 C CHAR(31) UNAL;
+DCL ACCOUNT STATIC CHAR(8);
+DCL XSF$LOCCODT ENTRY(2) ALTRET;
+%F$DCB;
+%CODE03;
+%VLR_FID (FPTN=FID_RESULTS);
+%FPT_READ (FPTN=READSI, DCB=M$SI, BUF=COMMAND_REC, KEY=KEYIN, KEYR=YES);
+%FPT_WRITE (FPTN=GCOSFILE, BUF=GCOSBUFFER, DCB=M$GCOS,BIN=YES);
+%FPT_WRITE (FPTN=WRITELO, DCB=M$LO, VFC=YES, BUF=TERMINAL_TITLE);
+%FPT_OPEN (FPTN=CP6FILE, DCB=M$FILE, NAME=FILENAME, ACCT=ACCOUNT,
+      FPARAM=GCOSBUFFER, SCRUB=YES);
+%FPT_CLOSE (FPTN=CP6_CLOSE,DCB=M$FILE,NAME=FILENAME,ACCT=ACCOUNT);
+%FPT_FID(FPTN=FID, NAME=FILENAME, ACCT=ACCOUNT, ASN=CP6FILE.V.ASN#,
+       SNAME=YES,SACCT=YES, RESULTS=FID_RESULTS);
+%FPT_READ (FPTN=CP6_FILE,DCB=M$FILE,BUF=IN_REC,KEY=KEYIN,KEYR=YES);
+%PAGE (ARG=CONTROL-PROCEDURE,PAGE=YES);
+DCB$=DCBADDR (DCBNUM(M$FILE));
+PROGRAM_CONTROL:
+MORE_CP6_FILES='1'B;
+WRITE_ERROR='0'B;
+TOT_FILE_CNT=0;
+NAM_COUNT=0;
+CATA_SIZE=0;
+CALL M$WRITE (WRITELO);
+WRITELO.BUF_=VECTOR(DASH_LINE);
+CALL M$WRITE (WRITELO);
+DO WHILE (MORE_CP6_FILES);
+                                        /* Get the CP6 an gcos 8 file names
+                                        edit gcos 8 name
+                                        open CP6 file                         */
+   CALL FILE_SET_UP;
+                                        /*   Read the CP6 file
+                                        create GCOS8 blocks
+                                        write the GCOS8 records               */
+   IF MORE_CP6_FILES
+      THEN DO;
+              DO CASE (DCB$->F$DCB.ORG#);
+                 CASE(1);               /*   Consecutive                      */
+                    CALL CONSECUTIVE_FILE_PROCESS;
+                 CASE(2);               /*    Keyed                           */
+                    CALL KEYED_FILE_PROCESS;
+                 CASE(5);               /*    Relative                        */
+                    CALL RELATIVE_FILE_PROCESS;
+              END;
+                                        /*  At the end of the CP6 file
+                                   write the file statistics to the terminal  */
+              IF WRITE_ERROR
+                 THEN
+                    ALTRETURN;          /*Cannot proceed if we cannot write   */
+              CALL TERMINAL_MSG_PROCESS;
+           END;
+END;
+                                        /* All done
+                                        write total record to the gcos file
+                                        write totals to the terminal          */
+WRITELO.BUF_=VECTOR(DASH_LINE);
+CALL M$WRITE (WRITELO);
+FILE_TOTAL.CP6_TOT=' ';
+FILE_TOTAL.MSG='TOTAL NUMBER OF FILES';
+CALL BINCHAR(FILE_TOTAL.GCOS_TOT,TOT_FILE_CNT);
+CALL EDITSTR(FILE_TOTAL.GCOS_TOT,0,7,'107'O,FILE_TOTAL.GCOS_TOT);
+WRITELO.BUF_=VECTOR(FILE_TOTAL);
+CALL M$WRITE (WRITELO);
+GCOSBUFFER.FIRST_RECORD='0'B;           /*Clear block*/
+CALL BINCHAR(GCOSBUFFER.FIRST_RECORD.TOTAL_COUNT,TOT_FILE_CNT);
+GCOSBUFFER.FIRST_RECORD.SIZE=0;
+GCOSBUFFER.FIRST_RECORD.BSN=0;
+VEC=VECTOR(GCOSBUFFER);
+VEC.BOUND=79;
+GCOSFILE.BUF_=VEC;
+CALL M$WRITE(GCOSFILE);
+RETURN;
+%PAGE (ARG=FILE-SET-UP,PAGE=YES);
+    /*   Housekeeping   */
+FILE_SET_UP: PROC;
+ERROR_CODE=1;
+REC_COUNT_IN=0;
+DO WHILE (ERROR_CODE ~=0);
+                                   /* Check command type - copy or catalog    */
+   CATALOG='1'B;
+   DO WHILE (CATALOG);
+      CALL M$READ (READSI) ALTRET(END_OF_FILES);
+      ARS=DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+      IF ARS=0
+         THEN
+            GOTO END_OF_FILES;
+      CALL INDEX(N,' ',COMMAND_REC);
+      COMMAND=SUBSTR(COMMAND_REC,0,N);
+    /* Remove command word for string  */
+      COMMAND_REC=SUBSTR(COMMAND_REC,N+1,ARS-N-1);
+      IF COMMAND='C      ' OR COMMAND='COPY'
+         THEN DO;
+                 CATALOG='0'B;
+                 ERROR_CODE=1;
+              END;
+         ELSE DO;
+                 ERROR_CODE=0;
+                 CALL CATA_PROCESS;     /*Set userid-subcata                  */
+              END;
+   END;
+   CALL INDEX1(N,' ',COMMAND_REC);      /*Get CP6 filename                    */
+                                        /*  Open the CP6 file                 */
+   FID.TEXTFID_=VECTOR(SUBSTR(COMMAND_REC,0,N));
+   CALL M$FID(FID);
+   CALL M$OPEN(CP6FILE) ALTRET(CP6_OPEN);
+   DO CASE (DCB$->F$DCB.ORG#);
+      CASE(1,2);                        /*Consecutive or keyed                */
+         PARAM$=ADDR(GCOSBUFFER);
+         CALL XSF$LOCCODT(PARAM$,3);
+         FILE_SIZE=PARAM$->CODE03.UGRANS*2;
+         ERROR_CODE=0;
+         TYPE = 'SEQ';
+      CASE(5);                          /* Relative                           */
+         FILE_SIZE=DCB$->F$DCB.NRECS#;
+         ERROR_CODE=0;
+         TYPE = 'RAN';
+      CASE(ELSE);
+         ERROR_CODE=4;
+   /*E* ERROR:     XXX-00004-0
+      MESSAGE:     CP-6 FILE IS NOT KEYED, CONSECUTIVE OR RELATIVE
+      DESCRIPTION:  The CP-6 file to be copied must have an
+                    organization of keyed, consecutive or relative.
+     */
+   END;
+CP6_OPEN:
+  /*E* ERROR:      XXX-00001-0
+     MESSAGE:      NO SUCH FILE FOUND IN CP-6
+     DESCRIPTION:  On an attempt to open the CP-6 file, the altret
+                   was taken.  No file was found.
+       */
+   IF ERROR_CODE=0
+      THEN DO;
+              COMMAND_REC=SUBSTR(COMMAND_REC,N+1);
+   /*  Do we have a gcos filename specified  */
+              IF COMMAND_REC=' '
+                 THEN
+                    CALL CREATE_GCOS_NAME;
+                 ELSE DO;
+                         CALL INDEX1(N,' ',COMMAND_REC); /* Get rid of the 'TO' */
+                         COMMAND_REC=SUBSTR(COMMAND_REC,N+1);
+                         CALL GCOS_EDIT;
+                         IF ERROR_CODE=0
+    /*Add the userid if needed and available  */
+                            THEN DO;
+                                    CALL INDEX1(N,'/',COMMAND_REC);
+                                    IF N=132
+                                       THEN DO;
+                                               SAVE_NAME=COMMAND_REC;
+                                               IF CATA_SIZE=0
+                                                  THEN DO;
+                                                          CALL CONCAT(COMMAND_REC,SLASH,SAVE_NAME);
+                                                          L=L+1;
+                                                       END;
+                                                  ELSE DO;
+                                                          CALL CONCAT(COMMAND_REC,SUBSTR(CATA_AREA,0,CATA_SIZE),SLASH,SAVE_NAME);
+                                                          L=L+CATA_SIZE+1;
+                                                       END;
+                                            END;
+                                 END;
+                      END;
+CHK_ERRORS:
+              IF ERROR_CODE = 0
+                 THEN DO;
+WRITE_INFO_BLK:
+                         /*Write the gcos bcw and rcw and filename information*/
+                         GCOSBUFFER.FIRST_RECORD='0'B;
+                         BUFF$=ADDR(GCOSBUFFER);
+                                        /*Convert file size to gcos llinks    */
+                         FILE_SIZE=(FILE_SIZE*16/10)+1;
+                         GCOSBUFFER.FIRST_RECORD.SIZE=FILE_SIZE;
+                         GCOSBUFFER.FIRST_RECORD.FILESTRING=SUBSTR(COMMAND_REC,0,L);
+                         SUBSTR(GCOSBUFFER.FIRST_RECORD.FILESTRING,67,3) = TYPE;
+                         BSN=0;
+                         GCOSBUFFER.FIRST_RECORD.BSN=0;
+                         VEC=VECTOR(GCOSBUFFER);
+                         VEC.BOUND=(79);
+                         GCOSFILE.BUF_=VEC;
+                         CALL M$WRITE(GCOSFILE);
+                         TOT_FILE_CNT=TOT_FILE_CNT+1;
+                      END;
+                 ELSE
+                    CALL M$CLOSE(CP6_CLOSE);
+           END;
+      ELSE
+         CALL M$CLOSE(CP6_CLOSE);
+   CALL TERMINAL_MSG_PROCESS;
+END;
+RETURN;
+END_OF_FILES:
+MORE_CP6_FILES='0'B;
+RETURN;
+END FILE_SET_UP;
+%PAGE (ARG="EDIT THE GCOS FILENAME",PAGE=YES);
+GCOS_EDIT:PROC;
+                                        /*  Edit the gcos 8 file name
+                                                 each name must be < 13 char
+                                       no more than one password per level    */
+CALL INDEX1(L,' ',COMMAND_REC);
+X=0;
+DO WHILE (ERROR_CODE=0 AND X<L);
+   CALL INDEX1(N,'/',SUBSTR(COMMAND_REC,X,L-X));
+   CALL INDEX1(NN,'$',SUBSTR(COMMAND_REC,X,N));
+   IF NN>12
+      THEN
+         ERROR_CODE=2;
+  /*E* ERROR:        XXX-00002-0
+     MESSAGE:      INVALID GCOS 8 FILENAME - NAME TOO LONG
+     DESCRIPTION:  Any GCOS 8 userid, catalog, password or filename
+                   must be less than 13 characters.
+       */
+      ELSE DO;
+              IF(N-NN)>13
+                 THEN
+                    ERROR_CODE=2;
+  /*E* ERROR:      XXX-00002-0
+     MESSAGE:      INVALID GCOS 8 FILENAME - NAME TOO LONG
+     DESCRIPTION:  Any GCOS 8 userid, catalog, password or filename
+                   must be less than 13 characters.
+      */
+                 ELSE DO;
+                         IF N ~=NN
+                            THEN DO;
+                                    CALL INDEX1(TEMP,'$',SUBSTR(COMMAND_REC,X+NN+1,N-NN-1)) ALTRET(OK);
+                                    ERROR_CODE=3;
+  /*E* ERROR:       XXX-00003-0
+     MESSAGE:      INVALID GCOS 8 FILENAME - MUTIPLE PASSWORDS
+     DESCRIPTION:  There may be no more than one password (delimited
+                   by '$') per file or catalog or userid.
+     */
+                                 END;
+                      END;
+           END;
+OK:
+   X=X+N+1;
+END;
+END GCOS_EDIT;
+%PAGE (ARG="CATALOG COMMAND PROCESS ",PAGE=YES);
+                              /*  There is a userid/subcatalog string to be used
+                                  for a default on gcos filenames             */
+CATA_PROCESS:PROC;
+CALL GCOS_EDIT;
+IF ERROR_CODE=0
+   THEN DO;
+           CATA_AREA = SUBSTR(COMMAND_REC,0,L);
+           CATA_SIZE = L;
+        END;
+   ELSE DO;
+           CATA_AREA = ' ';
+           FILENAME.C = COMMAND_REC;
+           ACCOUNT = ' ';
+           CALL TERMINAL_MSG_PROCESS;
+           ERROR_CODE=0;
+        END;
+END CATA_PROCESS;
+%PAGE (ARG="CREATE GCOS FILENAME FROM CP6 NAME",PAGE=YES);
+CREATE_GCOS_NAME:PROC;
+                    /*  $ and : Are illegal in gcos  replace with . And -     */
+N=0;
+COMMAND_REC=SUBSTR(FILENAME.C,0,FILENAME.L);
+DO WHILE (N<32);
+   CALL INDEX1(N,'$',SUBSTR(COMMAND_REC,N));
+   IF N < 32
+      THEN
+         SUBSTR(COMMAND_REC,N,1)='.';
+END;
+N=0;
+DO WHILE (N<32);
+   CALL INDEX1(N,':',SUBSTR(COMMAND_REC,N));
+   IF N<32
+      THEN
+         SUBSTR(COMMAND_REC,N,1)='-';
+END;
+CALL GCOS_EDIT;
+IF ERROR_CODE=2
+   /*E* ERROR:      XX-00002-0
+      MESSAGE:      NAME EXCEEDS GCOS LIMIT. SUBSTITUTED NAME=
+      DESCRIPTOR :  In an attempt to make the CP-6 filename
+                    into the GCOS 8 filename, the name was too
+                    long.  The program whas forced a dummy
+                    filename in the format "...nn" where "nn" is a
+                    numeric value incremented by one each time another
+                    filename is created.
+      */
+   THEN DO;
+           ERROR_CODE=0;
+           NAM_COUNT=NAM_COUNT+1;
+           CALL BINCHAR(SUB_NAME.NUMBER,NAM_COUNT);
+           ERROR_LINE.CP6_NAME=COMMAND_REC;
+           CALL CONCAT(COMMAND_REC,SUB_NAME.DOT,SUB_NAME.NUMBER);
+           CALL CONCAT(ERROR_LINE.MESSAGE,
+                 'NAME EXCEEDS 12 CHARACTERS. SUBSTITUTED NAME = ',COMMAND_REC);
+           WRITELO.BUF_=VECTOR(ERROR_LINE);
+           CALL M$WRITE(WRITELO);
+        END;
+IF CATA_SIZE=0
+   THEN;
+   ELSE DO;
+           SAVE_NAME = COMMAND_REC;
+           CALL CONCAT(COMMAND_REC,SUBSTR(CATA_AREA,0,CATA_SIZE),
+                 SLASH, SAVE_NAME);
+           L=L+CATA_SIZE+1;
+        END;
+END CREATE_GCOS_NAME;
+%PAGE (ARG="WRITE TERMINAL MSG",PAGE=YES);
+TERMINAL_MSG_PROCESS: PROC;
+IF ERROR_CODE=0
+   THEN DO;
+           IF REC_COUNT_IN=0            /*This is beginning of a file*/
+              THEN DO;
+                      DO CASE (DCB$->F$DCB.ORG#);
+                         CASE(1);
+                            ACCT_TYPE='CONSECUTIVE';
+                         CASE(2);
+                            ACCT_TYPE='KEYED';
+                         CASE(5);
+                            ACCT_TYPE='RELATIVE';
+                         CASE(ELSE);
+                            ACCT_TYPE='OTHER TYPE';
+                      END;
+                      CALL INDEX(N,' ',FILENAME.C);
+                      CALL CONCAT(FILE_NAMES.CP6_NAME,SUBSTR(FILENAME.C,0,N),DOT,
+                            ACCOUNT,SPACER,ACCT_TYPE);
+                      FILE_NAMES.GCOS_NAME=SUBSTR(COMMAND_REC,0,L);
+                      WRITELO.BUF_=VECTOR(FILE_NAMES);
+                      CALL M$WRITE (WRITELO);
+                   END;
+              ELSE DO;                  /*End of a file                       */
+                      CALL BINCHAR (FILE_TOTAL.CP6_TOT,REC_COUNT_IN);
+                      CALL EDITSTR(FILE_TOTAL.CP6_TOT,0,7,'107'O,FILE_TOTAL.CP6_TOT);
+                      IF TYPE = 'SEQ'
+                         THEN
+                            CALL BINCHAR (FILE_TOTAL.GCOS_TOT,BSN-1);
+                         ELSE CALL BINCHAR(FILE_TOTAL.GCOS_TOT,(((BSN-1)*16+10)/10));
+                      CALL EDITSTR(FILE_TOTAL.GCOS_TOT,0,7,'107'O,FILE_TOTAL.GCOS_TOT);
+                      WRITELO.BUF_=VECTOR(FILE_TOTAL);
+                      CALL M$WRITE (WRITELO);
+                   END;
+        END;
+   ELSE DO;                             /*Error messages                      */
+           CALL INDEX(N,' ',FILENAME.C);
+           CALL CONCAT(ERROR_LINE.CP6_NAME,SUBSTR(FILENAME.C,0,N),DOT,ACCOUNT);
+           ERROR_LINE.MESSAGE=SUBSTR(COMMAND_REC,0,L);
+           DO CASE(ERROR_CODE);
+              CASE(1);
+                 ERROR_LINE.MESSAGE='NO SUCH FILE FOUND IN CP6';
+              CASE(2);
+                 WRITELO.BUF_=VECTOR(ERROR_LINE);
+                 CALL M$WRITE(WRITELO);
+                 ERROR_LINE.MESSAGE='INVALID GCOS8 FILENAME-NAME TOO LONG';
+              CASE(3);
+                 WRITELO.BUF_=VECTOR(ERROR_LINE);
+                 CALL M$WRITE(WRITELO);
+                 ERROR_LINE.MESSAGE='INVALID GCOS8 FILENAME-MULTIPLE PASSWORDS';
+              CASE(4);
+                 ERROR_LINE.MESSAGE='CP6 FILE IS NOT KEYED,CONSECUTIVE OR RELATIVE';
+              CASE(5);
+                 ERROR_LINE.MESSAGE='NO RECORDS ON CP-6 FILE';
+              CASE(6);
+                 ERROR_LINE.MESSAGE='ERROR ON THE ATTEMPTED WRITE';
+           END;
+           WRITELO.BUF_=VECTOR(ERROR_LINE);
+           CALL M$WRITE (WRITELO);
+        END;
+END TERMINAL_MSG_PROCESS;
+%PAGE (ARG="KEYED FILE",PAGE=YES);
+KEYED_FILE_PROCESS:PROC;
+EOF='0'B;
+CP6_FILE.BUF_=VECTOR(IN_REC);
+SSF$BLOCK='0'B;
+REC$=ADDR(SSF$BLOCK.DATA);
+DATA$=ADDR(SSF$RECORD.DATA);
+CALL M$READ(CP6_FILE) ALTRET(NO_FILE);
+SSF$BLOCK.BSN=1;
+BSN=1;
+REC_COUNT_IN=1;
+ARS=DCB$->F$DCB.ARS#;
+                         /*  Special time sharing record necessary for gcos   */
+SSF$RECORD.SIZE=20;
+SSF$RECORD.MEDIA_CODE=8;
+SSF$BLOCK.LENGTH=SSF$BLOCK.LENGTH+21;
+REC$=PINCRW(REC$,21);
+DATA$=ADDR(SSF$RECORD.DATA);
+DO WHILE (NOT EOF);
+   REC_SIZEW=(ARS+10)/4;                /*Add size of LINE_NO                 */
+   IF SSF$BLOCK.LENGTH+REC_SIZEW>318
+      THEN
+         CALL BLOCK_MOVE;
+   KEY_CONSEC.SPACE = ' ';
+   CALL BINCHAR(KEY_CONSEC.LINE_NO,KEYIN.T);
+   KEY_CONSEC.DATA=SUBSTR(IN_REC,0,ARS);
+   SSF$RECORD.SIZE=REC_SIZEW;
+   SSF$RECORD.MEDIA_CODE=6;
+   SSF$RECORD.NEXT_BYTE=MOD(ARS+7,4);
+   SSF$BLOCK.LENGTH=SSF$BLOCK.LENGTH+REC_SIZEW+1;
+   REC$=PINCRW(REC$,SSF$RECORD.SIZE+1);
+   DATA$=ADDR(SSF$RECORD.DATA);
+   EOF='1'B;
+   CALL M$READ(CP6_FILE) ALTRET(END_O_F);
+   EOF='0'B;
+   ARS=DCB$->F$DCB.ARS#;
+   REC_COUNT_IN=REC_COUNT_IN+1;
+END_O_F:
+END;
+IF SSF$BLOCK.LENGTH + 1 > 318
+   THEN CALL BLOCK_MOVE;
+SSF$RECORD.EOF=-1;
+REC$=PINCRW(REC$,1);
+SSF$BLOCK.LENGTH=SSF$BLOCK.LENGTH+1;
+CALL M$CLOSE(CP6_CLOSE);
+CALL BLOCK_MOVE;
+RETURN;
+NO_FILE:
+ERROR_CODE=5;
+CALL M$CLOSE(CP6_CLOSE);
+END KEYED_FILE_PROCESS;
+%PAGE (ARG="BLOCK MOVE",PAGE=YES);
+BLOCK_MOVE: PROC;
+IF MOD(BSN,8)=0 OR EOF
+   THEN DO;
+           VEC=VECTOR(GCOSBUFFER);
+           IF EOF
+              THEN
+                 VEC.BOUND=(POFFC(BUFF$,ADDR(GCOSBUFFER)))+1279;
+              ELSE
+                 VEC.BOUND=(10239);
+           GCOSFILE.BUF_=VEC;
+           CALL M$WRITE(GCOSFILE) ALTRET(NO_WRIT);
+           BUFF$=ADDR(GCOSBUFFER);
+        END;
+   ELSE
+      BUFF$=PINCRW(BUFF$,320);
+REC$=ADDR(SSF$BLOCK.DATA);
+DATA$=ADDR(SSF$RECORD.DATA);
+SSF$BLOCK='0'B;
+BSN=BSN+1;
+SSF$BLOCK.BSN=BSN;
+RETURN;
+NO_WRIT:
+ERROR_CODE=6;
+CALL TERMINAL_MSG_PROCESS;
+WRITE_ERROR='1'B;
+RETURN;
+END BLOCK_MOVE;
+%PAGE (ARG="CONSECUTIVE FILE",PAGE=YES);
+CONSECUTIVE_FILE_PROCESS:PROC;
+EOF='0'B;
+CP6_FILE.BUF_=VECTOR(IN_REC);
+SSF$BLOCK='0'B;
+REC$=ADDR(SSF$BLOCK.DATA);
+DATA$=ADDR(SSF$RECORD.DATA);
+CALL M$READ(CP6_FILE) ALTRET(NO_FILE);
+SSF$BLOCK.BSN=1;
+BSN=1;
+REC_COUNT_IN=100;
+ARS=DCB$->F$DCB.ARS#;
+                         /*  Special timesharing record necessary for gcos    */
+SSF$RECORD.SIZE=20;
+SSF$RECORD.MEDIA_CODE=8;
+SSF$BLOCK.LENGTH=SSF$BLOCK.LENGTH+21;
+REC$=PINCRW(REC$,21);
+DATA$=ADDR(SSF$RECORD.DATA);
+DO WHILE (NOT EOF);
+   REC_SIZEW=(ARS+10)/4;                /*Add size of LINE_NO                 */
+   IF SSF$BLOCK.LENGTH+REC_SIZEW>318
+      THEN
+         CALL BLOCK_MOVE;
+   KEY_CONSEC.SPACE = ' ';
+   CALL BINCHAR(KEY_CONSEC.LINE_NO,REC_COUNT_IN);
+   KEY_CONSEC.DATA=SUBSTR(IN_REC,0,ARS);
+   SSF$RECORD.SIZE=REC_SIZEW;
+   SSF$RECORD.MEDIA_CODE=6;
+   SSF$RECORD.NEXT_BYTE=MOD(ARS+7,4);
+   SSF$BLOCK.LENGTH=SSF$BLOCK.LENGTH+REC_SIZEW+1;
+   REC$=PINCRW(REC$,SSF$RECORD.SIZE+1);
+   DATA$=ADDR(SSF$RECORD.DATA);
+   EOF='1'B;
+   CALL M$READ(CP6_FILE) ALTRET(END_O_F);
+   EOF='0'B;
+   ARS=DCB$->F$DCB.ARS#;
+   REC_COUNT_IN=REC_COUNT_IN+100;
+END_O_F:
+END;
+IF SSF$BLOCK.LENGTH + 1 > 318
+   THEN CALL BLOCK_MOVE;
+SSF$RECORD.EOF=-1;
+REC$=PINCRW(REC$,1);
+SSF$BLOCK.LENGTH=SSF$BLOCK.LENGTH+1;
+CALL M$CLOSE(CP6_CLOSE);
+CALL BLOCK_MOVE;
+REC_COUNT_IN=REC_COUNT_IN/100;
+RETURN;
+NO_FILE:
+ERROR_CODE=5;
+CALL M$CLOSE(CP6_CLOSE);
+END CONSECUTIVE_FILE_PROCESS;
+%PAGE (ARG="RELATIVE FILE",PAGE=YES);
+RELATIVE_FILE_PROCESS:PROC;
+EOF='0'B;
+                              /*  Read the CP6 record (512 words) right into the
+                                  gcosbuffer because there is no data manipulation
+                                  to be done.                                 */
+CP6_FILE.BUF_=VECTOR(GCOSBUFFER.FIRST_RECORD);
+BSN=1;
+CALL M$READ(CP6_FILE) ALTRET(NO_FILE);
+DO WHILE (NOT EOF);
+   IF MOD(BSN,5) = 0
+      THEN DO;
+                                        /*  The buffer is full                */
+              GCOSFILE.BUF_=VECTOR(GCOSBUFFER);
+              CALL M$WRITE(GCOSFILE) ALTRET(NO_WRIT);
+              CP6_FILE.BUF_.BUF$=ADDR(GCOSBUFFER);
+           END;
+      ELSE
+                                        /*  Increment the pointer             */
+         CP6_FILE.BUF_.BUF$=PINCRW(CP6_FILE.BUF_.BUF$,512);
+   EOF='1'B;
+   BSN=BSN+1;
+   CALL M$READ(CP6_FILE) ALTRET(END_O_F);
+   EOF='0'B;
+END_O_F:
+END;
+                                        /*  Finish up                         */
+IF MOD(BSN-1,5)~=0
+   THEN DO;
+           GCOSFILE.BUF_=VECTOR(GCOSBUFFER);
+           GCOSFILE.BUF_.BOUND=MOD(BSN-1,5)*2048-1;
+                                        /* It is not a full block this time   */
+           CALL M$WRITE(GCOSFILE) ALTRET(NO_FILE);
+        END;
+CALL M$CLOSE(CP6_CLOSE);
+REC_COUNT_IN=BSN;
+RETURN;
+NO_FILE:
+ERROR_CODE=5;
+RETURN;
+NO_WRIT:
+ERROR_CODE=6;
+CALL M$CLOSE(CP6_CLOSE);
+CALL TERMINAL_MSG_PROCESS;
+WRITE_ERROR='1'B;
+RETURN;
+END RELATIVE_FILE_PROCESS;
+END EXPORT;

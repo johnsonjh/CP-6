@@ -1,0 +1,966 @@
+/*M* RECSIZE_SI61 - main source for RECSIZE.X program */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMR,PLM=2,IND=2,CTI=2,SDI=2,MCL=10,CSI=0,ECI=0 */
+RECSIZE:PROC MAIN ALTRET;
+ 
+/* Includes */
+ 
+%INCLUDE CP_6;                          /* Monitor stuff */
+%INCLUDE XU_FORMAT_C;                   /* CP6 formatter */
+%INCLUDE XU_MACRO_C;                    /* CP6 parser */
+%INCLUDE B_ERRORS_C;                    /* EQUs for Monitor Error codes */
+%INCLUDE CP_6_SUBS;                     /* EQUs for Monitor FPTs */
+%INCLUDE B$JIT;                         /* Jit structure */
+%INCLUDE B_MICROPS_C;              /* SUBs for calls to PL6's EDIT functions */
+%INCLUDE B_SEGIDS_C;                    /* SUBs for memory seg ids. */
+%INCLUDE XS_MACRO_C;                    /* FSFA macros.             */
+%INCLUDE RECSIZE_C61;
+ 
+/* Entries */
+ 
+DCL X$PARSE ENTRY(1) ALTRET;
+DCL X$WRITE ENTRY(22);
+DCL BREAK_CONTROL ENTRY ASYNC;
+DCL XSA$READ ENTRY(2) ALTRET;
+DCL XSA$CLOSE ENTRY(2) ALTRET;
+DCL XSA$OPEN ENTRY(2) ALTRET;
+DCL XSA$PRECORD ENTRY(2) ALTRET;
+ 
+/* Macros */
+ 
+%F$DCB;
+%B$ALT;
+%B$TCB;
+%XSA_PARAM;
+%PARSE$OUT (NAME = OUT,STCLASS="BASED(CMD$)");
+%PARSE$SYM (NAME = SYM,STCLASS="BASED(CMD$)");
+%P_PCB (WSZ=1024,R=CCBUF_OPS,OUTDCB=M$DO,T=BUF,CNTU=NO);
+%F_FDS (DCB=M$LO,BUF=OUT_BUF);
+%F_FDS (DCB=M$DO,BUF=OUT_BUF,NAME=M$DO_FDS);
+ 
+/* Dcbs */
+ 
+DCL M$ME DCB;
+DCL M$SI DCB;
+DCL M$LO DCB;
+DCL M$DO DCB;
+ 
+/* EQUs */
+ 
+%EQU BOF#=1;
+%EQU EOF#=99999999;
+%EQU HEADER_WRITTEN# = 0;
+%EQU HEADER_NOT_WRITTEN# = 1;
+ 
+%EJECT;
+/* Vlps and Fpts */
+ 
+%VLP_VECTOR;
+%VLP_VECTOR (FPTN=DYN_MEM,SEGID=%DS3SID);
+%VLP_VECTOR (FPTN=Q_MEM,  SEGID=%DS4SID);
+ 
+%FPT_WRITE;
+%FPT_CORRES (DCB1 = M$LO, DCB2 = M$DO);
+%FPT_READ   (DCB = M$SI,
+             KEYR = YES,
+             KEY = KEY_STRUCT);
+%FPT_ERRMSG (OUTDCB1 = M$DO,
+             BUF = BUF,
+             FLAGLEV = 3);
+%FPT_OPEN   (DCB=M$SI,
+             SHARE = NONE,
+             ACS =  SEQUEN,
+             FUN=IN);
+%FPT_YC     (CMD=CMD);
+%FPT_CLOSE  (DCB=M$LO,DISP=SAVE);
+%FPT_GDP    (RESULTS=VLP_VECTOR,PAGES=6);
+%FPT_FDP    (RESULTS=VLP_VECTOR,PAGES=1);
+%FPT_PRECORD(DCB=M$SI);
+%FPT_INT    (UENTRY=BREAK_CONTROL);
+%FPT_GDS    (RESULTS=DYN_MEM,
+             FREE=YES,
+             SEGSIZE=64);               /*256 Bytes of dynamic memory*/
+%FPT_GDS    (RESULTS=Q_MEM,
+             FREE=YES,
+             SEGSIZE="SIZEW(UN_Q)",
+             FPTN=ENLARGE_Q);
+%FPT_CLOSE  (DCB=M$SI,FPTN=SI_CLOSE);
+%FPT_EXIT (FPTN=GET_GONE);
+ 
+/* Ptrs */
+ 
+DCL B$JIT$ PTR SYMREF;
+DCL B$TCB$ PTR SYMREF;
+DCL TEMP$ PTR;
+DCL REAR$ PTR STATIC INIT(ADDR(NIL));
+DCL CMD$ PTR;
+DCL M$SI$ PTR;
+DCL DYN_BUF$ PTR STATIC INIT(ADDR(NIL));
+ 
+%EJECT;
+/* Miscellaneous Scalars */
+ 
+DCL I SBIN;
+DCL J UBIN;
+DCL SG# SBIN;
+DCL SE# SBIN;
+DCL SL# SBIN;
+DCL SB_LOW# SBIN;
+DCL SB_HI#  SBIN;
+DCL SB_COUNTER# SBIN STATIC INIT(0);
+DCL SL_COUNTER# SBIN STATIC INIT(0);
+DCL SG_COUNTER# SBIN STATIC INIT(0);
+DCL SE_COUNTER# SBIN STATIC INIT(0);
+DCL UNPRINT_COUNTER# SBIN STATIC INIT(0);
+DCL BLK# SBIN;
+DCL RBLK# SBIN;
+DCL MAX_REC# SBIN STATIC INIT(0);
+DCL MIN_REC# SBIN STATIC INIT(0);
+DCL CHAR_COUNT# SBIN STATIC SYMDEF INIT(0);
+DCL MAX_RECSIZE# SBIN STATIC SYMDEF INIT(0);
+DCL MIN_RECSIZE# SBIN STATIC SYMDEF INIT(99999999);
+DCL CURRENT_REC# SBIN STATIC SYMDEF INIT(0);
+DCL HDR# SBIN STATIC INIT(1);
+DCL DYN_BUF_LEN# SBIN STATIC INIT(256);
+DCL STEPCC SBIN STATIC SYMDEF INIT(0);
+DCL CCDISP SBIN WORD;
+DCL START_RECORD# SBIN STATIC INIT(%BOF#);
+DCL END_RECORD# SBIN STATIC INIT(%EOF#);
+ 
+DCL CH CHAR(1);
+DCL HELLO CHAR(0) CONSTANT INIT ('Recsize B00 Here');
+DCL SAY_WHAT CHAR(0) CONSTANT INIT ('  Recize What?');
+DCL PAST_EOF CHAR(0) CONSTANT INIT ('  Starting Record Sequence No. is beyond EOF.');
+DCL BUF CHAR(256) STATIC WALIGNED;
+DCL BUF_ARRAY (0:255) REDEF BUF CHAR(1);
+DCL DUMMY CHAR(8) ;
+DCL KEY_CHARS CHAR(9) ;
+DCL EDIT1 (0:5) BIT(9) CONSTANT INIT(%MVZB4,%MVC1,%SES10,%INSP0,ASCBIT('.'),%MVC3);
+DCL CMD CHAR(0) CONSTANT INIT('HELP (RECSIZE.:USER) SYNTAX');
+DCL ILLEGAL_SEQUENCE CHAR(0) CONSTANT INIT('  Illegal Record Range. Lo > Hi');
+DCL DEVICE_GRIPE CHAR(0) CONSTANT INIT(
+       '  Recsize me no DEVICES and I''ll Recsize you no XXX.');
+DCL DUMB_BETWEEN_RANGE CHAR(0) CONSTANT INIT('  Bad "Between" Size.  Lo >= Hi.');
+DCL NO_RECS CHAR(0) CONSTANT INIT('  Your file has no records.');
+DCL OUT_BUF CHAR(80) WALIGNED STATIC;
+DCL DYN_BUF CHAR(DYN_BUF_LEN#) BASED(DYN_BUF$);
+DCL BUF_SG_EDIT CHAR(0) CONSTANT INIT('%3X>%5D%5X%7D%6X%9D%5X%9LA');
+DCL BUF_SG_NO_EDIT CHAR(0) CONSTANT INIT('%3X>%5D%5X%7D%6X%9D');
+DCL VEC_BUF_SG_EDIT VECTOR CONSTANT INIT(VECTOR(BUF_SG_EDIT));
+DCL VEC_BUF_SG_NO_EDIT VECTOR CONSTANT INIT(VECTOR(BUF_SG_NO_EDIT));
+DCL BUF_SE_EDIT CHAR(0) CONSTANT INIT('%3X=%5D%5X%7D%6X%9D%5X%9LA');
+DCL BUF_SE_NO_EDIT CHAR(0) CONSTANT INIT('%3X=%5D%5X%7D%6X%9D');
+DCL VEC_BUF_SE_EDIT VECTOR CONSTANT INIT(VECTOR(BUF_SE_EDIT));
+DCL VEC_BUF_SE_NO_EDIT VECTOR CONSTANT INIT(VECTOR(BUF_SE_NO_EDIT));
+DCL BUF_SL_EDIT CHAR(0) CONSTANT INIT('%3X<%5D%5X%7D%6X%9D%5X%9LA');
+DCL BUF_SL_NO_EDIT CHAR(0) CONSTANT INIT('%3X<%5D%5X%7D%6X%9D');
+DCL VEC_BUF_SL_EDIT VECTOR CONSTANT INIT(VECTOR(BUF_SL_EDIT));
+DCL VEC_BUF_SL_NO_EDIT VECTOR CONSTANT INIT(VECTOR(BUF_SL_NO_EDIT));
+DCL BUF_SB_EDIT CHAR(0) CONSTANT INIT('||(%D,%D)%15-%7D%6X%9D%5X%9LA');
+DCL BUF_SB_NO_EDIT CHAR(0) CONSTANT INIT('||(%D,%D)%15-%7D%6X%9D');
+DCL VEC_BUF_SB_EDIT VECTOR CONSTANT INIT(VECTOR(BUF_SB_EDIT));
+DCL VEC_BUF_SB_NO_EDIT VECTOR CONSTANT INIT(VECTOR(BUF_SB_NO_EDIT));
+DCL BUF_SG_TOTAL CHAR(0) CONSTANT INIT('No. of Records >%5D bytes:  %D');
+DCL VEC_BUF_SG_TOTAL VECTOR CONSTANT INIT(VECTOR(BUF_SG_TOTAL));
+DCL BUF_SL_TOTAL CHAR(0) CONSTANT INIT('No. of Records <%5D bytes:  %D');
+DCL VEC_BUF_SL_TOTAL VECTOR CONSTANT INIT(VECTOR(BUF_SL_TOTAL));
+DCL BUF_SE_TOTAL CHAR(0) CONSTANT INIT('No. of Records =%5D bytes:  %D');
+DCL VEC_BUF_SE_TOTAL VECTOR CONSTANT INIT(VECTOR(BUF_SE_TOTAL));
+DCL BUF_SB_TOTAL CHAR(0) CONSTANT INIT('No. of Records Between %D and %D bytes:  %D');
+DCL VEC_BUF_SB_TOTAL VECTOR CONSTANT INIT(VECTOR(BUF_SB_TOTAL));
+DCL WORKING1 CHAR(0) CONSTANT INIT(
+       '...Working.  Record Range:  BOF-EOF');
+DCL VEC_WORKING1 VECTOR CONSTANT INIT(VECTOR(WORKING1));
+DCL WORKING2 CHAR(0) CONSTANT INIT(
+       '...Working.  Record Range:  BOF-%D');
+DCL VEC_WORKING2 VECTOR CONSTANT INIT(VECTOR(WORKING2));
+DCL WORKING3 CHAR(0) CONSTANT INIT(
+       '...Working.  Record Range:  %D-EOF');
+DCL VEC_WORKING3 VECTOR CONSTANT INIT(VECTOR(WORKING3));
+DCL WORKING4 CHAR(0) CONSTANT INIT(
+       '...Working.  Record Range:  %D-%D');
+DCL VEC_WORKING4 VECTOR CONSTANT INIT(VECTOR(WORKING4));
+DCL BCFMT CHAR(0) CONSTANT INIT(
+       '%1/**Total Bytes:      %D');
+DCL VEC_BCFMT VECTOR CONSTANT INIT(VECTOR(BCFMT));
+DCL FMTKEYEOF CHAR(0) CONSTANT INIT(
+       'End Of File detected after record number %D; Key %<>LA .');
+DCL VEC_FMTKEYEOF VECTOR CONSTANT INIT(VECTOR(FMTKEYEOF));
+DCL FMTNOKEYEOF CHAR(0) CONSTANT INIT(
+       'End Of File detected after record number %D.');
+DCL VEC_FMTNOKEYEOF VECTOR CONSTANT INIT(VECTOR(FMTNOKEYEOF));
+DCL FMT_HEADERKEY CHAR(0) CONSTANT INIT(
+       '%1/Condition%5XRecSize%5XRecord No.%11XKey%1/%50(-%)');
+DCL VEC_FMT_HEADERKEY VECTOR CONSTANT INIT(VECTOR(FMT_HEADERKEY));
+DCL FMT_HEADERNOKEY CHAR(0) CONSTANT INIT(
+       '%1/Condition%5XRecSize%5XRecord No.%1/%36(-%)');
+DCL VEC_FMT_HEADERNOKEY VECTOR CONSTANT INIT(VECTOR(FMT_HEADERNOKEY));
+DCL FMT_MAXRECSIZENOKEY CHAR(0) CONSTANT INIT(
+       '**Largest record was %D bytes, first found at record %D.');
+DCL VEC_FMT_MAXRECSIZENOKEY VECTOR CONSTANT INIT(VECTOR(FMT_MAXRECSIZENOKEY));
+DCL FMT_MINRECSIZENOKEY CHAR(0) CONSTANT INIT(
+       '**Smallest record was %D bytes, first found at record %D.');
+DCL VEC_FMT_MINRECSIZENOKEY VECTOR CONSTANT INIT(VECTOR(FMT_MINRECSIZENOKEY));
+DCL FMT_MAXRECSIZEKEY CHAR(0) CONSTANT INIT(
+       '**Largest record was %D bytes, first found at record %D%1/%13X@Key:  %<>LA');
+DCL VEC_FMT_MAXRECSIZEKEY VECTOR CONSTANT INIT(VECTOR(FMT_MAXRECSIZEKEY));
+DCL FMT_MINRECSIZEKEY CHAR(0) CONSTANT INIT(
+       '**Smallest record was %D bytes, first found at record %D%1/%13X@Key:  %<>LA');
+DCL VEC_FMT_MINRECSIZEKEY VECTOR CONSTANT INIT(VECTOR(FMT_MINRECSIZEKEY));
+DCL FMT_BLANK_LINE  CHAR(0) CONSTANT INIT(' ');
+DCL VEC_FMT_BLANK_LINE VECTOR CONSTANT INIT(VECTOR(FMT_BLANK_LINE));
+DCL UNPRINTNOKEY CHAR(0) CONSTANT INIT(
+       'Unprintable O''%3ZO'' at column %D in record %D');
+DCL VEC_UNPRINTNOKEY VECTOR CONSTANT INIT(VECTOR(UNPRINTNOKEY));
+DCL UNPRINTKEY CHAR(0) CONSTANT INIT(
+       'Unprintable O''%3ZO'' at column %D in record %D; Key %<>A');
+DCL VEC_UNPRINTKEY VECTOR CONSTANT INIT(VECTOR(UNPRINTKEY));
+DCL UNTOTAL CHAR(0) CONSTANT INIT(
+       'Total unprintable characters found:  %D');
+DCL VEC_UNTOTAL VECTOR CONSTANT INIT(VECTOR(UNTOTAL));
+ 
+DCL DCBS_CORRES BIT(1) WALIGNED STATIC INIT(%NO#);
+DCL BC BIT(1) WALIGNED STATIC INIT(%NO#);
+DCL ANY_RECSIZE_OPT BIT(1) WALIGNED STATIC INIT(%NO#);
+DCL SG_OPT BIT(1) WALIGNED STATIC INIT(%NO#);
+DCL SE_OPT BIT(1) WALIGNED STATIC INIT(%NO#);
+DCL SB_OPT BIT(1) WALIGNED STATIC INIT(%NO#);
+DCL SL_OPT BIT(1) WALIGNED STATIC INIT(%NO#);
+DCL UN_OPT BIT(1) WALIGNED STATIC INIT(%NO#);
+ 
+DCL CCBUF_OPS BIT(36) SYMREF;           /* Partrge Nodes */
+ 
+%EJECT;
+/* Structures and Arrays */
+ 
+DCL 1 KEY_STRUCT STATIC SYMDEF WALIGNED,
+      2 LEN# UBIN BYTE UNAL INIT(0),
+      2 FULL_KEY CHAR(255) UNAL,
+      2 SUB_KEY REDEF FULL_KEY,
+        3 EDIT UBIN(27) UNAL,
+        3 * CHAR(252) UNAL;
+ 
+DCL 1 MAX_STRUCT STATIC SYMDEF WALIGNED,
+      2 LEN# UBIN BYTE UNAL INIT(0),
+      2 FULL_KEY CHAR(255) UNAL,
+      2 SUB_KEY REDEF FULL_KEY,
+        3 EDIT UBIN(27) UNAL,
+        3 * CHAR(252) UNAL;
+ 
+DCL 1 MIN_STRUCT STATIC SYMDEF WALIGNED,
+      2 LEN# UBIN BYTE UNAL INIT(0),
+      2 FULL_KEY CHAR(255) UNAL,
+      2 SUB_KEY REDEF FULL_KEY,
+        3 EDIT UBIN(27) UNAL,
+        3 * CHAR(252) UNAL;
+ 
+DCL 1 UNPRINT_STRUCT STATIC WALIGNED,
+      2 * (0:31) UBIN BYTE UNAL INIT(
+           1,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,
+           18,19,20,21,22,23,24,25,26,27,28,29,30,31),
+      2 * (0:94) UBIN BYTE UNAL INIT(0*0),
+      2 * (0:384) UBIN BYTE UNAL INIT(127,128,129,
+           130,131,132,133,134,135,136,137,138,139,
+           140,141,142,143,144,145,146,147,148,149,
+           150,151,152,153,154,155,156,157,158,159,
+           160,161,162,163,164,165,166,167,168,169,
+           170,171,172,173,174,175,176,177,178,179,
+           180,181,182,183,184,185,186,187,188,189,
+           190,191,192,193,194,195,196,197,198,199,
+           200,201,202,203,204,205,206,207,208,209,
+           210,211,212,213,214,215,216,217,218,219,
+           220,221,222,223,224,225,226,227,228,229,
+           230,231,232,233,234,235,236,237,238,239,
+           240,241,242,243,244,245,246,247,248,249,
+           250,251,252,253,254,255,256,257,258,259,
+           260,261,262,263,264,265,266,267,268,269,
+           270,271,272,273,274,275,276,277,278,279,
+           280,281,282,283,284,285,286,287,288,289,
+           290,291,292,293,294,295,296,297,298,299,
+           300,301,302,303,304,305,306,307,308,309,
+           310,311,312,313,314,315,316,317,318,319,
+           320,321,322,323,324,325,326,327,328,329,
+           330,331,332,333,334,335,336,337,338,339,
+           340,341,342,343,344,345,346,347,348,349,
+           350,351,352,353,354,355,356,357,358,359,
+           360,361,362,363,364,365,366,367,368,369,
+           370,371,372,373,374,375,376,377,378,379,
+           380,381,382,383,384,385,386,387,388,389,
+           390,391,392,393,394,395,396,397,398,399,
+           400,401,402,403,404,405,406,407,408,409,
+           410,411,412,413,414,415,416,417,418,419,
+           420,421,422,423,424,425,426,427,428,429,
+           430,431,432,433,434,435,436,437,438,439,
+           440,441,442,443,444,445,446,447,448,449,
+           450,451,452,453,454,455,456,457,458,459,
+           460,461,462,463,464,465,466,467,468,469,
+           470,471,472,473,474,475,476,477,478,479,
+           480,481,482,483,484,485,486,487,488,489,
+           490,491,492,493,494,495,496,497,498,499,
+           500,501,502,503,504,505,506,507,508,509,510,511);
+ 
+DCL UNPRINT_TABLE (0:511) REDEF UNPRINT_STRUCT CHAR(1);
+ 
+DCL 1 UN_Q BASED,
+      2 NEXT$ PTR,
+      2 COL# UBIN WORD,
+      2 REC# UBIN WORD,
+      2 UNPRINTABLE_CHAR CHAR(1) UNAL,
+      2 * CHAR(3) UNAL,
+      2 KEY_STRUCT,
+        3 LEN# UBIN BYTE UNAL,
+        3 EDIT UBIN(27) UNAL;
+ 
+DCL 1 Q_ITEM STATIC,
+      2 NEXT$ PTR INIT(ADDR(NIL)),
+      2 COL# UBIN WORD,
+      2 REC# UBIN WORD,
+      2 UNPRINTABLE_CHAR CHAR(1) UNAL,
+      2 * CHAR(3) UNAL,
+      2 KEY_STRUCT,
+        3 LEN# UBIN BYTE UNAL,
+        3 EDIT UBIN(27) UNAL;
+ 
+%EJECT;
+/* Code */
+ 
+  M$SI$ = DCBADDR(DCBNUM(M$SI));
+  IF ~M$SI$->F$DCB.AMR# THEN
+ 
+                                        /* No input file specified. */
+ 
+  DO;
+    FPT_WRITE.BUF_ = VECTOR(SAY_WHAT);
+    FPT_WRITE.V.DCB# = DCBNUM(M$DO);
+    CALL M$WRITE (FPT_WRITE) ALTRET(SYSTEM_ERROR);
+    RETURN;
+     END;
+ 
+  IF M$SI$->F$DCB.ASN# = %DEVICE# THEN
+ 
+                                        /* Who cares? */
+ 
+  DO;
+    FPT_WRITE.BUF_ = VECTOR(DEVICE_GRIPE);
+    FPT_WRITE.V.DCB# = DCBNUM(M$DO);
+    CALL M$WRITE(FPT_WRITE) ALTRET(SYSTEM_ERROR);
+    CALL M$XXX;
+     END;
+ 
+  CALL XSA$OPEN(FPT_OPEN,XSA_PARAM) ALTRET(XSA_ERROR);
+ 
+       /* Ck to see if user's input fid is compatible with FSFA.
+          If yes (XSA_PARAM.ORG ~= 0), then grab some mem for
+          FSFA's key and blocking buffers.                       */
+ 
+  IF XSA_PARAM.ORG ~= 0 THEN
+  DO;
+    CALL M$GDP(FPT_GDP) ALTRET(SYSTEM_ERROR);
+    XSA_PARAM.BBUF_ = VLP_VECTOR;
+    FPT_GDP.V.PAGES# = 1;
+    CALL M$GDP(FPT_GDP) ALTRET(SYSTEM_ERROR);
+    XSA_PARAM.KBUF_ = VLP_VECTOR;
+     END;                               /* Do */
+  ELSE
+    FPT_GDP.V.PAGES# = 1;
+ 
+  IF M$SI$->F$DCB.NRECS# = 0 THEN
+ 
+                                        /* Basic Waste of Time */
+ 
+  DO;
+    FPT_WRITE.BUF_ = VECTOR(NO_RECS);
+    FPT_WRITE.V.DCB# = DCBNUM(M$DO);
+    CALL M$WRITE(FPT_WRITE) ALTRET(SYSTEM_ERROR);
+    ALTRETURN;
+     END;
+ 
+       /* See if the user specified any options on the IBEX
+          command line.  If yes, parse the options.         */
+ 
+  CCDISP = B$JIT.CCDISP;
+  IF CCDISP ~= B$JIT.CCARS THEN
+ 
+                                        /* Parse Options */
+ 
+  DO;
+    CALL M$GDP(FPT_GDP) ALTRET(SYSTEM_ERROR); /* Mem for X$PARSE */
+    P_PCB.WORK$ = VLP_VECTOR.PTR$;
+    BUF = SUBSTR(B$JIT.CCBUF,CCDISP);
+    P_PCB.NCHARS = B$JIT.CCARS - CCDISP;
+    CALL X$PARSE(P_PCB) ALTRET(HELPER);
+    CMD$ = P_PCB.OUT$;
+ 
+    DO BLK# = 0 TO OUT.NSUBLKS - 1;
+      DO CASE (OUT.SUBLK$(BLK#)->OUT.CODE);
+      CASE(4) ;                         /* BC  ('B/YTE' 'C/OUNT') */
+         BC = %YES#;
+      CASE(5) ;     /* SG  ( {'>'|['S/IZE'] 'G/REATER' ['T/HAN'] } .DEC5) */
+         SG_OPT = %YES#;
+         CALL CHARBIN(SG#,OUT.SUBLK$(BLK#)->OUT.SUBLK$(0)->SYM.TEXT);
+      CASE(6) ;          /* SE  ( {'='|['S/IZE'] 'E/QUAL' ['T/O'] } .DEC5) */
+         SE_OPT = %YES#;
+         CALL CHARBIN(SE#,OUT.SUBLK$(BLK#)->OUT.SUBLK$(0)->SYM.TEXT);
+      CASE(7) ;          /* SL  ( {'<'|['S/IZE'] 'L/ESS' ['T/HAN'] } .DEC5) */
+         SL_OPT = %YES#;
+         CALL CHARBIN(SL#,OUT.SUBLK$(BLK#)->OUT.SUBLK$(0)->SYM.TEXT);
+      CASE(8) ;     /* SB  ( {'||'|['S/IZE'] 'B/ETWEEN'} '('.DEC5,.DEC5 ')') */
+         SB_OPT = %YES#;
+         CALL CHARBIN(SB_LOW#,OUT.SUBLK$(BLK#)->OUT.SUBLK$(0)->SYM.TEXT);
+         CALL CHARBIN(SB_HI#,OUT.SUBLK$(BLK#)->OUT.SUBLK$(1)->SYM.TEXT);
+         IF SB_LOW# >= SB_HI# THEN
+         DO;
+           FPT_WRITE.BUF_ = VECTOR(DUMB_BETWEEN_RANGE);
+           FPT_WRITE.V.DCB# = DCBNUM(M$DO);
+           CALL M$WRITE(FPT_WRITE) ALTRET(SYSTEM_ERROR);
+           ALTRETURN;
+            END;                        /* Do */
+      CASE(9) ;  /* 'U/NPRINT' ['(' <',',{'N/O' ascii mnemonic}> ')']
+ 
+                                  Valid ascii mnemonics:
+                                  ----------------------
+                                  NUL/L SOH STX ETX EOT ENQ ACK BEL/L
+                                  BS    HT  LF  VT  FF  CR  SO  SI
+                                  DLE   DC1 DC2 DC3 DC4 NAK SYN ETB
+                                  CAN   EM  SUB ESC FS  GS  RS  US
+                                  DEL                                 */
+ 
+         UN_OPT = %YES#;
+         DO I = 0 TO OUT.SUBLK$(BLK#)->OUT.NSUBLKS - 1;
+           J=OUT.SUBLK$(BLK#)->OUT.SUBLK$(I)->OUT.CODE;
+           UNPRINT_TABLE(J) = BINASC(0);
+            END;                        /* Do I=0 to .. */
+      CASE(1) ;               /* 'R/ECORD' 'R/ANGE' ['='] [.DEC8] '-' [.DEC8] */
+         DO RBLK# = 0 TO OUT.SUBLK$(BLK#)->OUT.NSUBLKS - 1;
+           DO CASE(OUT.SUBLK$(BLK#)->OUT.SUBLK$(RBLK#)->OUT.CODE);
+           CASE(2);
+              CALL CHARBIN(START_RECORD#,
+                OUT.SUBLK$(BLK#)->OUT.SUBLK$(RBLK#)->SYM.TEXT);
+              IF START_RECORD# = 0 THEN
+                START_RECORD# =  1;
+           CASE(3);
+              CALL CHARBIN(END_RECORD#,
+                OUT.SUBLK$(BLK#)->OUT.SUBLK$(RBLK#)->SYM.TEXT);
+              IF END_RECORD# = 0 THEN
+                END_RECORD# =  1;
+           END;                         /* Do Case */
+            END;                        /* Do To */
+      END;                              /* Do Case */
+       END;                             /* Do To */
+ 
+                         /* Ck the limits of START_RECORD# and END_RECORD# */
+ 
+    IF START_RECORD# > END_RECORD# THEN
+ 
+                                        /* Scream */
+ 
+    DO;
+      FPT_WRITE.BUF_ = VECTOR(ILLEGAL_SEQUENCE);
+      FPT_WRITE.V.DCB# = DCBNUM(M$DO);
+      CALL M$WRITE(FPT_WRITE) ALTRET(SYSTEM_ERROR);
+      ALTRETURN;
+       END;
+ 
+                    /* Give up the parser's memory--don't need it anymore. */
+ 
+    CALL M$FDP(FPT_FDP) ALTRET(SYSTEM_ERROR);
+ 
+                                        /* Were any size options specified? */
+ 
+    ANY_RECSIZE_OPT = SG_OPT | SB_OPT | SL_OPT | SE_OPT;
+     END;                               /* Do parsing */
+%EJECT;
+SPIN_THRU_FILE: ;
+ 
+       /* tell the folks Hi */
+ 
+  FPT_WRITE.BUF_ = VECTOR(HELLO);
+  FPT_WRITE.V.DCB# = DCBNUM(M$ME);
+  CALL M$WRITE(FPT_WRITE) ALTRET(SYSTEM_ERROR);
+ 
+       /* Get some memory for an input buffer */
+ 
+  CALL M$GDS(FPT_GDS) ALTRET(SYSTEM_ERROR);
+  DYN_BUF$ = DYN_MEM.PTR$;
+  FPT_READ.BUF_ = VECTOR(DYN_BUF);
+ 
+  IF START_RECORD# ~= %BOF# THEN
+ 
+                    /* See if the file can be positioned to START_RECORD# */
+ 
+  DO;
+    FPT_PRECORD.V.N# = START_RECORD# - 1;
+    CALL XSA$PRECORD(FPT_PRECORD,XSA_PARAM) ALTRET(BAD_RANGE);
+     END;
+ 
+       /* Let the folks know that something is about to occur.*/
+ 
+  CALL M$INT(FPT_INT) ALTRET(SYSTEM_ERROR); /* Take Break Control */
+  IF START_RECORD# = %BOF# & END_RECORD# = %EOF# THEN
+    CALL X$WRITE(F_FDS,VEC_WORKING1);
+  ELSE
+    IF START_RECORD# = %BOF# & END_RECORD# ~=%EOF# THEN
+      CALL X$WRITE(F_FDS,VEC_WORKING2,VECTOR(END_RECORD#));
+    ELSE
+      IF START_RECORD# ~=%BOF# & END_RECORD# = %EOF# THEN
+        CALL X$WRITE(F_FDS,VEC_WORKING3,VECTOR(START_RECORD#));
+      ELSE
+        CALL X$WRITE(F_FDS,VEC_WORKING4,VECTOR(START_RECORD#),
+          VECTOR(END_RECORD#));
+ 
+ 
+       /* While not EOF and Not End of User Specified Record Range,
+          Do accumulate stats.                                     */
+ 
+        DO CURRENT_REC# = START_RECORD# TO END_RECORD#;
+ 
+LD_RECOV: ;
+          CALL XSA$READ(FPT_READ,XSA_PARAM) ALTRET(EOF_ERROR);
+          DO WHILE('0'B);
+ 
+EOF_ERROR:  ;
+            IF XSA_PARAM.ERR.CODE = %E$EOF THEN
+            DO;
+              CURRENT_REC# = CURRENT_REC# - 1;
+ 
+                   /* First, ck to see if size options were specified at the
+                      same time as the unprint option.  If so, we may have some
+                      unprintable chars buffered up in data segment DS4SID and
+                      they need to be output.                                 */
+ 
+              IF ANY_RECSIZE_OPT & UN_OPT THEN
+                IF REAR$ ~= ADDR(NIL) THEN
+                DO;
+                  CALL X$WRITE(F_FDS,VEC_FMT_BLANK_LINE);
+                  DO WHILE Q_MEM.PTR$ ~= ADDR(NIL);
+                    IF Q_MEM.PTR$->UN_Q.KEY_STRUCT.LEN# = 3 THEN
+                    DO;
+                      CALL BINCHAR(DUMMY,
+                        Q_MEM.PTR$->UN_Q.KEY_STRUCT.EDIT);
+                      CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+                      CALL X$WRITE(F_FDS,VEC_UNPRINTKEY,
+                        VECTOR(Q_MEM.PTR$->UN_Q.UNPRINTABLE_CHAR),
+                        VECTOR(Q_MEM.PTR$->UN_Q.COL#),
+                        VECTOR(Q_MEM.PTR$->UN_Q.REC#),
+                        VECTOR(KEY_CHARS));
+                       END;
+                    ELSE
+                      CALL X$WRITE(F_FDS,VEC_UNPRINTNOKEY,
+                        VECTOR(Q_MEM.PTR$->UN_Q.UNPRINTABLE_CHAR),
+                        VECTOR(Q_MEM.PTR$->UN_Q.COL#),
+                        VECTOR(Q_MEM.PTR$->UN_Q.REC#));
+                    Q_MEM.PTR$ = Q_MEM.PTR$->UN_Q.NEXT$;
+                     END;               /* Do while */
+                   END;                 /* If Rear$ ... */
+              IF KEY_STRUCT.LEN# ~=3 THEN /*Probably not an Edit file.*/
+                CALL X$WRITE(F_FDS,VEC_FMTNOKEYEOF,VECTOR(CURRENT_REC#));
+              ELSE
+              DO;
+                CALL BINCHAR(DUMMY,KEY_STRUCT.SUB_KEY.EDIT);
+                CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+                CALL X$WRITE(F_FDS,VEC_FMTKEYEOF,VECTOR(CURRENT_REC#),
+                  VECTOR(KEY_CHARS));
+                 END;                   /*DO*/
+              GOTO OUTPUT_RESULTS;
+               END;                     /*DO*/
+            ELSE
+              IF XSA_PARAM.ERR.CODE = %E$LD THEN
+ 
+                                   /* Try to get more memory for the read. */
+ 
+              DO;
+                FPT_GDS.V.SEGSIZE#=FPT_GDS.V.SEGSIZE#*2;
+                CALL M$GDS(FPT_GDS) ALTRET(SYSTEM_ERROR);
+                DYN_BUF_LEN# = FPT_GDS.V.SEGSIZE#*4;
+                IF DYN_BUF_LEN# > 100000 THEN
+ 
+                                        /* This record is ridiculously long. */
+ 
+                  GOTO XSA_ERROR;
+                DYN_BUF$ = DYN_MEM.PTR$;
+                FPT_READ.BUF_ = VECTOR(DYN_BUF);
+                FPT_PRECORD.V.N# = -1;
+                CALL XSA$PRECORD(FPT_PRECORD,XSA_PARAM) ALTRET(XSA_ERROR);
+                GOTO LD_RECOV;
+                 END;
+              ELSE
+                GOTO XSA_ERROR;
+             END;                       /* Do while */
+          IF BC THEN
+            CHAR_COUNT# = CHAR_COUNT# + XSA_PARAM.ARS#;
+          IF XSA_PARAM.ARS# > MAX_RECSIZE# THEN
+          DO;
+            IF KEY_STRUCT.LEN# = 3 THEN
+              MAX_STRUCT = KEY_STRUCT;
+            MAX_REC# = CURRENT_REC#;
+            MAX_RECSIZE# = XSA_PARAM.ARS#;
+             END;                       /*Do*/
+          IF XSA_PARAM.ARS# < MIN_RECSIZE# THEN
+          DO;
+            IF KEY_STRUCT.LEN# = 3 THEN
+              MIN_STRUCT = KEY_STRUCT;
+            MIN_REC# = CURRENT_REC#;
+            MIN_RECSIZE# = XSA_PARAM.ARS#;
+             END;                       /*Do*/
+          IF SG_OPT & (XSA_PARAM.ARS# > SG#) THEN
+          DO;
+            SG_COUNTER# = SG_COUNTER# + 1;
+            IF HDR# = %HEADER_NOT_WRITTEN# THEN
+ 
+                                        /* Gotta' spit out a hdr */
+ 
+              CALL PRINT_HEADER;
+            IF KEY_STRUCT.LEN# = 3 THEN
+            DO;
+              CALL BINCHAR(DUMMY,KEY_STRUCT.SUB_KEY.EDIT);
+              CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+              CALL X$WRITE(F_FDS,VEC_BUF_SG_EDIT,VECTOR(SG#),
+                VECTOR(XSA_PARAM.ARS#),VECTOR(CURRENT_REC#),
+                VECTOR(KEY_CHARS));
+               END;
+            ELSE
+              CALL X$WRITE(F_FDS,VEC_BUF_SG_NO_EDIT,VECTOR(SG#),
+                VECTOR(XSA_PARAM.ARS#),VECTOR(CURRENT_REC#));
+             END;
+          IF SE_OPT & (XSA_PARAM.ARS# = SE#) THEN
+          DO;
+            SE_COUNTER# = SE_COUNTER# + 1;
+            IF HDR# = %HEADER_NOT_WRITTEN# THEN
+              CALL PRINT_HEADER;
+            IF KEY_STRUCT.LEN# = 3 THEN
+            DO;
+              CALL BINCHAR(DUMMY,KEY_STRUCT.SUB_KEY.EDIT);
+              CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+              CALL X$WRITE(F_FDS,VEC_BUF_SE_EDIT,VECTOR(SE#),
+                VECTOR(XSA_PARAM.ARS#),VECTOR(CURRENT_REC#),
+                VECTOR(KEY_CHARS));
+               END;
+            ELSE
+              CALL X$WRITE(F_FDS,VEC_BUF_SE_NO_EDIT,VECTOR(SE#),
+                VECTOR(XSA_PARAM.ARS#),VECTOR(CURRENT_REC#));
+             END;
+          IF SL_OPT & (XSA_PARAM.ARS# < SL#) THEN
+          DO;
+            SL_COUNTER# = SL_COUNTER# + 1;
+            IF HDR# = %HEADER_NOT_WRITTEN# THEN
+              CALL PRINT_HEADER;
+            IF KEY_STRUCT.LEN# = 3 THEN
+            DO;
+              CALL BINCHAR(DUMMY,KEY_STRUCT.SUB_KEY.EDIT);
+              CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+              CALL X$WRITE(F_FDS,VEC_BUF_SL_EDIT,VECTOR(SL#),
+                VECTOR(XSA_PARAM.ARS#),VECTOR(CURRENT_REC#),
+                VECTOR(KEY_CHARS));
+               END;
+            ELSE
+              CALL X$WRITE(F_FDS,VEC_BUF_SL_NO_EDIT,VECTOR(SL#),
+                VECTOR(XSA_PARAM.ARS#),VECTOR(CURRENT_REC#));
+             END;
+          IF SB_OPT & (XSA_PARAM.ARS# >= SB_LOW# & XSA_PARAM.ARS# <= SB_HI#) THEN
+          DO;
+            SB_COUNTER# = SB_COUNTER# + 1;
+            IF HDR# = %HEADER_NOT_WRITTEN# THEN
+              CALL PRINT_HEADER;
+            IF KEY_STRUCT.LEN# = 3 THEN
+            DO;
+              CALL BINCHAR(DUMMY,KEY_STRUCT.SUB_KEY.EDIT);
+              CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+              CALL X$WRITE(F_FDS,VEC_BUF_SB_EDIT,VECTOR(SB_LOW#),
+                VECTOR(SB_HI#),VECTOR(XSA_PARAM.ARS#),
+                VECTOR(CURRENT_REC#),VECTOR(KEY_CHARS));
+               END;
+            ELSE
+              CALL X$WRITE(F_FDS,VEC_BUF_SB_NO_EDIT,VECTOR(SB_LOW#),
+                VECTOR(SB_HI#),VECTOR(XSA_PARAM.ARS#),
+                VECTOR(CURRENT_REC#));
+             END;
+          IF UN_OPT THEN
+          DO;
+            I=0;
+            DO WHILE('1'B);
+              CALL SEARCH(I,J,UNPRINT_TABLE,
+                SUBSTR(DYN_BUF,0,XSA_PARAM.ARS#),
+                I) ALTRET(UN_DONE);
+ 
+                                        /* No altret, found an unprintable. */
+ 
+              CH = SUBSTR(DYN_BUF,I,1);
+              I = I+1;
+              UNPRINT_COUNTER# = UNPRINT_COUNTER# + 1;
+              IF ~ANY_RECSIZE_OPT THEN
+ 
+                                   /* Dont buffer the unprintable, print it.*/
+ 
+                IF KEY_STRUCT.LEN# ~=3 THEN
+                  CALL X$WRITE(F_FDS,VEC_UNPRINTNOKEY,
+                    VECTOR(CH),VECTOR(I),
+                    VECTOR(CURRENT_REC#));
+                ELSE
+                DO;
+                  CALL BINCHAR(DUMMY,KEY_STRUCT.SUB_KEY.EDIT);
+                  CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+                  CALL X$WRITE(F_FDS,VEC_UNPRINTKEY,
+                    VECTOR(CH),VECTOR(I),
+                    VECTOR(CURRENT_REC#),VECTOR(KEY_CHARS));
+                   END;                 /* Else*/
+              ELSE
+ 
+                       /* Use a queue to buffer up this unprintable and
+                          its current environment.  This unprintable will
+                          be output at EOF/END_RECORD# .                */
+ 
+              DO;
+                Q_ITEM.COL# = I;
+                Q_ITEM.REC# = CURRENT_REC#;
+                Q_ITEM.KEY_STRUCT = KEY_STRUCT;
+                Q_ITEM.UNPRINTABLE_CHAR = CH;
+                CALL M$GDS(ENLARGE_Q) ALTRET(SYSTEM_ERROR);
+                IF REAR$ = ADDR(NIL) THEN
+                DO;
+                  REAR$ = Q_MEM.PTR$;
+                  REAR$->UN_Q = Q_ITEM;
+                   END;
+                ELSE
+                DO;
+                  TEMP$ = PINCRW(REAR$,SIZEW(UN_Q));
+                  TEMP$->UN_Q = Q_ITEM;
+                  REAR$->UN_Q.NEXT$ = TEMP$;
+                  REAR$ = TEMP$;
+                   END;
+                 END;                   /* Qing unprintable */
+              IF I > DYN_BUF_LEN# THEN
+                GOTO UN_DONE;
+               END;                     /*Do While '1'B */
+UN_DONE:    ;
+             END;                       /* If Un_opt*/
+           END;                         /* Do To */
+ 
+%EJECT;
+OUTPUT_RESULTS: ;
+ 
+       /* Some summaries. (Maybe) */
+ 
+  IF ANY_RECSIZE_OPT | UN_OPT THEN
+  DO;
+ 
+           /* Ck to see if M$LO and M$DO correspond to the same fid.
+              If M$LO and M$DO correspond to the same fid, write
+              summaries via M$LO.  Otherwise, write summaries via
+              both M$LO and M$DO.                                 */
+ 
+    CALL M$CORRES(FPT_CORRES) ALTRET(CORRES);
+    DO WHILE('0'B);
+CORRES: DCBS_CORRES = %YES#;
+       END;                             /* Do While('0'B) */
+    CALL X$WRITE(F_FDS,VEC_FMT_BLANK_LINE);
+    IF SG_OPT THEN
+    DO;
+      CALL X$WRITE(F_FDS,VEC_BUF_SG_TOTAL,
+        VECTOR(SG#),VECTOR(SG_COUNTER#));
+      IF ~DCBS_CORRES THEN
+        CALL X$WRITE(M$DO_FDS,VEC_BUF_SG_TOTAL,
+          VECTOR(SG#),VECTOR(SG_COUNTER#));
+      IF SG_COUNTER# ~= 0
+      THEN
+        STEPCC = 1;
+       END;                             /* SG_OPT summary */
+    IF SL_OPT THEN
+    DO;
+      CALL X$WRITE(F_FDS,VEC_BUF_SL_TOTAL,
+        VECTOR(SL#),VECTOR(SL_COUNTER#));
+      IF ~DCBS_CORRES THEN
+        CALL X$WRITE(M$DO_FDS,VEC_BUF_SL_TOTAL,
+          VECTOR(SL#),VECTOR(SL_COUNTER#));
+      IF SL_COUNTER# ~= 0
+      THEN
+        STEPCC=1;
+       END;                             /* SL_OPT summary */
+    IF SE_OPT THEN
+    DO;
+      CALL X$WRITE(F_FDS,VEC_BUF_SE_TOTAL,
+        VECTOR(SE#),VECTOR(SE_COUNTER#));
+      IF ~DCBS_CORRES THEN
+        CALL X$WRITE(M$DO_FDS,VEC_BUF_SE_TOTAL,
+          VECTOR(SE#),VECTOR(SE_COUNTER#));
+      IF SE_COUNTER# ~= 0
+      THEN
+        STEPCC=1;
+       END;                             /* SE_OPT summary */
+    IF SB_OPT THEN
+    DO;
+      CALL X$WRITE(F_FDS,VEC_BUF_SB_TOTAL,
+        VECTOR(SB_LOW#),VECTOR(SB_HI#),VECTOR(SB_COUNTER#));
+      IF ~DCBS_CORRES THEN
+        CALL X$WRITE(M$DO_FDS,VEC_BUF_SB_TOTAL,
+          VECTOR(SB_LOW#),VECTOR(SB_HI#),VECTOR(SB_COUNTER#));
+      IF SB_COUNTER# ~= 0
+      THEN
+        STEPCC=1;
+       END;                             /* SB_OPT summary */
+    IF UN_OPT THEN
+    DO;
+      CALL X$WRITE(F_FDS,VEC_UNTOTAL,VECTOR(UNPRINT_COUNTER#));
+      IF ~DCBS_CORRES THEN
+        CALL X$WRITE(M$DO_FDS,VEC_UNTOTAL,VECTOR(UNPRINT_COUNTER#));
+       END;                             /* Un_opt summary */
+     END;                               /* Summaries */
+ 
+  IF BC THEN
+    CALL X$WRITE(F_FDS,VEC_BCFMT,VECTOR(CHAR_COUNT#));
+ 
+       /* Max and Min Recsizes; first occurences only */
+ 
+  IF MAX_STRUCT.LEN# ~= 3 THEN
+    CALL X$WRITE(F_FDS,VEC_FMT_MAXRECSIZENOKEY,VECTOR(MAX_RECSIZE#),
+      VECTOR(MAX_REC#));
+  ELSE
+  DO;
+    CALL BINCHAR(DUMMY,MAX_STRUCT.SUB_KEY.EDIT);
+    CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+    CALL X$WRITE(F_FDS,VEC_FMT_MAXRECSIZEKEY,VECTOR(MAX_RECSIZE#),
+      VECTOR(MAX_REC#),VECTOR(KEY_CHARS));
+     END;                               /*Do*/
+ 
+  IF MIN_STRUCT.LEN# ~= 3 THEN
+    CALL X$WRITE(F_FDS,VEC_FMT_MINRECSIZENOKEY,VECTOR(MIN_RECSIZE#),
+      VECTOR(MIN_REC#));
+  ELSE
+  DO;
+    CALL BINCHAR(DUMMY,MIN_STRUCT.SUB_KEY.EDIT);
+    CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+    CALL X$WRITE(F_FDS,VEC_FMT_MINRECSIZEKEY,VECTOR(MIN_RECSIZE#),
+      VECTOR(MIN_REC#),VECTOR(KEY_CHARS));
+     END;                               /*Do*/
+ 
+ 
+ 
+ 
+ 
+  CALL XSA$CLOSE(SI_CLOSE,XSA_PARAM) ALTRET(XSA_ERROR);
+  IF DCBADDR(DCBNUM(M$LO))->F$DCB.AMR# THEN
+    CALL M$CLOSE(FPT_CLOSE) ALTRET(SYSTEM_ERROR);
+  IF STEPCC ~= 0 THEN
+    GET_GONE.V.STEPCC# = STEPCC;
+ 
+  CALL M$EXIT (GET_GONE);
+ 
+ 
+/* --- End of Main Line Code --- */
+ 
+%EJECT;
+       /* Error Control */
+ 
+BAD_RANGE: ;
+  IF XSA_PARAM.ERR.CODE = %E$EOF THEN
+  DO;
+    FPT_WRITE.V.DCB# = DCBNUM(M$DO);
+    FPT_WRITE.BUF_ = VECTOR(PAST_EOF);
+    CALL M$WRITE(FPT_WRITE) ALTRET(SYSTEM_ERROR);
+    ALTRETURN;
+     END;
+ 
+XSA_ERROR:;
+  FPT_ERRMSG.V.DCB# = DCBNUM(M$SI);
+  FPT_ERRMSG.CODE_  = VECTOR(XSA_PARAM.ERR);
+  CALL M$ERRMSG(FPT_ERRMSG);
+  ALTRETURN;
+ 
+SYSTEM_ERROR: ;
+  FPT_ERRMSG.V.DCB# = B$TCB$->B$TCB.ALT$->B$ALT.DCB#;
+  FPT_ERRMSG.CODE_  = VECTOR(B$TCB$->B$TCB.ALT$->B$ALT.ERR);
+  CALL M$ERRMSG (FPT_ERRMSG);
+  CALL M$ERR;
+ 
+HELPER: ;
+ 
+       /* Dump the correct RECSIZE syntax. */
+ 
+  BUF = ' ';
+  BUF_ARRAY(P_PCB.HI_CHAR + CCDISP + 1) = '^';
+  FPT_WRITE.BUF_ = VECTOR(BUF);
+  FPT_WRITE.V.DCB# = DCBNUM(M$DO);
+  CALL M$WRITE(FPT_WRITE) ALTRET(SYSTEM_ERROR);
+  CALL M$YC (FPT_YC);
+  ALTRETURN;
+ 
+%EJECT;
+PRINT_HEADER:PROC;
+ 
+  IF KEY_STRUCT.LEN#=3 THEN
+    CALL X$WRITE(F_FDS,VEC_FMT_HEADERKEY);
+  ELSE
+    CALL X$WRITE(F_FDS,VEC_FMT_HEADERNOKEY);
+  HDR# = %HEADER_WRITTEN#;
+ 
+END PRINT_HEADER;
+ 
+END RECSIZE;
+ 
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+BREAK_CONTROL: PROC ASYNC;
+%INCLUDE CP_6;
+%INCLUDE B_MICROPS_C;
+%INCLUDE XU_FORMAT_C;
+ 
+DCL X$WRITE ENTRY(22);
+ 
+DCL M$ME DCB;
+ 
+%FPT_TRMPRG(RSTBRK=YES);
+%F_FDS (DCB=M$ME,BUF=BUF);
+ 
+DCL BUF CHAR(80) STATIC WALIGNED;
+DCL 1 KEY_STRUCT SYMREF,
+      2 LEN# UBIN BYTE UNAL,
+      2 FULL_KEY CHAR(255) UNAL,
+      2 SUB_KEY REDEF FULL_KEY,
+        3 EDIT UBIN(27) UNAL,
+        3 * CHAR(252) UNAL;
+ 
+DCL CURRENT_REC# SBIN SYMREF;
+DCL MAX_RECSIZE# SBIN SYMREF;
+DCL MIN_RECSIZE# SBIN SYMREF;
+DCL KEY_CHARS CHAR(9);
+DCL DUMMY CHAR(8) ;
+DCL EDIT1 (0:5) BIT(9) CONSTANT INIT(%MVZB4,%MVC1,%SES10,%INSP0,ASCBIT('.'),%MVC3);
+DCL FMTKEY CHAR(0) CONSTANT INIT(
+       'Current Rec No:%8D%5XKey:%9LA%5XMaxSize:%5D%5XMinSize:%5D%1/');
+DCL VEC_FMTKEY VECTOR CONSTANT INIT(VECTOR(FMTKEY));
+DCL FMTNOKEY CHAR(0) CONSTANT INIT(
+       'Current Rec No:%8D%5XKey:%9LA%5XMaxSize:%5D%5XMinSize:%5D%1/');
+DCL VEC_FMTNOKEY VECTOR CONSTANT INIT(VECTOR(FMTNOKEY));
+ 
+ 
+/**/
+ 
+  DO INHIBIT;
+    CALL M$TRMPRG(FPT_TRMPRG);          /* Reset break counter */
+    IF KEY_STRUCT.LEN# = 3 THEN
+ 
+                                   /* This is probably an Edit-built file.*/
+ 
+    DO INHIBIT;
+      CALL BINCHAR(DUMMY,KEY_STRUCT.SUB_KEY.EDIT);
+      CALL EDITSTR(KEY_CHARS,,,EDIT1,DUMMY);
+      CALL X$WRITE(F_FDS,VEC_FMTKEY,VECTOR(CURRENT_REC#),
+        VECTOR(KEY_CHARS),VECTOR(MAX_RECSIZE#),VECTOR(MIN_RECSIZE#));
+       END;                             /* Do inhibit */
+    ELSE
+    DO INHIBIT;
+      KEY_CHARS=' Not Edit';
+      CALL X$WRITE(F_FDS,VEC_FMTNOKEY,VECTOR(CURRENT_REC#),
+        VECTOR(KEY_CHARS),VECTOR(MAX_RECSIZE#),VECTOR(MIN_RECSIZE#));
+       END;                             /* Do inhibit */
+    RETURN;
+     END;                               /* Do Inhibit */
+END BREAK_CONTROL;

@@ -1,0 +1,3324 @@
+/*M*  THING_SI61   PL-6 source for THING program */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMR,PLM=5,IND=3,CTI=3,SDI=3,MCL=10,CSI=0,ECI=0 */
+/*P*  NAME:    THING_SI61
+      PURPOSE: This module contains the main source for the THING
+               ghost program.
+*/
+ 
+THING: PROC MAIN;
+ 
+/*D*  NAME:       THING
+      DESCRIPTION: THING is a program which is designed to run as a
+                  "companion" system ghost.  THING will monitor the :CALENDAR
+                  and :MAIL_CENTRAL files for one or more on-line
+                  users;  when THING notices that new mail has been delivered,
+                  or that a user has an appointment in the near future, it will
+                  send a message to the user announcing that fact.
+ 
+                  THING operates in one of three different modes:
+ 
+                  1) As a single-user ghost.  This mode is activated by starting
+                     THING as a ghost user, with the SYSID=n option specifying
+                     the identity of the user to be monitored and alerted.
+                     THING will terminate itself when the specified user logs
+                     off.
+ 
+                  2) As a universal ghost.  This mode is activated by starting
+                     THING as a ghost, without the SYSID=n option.  In this
+                     mode, THING creates a comgroup called THINGCG.:SYS;  it
+                     acts as the administrative user, and receives messages
+                     from on-line users of THING (mode #3).  The universal
+                     THING ghost will service any number of on-line users
+                     simultaneously.
+ 
+                  3) As an on-line program.  This mode is activated by starting
+                     THING on-line, without the SYSID=n option.  THING will
+                     parse your options (if any) and will communicate them to
+                     the universal THING ghost via the THING comgroup.  The
+                     ghost will then take over the responsibility of notifying
+                     you of any upcoming appointments and/or new mail.
+*/
+ 
+%INCLUDE B$JIT;
+%INCLUDE B$USER;
+%INCLUDE B_ERRORS_C;
+%INCLUDE CP_6.:LIBRARY;
+%INCLUDE CP_6_SUBS;
+%INCLUDE DA_MAP_R;
+%INCLUDE FM$FIT;
+%INCLUDE THING_C61;
+%INCLUDE VM_MACRO_C;
+%INCLUDE XU_FORMAT_C;
+%INCLUDE XU_MACRO_C;
+%INCLUDE XUF_ENTRY;
+%INCLUDE XUD_UTS_M;
+  %XUD$UTS_ENTRIES;
+  %XUD_UTS_EQU;
+ 
+%EQU E$DA_NO_USER = 100;                /* DA_PERR_C file isn't available... */
+%EQU E$DA_NO_PAGES = 103;               /* DA_PERR_C file isn't available... */
+%EQU BELL = BITASC('007'O);
+%EQU NO_CHANGE# = '01'B;
+%EQU MAILNAME# = ':MAIL_CENTRAL';
+%EQU MAILLEN# = 13;
+%SUB NEVER = "WHILE('0'B)";
+DCL CALENDAR DCB;
+DCL CSCG DCB;
+DCL EXORCISE DCB;
+DCL MAILBOX DCB;
+DCL THINGCG DCB;
+DCL M$DO DCB;
+DCL M$LM DCB;
+DCL M$LO DCB;
+ 
+%P_PCB  (R=THING_OPTS,
+         CNTU=NO,
+         OUTDCB=M$LO);
+ 
+%P_PCB  (NAME=SCHEDULE_PCB,
+         R=DATE_STRING,
+         U$=THING_ITEM_TESTER,
+         CNTU=NO);
+ 
+%F_FDS  (DCB=M$LO);
+ 
+%PARSE$OUT (NAME=OUT$BLK, STCLASS="BASED(BLK$)");
+%PARSE$SYM (NAME=OUT$SYM, STCLASS="BASED(BLK$)");
+ 
+%B$TCB (STCLASS="BASED(B$TCB$)");
+%B$ALT;
+%B$CGAUCRD;
+%EQU_CG;
+ 
+%F$DCB;
+ 
+%CODE04 (NAME=CODE04);
+ 
+%EJECT;
+/*
+ * Additions to allow THING to check the registrar for registered
+ * users had to open the appropriate folder.
+ *
+*/
+DCL OPTION BIT(1);
+DCL ALERT_TIME CHAR(3);
+DCL ACCOUNT CHAR(8);
+DCL 1 NAME_KEY STATIC,
+       2 LEN UBIN BYTE CALIGNED INIT(20),
+       2 ACCOUNT CHAR(8),
+       2 NAME CHAR(12);
+ 
+DCL 1 CENTRAL_KEY STATIC,
+       2 LEN UBIN BYTE CALIGNED,
+       2 NAME CHAR(200);
+ 
+DCL NAMEBUF CHAR(200) STATIC;
+DCL 1 CENTRALBUF STATIC,
+       2 * CHAR(38),
+       2 ACCOUNT CHAR(8),
+       2 NAME CHAR(12),
+       2 FOLDER CHAR(25),
+       2 PASS CHAR(8),
+       2 * CHAR(100);
+ 
+DCL UNAME CHAR(12);
+ 
+%FPT_OPEN (FPTN=OPEN_NAMEFILE,
+            DCB=NAMEFILE,
+           NAME=NAME_NAME,
+           ACCT=NAME_ACCT,
+            ASN=FILE,
+            FUN=IN,
+            ACS=DIRECT,
+          SHARE=ALL);
+ 
+%FPT_OPEN (FPTN=OPEN_CENTRAL,
+            DCB=CENTRAL,
+           NAME=CENTRAL_NAME,
+           ACCT=NAME_ACCT,
+            ASN=FILE,
+            FUN=IN,
+            ACS=DIRECT,
+          SHARE=ALL);
+ 
+%FPT_READ (FPTN=READ_NAMEFILE,
+            DCB=NAMEFILE,
+            BUF=NAMEBUF,
+           KEYS=YES,
+            KEY=NAME_KEY);
+ 
+%FPT_READ (FPTN=READ_CENTRAL,
+            DCB=CENTRAL,
+            BUF=CENTRALBUF,
+           KEYS=YES,
+            KEY=CENTRAL_KEY);
+ 
+%FPT_CLOSE (FPTN=CLOSE_NAMEFILE,
+             DCB=NAMEFILE,
+            DISP=SAVE);
+ 
+%FPT_CLOSE (FPTN=CLOSE_CENTRAL,
+             DCB=CENTRAL,
+            DISP=SAVE);
+ 
+%VLP_NAME (FPTN=NAME_NAME,
+           NAME=':NAME');
+ 
+%VLP_NAME (FPTN=CENTRAL_NAME,
+           NAME=':MAIL_CENTRAL');
+ 
+%VLP_ACCT (FPTN=NAME_ACCT,
+           ACCT=':MAIL');
+ 
+DCL NAMELEN UBIN;
+DCL NAMEFILE DCB;
+DCL CENTRAL DCB;
+DCL REGISTERED BIT(1);
+ 
+%FPT_OPEN  (FPTN=OPEN_CALENDAR,
+            DCB=CALENDAR,
+            NAME=CALENDAR_NAME,
+            ACCT=USER_ACCOUNT,
+            ASN=FILE,
+            FUN=IN,
+            ACS=DIRECT);
+ 
+%FPT_CLOSE (FPTN=CLOSE_CALENDAR,
+            STCLASS=CONSTANT,
+            DCB=CALENDAR,
+            DISP=SAVE);
+ 
+%FPT_READ  (FPTN=READ_CALENDAR,
+            STCLASS=CONSTANT,
+            DCB=CALENDAR,
+            BUF=CALENDAR_RECORD,
+            KEYS=NO,
+            KEYR=YES,
+            KEY=CALENDAR_KEY);
+ 
+%FPT_READ  (FPTN=READ_CALENDAR_CONFLICT,
+            STCLASS=CONSTANT,
+            DCB=CALENDAR,
+            BUF=OLD_CALENDAR_RECORD,
+            KEYS=YES,
+            KEYR=NO,
+            KEY=CALENDAR_KEY);
+ 
+%FPT_WRITE (FPTN=WRITE_CALENDAR,
+            DCB=CALENDAR,
+            BUF=CALENDAR_RECORD,
+            ONEWKEY=NO, NEWKEY=YES,
+            KEY=CALENDAR_KEY);
+ 
+%FPT_PRECORD  (FPTN=POSITION_CALENDAR,
+               DCB=CALENDAR,
+               KEY=CALENDAR_KEY,
+               KEYS=YES,
+               KEYR=NO);
+ 
+%VLP_NAME  (FPTN=CALENDAR_NAME,
+            STCLASS=CONSTANT,
+            NAME=':CALENDAR');
+ 
+%EJECT;
+%FPT_OPEN  (FPTN=OPEN_MAILBOX,
+            DCB=MAILBOX,
+            NAME=MAILBOX_NAME,
+            ACCT=USER_ACCOUNT,
+            ASN=FILE,
+            FUN=UPDATE,
+            ACS=DIRECT,
+            SHARE=ALL);
+ 
+%FPT_CLOSE (FPTN=CLOSE_MAILBOX,
+            STCLASS=CONSTANT,
+            DCB=MAILBOX,
+            DISP=SAVE);
+ 
+%FPT_READ  (FPTN=READ_MAILBOX,
+            STCLASS=STATIC,
+            DCB=MAILBOX,
+            KEYS=NO,
+            KEYR=YES);
+ 
+%FPT_WRITE  (FPTN=WRITE_MAILBOX,
+             STCLASS=STATIC,
+             DCB=MAILBOX);
+ 
+%FPT_READ  (FPTN=READ_MESSAGE_BODY,
+            DCB=MAILBOX,
+            BUF=VM_BODYREC,
+            KEY=VM_BODYKEY);
+ 
+%FPT_PRECORD  (FPTN=POSITION_MAILBOX,
+               DCB=MAILBOX,
+               KEYS=YES,
+               KEYR=NO);
+ 
+%FPT_ENQ   (FPTN=ENQUEUE_ON_MAILBOX,
+            STCLASS=CONSTANT,
+            DCB=MAILBOX,
+            RNAME=FILE_RESOURCE,
+            SHARE=NONE,
+            WAIT=YES,
+            WAIT_TIME=0);
+ 
+%FPT_DEQ   (FPTN=DEQUEUE_FROM_MAILBOX,
+            STCLASS=CONSTANT,
+            DCB=MAILBOX);
+ 
+%VLP_NAME  (FPTN=MAILBOX_NAME);
+ 
+%VLP_NAME  (FPTN=FILE_RESOURCE,
+            STCLASS=CONSTANT,
+            NAME='FILE');
+ 
+%VLP_ACCT  (FPTN=USER_ACCOUNT);
+ 
+%VM_KEYTYPES;
+%VM_BODYTYPES;
+%VM_HEADER (STCLASS="BASED(DYNAMIC_BUFFER.PTR$)");
+%VM_INFOKEY;
+%VM_BODYREC;
+%VM_BODYKEY;
+ 
+%EJECT;
+%FPT_OPEN  (FPTN=OPEN_EXORCISE,
+            STCLASS=CONSTANT,
+            DCB=EXORCISE,
+            NAME=EXORCISE_NAME,
+            ASN=FILE,
+            FUN=UPDATE,
+            DELETE=YES);
+ 
+%VLP_NAME  (FPTN=EXORCISE_NAME,
+            STCLASS=CONSTANT,
+            NAME='$$EXORCISE');
+ 
+%EJECT;
+%FPT_OPEN  (FPTN=OPEN_CSCG,
+            STCLASS=CONSTANT,
+            DCB=CSCG,
+            ASN=COMGROUP,
+            NAME=CSCG_NAME,
+            ACCT=CSCG_ACCT,
+            SETSTA=CSCG_STATION,
+            FUN=UPDATE);
+ 
+%FPT_WRITE (FPTN=WRITE_CSCG,
+            STCLASS=STATIC,
+            DCB=CSCG,
+            BUF=MESSBUF,
+            WAIT=YES);
+ 
+%FPT_CLOSE (FPTN=CLOSE_CSCG,
+            STCLASS=CONSTANT,
+            DCB=CSCG);
+ 
+%VLP_NAME  (FPTN=CSCG_NAME,
+            STCLASS=CONSTANT,
+            NAME='CSCG');
+ 
+%VLP_ACCT  (FPTN=CSCG_ACCT,
+            STCLASS=CONSTANT,
+            ACCT=':SYS');
+ 
+%VLP_SETSTA   (FPTN=CSCG_STATION,
+               STCLASS=STATIC,
+               DIRONLY=YES,
+               MYSTATION='RE000000',
+               OSTATION='MONKEY');
+ 
+%EJECT;
+%FPT_OPEN  (FPTN=OPEN_THINGCG,
+            STCLASS=STATIC,
+            DCB=THINGCG,
+            ASN=COMGROUP,
+            IXTNSIZE=20,
+            NAME=THINGCG_NAME,
+            ACCT=THINGCG_ACCT,
+            ACCESS=THINGCG_ACCESS,
+            ACSVEH=THINGCG_ACSVEH);
+ 
+%FPT_READ  (FPTN=READ_THINGCG,
+            STCLASS=STATIC,
+            DCB=THINGCG,
+            STATION=THINGCG_STATION);
+ 
+%FPT_CHECK (FPTN=CHECK_THINGCG,
+            STCLASS=CONSTANT,
+            DCB=THINGCG);
+ 
+%FPT_WRITE (FPTN=WRITE_THINGCG,
+            STCLASS=STATIC,
+            DCB=THINGCG,
+            STATION=THINGCG_STATION);
+ 
+%FPT_CLOSE (FPTN=CLOSE_THINGCG,
+            STCLASS=STATIC,
+            DCB=THINGCG,
+            DISP=SAVE);
+ 
+%FPT_CGCTL (FPTN=THINGCG_CGCTL,
+            STCLASS=CONSTANT,
+            DCB=THINGCG,
+            CGCP=THINGCG_CGCP);
+ 
+%VLP_NAME  (FPTN=THINGCG_NAME,
+            STCLASS=CONSTANT,
+            NAME='THINGCG');
+ 
+%VLP_ACCT  (FPTN=THINGCG_ACCT,
+            STCLASS=CONSTANT,
+            ACCT=':SYS');
+ 
+%VLP_STATION  (FPTN=THINGCG_STATION,
+               STCLASS=STATIC);
+ 
+%VLP_STATION  (FPTN=VLP_STATION,
+               STCLASS=BASED);
+ 
+%VLP_SETSTA   (FPTN=THINGCG_SETSTA);
+ 
+%VLP_ATTR  (FPTN=THINGCG_ACCESS, STCLASS=CONSTANT);
+%VLP_ACCESS   (EXEC=YES,ACCT='?');
+%VLP_ACCESS   (READ=YES,UPD=YES,WNEW=YES,DELF=YES,ACCT='DCP?',LAST=";");
+ 
+%VLP_ATTR  (FPTN=THINGCG_ACSVEH, STCLASS=CONSTANT);
+%VLP_ACSVEH   (READ=YES,UPD=YES,WNEW=YES,VEHICLE='THING.DCPPL6');
+%VLP_ACSVEH   (READ=YES,UPD=YES,WNEW=YES,VEHICLE='THING',LAST=";");
+ 
+%VLP_CGCP  (FPTN=THINGCG_CGCP,
+            STCLASS=CONSTANT,
+            CONMSG=YES,
+            DMTYP='HELLO',
+            TERMCONLGL=NO);
+ 
+%EJECT;
+%FPT_OPEN  (FPTN=OPEN_LO,
+            STCLASS=CONSTANT,
+            DCB=M$LO,
+            ASN=DEVICE,
+            RES='LO',
+            ORG=TERMINAL,
+            FUN=CREATE,
+            DISP=NAMED);
+ 
+%FPT_WRITE (FPTN=WRITE_LO,
+            DCB=M$LO);
+ 
+%FPT_CLOSE (FPTN=CLOSE_LO,
+            STCLASS=CONSTANT,
+            DCB=M$LO,
+            DISP=SAVE);
+ 
+%EJECT;
+%FPT_ERRMSG   (FPTN=REPORT_ERRMSG,
+               OUTDCB1=M$LO,
+               OUTDCB2=M$DO,
+               BUF=ERRMSG_BUFFER,
+               CODE=P_PCB.ERROR,
+               RESULTS=VLR_ERRMSG);
+ 
+%VLR_ERRMSG;
+ 
+%FPT_TRMCTL  (FPTN=SET_TERMINAL_CTL,
+              STCLASS=CONSTANT,
+              TRMCTL=TERMINAL_CTL);
+ 
+%VLP_TRMCTL  (FPTN=TERMINAL_CTL,
+              STCLASS=STATIC);
+ 
+%FPT_EVENT (FPTN=SETUP_EVENT_HANDLER,
+            STCLASS=CONSTANT,
+            UENTRY=THING_EVENT_HANDLER);
+ 
+%FPT_KEYIN (FPTN=SEND_MESSAGE_TO_OPER,
+            OCTYPE=SYSTEM);
+ 
+%FPT_EXIT  (FPTN=SET_ERROR_STEPCC,
+            STCLASS=CONSTANT,
+            STEPCC=ERROR);
+ 
+%FPT_TIME  (FPTN=GET_TIME_NOW,
+            STCLASS=CONSTANT,
+            SOURCE=CLOCK,
+            TSTAMP=TIME_NOW);
+ 
+%FPT_TIME  (FPTN=CONVERT_TIME,
+            TSTAMP=CONVERSION_UTS,
+            DAY=DAY_OF_WEEK,
+            DATE=MMDDYY,
+            TIME=HHMMSSMS);
+ 
+%FPT_WAIT  (FPTN=SLEEP_FOR_AWHILE);
+ 
+%FPT_YC (FPTN=CONTROL_Y);
+ 
+%FPT_MONINFO  (FPTN=GET_MONITOR_POINTERS,
+               STCLASS=CONSTANT,
+               MONPTRS=MONITOR_POINTERS);
+ 
+%VLR_MONPTRS  (FPTN=MONITOR_POINTERS);
+ 
+%FPT_PRIV  (FPTN=SET_SPCLMM,
+            STCLASS=CONSTANT,
+            PRIV="%(PR_SPCLMM# | PR_FMSEC#)",
+            AUTH=YES);
+ 
+%FPT_TRAP  (FPTN=SET_TRAP_CONTROL,
+            STCLASS=CONSTANT,
+            ARITHMETIC=THING_TRAP_HANDLER,
+               DIVIDE_CHECK=TRAP,
+               OVERFLOW=TRAP,
+            ERRORS=THING_TRAP_HANDLER,
+               COMMAND=TRAP,
+               IPR=TRAP,
+               LOCKUP=TRAP,
+               MEMORY=TRAP,
+               MISSING_PAGE=TRAP,
+               MISSING_SEG=TRAP,
+               SECURITY_2=TRAP,
+            PROGRAMMED=THING_TRAP_HANDLER,
+               DERAIL=TRAP,
+               FAULT_TAG=TRAP,
+               MME=TRAP,
+            HISTORY_REGS=NO);
+ 
+%FPT_RESCTL   (FPTN=RESOURCE_FPT,
+               STCLASS=STATIC);
+ 
+%VLP_RPSN     (FPTN=VLP_RPSN,
+               STCLASS="BASED(DYNAMIC_BUFFER.PTR$)");
+ 
+%FPT_GDS   (FPTN=GET_DYNAMIC_BUFFER,
+            STCLASS=CONSTANT,
+            SEGSIZE=1024,
+            COMMON=YES,
+            RESULTS=DYNAMIC_BUFFER);
+ 
+%FPT_FDS   (FPTN=RELEASE_DYNAMIC_BUFFER,
+            STCLASS=CONSTANT,
+            SEGSIZE=1024,
+            RESULTS=DYNAMIC_BUFFER);
+ 
+%FPT_GDS   (FPTN=GET_USER_AREA,
+            STCLASS=STATIC,
+            RESULTS=USER_AREA);
+ 
+%VLP_VECTOR   (FPTN=DYNAMIC_BUFFER);
+ 
+%VLP_VECTOR   (FPTN=USER_AREA);
+ 
+%EJECT;
+DCL 1 APPOINTMENT_BANNER_STRUCTURE CONSTANT,
+       2 * (0:4) UBIN BYTE CALIGNED INIT (7 * 0),
+       2 * CHAR (29) INIT (' * *  Appointment notice  * *'),
+       2 * (0:4) UBIN BYTE CALIGNED INIT (7 * 0);
+ 
+DCL APPOINTMENT_BANNER REDEF APPOINTMENT_BANNER_STRUCTURE CHAR (39);
+ 
+DCL BELL$ PTR CONSTANT INIT (ADDR(BELL_STRING));
+DCL BELL_STRING CHAR (1) CONSTANT INIT (%BELL);
+DCL BELL_LEN UBIN WORD;
+DCL BELL CHAR (BELL_LEN) BASED (BELL$);
+ 
+DCL 1 CALENDAR_RECORD STATIC,
+       2 DATE CHAR (8),
+       2 * CHAR (2) INIT ('  '),
+       2 TIME CHAR (5),
+       2 * CHAR (2) INIT ('  '),
+       2 PLACE CHAR (80),
+       2 REASON CHAR (80),
+       2 REMINDING_PERIOD CHAR (2),
+       2 NOTE_COUNT UBIN BYTE,
+       2 NOTES (0:0) CHAR (80);
+ 
+DCL 1 OLD_CALENDAR_RECORD STATIC,
+       2 DATE CHAR (8),
+       2 * CHAR (2) INIT ('  '),
+       2 TIME CHAR (5),
+       2 * CHAR (2) INIT ('  '),
+       2 PLACE CHAR (80),
+       2 REASON CHAR (80),
+       2 REMINDING_PERIOD CHAR (2),
+       2 NOTE_COUNT UBIN BYTE,
+       2 NOTES (0:0) CHAR (80);
+ 
+DCL 1 CALENDAR_KEY STATIC,
+       2 LEN UBIN BYTE CALIGNED,
+       2 UTS UBIN WORD CALIGNED,
+       2 SUBENTRY UBIN BYTE CALIGNED;
+ 
+DCL 1 MULTICS_SENDER,
+       2 COUNT UBIN BYTE CALIGNED,
+       2 TEXT CHAR (63);
+ 
+DCL COMGROUP_BUFFER (0:99) UBIN WORD;
+ 
+DCL F$USER_JOINED CHAR(0) CONSTANT INIT
+   ('Msg #%D: Station %>A (%>A,%>A) has joined the comgroup.');
+DCL F$USER_LEFT CHAR (0) CONSTANT INIT
+   ('Msg #%D: Station %>A has left the comgroup.');
+DCL F$USER_STARTUP CHAR (0) CONSTANT INIT
+ ('Msg #%D: Station %>A (user .%O, sysid %D) has initiated THING monitoring.');
+DCL F$USER_UPDATE CHAR (0) CONSTANT INIT
+ ('Msg #%D: Station %>A (user .%O, sysid %D) has updated THING monitoring.');
+DCL F$USER_QUIT CHAR (0) CONSTANT INIT
+ ('Msg #%D: Station %>A (user .%O, sysid %D) has stopped THING monitoring.');
+DCL F$USER_FLUSHED CHAR (0) CONSTANT INIT
+   ('****** User .%O, sysid %D has logged off; THING monitoring ends.');
+ 
+DCL 1 MESSAGE,
+       2 USER# UBIN HALF HALIGNED,
+       2 SYSID UBIN HALF HALIGNED,
+       2 ACTIVE BIT (1),
+       2 BELL_ENABLED BIT (2),
+       2 MAIL_SCAN BIT (2),
+       2 MAIL_FOLDER BIT (2),
+       2 MAIL_NAME CHAR(25),
+       2 MAIL_LEN UBIN,
+       2 CALENDAR_SCAN BIT (2),
+       2 ISSUE_SALUTATION BIT (2),
+       2 AUTOSCHED BIT (2),
+       2 MESSAGE_FORMAT UBIN HALF HALIGNED,
+       2 INTERVAL UBIN HALF HALIGNED,
+       2 ALERT_COUNT UBIN HALF HALIGNED,
+       2 ALERT_TIMES (0:9) UBIN WORD,
+       2 OPTION BIT (1),
+       2 ACCOUNT CHAR (8),
+       2 UNAME CHAR (12);
+ 
+DCL 1 MESSBUF STATIC ALIGNED,
+       2 VECTR UBIN BYTE UNAL INIT(7),
+       2 KEYIN# UBIN BYTE UNAL INIT(2),
+       2 CATTR BIT(18) UNAL INIT('200000'O),
+       2 WSN CHAR(8) UNAL INIT('?       '),
+       2 SYSID UBIN HALF UNAL,
+       2 COUNT UBIN HALF UNAL,
+       2 TEXT CHAR(132) UNAL;
+ 
+DCL 1 NULL_SUBJECT CONSTANT,
+       2 LEN UBIN BYTE CALIGNED INIT (LENGTHC('(something secret)')),
+       2 TEXT CHAR (0) INIT ('(something secret)');
+ 
+DCL 1 TEXTC BASED CALIGNED,
+       2 LEN UBIN BYTE CALIGNED,
+       2 TEXT CHAR (TEXTC.LEN);
+ 
+DCL DUMMY_NAME CHAR(200);
+DCL KEYIN_THING_STARTED CHAR (0) CONSTANT INIT ('THING is up!');
+DCL KEYIN_THING_STOPPED CHAR (0) CONSTANT INIT ('THING is exiting!');
+ 
+DCL STOP_ON_NONBLANK (0:511) UBIN BYTE CALIGNED CONSTANT
+   INIT (1 * %ASCBIN(' '), 0, 1 * 0);
+ 
+DCL 1 USER_TABLE BASED (USER_TABLE$) ALIGNED,
+       2 ACTIVE BIT (1),
+       2 FIRST_ITERATION BIT (1),
+       2 REACKNOWLEDGE BIT (1),
+       2 QUIT BIT (1),
+       2 BELL_ENABLED BIT (1),
+       2 MAIL_SCAN BIT (1),
+       2 MAIL_FOLDER BIT(1),
+       2 MAIL_NAME CHAR(31),
+       2 MAIL_LEN UBIN,
+       2 CALENDAR_SCAN BIT (1),
+       2 ISSUE_SALUTATION BIT (1),
+       2 AUTOSCHED BIT (1),
+       2 MESSAGE_FORMAT UBIN BYTE CALIGNED,
+       2 SYSID UBIN HALF HALIGNED,
+       2 ALERT_COUNT UBIN HALF,
+       2 ALERT_TIMES (0:9) UBIN WORD,
+       2 MAILBOX_LAST_EXAMINED_UTS UBIN WORD,
+       2 MAILBOX_LAST_UPDATED_UTS UBIN WORD,
+       2 CALENDAR_LAST_EXAMINED_UTS UBIN WORD,
+       2 CALENDAR_LAST_UPDATED_UTS UBIN WORD,
+       2 NEXT_APPOINTMENT_UTS UBIN WORD,
+       2 LONGEST_ALERT_UTS UBIN WORD,
+       2 TIME_TO_AWAKEN UBIN WORD,
+       2 ACCOUNT CHAR (8);
+ 
+DCL ALL_ONE_BITS BIT (36) CONSTANT INIT ('777777777777'O);
+DCL FAR_IN_THE_FUTURE REDEF ALL_ONE_BITS UBIN WORD;
+ 
+DCL SYSID SBIN WORD;
+DCL INTERVAL UBIN WORD;
+DCL ALERT_COUNT SBIN WORD;
+DCL ALERT_TIMES (0:9) UBIN WORD;
+ 
+DCL ALERT_POINT UBIN;
+DCL ALERT_TEXT CHAR (256);
+DCL AUTOSCHED BIT (2);
+DCL AU_OF_COMGROUP BIT (1);
+DCL BAILOUT REMEMBER STATIC SYMDEF;
+DCL BAILOUT_ENABLED BIT (1) STATIC SYMDEF;
+DCL BELL_ENABLED BIT (2);
+DCL BLINKIT BIT (1);
+DCL BLK$ PTR;
+DCL BODY_LENGTH UBIN;
+DCL BUFFER_IS_ALLOCATED BIT (1);
+DCL CALENDAR_LAST_EXAMINED_UTS UBIN;
+DCL CALENDAR_LAST_UPDATED_UTS UBIN;
+DCL CALENDAR_SCAN BIT (2);
+DCL COMGROUP_BUFFER$ PTR;
+DCL CONTINUE_PROCESSING BIT (1);
+DCL CONVERSION_UTS UBIN WORD STATIC;
+DCL CURRENT_MONTH UBIN WORD;
+DCL CURRENT_YEAR UBIN WORD;
+DCL DATE_FOUND BIT (1);
+DCL DAY SBIN WORD;
+DCL DAY_OF_WEEK CHAR (3) STATIC;
+DCL DEBUG_MODE BIT (36) STATIC SYMDEF INIT (%NO#);
+DCL DISCARD_IT SBIN;
+DCL DS8 UBIN CONSTANT AREADEF(DS8SID);
+DCL DUPLICATE_SCHEDULING BIT (1);
+DCL ERRMSG_BUFFER CHAR (120) STATIC;
+DCL ERROR_CODE BIT (36);
+DCL EVENT_HAS_OCCURRED BIT (36) STATIC SYMDEF;
+DCL FINAL_PASS BIT (1) STATIC SYMDEF INIT (%NO#);
+DCL FIRST_ITERATION BIT (1);
+DCL FIT$ PTR;
+DCL HHMMSSMS CHAR (11) STATIC;
+DCL HOUR SBIN WORD;
+DCL I SBIN WORD;
+DCL INTERVAL_END_UTS UBIN WORD;
+DCL INTERVAL_START_UTS UBIN WORD;
+DCL ISSUE_SALUTATION BIT (2);
+DCL J SBIN WORD;
+DCL JUST_PROCESSED_AN_EVENT BIT (1);
+DCL LAST_PACKSET_RELEASE_UTS UBIN;
+DCL LONGEST_ALERT_UTS UBIN;
+DCL MAIL_SCAN BIT (2);
+DCL MAIL_FOLDER BIT(2);
+DCL MAIL_NAME CHAR(25);
+DCL MAIL_LEN UBIN;
+DCL MAILBOX_LAST_EXAMINED_UTS UBIN;
+DCL MAILBOX_LAST_UPDATED_UTS UBIN;
+DCL MESSAGE_FORMAT UBIN;
+DCL MESSAGE_LINE_USED BIT (1);
+DCL MINUTE SBIN WORD;
+DCL MINUTES_TO_GO SBIN;
+DCL MMDDYY CHAR (8) STATIC;
+DCL MONTH SBIN WORD;
+DCL NEXT_APPOINTMENT_UTS UBIN;
+DCL PARSE_WORK_AREA (0:254) UBIN WORD;
+DCL PREVIOUS_INTERVAL_START_UTS UBIN WORD;
+DCL QUIT BIT (1);
+DCL REACKNOWLEDGE BIT (1);
+DCL SCHEDULE_ATTEMPTED BIT (1);
+DCL SCHEDULE_SUCCESSFUL BIT (1);
+DCL SHORTEST_AWAKENING_TIME UBIN WORD;
+DCL STRING_BUFFER CHAR (256);
+DCL STRING_LENGTH SBIN;
+DCL T_DAYC SBIN;
+DCL T_DAYI SBIN;
+DCL T_DIFF SBIN;
+DCL T_UTS UBIN;
+DCL TEMP SBIN;
+DCL TEMP_STRING CHAR (300);
+DCL THINGCG$ PTR;
+DCL THING_IS_HAVING_PROBLEMS BIT (1);
+DCL TIME_NOW UBIN STATIC;
+DCL TIME_TO_AWAKEN UBIN;
+DCL TRANSPARENT_TRANSMISSION BIT (1);
+DCL TRAP_COUNT UBIN WORD STATIC SYMDEF INIT (0);
+DCL TRAP_LIMIT UBIN WORD CONSTANT SYMDEF INIT (10);
+DCL USE_COMGROUP BIT (36) STATIC SYMDEF INIT (%NO#);
+DCL USER_JIT$ PTR;
+DCL USER_NUMBER UBIN;
+DCL USER_TABLE$ PTR;
+DCL USRT$ PTR;
+DCL YEAR SBIN WORD;
+DCL YEAR_PRESENT BIT(1);
+ 
+DCL B$JIT$ PTR SYMREF READONLY;
+DCL B$TCB$ PTR SYMREF READONLY;
+DCL DATE_STRING BIT (36) SYMREF READONLY;
+DCL THING_OPTS BIT (36) SYMREF READONLY;
+ 
+DCL DAM$FREEM ENTRY;
+DCL DAM$INIT ENTRY ALTRET;
+DCL DAM$MAP ENTRY (5) ALTRET;
+DCL THING_EVENT_HANDLER ENTRY ASYNC;
+DCL THING_ITEM_TESTER ENTRY (1);
+DCL THING_TRAP_HANDLER ENTRY ASYNC;
+ 
+DCL XSF$LOCCODP ENTRY (2) ALTRET;
+ 
+DCL X$PARSE ENTRY (1) ALTRET;
+%EJECT;
+     SYSID = -1;
+     USER_NUMBER = 0;
+     INTERVAL = 1;
+     BLINKIT = %NO#;
+     CALENDAR_LAST_EXAMINED_UTS = 0;
+     CONTINUE_PROCESSING = %YES#;
+     EVENT_HAS_OCCURRED = %NO#;
+     LAST_PACKSET_RELEASE_UTS = 0;
+     MAILBOX_LAST_EXAMINED_UTS = 0;
+     NEXT_APPOINTMENT_UTS = FAR_IN_THE_FUTURE;
+     QUIT = %NO#;
+     REACKNOWLEDGE = %NO#;
+     FINAL_PASS = %NO#;
+     ALERT_COUNT = 0;
+     AU_OF_COMGROUP = %NO#;
+     MESSAGE_FORMAT = 0;
+     TRANSPARENT_TRANSMISSION = %NO#;
+     BELL_ENABLED = %NO_CHANGE#;
+     CALENDAR_SCAN = %NO_CHANGE#;
+     AUTOSCHED = %NO_CHANGE#;
+     ISSUE_SALUTATION = %NO_CHANGE#;
+     MAIL_SCAN = %NO_CHANGE#;
+     MAIL_FOLDER = %NO#;
+     MAIL_NAME = %MAILNAME#;
+     MAIL_LEN = %MAILLEN#;
+     OPTION = %NO#;
+     BAILOUT_ENABLED = %NO#;
+     REGISTERED = '0'B;
+     F_FDS.BUF_ = VECTOR(STRING_BUFFER);
+ 
+     CALL M$TRAP (SET_TRAP_CONTROL);
+ 
+     CALL M$OPEN (OPEN_LO);
+ 
+     CALL M$SPRIV (SET_SPCLMM);
+ 
+     CALL PARSE_CCBUF_OPTIONS;
+ 
+     IF SYSID = -1
+     THEN DO;
+ 
+        IF B$JIT.MODE = %M_GHOST# OR DEBUG_MODE
+        THEN DO;
+ 
+           AU_OF_COMGROUP = %YES#;
+ 
+           CALL INITIALIZE_MAPPER ALTRET (UNEXPECTED_ALTRET);
+           CALL SETUP_USER_TABLE ALTRET (UNEXPECTED_ALTRET);
+           CALL INITIALIZE_COMGROUP ALTRET (UNEXPECTED_ALTRET);
+ 
+           SEND_MESSAGE_TO_OPER.MESS_ = VECTOR (KEYIN_THING_STARTED);
+ 
+           CALL M$KEYIN (SEND_MESSAGE_TO_OPER) ALTRET (UNEXPECTED_ALTRET);
+ 
+           END;
+ 
+        ELSE DO;
+ 
+           CALL SPEAK_TO_GHOST
+           WHENALTRETURN DO;
+ 
+              STRING_BUFFER = 'Cannot communicate with the Thing ghost';
+              GOTO CRASH_AND_BURN;
+ 
+              END;
+ 
+           CALL M$CLOSE (CLOSE_LO);
+           CALL M$EXIT;
+ 
+           END;
+ 
+        END;
+ 
+     ELSE DO;
+ 
+        CALL INITIALIZE_MAPPER ALTRET (UNEXPECTED_ALTRET);
+ 
+        IF MESSAGE_FORMAT = 0
+        THEN
+           MESSAGE_FORMAT = %SHORTFORM_OPTION;
+ 
+        END;
+ 
+     IF B$JIT.MODE = %M_GHOST# AND NOT DEBUG_MODE
+     THEN DO;
+ 
+        CALL BINCHAR (SUBSTR (CSCG_STATION.MYSTATION#, 2), B$JIT.SYSID);
+ 
+        CALL M$OPEN (OPEN_CSCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+        END;
+ 
+     THING_IS_HAVING_PROBLEMS = %NO#;
+     FIRST_ITERATION = %YES#;
+ 
+     CALL M$TIME (GET_TIME_NOW) ALTRET (UNEXPECTED_ALTRET);
+ 
+     INTERVAL_END_UTS = TIME_NOW;
+     INTERVAL_START_UTS = TIME_NOW - ALERT_TIMES(ALERT_COUNT - 1) * 6000;
+     PREVIOUS_INTERVAL_START_UTS = INTERVAL_START_UTS + 1; /* startup */
+     LONGEST_ALERT_UTS = ALERT_TIMES (ALERT_COUNT - 1) * 6000;
+ 
+     IF AU_OF_COMGROUP
+     THEN
+        REMEMBER EXPUNGE_USER IN BAILOUT;
+     ELSE
+        REMEMBER LOOP_WHILE_USER_EXISTS IN BAILOUT;
+ 
+     BAILOUT_ENABLED = %YES#;
+ 
+LOOP_WHILE_USER_EXISTS: DO UNTIL (NOT CONTINUE_PROCESSING);
+ 
+        IF FINAL_PASS
+        THEN
+           CONTINUE_PROCESSING = %NO#;
+ 
+        CALL M$OPEN (OPEN_EXORCISE)
+        WHENRETURN DO;
+ 
+           STRING_BUFFER = 'Thing has been exorcised!';
+ 
+           IF AU_OF_COMGROUP
+           THEN
+              CALL PRINT_BUFFER;
+           ELSE
+              CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+           CALL M$CLOSE (CLOSE_LO);
+ 
+           IF AU_OF_COMGROUP
+           THEN DO;
+ 
+              CLOSE_THINGCG.V.DISP# = %SAVE#;
+              CALL M$CLOSE (CLOSE_THINGCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+              END;
+ 
+           CALL M$EXIT;
+ 
+           END;
+ 
+        IF AU_OF_COMGROUP
+        THEN DO;
+ 
+           CALL XUD$UTS_ADJUST (SHORTEST_AWAKENING_TIME, INTERVAL_END_UTS, INTERVAL * %UTS_CSEC_MIN#);
+ 
+           DO USER_NUMBER = 1 TO DA_MUAIS-1;
+ 
+              USER_TABLE$ = PINCRW (USER_AREA.PTR$, USER_NUMBER *
+                 SIZEW(USER_TABLE));
+ 
+              IF USER_TABLE.ACTIVE
+              THEN DO;
+ 
+                 FIRST_ITERATION = USER_TABLE.FIRST_ITERATION;
+                 QUIT = USER_TABLE.QUIT;
+                 REACKNOWLEDGE = USER_TABLE.REACKNOWLEDGE;
+                 BELL_ENABLED = USER_TABLE.BELL_ENABLED;
+                 MAIL_SCAN = USER_TABLE.MAIL_SCAN;
+                 MAIL_FOLDER = USER_TABLE.MAIL_FOLDER;
+                 MAIL_NAME = USER_TABLE.MAIL_NAME;
+                 MAIL_LEN = USER_TABLE.MAIL_LEN;
+                 CALENDAR_SCAN = USER_TABLE.CALENDAR_SCAN;
+                 ISSUE_SALUTATION = USER_TABLE.ISSUE_SALUTATION;
+                 AUTOSCHED = USER_TABLE.AUTOSCHED;
+                 MESSAGE_FORMAT = USER_TABLE.MESSAGE_FORMAT;
+                 SYSID = USER_TABLE.SYSID;
+                 ALERT_COUNT = USER_TABLE.ALERT_COUNT;
+                 ALERT_TIMES = USER_TABLE.ALERT_TIMES;
+                 CALENDAR_LAST_EXAMINED_UTS = USER_TABLE.CALENDAR_LAST_EXAMINED_UTS;
+                 CALENDAR_LAST_UPDATED_UTS = USER_TABLE.CALENDAR_LAST_UPDATED_UTS;
+                 MAILBOX_LAST_EXAMINED_UTS = USER_TABLE.MAILBOX_LAST_EXAMINED_UTS;
+                 NEXT_APPOINTMENT_UTS = USER_TABLE.NEXT_APPOINTMENT_UTS;
+                 LONGEST_ALERT_UTS = USER_TABLE.LONGEST_ALERT_UTS;
+                 USER_ACCOUNT.ACCT# = USER_TABLE.ACCOUNT;
+ 
+                 IF FINAL_PASS OR USER_TABLE.TIME_TO_AWAKEN <= INTERVAL_END_UTS
+                 THEN PROD_USER: DO;
+ 
+                    CALL PROCESS_CURRENT_SYSID
+                    WHENALTRETURN DO;
+ 
+EXPUNGE_USER:          USER_TABLE.ACTIVE = %NO#;
+ 
+                       CALL X$WRITE (F_FDS, VECTOR (F$USER_FLUSHED),
+                          VECTOR (USER_NUMBER), VECTOR (SYSID));
+ 
+                       IF DCBADDR(DCBNUM(CALENDAR)) -> F$DCB.FCD#
+                       THEN
+                          CALL M$CLOSE(CLOSE_CALENDAR) ALTRET (UNEXPECTED_ALTRET);
+ 
+                       IF DCBADDR(DCBNUM(MAILBOX)) -> F$DCB.FCD#
+                       THEN
+                          CALL M$CLOSE(CLOSE_MAILBOX) ALTRET (UNEXPECTED_ALTRET);
+ 
+                       END;
+ 
+                    IF QUIT
+                    THEN DO;
+ 
+                       USER_TABLE.ACTIVE = %NO#;
+                       USER_TABLE.QUIT = %NO#;
+ 
+                       END;
+ 
+                    USER_TABLE.FIRST_ITERATION = FIRST_ITERATION;
+                    USER_TABLE.REACKNOWLEDGE = REACKNOWLEDGE;
+                    USER_TABLE.CALENDAR_LAST_EXAMINED_UTS = CALENDAR_LAST_EXAMINED_UTS;
+                    USER_TABLE.CALENDAR_LAST_UPDATED_UTS = CALENDAR_LAST_UPDATED_UTS;
+                    USER_TABLE.MAILBOX_LAST_EXAMINED_UTS = MAILBOX_LAST_EXAMINED_UTS;
+                    USER_TABLE.NEXT_APPOINTMENT_UTS = NEXT_APPOINTMENT_UTS;
+                    USER_TABLE.LONGEST_ALERT_UTS = LONGEST_ALERT_UTS;
+                    USER_TABLE.TIME_TO_AWAKEN = TIME_TO_AWAKEN;
+ 
+                    END PROD_USER;
+ 
+                 SHORTEST_AWAKENING_TIME = MINIMUM (SHORTEST_AWAKENING_TIME,
+                    USER_TABLE.TIME_TO_AWAKEN);
+ 
+                 END;                   /* do if user is alive */
+ 
+              END;                      /* do user_number = ... */
+ 
+           TIME_TO_AWAKEN = SHORTEST_AWAKENING_TIME;
+ 
+           CALL XUD$UTS_DIFF_SEC (T_DIFF, TIME_TO_AWAKEN, LAST_PACKSET_RELEASE_UTS);
+           IF T_DIFF > 60
+           THEN
+              CALL RELEASE_PACKSETS ALTRET (UNEXPECTED_ALTRET);
+ 
+           QUIT = %NO#;
+ 
+           END;                         /* do if AU of comgroup */
+ 
+        ELSE
+           CALL PROCESS_CURRENT_SYSID
+           WHENALTRETURN DO;
+ 
+              CONTINUE_PROCESSING = %NO#;
+ 
+              END;
+ 
+ 
+        INTERVAL_START_UTS = INTERVAL_END_UTS + 1;
+ 
+        JUST_PROCESSED_AN_EVENT = %NO#;
+ 
+        DO INHIBIT;
+ 
+           DO WHILE (EVENT_HAS_OCCURRED);
+ 
+              CALL PROCESS_EVENT ALTRET (UNEXPECTED_ALTRET);
+ 
+              JUST_PROCESSED_AN_EVENT = %YES#;
+ 
+              END;
+ 
+           IF TRAP_COUNT > 0
+           THEN
+              IF TRAP_COUNT >= 10
+              THEN
+                 FINAL_PASS = %YES#;
+              ELSE
+                 TRAP_COUNT = TRAP_COUNT - 1;
+ 
+           CALL M$TIME (GET_TIME_NOW) ALTRET (UNEXPECTED_ALTRET);
+ 
+           CALL XUD$UTS_ADJUST (T_UTS, TIME_NOW, 510);
+           IF TIME_TO_AWAKEN < T_UTS
+           THEN
+              SLEEP_FOR_AWHILE.V.UNITS# = 5;
+           ELSE DO;
+              CALL XUD$UTS_DIFF_SEC (T_DIFF, TIME_TO_AWAKEN, TIME_NOW);
+              SLEEP_FOR_AWHILE.V.UNITS# = T_DIFF + 1;
+              END;
+ 
+           IF CONTINUE_PROCESSING
+              AND NOT JUST_PROCESSED_AN_EVENT
+              AND NOT QUIT
+              AND NOT FINAL_PASS
+           THEN
+              CALL M$WAIT (SLEEP_FOR_AWHILE);
+ 
+           END;
+ 
+        CALL M$TIME (GET_TIME_NOW) ALTRET (UNEXPECTED_ALTRET);
+ 
+        INTERVAL_END_UTS = TIME_NOW;
+ 
+        END LOOP_WHILE_USER_EXISTS;
+ 
+     IF NOT DEBUG_MODE
+     THEN
+        CALL M$CLOSE (CLOSE_CSCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+     CALL M$CLOSE (CLOSE_LO);
+ 
+     STRING_BUFFER = 'SET M$LL NO';
+     CALL ISSUE_M$YC;
+ 
+     STRING_BUFFER = 'LDEV LP01,REMOVE,ERASE';
+     CALL ISSUE_M$YC;
+ 
+     STRING_BUFFER = 'REPORT JOB=NONE';
+     CALL ISSUE_M$YC;
+ 
+     SEND_MESSAGE_TO_OPER.MESS_ = VECTOR (KEYIN_THING_STOPPED);
+ 
+     CALL M$KEYIN (SEND_MESSAGE_TO_OPER) ALTRET (TERMINATE_ANYHOW);
+ 
+TERMINATE_ANYHOW: CALL M$EXIT;
+ 
+UNEXPECTED_ALTRET:
+ 
+     STRING_BUFFER = 'Thing has died from an unexpected ALTRET!';
+ 
+CRASH_AND_BURN:
+ 
+     REPORT_ERRMSG.CODE_ = VECTOR (ERROR_CODE);
+     REPORT_ERRMSG.V.DCB# = B$TCB.ALT$ -> B$ALT.DCB#;
+     ERROR_CODE = B$TCB.ALT$ -> B$ALT.ERR;
+ 
+     CALL M$ERRMSG (REPORT_ERRMSG);
+ 
+     IF B$JIT.MODE = %M_INT# OR AU_OF_COMGROUP
+     THEN
+        CALL PRINT_BUFFER;
+     ELSE
+        CALL SEND_MESSAGE;
+ 
+     CALL M$CLOSE (CLOSE_LO);
+ 
+     IF DCBADDR(DCBNUM(CSCG)) -> F$DCB.FCD#
+     THEN
+        CALL M$CLOSE (CLOSE_CSCG) ALTRET (CSCG_ERROR);
+ 
+CSCG_ERROR:
+ 
+     SEND_MESSAGE_TO_OPER.MESS_ = VECTOR (KEYIN_THING_STOPPED);
+ 
+     CALL M$KEYIN (SEND_MESSAGE_TO_OPER) ALTRET (DIE_ANYHOW);
+ 
+DIE_ANYHOW: CALL M$EXIT (SET_ERROR_STEPCC);
+ 
+%EJECT;
+PARSE_CCBUF_OPTIONS: PROC;
+DCL PTR$ PTR;
+DCL NAME CHAR(200);
+DCL NAMELEN UBIN;
+DCL SITE CHAR(8);
+DCL SITELEN UBIN;
+     ACCOUNT = B$JIT.ACCN;
+     IF B$JIT.CCDISP = B$JIT.CCARS
+     THEN
+        RETURN;
+ 
+     P_PCB.WORK$ = ADDR (PARSE_WORK_AREA);
+     P_PCB.WKSZ = SIZEW(PARSE_WORK_AREA);
+ 
+     P_PCB.TEXT$ = ADDR (SUBSTR(B$JIT.CCBUF, B$JIT.CCDISP));
+     P_PCB.NCHARS = B$JIT.CCARS - B$JIT.CCDISP;
+ 
+     CALL X$PARSE (P_PCB)
+     WHENALTRETURN DO;
+ 
+        REPORT_ERRMSG.V.POINTER# = B$JIT.CCDISP + P_PCB.HI_CHAR + 2;
+ 
+        CALL M$ERRMSG (REPORT_ERRMSG);
+ 
+        P_PCB.NXT = '1'B;
+ 
+        CALL X$PARSE (P_PCB);
+        CALL M$CLOSE (CLOSE_LO);
+        CALL M$EXIT (SET_ERROR_STEPCC);
+ 
+        END;
+ 
+     DO I = 0 TO P_PCB.OUT$ -> OUT$BLK.NSUBLKS - 1;
+ 
+        BLK$ = P_PCB.OUT$ -> OUT$BLK.SUBLK$(I);
+ 
+        DO CASE (OUT$BLK.CODE);
+ 
+        CASE (%SYSID_OPTION);
+ 
+           IF B$JIT.MODE = %M_GHOST# OR DEBUG_MODE
+           THEN
+              CALL CHARBIN (SYSID, OUT$BLK.SUBLK$(0) -> OUT$SYM.TEXT);
+ 
+        CASE (%INTERVAL_OPTION);
+ 
+           CALL CHARBIN (INTERVAL, OUT$BLK.SUBLK$(0) -> OUT$SYM.TEXT);
+ 
+        CASE (%ALERT_OPTION);
+ 
+           ALERT_COUNT = MINIMUM (OUT$BLK.NSUBLKS, SIZEW(ALERT_TIMES));
+ 
+           DO J = 0 TO ALERT_COUNT - 1;
+ 
+              CALL CHARBIN (ALERT_TIMES(J), OUT$BLK.SUBLK$(J) ->
+                 OUT$SYM.TEXT);
+ 
+              END;
+ 
+        CASE (%LONGFORM_OPTION, %SHORTFORM_OPTION, %MESSAGELINE_OPTION);
+ 
+           MESSAGE_FORMAT = OUT$BLK.CODE;
+ 
+        CASE (%QUIT_OPTION);
+ 
+           QUIT = %YES#;
+ 
+        CASE (%BELL_OPTION);
+ 
+           BELL_ENABLED = %YES#;
+ 
+        CASE (%NOBELL_OPTION);
+ 
+           BELL_ENABLED = %NO#;
+ 
+        CASE (%MAIL_OPTION);
+ 
+           MAIL_SCAN = %YES#;
+           IF OUT$BLK.NSUBLKS > 0 THEN
+           DO;
+              ACCOUNT = ' ';
+              MAIL_NAME = ':MAIL_CENTRAL';
+              MAIL_LEN = 13;
+              MAIL_FOLDER = %YES#;
+              DO J = 0 TO OUT$BLK.NSUBLKS - 1;
+                 PTR$ = OUT$BLK.SUBLK$(J);
+                 DO CASE (PTR$->OUT$BLK.CODE);
+ 
+                 CASE (%NAME);
+                    NAME = ' ';
+                    NAME = PTR$->OUT$BLK.SUBLK$(0)->OUT$SYM.TEXT;
+                    NAMELEN = PTR$->OUT$BLK.SUBLK$(0)->OUT$SYM.COUNT;
+                    CALL GETFOLDER (NAME,NAMELEN);
+ 
+                 CASE (%FOLDER);
+                    CALL CONCAT(MAIL_NAME,':MAIL_',PTR$->OUT$BLK.SUBLK$(0)->OUT$SYM.TEXT);
+                    MAIL_LEN = PTR$->OUT$BLK.SUBLK$(0)->OUT$SYM.COUNT + 6;
+ 
+                 CASE (%ACCOUNT);
+                    ACCOUNT = PTR$->OUT$SYM.TEXT;
+ 
+/***
+  The following Case for SITE is provided for future modification.  This
+  allows a user to give a SITE other than his/her's.  Currently, this
+  option is ignored by THING.
+ 
+***/
+                 CASE (%SITE);
+                    SITE = PTR$->OUT$BLK.SUBLK$(0)->OUT$SYM.TEXT;
+                    SITELEN = PTR$->OUT$BLK.SUBLK$(0)->OUT$SYM.COUNT;
+ 
+                 END;                   /* DO CASE */
+                 END;                   /* DO J=O TO ... */
+              IF ACCOUNT = ' ' THEN ACCOUNT = B$JIT.ACCN;
+              CALL CHECK_OPEN ALTRET (NO_MAIL);
+              DO NEVER;
+NO_MAIL:
+                 MAIL_LEN = %MAILLEN#;
+                 MAIL_NAME = %MAILNAME#;
+                 ACCOUNT = B$JIT.ACCN;
+                 END;                   /* DO NEVER */
+              END;                      /* IF OUT$BLK.NSUBLKS ... */
+ 
+ 
+ 
+ 
+        CASE (%NOMAIL_OPTION);
+ 
+           MAIL_SCAN = %NO#;
+ 
+        CASE (%CALENDAR_OPTION);
+ 
+           CALENDAR_SCAN = %YES#;
+ 
+        CASE (%NOCALENDAR_OPTION);
+ 
+           CALENDAR_SCAN = %NO#;
+ 
+        CASE (%SALUTATION_OPTION);
+ 
+           ISSUE_SALUTATION = %YES#;
+ 
+        CASE (%NOSALUTATION_OPTION);
+ 
+           ISSUE_SALUTATION = %NO#;
+ 
+        CASE (%AUTOSCHED_OPTION);
+ 
+           AUTOSCHED = %YES#;
+ 
+        CASE (%NOAUTOSCHED_OPTION);
+ 
+           AUTOSCHED = %NO#;
+ 
+        CASE (%OPTION_OPTION);
+ 
+           OPTION = %YES#;
+ 
+        CASE (ELSE);
+ 
+           STRING_BUFFER = 'Unrecognized/legal option - internal error';
+ 
+           CALL PRINT_BUFFER;
+           CALL M$CLOSE (CLOSE_LO);
+           CALL M$EXIT (SET_ERROR_STEPCC);
+ 
+        END;
+ 
+        END;
+ 
+     DO I = 0 TO ALERT_COUNT - 2;
+        DO J = I + 1 TO ALERT_COUNT - 1;
+ 
+           IF ALERT_TIMES(I) > ALERT_TIMES(J)
+           THEN DO;
+ 
+              TEMP = ALERT_TIMES(I);
+              ALERT_TIMES(I) = ALERT_TIMES(J);
+              ALERT_TIMES(J) = TEMP;
+ 
+              END;
+ 
+           END;
+        END;
+ 
+     RETURN;
+ 
+END PARSE_CCBUF_OPTIONS;
+ 
+%EJECT;
+INITIALIZE_MAPPER: PROC ALTRET;
+ 
+     CALL DAM$INIT
+     WHENALTRETURN DO;
+ 
+        REPORT_ERRMSG.CODE_ = VECTOR (DA_MAPERR);
+ 
+        CALL M$ERRMSG (REPORT_ERRMSG);
+ 
+        STRING_BUFFER = 'DAM$INIT issued an ALTRETURN;  I die now.';
+ 
+        CALL PRINT_BUFFER;
+        CALL M$CLOSE (CLOSE_LO);
+        CALL M$EXIT (SET_ERROR_STEPCC);
+ 
+        END;
+ 
+     CALL M$MONINFO (GET_MONITOR_POINTERS) ALTRET (UNEXPECTED_ALTRET);
+ 
+     CALL DAM$MAP (MONITOR_POINTERS.B$USRT$, USRT$, 0)
+     WHENALTRETURN DO;
+ 
+        REPORT_ERRMSG.CODE_ = VECTOR (DA_MAPERR);
+ 
+        CALL M$ERRMSG (REPORT_ERRMSG);
+ 
+        STRING_BUFFER = 'Thing has received an ALTRET from DAM$MAP!';
+        CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+        CALL M$CLOSE (CLOSE_LO);
+        CALL M$EXIT (SET_ERROR_STEPCC);
+ 
+        END;
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END INITIALIZE_MAPPER;
+ 
+%EJECT;
+SETUP_USER_TABLE: PROC ALTRET;
+ 
+     GET_USER_AREA.V.SEGSIZE# = SIZEW(USER_TABLE) * DA_MUAIS;
+ 
+     CALL M$GDS (GET_DYNAMIC_BUFFER)
+     WHENALTRETURN DO;
+        ALTRETURN;
+        END;
+ 
+     CALL M$GDS (GET_USER_AREA)
+     WHENALTRETURN DO;
+        ALTRETURN;
+        END;
+ 
+     DO USER_NUMBER = 0 TO DA_MUAIS-1;
+ 
+        USER_TABLE$ = PINCRW(USER_AREA.PTR$, USER_NUMBER * SIZEW(USER_TABLE));
+ 
+        USER_TABLE = '0'B;
+ 
+        END;
+ 
+     RETURN;
+ 
+END SETUP_USER_TABLE;
+ 
+%EJECT;
+INITIALIZE_COMGROUP: PROC ALTRET;
+ 
+DCL RETRY_COUNT UBIN WORD;
+ 
+     RETRY_COUNT = 10;
+ 
+     CALL M$EVENT (SETUP_EVENT_HANDLER) ALTRET (UNEXPECTED_ALTRET);
+ 
+     OPEN_THINGCG.V.FUN# = %CREATE#;
+     OPEN_THINGCG.V.CTG# = %YES#;
+     OPEN_THINGCG.V.EXIST# = %NEWFILE#;
+     OPEN_THINGCG.V.DISP# = %NAMED#;
+     OPEN_THINGCG.V.AU# = %YES#;
+     OPEN_THINGCG.SETSTA_ = VECTOR (THINGCG_SETSTA);
+ 
+     THINGCG_SETSTA.MYSTATION# = 'TheGhost';
+ 
+     CALL M$OPEN (OPEN_THINGCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+     CALL M$CGCTL (THINGCG_CGCTL) ALTRET (UNEXPECTED_ALTRET);
+ 
+     READ_THINGCG.V.WAIT# = %NO#;
+     READ_THINGCG.V.EVENT# = 12345;
+     READ_THINGCG.BUF_ = VECTOR (COMGROUP_BUFFER);
+ 
+     CALL M$READ (READ_THINGCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+     THINGCG$ = DCBADDR(DCBNUM(THINGCG));
+     COMGROUP_BUFFER$ = ADDR(COMGROUP_BUFFER);
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     IF B$TCB.ALT$ -> B$ALT.ERR.CODE = %E$FILEBUSY
+        AND RETRY_COUNT > 0
+     THEN DO;
+ 
+        RETRY_COUNT = RETRY_COUNT - 1;
+ 
+        SLEEP_FOR_AWHILE.V.UNITS# = 5;
+ 
+        CALL M$WAIT (SLEEP_FOR_AWHILE);
+ 
+        CALL M$RETRY;
+ 
+        END;
+ 
+     ALTRETURN;
+ 
+END INITIALIZE_COMGROUP;
+ 
+%EJECT;
+SPEAK_TO_GHOST: PROC ALTRET;
+ 
+     IF B$JIT.MODE ~= %M_INT#
+     THEN DO;
+ 
+        STRING_BUFFER = 'Thing can only be used on-line!';
+        CALL PRINT_BUFFER;
+        CALL M$CLOSE (CLOSE_LO);
+        CALL M$EXIT;
+ 
+        END;
+ 
+     IF MAIL_FOLDER ~= %YES# THEN
+        CALL DETERMINE_MAILBOX(DUMMY_NAME,I);
+ 
+     MESSAGE.USER# = B$JIT.USER;
+     MESSAGE.SYSID = B$JIT.SYSID;
+     MESSAGE.ACTIVE = ~ QUIT;
+     MESSAGE.BELL_ENABLED = BELL_ENABLED;
+     MESSAGE.MAIL_SCAN = MAIL_SCAN;
+     MESSAGE.MAIL_FOLDER = MAIL_FOLDER;
+     MESSAGE.MAIL_NAME = MAIL_NAME;
+     MESSAGE.MAIL_LEN = MAIL_LEN;
+     MESSAGE.CALENDAR_SCAN = CALENDAR_SCAN;
+     MESSAGE.ISSUE_SALUTATION = ISSUE_SALUTATION;
+     MESSAGE.AUTOSCHED = AUTOSCHED;
+     MESSAGE.INTERVAL = INTERVAL;
+     MESSAGE.ALERT_COUNT = ALERT_COUNT;
+     MESSAGE.ALERT_TIMES = ALERT_TIMES;
+     MESSAGE.OPTION = OPTION;
+     MESSAGE.ACCOUNT = ACCOUNT;
+     MESSAGE.UNAME = B$JIT.UNAME;
+     MESSAGE.MESSAGE_FORMAT = MESSAGE_FORMAT;
+ 
+ 
+     OPEN_THINGCG.V.FUN# = %UPDATE#;
+     OPEN_THINGCG.V.AU# = %NO#;
+ 
+     CALL M$OPEN (OPEN_THINGCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+     THINGCG_STATION.STATION# = 'TheGhost';
+     THINGCG_STATION.MSGTYP# = 'HELLO';
+ 
+     WRITE_THINGCG.BUF_ = VECTOR (MESSAGE);
+ 
+     CALL M$WRITE (WRITE_THINGCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+     CALL M$CLOSE (CLOSE_THINGCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+     DO CASE (MESSAGE_FORMAT);
+ 
+     CASE (%LONGFORM_OPTION, %SHORTFORM_OPTION);
+ 
+        TERMINAL_CTL.MSGLINE# = %NO#;
+ 
+     CASE (%MESSAGELINE_OPTION);
+ 
+        TERMINAL_CTL.MSGLINE# = %YES#;
+ 
+     END;
+ 
+     CALL M$STRMCTL (SET_TERMINAL_CTL) ALTRET (UNEXPECTED_ALTRET);
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END SPEAK_TO_GHOST;
+ 
+%EJECT;
+PROCESS_CURRENT_SYSID: PROC ALTRET;
+ 
+     IF BELL_ENABLED
+     THEN
+        BELL_LEN = 1;
+     ELSE
+        BELL_LEN = 0;
+ 
+     BUFFER_IS_ALLOCATED = %NO#;
+ 
+     TIME_TO_AWAKEN = INTERVAL_END_UTS + INTERVAL * 6000;
+ 
+     CALL DAM$FREEM;
+ 
+     CALL DAM$MAP (B$JIT$, USER_JIT$, SYSID, 0)
+     WHENALTRETURN DO;
+ 
+        IF DA_MAPERR.CODE = %E$DA_NO_USER OR DA_MAPERR.CODE = %E$DA_NO_PAGES
+        THEN DO;
+ 
+           IF FIRST_ITERATION AND NOT AU_OF_COMGROUP
+           THEN DO;
+ 
+              STRING_BUFFER = 'THING can''t find the specified SYSID!';
+              CALL PRINT_BUFFER;
+              CALL M$CLOSE (CLOSE_LO);
+              CALL M$EXIT (SET_ERROR_STEPCC);
+ 
+              END;
+ 
+           ALTRETURN;
+ 
+           END;
+ 
+MAP_ERROR: REPORT_ERRMSG.CODE_ = VECTOR (DA_MAPERR);
+ 
+        CALL M$ERRMSG (REPORT_ERRMSG);
+ 
+        STRING_BUFFER = 'Thing has received an ALTRET from DAM$MAP!';
+        CALL PRINT_BUFFER;
+        CALL M$CLOSE (CLOSE_LO);
+        CALL M$EXIT (SET_ERROR_STEPCC);
+ 
+        END;
+ 
+     IF FIRST_ITERATION AND USER_JIT$ -> B$JIT.MODE ~= %M_INT#
+        AND NOT AU_OF_COMGROUP
+     THEN DO;
+ 
+        STRING_BUFFER = 'Thing can''t communicate with non-online users!';
+        CALL PRINT_BUFFER;
+        CALL M$CLOSE (CLOSE_LO);
+        CALL M$EXIT (SET_ERROR_STEPCC);
+ 
+        END;
+ 
+     USER_NUMBER = USER_JIT$ -> B$JIT.USER;
+ 
+     IF USRT$ -> B$USER.SYSID(USER_NUMBER) ~= SYSID
+     THEN
+        ALTRETURN;
+ 
+     IF NOT (USRT$ -> B$USER.FLG(USER_NUMBER) & %U_NSND)
+     THEN DO; TRY_THIS_USER: DO;
+ 
+           IF FINAL_PASS
+           THEN DO;
+ 
+              CALL CONCAT (STRING_BUFFER, BELL_STRING,
+                 'Thing has gone away.  Please re-invoke him later.');
+              CALL SEND_MESSAGE;
+ 
+              RETURN;
+ 
+              END;
+ 
+ 
+           IF QUIT
+           THEN DO;
+ 
+              STRING_BUFFER = 'Thing will stop bothering you now.';
+              CALL SEND_MESSAGE;
+ 
+              RETURN;
+ 
+              END;
+ 
+           IF FIRST_ITERATION
+           THEN DO;
+ 
+              IF REACKNOWLEDGE
+              THEN
+                 STRING_BUFFER = 'Thing says... I hear and obey!';
+              ELSE
+                 STRING_BUFFER = 'Hello there... Thing is now at your service!';
+ 
+              IF (ISSUE_SALUTATION | REACKNOWLEDGE) & ~MESSAGE.OPTION
+              THEN
+                 CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+/*       IF ~REACKNOWLEDGE & MAIL_SCAN & ~MESSAGE.OPTION
+           THEN DO;
+             CALL INDEX (I,'  ',MESSAGE.MAIL_NAME);
+             CALL CONCAT(STRING_BUFFER,'Thing is watching /',SUBSTR(MESSAGE.MAIL_NAME,6,I-6),'.',MESSAGE.ACCOUNT);
+             CALL SEND_MESSAGE;
+             END;
+ */
+              IF MESSAGE.OPTION
+              THEN DO;
+                 CALL FORMAT_OPTION;
+                 MESSAGE.OPTION = '0'B;
+                 CALL SEND_MESSAGE;
+                 END;
+ 
+              FIRST_ITERATION = %NO#;
+              REACKNOWLEDGE = %NO#;
+              CALL XUD$UTS_ADJUST (TIME_TO_AWAKEN, INTERVAL_END_UTS, 2000);
+ 
+              RETURN;
+ 
+              END;
+ 
+           IF NOT AU_OF_COMGROUP
+           THEN
+              USER_ACCOUNT.ACCT# = USER_JIT$ -> B$JIT.ACCN;
+ 
+           MESSAGE_LINE_USED = %NO#;
+ 
+           IF NOT AU_OF_COMGROUP
+           THEN DO;
+ 
+              CALL M$GDS (GET_DYNAMIC_BUFFER) ALTRET (UNEXPECTED_ALTRET);
+ 
+              BUFFER_IS_ALLOCATED = %YES#;
+ 
+              END;
+ 
+           IF ALERT_COUNT = 0 OR NOT CALENDAR_SCAN
+           THEN
+              GOTO NO_CALENDAR_FILE;
+ 
+           OPEN_CALENDAR.FPARAM_ = DYNAMIC_BUFFER;
+           OPEN_CALENDAR.V.FUN# = %IN#;
+ 
+           CALL M$OPEN (OPEN_CALENDAR) ALTRET (NO_CALENDAR_FILE);
+ 
+           FIT$ = DYNAMIC_BUFFER.PTR$;
+ 
+           CALL XSF$LOCCODP (FIT$, 4) ALTRET (CLOSE_THE_CALENDAR);
+ 
+           CALENDAR_LAST_UPDATED_UTS = FIT$ -> CODE04.MODIFY.TIME;
+ 
+           CALL XUD$UTS_ADJUST (T_UTS, INTERVAL_END_UTS, LONGEST_ALERT_UTS + INTERVAL*%UTS_CSEC_MIN#);
+           IF CALENDAR_LAST_UPDATED_UTS > CALENDAR_LAST_EXAMINED_UTS
+              OR NEXT_APPOINTMENT_UTS < T_UTS
+           THEN DO;
+ 
+              CALL PROCESS_CALENDAR_ENTRIES ALTRET (UNEXPECTED_ALTRET);
+ 
+              CALENDAR_LAST_EXAMINED_UTS = INTERVAL_END_UTS;
+ 
+              END;
+ 
+CLOSE_THE_CALENDAR:
+ 
+           CALL M$CLOSE (CLOSE_CALENDAR) ALTRET (UNEXPECTED_ALTRET);
+ 
+           IF MESSAGE_LINE_USED
+           THEN DO;
+ 
+              CALL XUD$UTS_ADJUST (T_UTS, INTERVAL_END_UTS, 1500);
+              TIME_TO_AWAKEN = MINIMUM (TIME_TO_AWAKEN, T_UTS);
+ 
+              EXIT TRY_THIS_USER;
+ 
+              END;
+ 
+NO_CALENDAR_FILE:
+ 
+           IF NOT MAIL_SCAN
+           THEN
+              EXIT TRY_THIS_USER;
+ 
+           OPEN_MAILBOX.FPARAM_ = DYNAMIC_BUFFER;
+ 
+           MAILBOX_NAME.NAME# = MAIL_NAME;
+           MAILBOX_NAME.L# = MAIL_LEN;
+           CALL M$OPEN (OPEN_MAILBOX) ALTRET (NO_MAILBOX_FILE);
+ 
+           FIT$ = DYNAMIC_BUFFER.PTR$;
+ 
+           CALL XSF$LOCCODP (FIT$, 4) ALTRET (CLOSE_THE_MAILBOX);
+ 
+           MAILBOX_LAST_UPDATED_UTS = FIT$ -> CODE04.MODIFY.TIME;
+ 
+           IF MAILBOX_LAST_UPDATED_UTS ~= MAILBOX_LAST_EXAMINED_UTS
+           THEN DO;
+ 
+              CALL M$ENQ (ENQUEUE_ON_MAILBOX) ALTRET (CLOSE_THE_MAILBOX);
+              CALL M$DEQ (DEQUEUE_FROM_MAILBOX) ALTRET (CLOSE_THE_MAILBOX);
+ 
+              CALL PROCESS_MAILBOX_ENTRIES ALTRET (UNEXPECTED_ALTRET);
+ 
+              MAILBOX_LAST_EXAMINED_UTS = MAILBOX_LAST_UPDATED_UTS;
+ 
+              END;
+ 
+CLOSE_THE_MAILBOX:
+ 
+           CALL M$CLOSE (CLOSE_MAILBOX) ALTRET (UNEXPECTED_ALTRET);
+ 
+NO_MAILBOX_FILE:
+ 
+           END TRY_THIS_USER; END;
+ 
+     ELSE
+        CALL XUD$UTS_ADJUST (TIME_TO_AWAKEN, INTERVAL_END_UTS, %UTS_CSEC_MIN#);
+ 
+     IF BUFFER_IS_ALLOCATED
+     THEN
+        CALL M$FDS (RELEASE_DYNAMIC_BUFFER) ALTRET (UNEXPECTED_ALTRET);
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END PROCESS_CURRENT_SYSID;
+ 
+%EJECT;
+PROCESS_EVENT: PROC ALTRET;
+ 
+     CALL M$CHECK (CHECK_THINGCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+     DO SELECT (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.MSGTYP#);
+ 
+        SELECT ('*AUEV');
+ 
+        DO CASE (COMGROUP_BUFFER$ -> B$CGAUCRD.EVENT);
+ 
+        CASE (%CG_DOPN#);
+ 
+           CALL X$WRITE (F_FDS, VECTOR (F$USER_JOINED),
+              VECTOR (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.MSGID#),
+              VECTOR (COMGROUP_BUFFER$ -> B$CGAUCRD.STATION),
+              VECTOR (COMGROUP_BUFFER$ -> B$CGAUCRD.CGAUCI.WHO.ACCT),
+              VECTOR (COMGROUP_BUFFER$ -> B$CGAUCRD.CGAUCI.WHO.NAME));
+ 
+        CASE (%CG_DCLS#);
+ 
+/*       CALL X$WRITE (F_FDS, VECTOR (F$USER_LEFT),
+          VECTOR (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.MSGID#),
+          VECTOR (COMGROUP_BUFFER$ -> B$CGAUCRD.STATION)); */
+ 
+        END;
+ 
+        SELECT ('HELLO');
+ 
+        MESSAGE = COMGROUP_BUFFER;
+ 
+        IF MESSAGE.USER# >= DA_MUAIS
+        THEN
+           EXIT;
+ 
+        USER_NUMBER = MESSAGE.USER#;
+        SYSID = MESSAGE.SYSID;
+ 
+        USER_TABLE$ = PINCRW(USER_AREA.PTR$, USER_NUMBER * SIZEW(USER_TABLE));
+ 
+        IF USER_TABLE.SYSID ~= SYSID
+        THEN
+           USER_TABLE.ACTIVE = %NO#;
+ 
+        USER_TABLE.SYSID = SYSID;
+        USER_TABLE.CALENDAR_LAST_EXAMINED_UTS = 0;
+        USER_TABLE.CALENDAR_LAST_UPDATED_UTS = 0;
+        USER_TABLE.MAILBOX_LAST_EXAMINED_UTS = 0;
+        USER_TABLE.MAILBOX_LAST_UPDATED_UTS = 0;
+        USER_TABLE.NEXT_APPOINTMENT_UTS = 0;
+        USER_TABLE.TIME_TO_AWAKEN = 0;
+        IF MESSAGE.MAIL_SCAN = '10'B OR
+           USER_TABLE.ACTIVE = %NO# THEN
+        DO;
+           USER_TABLE.ACCOUNT = MESSAGE.ACCOUNT;
+           USER_TABLE.MAIL_LEN = MESSAGE.MAIL_LEN;
+           USER_TABLE.MAIL_NAME = MESSAGE.MAIL_NAME;
+           END;
+ 
+        IF MESSAGE.MESSAGE_FORMAT > 0
+        THEN
+           USER_TABLE.MESSAGE_FORMAT = MESSAGE.MESSAGE_FORMAT;
+        ELSE
+           IF NOT USER_TABLE.ACTIVE OR USER_TABLE.MESSAGE_FORMAT = 0
+           THEN
+              USER_TABLE.MESSAGE_FORMAT = %SHORTFORM_OPTION;
+ 
+        IF MESSAGE.ALERT_COUNT > 0
+        THEN DO;
+ 
+           USER_TABLE.ALERT_COUNT = MESSAGE.ALERT_COUNT;
+           USER_TABLE.ALERT_TIMES = MESSAGE.ALERT_TIMES;
+           USER_TABLE.LONGEST_ALERT_UTS = 6000 *
+              MESSAGE.ALERT_TIMES (MESSAGE.ALERT_COUNT - 1);
+ 
+           END;
+ 
+        ELSE
+           IF NOT USER_TABLE.ACTIVE
+           THEN DO;
+ 
+              USER_TABLE.ALERT_COUNT = 1;
+              USER_TABLE.ALERT_TIMES(0) = 0;
+              USER_TABLE.LONGEST_ALERT_UTS = 0;
+ 
+              END;
+ 
+        CALL SET_DEFAULT (USER_TABLE.BELL_ENABLED, MESSAGE.BELL_ENABLED, %YES#);
+        CALL SET_DEFAULT (USER_TABLE.MAIL_SCAN, MESSAGE.MAIL_SCAN, %YES#);
+        CALL SET_DEFAULT (USER_TABLE.CALENDAR_SCAN, MESSAGE.CALENDAR_SCAN, %YES#);
+        CALL SET_DEFAULT (USER_TABLE.ISSUE_SALUTATION, MESSAGE.ISSUE_SALUTATION,
+           %YES#);
+        CALL SET_DEFAULT (USER_TABLE.AUTOSCHED, MESSAGE.AUTOSCHED, %YES#);
+ 
+        IF MESSAGE.ACTIVE
+        THEN DO;
+ 
+           IF USER_TABLE.ACTIVE
+           THEN
+              CALL X$WRITE (F_FDS, VECTOR (F$USER_UPDATE),
+                 VECTOR (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.MSGID#),
+                 VECTOR (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.STATION#),
+                 VECTOR (USER_NUMBER), VECTOR (SYSID));
+           ELSE
+              CALL X$WRITE (F_FDS, VECTOR (F$USER_STARTUP),
+                 VECTOR (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.MSGID#),
+                 VECTOR (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.STATION#),
+                 VECTOR (USER_NUMBER), VECTOR (SYSID));
+ 
+           USER_TABLE.REACKNOWLEDGE = USER_TABLE.ACTIVE;
+           USER_TABLE.ACTIVE = %YES#;
+           USER_TABLE.FIRST_ITERATION = %YES#;
+           USER_TABLE.MAIL_FOLDER = %YES#;
+ 
+           END;
+ 
+        ELSE DO;
+ 
+           IF USER_TABLE.ACTIVE
+           THEN DO;
+ 
+              CALL X$WRITE (F_FDS, VECTOR (F$USER_QUIT),
+                 VECTOR (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.MSGID#),
+                 VECTOR (THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.STATION#),
+                 VECTOR (USER_NUMBER), VECTOR (SYSID));
+ 
+              USER_TABLE.QUIT = %YES#;
+ 
+              END;
+ 
+           END;
+ 
+        IF USER_TABLE.QUIT
+           AND USER_TABLE.ALERT_TIMES(0) = 54321
+           AND SUBSTR (USER_TABLE.ACCOUNT, 0, 3) = 'DCP'
+        THEN
+           FINAL_PASS = %YES#;
+ 
+        SELECT (ELSE);
+ 
+     CALL CONCAT (STRING_BUFFER, 'Unknown message ', THINGCG$ ->
+        F$DCB.LASTSTA$ -> VLP_STATION.MSGTYP#, ' from station ',
+        THINGCG$ -> F$DCB.LASTSTA$ -> VLP_STATION.STATION#);
+ 
+     CALL PRINT_BUFFER;
+ 
+        END;
+ 
+     EVENT_HAS_OCCURRED = %NO#;
+ 
+     CALL M$READ (READ_THINGCG) ALTRET (UNEXPECTED_ALTRET);
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END PROCESS_EVENT;
+ 
+%EJECT;
+SET_DEFAULT: PROC (USER_FLAG, MESSAGE_FLAG, DEFAULT);
+ 
+/*I*  NAME:    SET_DEFAULT
+      PURPOSE: Sets user-table flag to appropriate value, based on message
+               contents, previous setting of user-table flag, default
+               setting, and whether user was previously active.
+*/
+ 
+DCL USER_FLAG BIT (1);
+DCL MESSAGE_FLAG BIT (2);
+DCL DEFAULT BIT (1);
+ 
+     IF MESSAGE_FLAG = %YES# OR MESSAGE_FLAG = %NO#
+     THEN
+        USER_FLAG = MESSAGE_FLAG;
+     ELSE
+        IF NOT USER_TABLE.ACTIVE
+        THEN
+           USER_FLAG = DEFAULT;
+ 
+END SET_DEFAULT;
+ 
+%EJECT;
+PROCESS_CALENDAR_ENTRIES: PROC ALTRET;
+ 
+/*I*  NAME:    PROCESS_CALENDAR_ENTRIES
+      FUNCTION: Reads through :CALENDAR file, selects upcoming appointments
+               and sends alert messages to the user.
+*/
+ 
+DCL INTERVAL UBIN;
+DCL MINLEN SBIN;
+DCL UBIN_TEMP UBIN;
+ 
+     CALENDAR_KEY.LEN = LENGTHC(CALENDAR_KEY) - 1;
+     CALENDAR_KEY.UTS = INTERVAL_START_UTS;
+     CALENDAR_KEY.SUBENTRY = 0;
+     NEXT_APPOINTMENT_UTS = FAR_IN_THE_FUTURE;
+ 
+     CALL M$PRECORD (POSITION_CALENDAR) ALTRET (LOOP_THROUGH_APPOINTMENTS);
+ 
+LOOP_THROUGH_APPOINTMENTS: DO UNTIL (%NO#);
+ 
+        CALL M$READ (READ_CALENDAR)
+        WHENALTRETURN DO;
+ 
+           IF B$TCB.ALT$ -> B$ALT.ERR.CODE = %E$EOF
+           THEN
+              RETURN;
+           ELSE
+              IF B$TCB.ALT$ -> B$ALT.ERR.CODE ~= %E$LD
+              THEN
+                 ALTRETURN;
+ 
+           END;
+ 
+        IF NEXT_APPOINTMENT_UTS = FAR_IN_THE_FUTURE
+        THEN
+           NEXT_APPOINTMENT_UTS = CALENDAR_KEY.UTS;
+ 
+        T_UTS = CALENDAR_KEY.UTS;
+        CALL XUD$UTS_DIFF (MINUTES_TO_GO, T_UTS, INTERVAL_END_UTS);
+        MINUTES_TO_GO = (MINUTES_TO_GO + 3000) / 6000;
+ 
+        IF MINUTES_TO_GO > ALERT_TIMES(ALERT_COUNT-1)
+        THEN DO;
+ 
+           T_UTS = CALENDAR_KEY.UTS;
+           CALL XUD$UTS_ADJUST (UBIN_TEMP, T_UTS, - ALERT_TIMES(ALERT_COUNT-1)*%UTS_CSEC_MIN# + 110);
+           TIME_TO_AWAKEN = MINIMUM (TIME_TO_AWAKEN, UBIN_TEMP);
+ 
+           RETURN;                      /* past end of alert range */
+ 
+           END;
+ 
+        IF MINUTES_TO_GO >= -5
+        THEN
+PROCESS_THIS_APPOINTMENT: DO;
+ 
+           IF CALENDAR_KEY.UTS <= INTERVAL_END_UTS
+           THEN DO;
+ 
+              ALERT_TEXT = '->NOW!!<-';
+ 
+              CALL SEND_APPOINTMENT_ALERT ALTRET (UNEXPECTED_ALTRET);
+ 
+              EXIT PROCESS_THIS_APPOINTMENT;
+ 
+              END;
+ 
+           DO INTERVAL = 0 TO ALERT_COUNT - 1;
+ 
+              T_UTS = CALENDAR_KEY.UTS;
+              CALL XUD$UTS_ADJUST (ALERT_POINT, T_UTS, - ALERT_TIMES(INTERVAL) * %UTS_CSEC_MIN#);
+ 
+              IF ALERT_POINT <= INTERVAL_END_UTS
+              THEN DO;
+ 
+                 T_UTS = CALENDAR_KEY.UTS;
+                 IF INTERVAL = 0
+                 THEN
+                    CALL XUD$UTS_ADJUST (T_UTS, T_UTS, 110);
+                 ELSE
+                    CALL XUD$UTS_ADJUST (T_UTS, T_UTS, - ALERT_TIMES(INTERVAL-1)*%UTS_CSEC_MIN# + 110);
+                 TIME_TO_AWAKEN = MINIMUM (TIME_TO_AWAKEN, T_UTS);
+ 
+                 IF ALERT_POINT > CALENDAR_LAST_EXAMINED_UTS
+                 THEN DO;               /* time just entered this interval */
+ 
+                    IF MINUTES_TO_GO < 2
+                    THEN
+                       ALERT_TEXT = '1 minute!';
+ 
+                    ELSE DO;
+ 
+                       IF MINUTES_TO_GO > 9
+                       THEN
+                          IF MINUTES_TO_GO > 99
+                          THEN
+                             IF MINUTES_TO_GO > 999
+                             THEN
+                                MINLEN = 4;
+                             ELSE
+                                MINLEN = 3;
+                          ELSE
+                             MINLEN = 2;
+                       ELSE
+                          MINLEN = 1;
+ 
+                       CALL BINCHAR (SUBSTR(ALERT_TEXT,0,MINLEN), MINUTES_TO_GO);
+ 
+                       SUBSTR (ALERT_TEXT, MINLEN) = ' minutes';
+ 
+                       END;
+ 
+                    CALL SEND_APPOINTMENT_ALERT ALTRET (UNEXPECTED_ALTRET);
+ 
+                    END;           /* do if appointment just entered interval */
+ 
+                 EXIT PROCESS_THIS_APPOINTMENT;
+ 
+                 END;              /* do if appointment is within interval */
+ 
+              END;                      /* do interval = ... */
+ 
+           END PROCESS_THIS_APPOINTMENT;
+ 
+        END LOOP_THROUGH_APPOINTMENTS;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END PROCESS_CALENDAR_ENTRIES;
+ 
+%EJECT;
+PROCESS_MAILBOX_ENTRIES: PROC ALTRET;
+ 
+DCL LOCATION_OF_@ UBIN WORD;
+ 
+     POSITION_MAILBOX.KEY_ = VECTOR (VM_INFOKEY);
+     READ_MAILBOX.BUF_ = DYNAMIC_BUFFER;
+     READ_MAILBOX.KEY_ = VECTOR (VM_INFOKEY);
+     VM_INFOKEY = '0'B;
+     VM_INFOKEY.COUNT = LENGTHC(VM_INFOKEY) - 1;
+     VM_INFOKEY.TYPE = %VM_TYPE_HEAD;
+ 
+     CALL M$PRECORD (POSITION_MAILBOX) ALTRET (LOOP_THROUGH_MESSAGES);
+ 
+LOOP_THROUGH_MESSAGES: DO UNTIL (%NO#);
+ 
+        CALL M$READ (READ_MAILBOX) ALTRET (MAILBOX_ENDS);
+ 
+        IF VM_INFOKEY.TYPE ~= %VM_TYPE_HEAD
+        THEN
+           EXIT LOOP_THROUGH_MESSAGES;
+ 
+        IF VM_HEADER.DELIVERY_DATE > MAILBOX_LAST_EXAMINED_UTS
+        THEN
+PROCESS_NEW_MESSAGE: DO;
+ 
+           CALL CORRECT_PTR (VM_HEADER.BAD_ADDRESS$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.BLIND$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.COPY$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.FILE_FOLDER$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.FROM$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.REFERENCE$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.REPLY_TO$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.RETURN_ADDRESS$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.SIGNED$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.SUBJECT$, VM_HEADER);
+           CALL CORRECT_PTR (VM_HEADER.TO$, VM_HEADER);
+ 
+           CALL INDEX (LOCATION_OF_@, '@', VM_HEADER.FROM$ -> TEXTC.TEXT)
+           WHENRETURN DO;
+ 
+              SUBSTR (VM_HEADER.FROM$ -> TEXTC.TEXT, LOCATION_OF_@) = ' ';
+ 
+              END;
+/* To fix #33785
+         IF VM_HEADER.SIGNED$ ~= ADDR(NIL)
+           THEN
+            IF VM_HEADER.SIGNED$ -> TEXTC.TEXT ~= ' '
+              THEN
+               VM_HEADER.FROM$ = VM_HEADER.SIGNED$; */
+ 
+/* To fix #34637 */
+           IF SUBSTR(VM_HEADER.FROM$->TEXTC.TEXT,0,VM_HEADER.FROM$->TEXTC.LEN) ~= ' '
+           THEN
+           DO WHILE (VM_HEADER.FROM$ -> TEXTC.LEN > 0);
+ 
+              IF SUBSTR(VM_HEADER.FROM$ -> TEXTC.TEXT, 0, 1) ~= ' '
+              THEN
+                 EXIT;
+ 
+              VM_HEADER.FROM$ -> TEXTC.TEXT = SUBSTR (VM_HEADER.FROM$ -> TEXTC.TEXT, 1);
+ 
+              END;
+ 
+           IF VM_HEADER.SUBJECT$ = ADDR(NIL)
+           THEN
+              VM_HEADER.SUBJECT$ = ADDR(NULL_SUBJECT);
+ 
+           SCHEDULE_ATTEMPTED = %NO#;
+           SCHEDULE_SUCCESSFUL = %NO#;
+           DUPLICATE_SCHEDULING = %NO#;
+ 
+           IF AUTOSCHED
+              AND NOT VM_HEADER.STATUS.ACK
+              AND NOT VM_HEADER.STATUS.RRACK
+              AND NOT VM_HEADER.STATUS.ERR
+              AND NOT VM_HEADER.STATUS.DEL
+              AND NOT VM_HEADER.STATUS.ANSWER
+              AND NOT VM_HEADER.STATUS.THINGED
+              AND VM_HEADER.SUBJECT$ ~= ADDR(NIL)
+              AND (VM_HEADER.STATUS.PRIMARY OR VM_HEADER.STATUS.C)
+           THEN
+              CALL ATTEMPT_TO_SCHEDULE ALTRET (UNEXPECTED_ALTRET);
+ 
+           IF NOT VM_HEADER.STATUS.ERR AND NOT DUPLICATE_SCHEDULING
+              AND (SCHEDULE_ATTEMPTED
+              OR ( NOT VM_HEADER.STATUS.OLD
+              AND NOT VM_HEADER.STATUS.EXAM
+              AND NOT VM_HEADER.STATUS.FCOPY ))
+           THEN
+              CALL SEND_MAIL_ALERT ALTRET (UNEXPECTED_ALTRET);
+ 
+           END PROCESS_NEW_MESSAGE;
+ 
+        END LOOP_THROUGH_MESSAGES;
+ 
+MAILBOX_ENDS:
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END PROCESS_MAILBOX_ENTRIES;
+ 
+%EJECT;
+SEND_APPOINTMENT_ALERT: PROC ALTRET;
+ 
+     IF MESSAGE_LINE_USED
+     THEN
+        RETURN;
+ 
+     DO CASE (MESSAGE_FORMAT);
+ 
+     CASE (%LONGFORM_OPTION);
+ 
+        STRING_BUFFER = APPOINTMENT_BANNER;
+        CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+        CALL CONCAT (STRING_BUFFER, 'Concerning: ', CALENDAR_RECORD.REASON);
+        CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+        CALL CONCAT (STRING_BUFFER, '     Place: ', CALENDAR_RECORD.PLACE);
+        CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+        CALL CONCAT (STRING_BUFFER, '      Time: ', CALENDAR_RECORD.TIME, ' - ',
+           ALERT_TEXT);
+        CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+        STRING_BUFFER = APPOINTMENT_BANNER;
+        CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+     CASE (%SHORTFORM_OPTION, %MESSAGELINE_OPTION);
+ 
+        CALL CONCAT (STRING_BUFFER, BELL, CALENDAR_RECORD.TIME, ' (', ALERT_TEXT);
+ 
+        CALL DETERMINE_STRING_LENGTH;
+ 
+        CALL INSERT (STRING_BUFFER, STRING_LENGTH,, ') ', CALENDAR_RECORD.PLACE);
+ 
+        CALL DETERMINE_STRING_LENGTH;
+ 
+        IF STRING_LENGTH < LENGTHC(STRING_BUFFER)
+        THEN DO;
+ 
+           CALL INSERT (STRING_BUFFER, STRING_LENGTH + 1, , ': ',
+              CALENDAR_RECORD.REASON);
+ 
+           END;
+ 
+        CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+     END;
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END SEND_APPOINTMENT_ALERT;
+ 
+%EJECT;
+SEND_MAIL_ALERT: PROC ALTRET;
+ 
+     IF MESSAGE_LINE_USED AND NOT SCHEDULE_ATTEMPTED
+     THEN
+        RETURN;
+ 
+     IF SUBSTR (VM_HEADER.FROM$ -> TEXTC.TEXT, 0, 12) = 'Multics Mail'
+        OR SUBSTR (VM_HEADER.FROM$ -> TEXTC.TEXT, 0, 12) = 'MULTICS MAIL'
+     THEN
+        IF VM_HEADER.SUBJECT$ -> TEXTC.TEXT ~= 'Undeliverable SMTP mail'
+        THEN
+           CALL SEARCH_FOR_MULTICS_SENDER;
+ 
+     IF VM_HEADER.STATUS.DELIVERY
+     THEN DO;
+ 
+        CALL CONCAT (STRING_BUFFER, BELL, VM_HEADER.TO$ -> TEXTC.TEXT);
+        CALL DETERMINE_STRING_LENGTH;
+        IF VM_HEADER.REFERENCE$ = ADDR(NIL)
+        THEN
+           CALL INSERT (STRING_BUFFER, STRING_LENGTH, , ' has received: ',
+              VM_HEADER.SUBJECT$ -> TEXTC.TEXT);
+        ELSE
+           CALL INSERT (STRING_BUFFER, STRING_LENGTH, , ' has received: ',
+              VM_HEADER.REFERENCE$ -> TEXTC.TEXT);
+        CALL DETERMINE_STRING_LENGTH;
+ 
+        END;
+     ELSE
+        IF VM_HEADER.STATUS.ANSWER
+        THEN DO;
+ 
+           CALL CONCAT (STRING_BUFFER, BELL, VM_HEADER.FROM$ -> TEXTC.TEXT);
+           CALL DETERMINE_STRING_LENGTH;
+           IF VM_HEADER.REFERENCE$ = ADDR(NIL)
+           THEN
+              CALL INSERT (STRING_BUFFER, STRING_LENGTH, , ' has answered: ',
+                 VM_HEADER.SUBJECT$ -> TEXTC.TEXT);
+           ELSE
+              CALL INSERT (STRING_BUFFER, STRING_LENGTH, , ' has answered: ',
+                 VM_HEADER.REFERENCE$ -> TEXTC.TEXT);
+           CALL DETERMINE_STRING_LENGTH;
+ 
+           END;
+ 
+        ELSE
+           IF VM_HEADER.STATUS.ACK
+           THEN DO;
+ 
+              CALL CONCAT (STRING_BUFFER, BELL, VM_HEADER.FROM$ -> TEXTC.TEXT);
+              CALL DETERMINE_STRING_LENGTH;
+              CALL INSERT (STRING_BUFFER, STRING_LENGTH, , ' has ACK''ed: ',
+                 VM_HEADER.SUBJECT$ -> TEXTC.TEXT);
+              CALL DETERMINE_STRING_LENGTH;
+ 
+              END;
+ 
+           ELSE
+              IF SCHEDULE_ATTEMPTED
+              THEN DO;
+ 
+                 IF SCHEDULE_SUCCESSFUL
+                 THEN DO;
+ 
+                    CALL CONCAT (STRING_BUFFER, BELL, 'Sched for ',
+                       VM_HEADER.FROM$ -> TEXTC.TEXT);
+                    CALL DETERMINE_STRING_LENGTH;
+                    CALL INSERT (STRING_BUFFER, STRING_LENGTH, , ': ',
+                       VM_HEADER.SUBJECT$ -> TEXTC.TEXT);
+                    CALL DETERMINE_STRING_LENGTH;
+ 
+                    END;
+ 
+                 ELSE DO;
+ 
+                    CALL CONCAT (STRING_BUFFER, BELL, 'NotSched for ',
+                       VM_HEADER.FROM$ -> TEXTC.TEXT);
+                    CALL DETERMINE_STRING_LENGTH;
+                    CALL INSERT (STRING_BUFFER, STRING_LENGTH, , ': ',
+                       VM_HEADER.SUBJECT$ -> TEXTC.TEXT);
+                    CALL DETERMINE_STRING_LENGTH;
+ 
+                    END;
+ 
+                 END;
+ 
+              ELSE DO;
+ 
+                 CALL CONCAT (STRING_BUFFER, BELL, 'Mail from ',
+                    VM_HEADER.FROM$ -> TEXTC.TEXT);
+                 CALL DETERMINE_STRING_LENGTH;
+                 CALL INSERT (STRING_BUFFER, STRING_LENGTH, , ' re: ',
+                    VM_HEADER.SUBJECT$ -> TEXTC.TEXT);
+                 CALL DETERMINE_STRING_LENGTH;
+ 
+                 END;
+ 
+     CALL SEND_MESSAGE ALTRET (UNEXPECTED_ALTRET);
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END SEND_MAIL_ALERT;
+%EJECT;
+SEARCH_FOR_MULTICS_SENDER: PROC;
+ 
+DCL ADDRESS_START SBIN;
+DCL FOUND_IT BIT (1);
+DCL NAME_START SBIN;
+DCL NAME_END SBIN;
+ 
+     FOUND_IT = %NO#;
+     VM_BODYKEY.MESSAGE_NUMBER = VM_INFOKEY.MESSAGE_NUMBER;
+     VM_BODYKEY.REC_NUMBER = 0;
+     READ_MESSAGE_BODY.V.KEYS# = %YES#;
+     READ_MESSAGE_BODY.V.KEYR# = %YES#;
+ 
+SCAN: DO UNTIL FOUND_IT;
+ 
+        VM_BODYREC.VALUE.DATA = ' ';
+ 
+        CALL M$READ (READ_MESSAGE_BODY)
+        WHENALTRETURN DO;
+           EXIT SCAN;
+           END;
+ 
+        IF VM_BODYREC.VALUE.DATA = ' '  /* end of header */
+           OR VM_BODYKEY.TYPE ~= %VM_TYPE_BODY /* ran off end of last message */
+           OR VM_BODYKEY.MESSAGE_NUMBER ~= VM_INFOKEY.MESSAGE_NUMBER /* next msg */
+        THEN
+           EXIT SCAN;
+ 
+        READ_MESSAGE_BODY.V.KEYS# = %NO#;
+ 
+        IF SUBSTR (VM_BODYREC.VALUE.DATA, 0, 5) = 'FROM:'
+           OR SUBSTR (VM_BODYREC.VALUE.DATA, 0, 5) = 'From:'
+           OR SUBSTR (VM_BODYREC.VALUE.DATA, 0, 5) = 'from:'
+        THEN
+IDENTIFY_SENDER: DO;
+ 
+/*
+   First - see if the From: record contains a (comment in parentheses);
+   if so, the comment is the sender's signature.  Use it.
+*/
+ 
+           CALL INDEX (NAME_START, '(', VM_BODYREC.VALUE.DATA)
+              ALTRET (NO_COMMENT);
+ 
+           CALL INDEX (NAME_END, ')', VM_BODYREC.VALUE.DATA, NAME_START)
+              ALTRET (NO_COMMENT);
+ 
+           MULTICS_SENDER.COUNT = NAME_END - NAME_START - 1;
+           MULTICS_SENDER.TEXT = SUBSTR (VM_BODYREC.VALUE.DATA, NAME_START + 1,
+              NAME_END - NAME_START - 1);
+ 
+           FOUND_IT = %YES#;
+           EXIT IDENTIFY_SENDER;
+ 
+NO_COMMENT:
+ 
+           CALL SEARCH (NAME_START, DISCARD_IT, STOP_ON_NONBLANK,
+              VM_BODYREC.VALUE.DATA, 5)
+           WHENALTRETURN DO;
+ 
+              EXIT IDENTIFY_SENDER;
+ 
+              END;
+ 
+/*
+   Check to see whether the From: record contains a phrase followed by an
+   <address>.  If so, the phrase is the signature.
+*/
+ 
+           CALL INDEX (ADDRESS_START, '<', VM_BODYREC.VALUE.DATA)
+              ALTRET (NO_ADDRESS);
+ 
+           IF NAME_START < ADDRESS_START
+           THEN DO;
+ 
+              CALL SEARCHR (NAME_END, DISCARD_IT, STOP_ON_NONBLANK,
+                 VM_BODYREC.VALUE.DATA, ADDRESS_START - 1) ALTRET (NO_ADDRESS);
+ 
+              MULTICS_SENDER.COUNT = NAME_END - NAME_START + 1;
+              MULTICS_SENDER.TEXT = SUBSTR (VM_BODYREC.VALUE.DATA, NAME_START,
+                 NAME_END - NAME_START + 1);
+ 
+              FOUND_IT = %YES#;
+              EXIT IDENTIFY_SENDER;
+ 
+              END;
+ 
+NO_ADDRESS:
+ 
+/*
+   Pretty lean pickings.  We've got some funky form of address out there, or
+   a non-standard signature.  Eliminate leading "<" if present.
+*/
+ 
+           IF SUBSTR (VM_BODYREC.VALUE.DATA, NAME_START, 1) = '<'
+           THEN
+              NAME_START = NAME_START + 1;
+ 
+/*
+   If the first/next character is an "@", it's probably an ARPA pathway
+   prefix.  Strip it off, up to the first ":".
+*/
+ 
+           IF SUBSTR (VM_BODYREC.VALUE.DATA, NAME_START, 1) = '@'
+           THEN DO;
+ 
+              CALL INDEX (NAME_END, ':', VM_BODYREC.VALUE.DATA, NAME_START)
+              WHENRETURN DO;
+ 
+                 NAME_START = NAME_END + 1;
+ 
+                 END;
+ 
+              END;
+ 
+/*
+   Try to figure out where the useful portion ends.
+*/
+ 
+           CALL INDEX (NAME_END, ' at ', VM_BODYREC.VALUE.DATA, NAME_START)
+           WHENALTRETURN DO;
+              CALL INDEX (NAME_END, ' ', VM_BODYREC.VALUE.DATA, NAME_START);
+              END;
+ 
+           CALL INDEX (NAME_END, '>', SUBSTR(VM_BODYREC.VALUE.DATA, 0, NAME_END), NAME_START);
+           CALL INDEX (NAME_END, '@', SUBSTR(VM_BODYREC.VALUE.DATA, 0, NAME_END), NAME_START);
+           CALL INDEX (NAME_END, '%', SUBSTR(VM_BODYREC.VALUE.DATA, 0, NAME_END), NAME_START);
+ 
+           IF NAME_END > NAME_START
+           THEN DO;
+ 
+              MULTICS_SENDER.COUNT = NAME_END - NAME_START;
+              MULTICS_SENDER.TEXT = SUBSTR (VM_BODYREC.VALUE.DATA, NAME_START,
+                 NAME_END - NAME_START);
+ 
+              FOUND_IT = %YES#;
+              EXIT IDENTIFY_SENDER;
+ 
+              END;
+ 
+           END IDENTIFY_SENDER;
+ 
+        END SCAN;
+ 
+     IF FOUND_IT
+     THEN DO;
+ 
+        VM_HEADER.FROM$ = ADDR(MULTICS_SENDER);
+ 
+        CALL INDEX (ADDRESS_START, '<', VM_HEADER.SUBJECT$ -> TEXTC.TEXT)
+        WHENRETURN DO;
+ 
+           VM_HEADER.SUBJECT$ -> TEXTC.LEN = ADDRESS_START;
+ 
+           END;
+ 
+        END;
+ 
+/*
+   Reposition mailbox file to the header immediately after the one that
+   we're currently working on, so that the scanner isn't disturbed.
+*/
+ 
+     POSITION_MAILBOX.V.N# = 1;
+ 
+     CALL M$PRECORD (POSITION_MAILBOX) WHENALTRETURN DO; END;
+ 
+     POSITION_MAILBOX.V.N# = 0;
+ 
+     RETURN;
+ 
+END SEARCH_FOR_MULTICS_SENDER;
+ 
+%EJECT;
+ATTEMPT_TO_SCHEDULE: PROC ALTRET;
+ 
+DCL STARTING_BRACKET UBIN;
+DCL ENDING_BRACKET UBIN;
+ 
+     CALL INDEX (STARTING_BRACKET, '[', VM_HEADER.SUBJECT$ -> TEXTC.TEXT)
+        ALTRET (CANCEL_SCHEDULING_ATTEMPT);
+ 
+     CALL INDEX (ENDING_BRACKET, ']', VM_HEADER.SUBJECT$ -> TEXTC.TEXT,
+        STARTING_BRACKET) ALTRET (CANCEL_SCHEDULING_ATTEMPT);
+ 
+     IF ENDING_BRACKET <= STARTING_BRACKET + 2
+     THEN
+        RETURN;
+ 
+     SCHEDULE_PCB.WORK$ = ADDR (PARSE_WORK_AREA);
+     SCHEDULE_PCB.WKSZ = SIZEW(PARSE_WORK_AREA);
+ 
+     SCHEDULE_PCB.TEXT$ = ADDR(SUBSTR(VM_HEADER.SUBJECT$ -> TEXTC.TEXT,
+        STARTING_BRACKET));
+     SCHEDULE_PCB.NCHARS = ENDING_BRACKET - STARTING_BRACKET + 1;
+ 
+     SCHEDULE_ATTEMPTED = %YES#;
+ 
+     CALL X$PARSE (SCHEDULE_PCB) ALTRET (CANCEL_SCHEDULING_ATTEMPT);
+ 
+     CALENDAR_KEY.LEN = LENGTHC(CALENDAR_KEY) - 1;
+     CALENDAR_KEY.SUBENTRY = 0;
+ 
+     CALENDAR_RECORD.REASON = SUBSTR (VM_HEADER.SUBJECT$ -> TEXTC.TEXT, 0,
+        STARTING_BRACKET);
+     CALENDAR_RECORD.REMINDING_PERIOD = '01';
+     CALENDAR_RECORD.NOTE_COUNT = 1;
+     CALENDAR_RECORD.PLACE = 'The Twilight Zone';
+ 
+     CALL CONCAT (STRING_BUFFER, '<<scheduled by THING for ', VM_HEADER.FROM$ ->
+        TEXTC.TEXT);
+ 
+     CALL DETERMINE_STRING_LENGTH;
+ 
+     CALL CONCAT (CALENDAR_RECORD.NOTES(0),
+        SUBSTR (STRING_BUFFER, 0, STRING_LENGTH), '>>');
+ 
+     CALL DECODE_SCHEDULING_INFORMATION ALTRET (CANCEL_SCHEDULING_ATTEMPT);
+ 
+     IF DAY_OF_WEEK = 'MON'
+     THEN
+        CALENDAR_RECORD.REMINDING_PERIOD = '03';
+ 
+     OPEN_CALENDAR.FPARAM_ = VECTOR(NIL);
+     OPEN_CALENDAR.V.FUN# = %UPDATE#;
+ 
+     CALL M$OPEN (OPEN_CALENDAR) ALTRET (CANCEL_SCHEDULING_ATTEMPT);
+ 
+     WRITE_CALENDAR.V.ONEWKEY# = %NO#;
+ 
+     CALL M$WRITE (WRITE_CALENDAR)
+     WHENRETURN DO;
+ 
+        SCHEDULE_SUCCESSFUL = %YES#;
+ 
+        END;
+ 
+     WHENALTRETURN DO;
+ 
+        IF B$TCB.ALT$ -> B$ALT.ERR.CODE ~= %E$OLDREC
+        THEN
+           EXIT;
+ 
+        CALL M$READ (READ_CALENDAR_CONFLICT) ALTRET (CLOSE_CALENDAR);
+ 
+        IF CALENDAR_RECORD.REASON = OLD_CALENDAR_RECORD.REASON
+           AND CALENDAR_RECORD.NOTE_COUNT = OLD_CALENDAR_RECORD.NOTE_COUNT
+           AND CALENDAR_RECORD.NOTES(0) = OLD_CALENDAR_RECORD.NOTES(0)
+        THEN DO;
+ 
+           IF CALENDAR_RECORD.PLACE ~= OLD_CALENDAR_RECORD.PLACE
+           THEN DO;
+ 
+              WRITE_CALENDAR.V.ONEWKEY# = %YES#;
+ 
+              CALL M$RETRY;
+ 
+              END;
+ 
+           DUPLICATE_SCHEDULING = %YES#;
+           SCHEDULE_SUCCESSFUL = %YES#;
+ 
+           END;
+ 
+        END;
+ 
+CLOSE_CALENDAR:
+ 
+     CALL M$CLOSE (CLOSE_CALENDAR) ALTRET (FORCE_PEEK_AT_CALENDAR);
+ 
+FORCE_PEEK_AT_CALENDAR:
+ 
+     CALENDAR_LAST_EXAMINED_UTS = 0;
+     CALL XUD$UTS_ADJUST (T_UTS, INTERVAL_END_UTS, 1500);
+     TIME_TO_AWAKEN = MINIMUM (TIME_TO_AWAKEN, T_UTS);
+ 
+MARK_MAILGRAM_AS_THINGED:
+ 
+     IF SCHEDULE_SUCCESSFUL = %YES# THEN DO;
+        VM_HEADER.STATUS.THINGED = %YES#;
+        CALL CORRECT_PTR (VM_HEADER.BAD_ADDRESS$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.BLIND$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.COPY$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.FILE_FOLDER$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.FROM$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.REFERENCE$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.REPLY_TO$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.RETURN_ADDRESS$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.SIGNED$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.SUBJECT$, DS8);
+        CALL CORRECT_PTR (VM_HEADER.TO$, DS8);
+        WRITE_MAILBOX.BUF_ = DYNAMIC_BUFFER;
+        WRITE_MAILBOX.KEY_ = VECTOR(VM_INFOKEY);
+        CALL M$WRITE (WRITE_MAILBOX) ALTRET (OH_WELL_WE_TRIED);
+OH_WELL_WE_TRIED:
+ 
+        CALL CORRECT_PTR (VM_HEADER.BAD_ADDRESS$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.BLIND$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.COPY$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.FILE_FOLDER$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.FROM$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.REFERENCE$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.REPLY_TO$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.RETURN_ADDRESS$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.SIGNED$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.SUBJECT$, VM_HEADER);
+        CALL CORRECT_PTR (VM_HEADER.TO$, VM_HEADER);
+        END;
+CANCEL_SCHEDULING_ATTEMPT:
+ 
+     RETURN;
+ 
+END ATTEMPT_TO_SCHEDULE;
+ 
+%EJECT;
+DECODE_SCHEDULING_INFORMATION: PROC ALTRET;
+ 
+     CONVERSION_UTS = VM_HEADER.CREATION_DATE;
+     CONVERT_TIME.V.SOURCE# = %UTS#;
+     CONVERT_TIME.V.DEST# = %LOCAL#;
+ 
+     CALL M$TIME (CONVERT_TIME) ALTRET (UNEXPECTED_ALTRET);
+ 
+     CALL CHARBIN (MONTH, SUBSTR (MMDDYY, 0, 2));
+     CALL CHARBIN (DAY, SUBSTR (MMDDYY, 3, 2));
+     CALL CHARBIN (YEAR, SUBSTR (MMDDYY, 6, 2));
+ 
+     CURRENT_MONTH = MONTH;
+     CURRENT_YEAR = YEAR;
+     HOUR = -1;
+     MINUTE = 0;
+     DATE_FOUND = %NO#;
+     YEAR_PRESENT = %NO#;
+ 
+     DO I = 0 TO SCHEDULE_PCB.OUT$ -> OUT$BLK.NSUBLKS - 1;
+ 
+        BLK$ = SCHEDULE_PCB.OUT$ -> OUT$BLK.SUBLK$(I);
+ 
+        DO CASE (OUT$BLK.CODE);
+ 
+        CASE (%MONDAY); CALL SCAN_FOR_DAY ('MON') ALTRET (UNEXPECTED_ALTRET);
+        CASE (%TUESDAY); CALL SCAN_FOR_DAY ('TUE') ALTRET (UNEXPECTED_ALTRET);
+        CASE (%WEDNESDAY); CALL SCAN_FOR_DAY ('WED') ALTRET (UNEXPECTED_ALTRET);
+        CASE (%THURSDAY); CALL SCAN_FOR_DAY ('THU') ALTRET (UNEXPECTED_ALTRET);
+        CASE (%FRIDAY); CALL SCAN_FOR_DAY ('FRI') ALTRET (UNEXPECTED_ALTRET);
+        CASE (%SATURDAY); CALL SCAN_FOR_DAY ('SAT') ALTRET (UNEXPECTED_ALTRET);
+        CASE (%SUNDAY); CALL SCAN_FOR_DAY ('SUN') ALTRET (UNEXPECTED_ALTRET);
+ 
+        CASE (%TODAY);
+ 
+        CASE (%TOMORROW);
+ 
+           IF NOT DATE_FOUND
+           THEN DO;
+ 
+              T_UTS = VM_HEADER.CREATION_DATE;
+              CALL XUD$UTS_ADJUST (CONVERSION_UTS, T_UTS, %UTS_CSEC_DAY#);
+              CONVERT_TIME.V.SOURCE# = %UTS#;
+              CONVERT_TIME.V.DEST# = %LOCAL#;
+ 
+              CALL M$TIME (CONVERT_TIME) ALTRET (UNEXPECTED_ALTRET);
+ 
+              CALL CHARBIN (MONTH, SUBSTR (MMDDYY, 0, 2));
+              CALL CHARBIN (DAY, SUBSTR (MMDDYY, 3, 2));
+              CALL CHARBIN (YEAR, SUBSTR (MMDDYY, 6, 2));
+ 
+              DATE_FOUND = %YES#;
+ 
+              YEAR_PRESENT = %YES#;
+ 
+              END;
+ 
+        CASE (%JANUARY, %FEBRUARY, %MARCH, %APRIL, %MAY, %JUNE,
+                 %JULY, %AUGUST, %SEPTEMBER, %OCTOBER, %NOVEMBER, %DECEMBER);
+ 
+           MONTH = OUT$BLK.CODE - %JANUARY + 1;
+           DATE_FOUND = %YES#;
+ 
+        CASE (%MONTH_NUMBER);
+ 
+           CALL CHARBIN (MONTH, OUT$SYM.TEXT);
+           DATE_FOUND = %YES#;
+ 
+        CASE (%DAY_NUMBER);
+ 
+           CALL CHARBIN (DAY, OUT$SYM.TEXT);
+           DATE_FOUND = %YES#;
+ 
+        CASE (%YEAR_NUMBER);
+ 
+           CALL CHARBIN (YEAR, OUT$SYM.TEXT);
+           YEAR = MOD (YEAR, 100);
+           DATE_FOUND = %YES#;
+           YEAR_PRESENT = %YES#;
+ 
+        CASE (%YYMMDD);
+ 
+           CALL CHARBIN (YEAR, SUBSTR (OUT$SYM.TEXT, 0, 2));
+           CALL CHARBIN (MONTH, SUBSTR (OUT$SYM.TEXT, 2, 2));
+           CALL CHARBIN (DAY, SUBSTR (OUT$SYM.TEXT, 4, 2));
+           YEAR_PRESENT = %YES#;
+           DATE_FOUND = %YES#;
+ 
+        CASE (%HOUR);
+ 
+           CALL CHARBIN (HOUR, OUT$SYM.TEXT);
+ 
+           IF HOUR < 7 AND OUT$SYM.COUNT = 1
+           THEN
+              HOUR = HOUR + 12;
+ 
+        CASE (%MINUTES);
+ 
+           CALL CHARBIN (MINUTE, OUT$SYM.TEXT);
+ 
+        CASE (%HHMM);
+ 
+           IF OUT$SYM.COUNT = 3
+           THEN DO;
+ 
+              CALL CHARBIN (HOUR, SUBSTR (OUT$SYM.TEXT, 0, 1));
+              CALL CHARBIN (MINUTE, SUBSTR (OUT$SYM.TEXT, 1, 2));
+ 
+              IF HOUR < 7
+              THEN
+                 HOUR = HOUR + 12;
+ 
+              END;
+ 
+           ELSE DO;
+ 
+              CALL CHARBIN (HOUR, SUBSTR (OUT$SYM.TEXT, 0, 2));
+              CALL CHARBIN (MINUTE, SUBSTR (OUT$SYM.TEXT, 2, 2));
+ 
+              END;
+ 
+        CASE (%AM);
+ 
+           HOUR = MOD (HOUR, 12);
+ 
+        CASE (%PM);
+ 
+           IF HOUR < 12
+           THEN
+              HOUR = HOUR + 12;
+ 
+        CASE (%NOON);
+ 
+           HOUR = 12;
+           MINUTE = 0;
+ 
+        CASE (%PLACE);
+ 
+           CALENDAR_RECORD.PLACE = OUT$SYM.TEXT;
+ 
+        CASE (ELSE);
+ 
+           ALTRETURN;
+ 
+        END;
+ 
+        END;
+ 
+     IF HOUR < 0
+     THEN
+        ALTRETURN;
+ 
+     IF MONTH < CURRENT_MONTH AND YEAR = CURRENT_YEAR
+        AND (NOT YEAR_PRESENT) THEN
+        YEAR = YEAR + 1;
+     YEAR = MOD (YEAR, 100);
+ 
+     MMDDYY = 'MM/DD/YY';
+     CALL BINCHAR (SUBSTR (MMDDYY, 0, 2), MONTH);
+     CALL BINCHAR (SUBSTR (MMDDYY, 3, 2), DAY);
+     CALL BINCHAR (SUBSTR (MMDDYY, 6, 2), YEAR);
+ 
+     HHMMSSMS = 'HH:MM:00.00';
+     CALL BINCHAR (SUBSTR (HHMMSSMS, 0, 2), HOUR);
+     CALL BINCHAR (SUBSTR (HHMMSSMS, 3, 2), MINUTE);
+ 
+     CONVERT_TIME.V.SOURCE# = %LOCAL#;
+     CONVERT_TIME.V.DEST# = %UTS#;
+ 
+     CALL M$TIME (CONVERT_TIME) ALTRET (UNEXPECTED_ALTRET);
+ 
+     CALL XUD$UTS_DIFF_25TH (T_DAYC, CONVERSION_UTS, 0);
+     T_DAYC = T_DAYC / %UTS_25TH_DAY#;
+     CALL XUD$UTS_DIFF_25TH (T_DAYI, INTERVAL_START_UTS, 0);
+     T_DAYI = T_DAYI / %UTS_25TH_DAY#;
+     IF CONVERSION_UTS < VM_HEADER.CREATION_DATE
+        OR T_DAYC < T_DAYI
+     THEN
+        ALTRETURN; /* Sender attempted to schedule an appointment prior to
+                    the time that the message was sent;  or, message wasn't
+                    seen by THING until the day after the appointment (or
+                    later).  In either case, trash it.      */
+ 
+     CALENDAR_KEY.UTS = CONVERSION_UTS;
+ 
+     CONVERT_TIME.V.SOURCE# = %UTS#;
+     CONVERT_TIME.V.DEST# = %LOCAL#;
+ 
+     CALL M$TIME (CONVERT_TIME) ALTRET (UNEXPECTED_ALTRET);
+ 
+     CALENDAR_RECORD.DATE = MMDDYY;
+     CALENDAR_RECORD.TIME = HHMMSSMS;
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END DECODE_SCHEDULING_INFORMATION;
+ 
+%EJECT;
+SCAN_FOR_DAY: PROC (DAY_NAME) ALTRET;
+ 
+DCL DAY_NAME CHAR (3);
+ 
+     CONVERSION_UTS = VM_HEADER.CREATION_DATE;
+     CONVERT_TIME.V.SOURCE# = %UTS#;
+     CONVERT_TIME.V.DEST# = %LOCAL#;
+ 
+     DO UNTIL (DAY_NAME = DAY_OF_WEEK);
+ 
+        CALL XUD$UTS_ADJUST (CONVERSION_UTS, CONVERSION_UTS, %UTS_CSEC_DAY#);
+ 
+        CALL M$TIME (CONVERT_TIME) ALTRET (UNEXPECTED_ALTRET);
+ 
+        END;
+ 
+     CALL CHARBIN (MONTH, SUBSTR (MMDDYY, 0, 2));
+     CALL CHARBIN (DAY, SUBSTR (MMDDYY, 3, 2));
+     CALL CHARBIN (YEAR, SUBSTR (MMDDYY, 6, 2));
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END SCAN_FOR_DAY;
+ 
+%EJECT;
+PRINT_BUFFER: PROC;
+ 
+     CALL DETERMINE_STRING_LENGTH;
+ 
+     WRITE_LO.BUF_ = VECTOR (SUBSTR(STRING_BUFFER, 0, STRING_LENGTH));
+     WRITE_LO.V.DVBYTE.TRANS# = TRANSPARENT_TRANSMISSION;
+     TRANSPARENT_TRANSMISSION = %NO#;
+ 
+     CALL M$WRITE (WRITE_LO);
+ 
+     RETURN;
+ 
+END PRINT_BUFFER;
+ 
+ISSUE_M$YC: PROC;
+ 
+     IF B$JIT.MODE = %M_GHOST# AND NOT DEBUG_MODE
+     THEN DO;
+ 
+        CALL DETERMINE_STRING_LENGTH;
+ 
+        CONTROL_Y.CMD_ = VECTOR (SUBSTR (STRING_BUFFER, 0, STRING_LENGTH));
+ 
+        CALL M$YC (CONTROL_Y);
+ 
+        END;
+ 
+     ELSE
+        CALL PRINT_BUFFER;
+ 
+     RETURN;
+ 
+END ISSUE_M$YC;
+ 
+SEND_MESSAGE: PROC ALTRET;
+ 
+DCL HEADER_LENGTH UBIN;
+ 
+     IF B$JIT.MODE = %M_GHOST# AND NOT DEBUG_MODE
+     THEN DO;
+ 
+        CALL DETERMINE_STRING_LENGTH;
+ 
+        MESSBUF.TEXT = STRING_BUFFER;
+        MESSBUF.COUNT = MINIMUM (120, STRING_LENGTH);
+        MESSBUF.SYSID = SYSID;
+ 
+        WRITE_CSCG.BUF_.BOUND = LENGTHC(MESSBUF) - LENGTHC(MESSBUF.TEXT) +
+           MESSBUF.COUNT - 1;
+ 
+        CALL DAM$MAP (B$JIT$, USER_JIT$, SYSID, 0)
+        WHENRETURN DO;
+           IF NOT (USRT$->B$USER.FLG(USER_JIT$->B$JIT.USER) & %U_SUSP) THEN
+              CALL M$WRITE (WRITE_CSCG) ALTRET (UNEXPECTED_ALTRET);
+           END;                         /* WHENRETURN */
+ 
+        IF MESSAGE_FORMAT = %MESSAGELINE_OPTION
+        THEN
+           MESSAGE_LINE_USED = %YES#;
+ 
+        END;
+ 
+     ELSE
+        CALL PRINT_BUFFER;
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END SEND_MESSAGE;
+ 
+ 
+DETERMINE_STRING_LENGTH: PROC;
+ 
+     CALL SEARCHR (STRING_LENGTH, DISCARD_IT, STOP_ON_NONBLANK, STRING_BUFFER)
+     WHENRETURN DO;
+ 
+        STRING_LENGTH = STRING_LENGTH + 1;
+ 
+        END;
+ 
+     WHENALTRETURN DO;
+ 
+        STRING_LENGTH = 1;
+ 
+        END;
+ 
+     RETURN;
+ 
+END DETERMINE_STRING_LENGTH;
+ 
+%EJECT;
+ 
+CORRECT_PTR: PROC (POINTER, BASE_LOCATION);
+ 
+DCL 1 POINTER ALIGNED,
+       2 OFFSET UBIN (18) HALIGNED,
+       2 * BIT (18);
+DCL POINTER$ REDEF POINTER PTR;
+DCL BASE_LOCATION BIT (36);
+ 
+     IF POINTER$ ~= ADDR(NIL)
+     THEN
+        POINTER$ = PINCRW(ADDR(BASE_LOCATION), POINTER.OFFSET);
+ 
+     RETURN;
+ 
+END CORRECT_PTR;
+%EJECT;
+RELEASE_PACKSETS: PROC ALTRET;
+ 
+     RESOURCE_FPT.RPSN_ = DYNAMIC_BUFFER;
+ 
+     VLP_RPSN.NN# = (((DYNAMIC_BUFFER.W1.VSIZE# + 1) / 4) - SIZEW(VLP_RPSN))
+        / SIZEW (VLP_RPSN.RPLIST);
+ 
+     CALL M$DISPRES (RESOURCE_FPT) ALTRET (UNEXPECTED_ALTRET);
+ 
+     DO I = 0 TO VLP_RPSN.NN# - 1;
+ 
+        VLP_RPSN.RPLIST.DISP#(I) = %REM#;
+ 
+        IF VLP_RPSN.RPLIST.PSN#(I) = 'SYS'
+        THEN DO;
+ 
+           VLP_RPSN.RPLIST.PSN#(I) = VLP_RPSN.RPLIST.PSN#(VLP_RPSN.NN# - 1);
+ 
+           VLP_RPSN.NN# = VLP_RPSN.NN# - 1;
+ 
+           END;
+ 
+        END;
+ 
+     IF VLP_RPSN.NN# > 0
+     THEN
+        CALL M$RELRES (RESOURCE_FPT) ALTRET (UNEXPECTED_ALTRET);
+ 
+     CALL M$TIME (GET_TIME_NOW) ALTRET (UNEXPECTED_ALTRET);
+ 
+     LAST_PACKSET_RELEASE_UTS = TIME_NOW;
+ 
+     RETURN;
+ 
+UNEXPECTED_ALTRET:
+ 
+     ALTRETURN;
+ 
+END RELEASE_PACKSETS;
+ 
+%EJECT;
+DETERMINE_MAILBOX: PROC (FULLNAME,I);
+ 
+ 
+DCL I UBIN;
+DCL FULLNAME CHAR(200);
+DCL 1 FULLNB (0:199) REDEF FULLNAME,
+       2 BITE CHAR(1);
+ 
+     CALL M$OPEN (OPEN_NAMEFILE) ALTRET (NOMAILBOX);
+     NAME_KEY.ACCOUNT = B$JIT.ACCN;
+     NAME_KEY.NAME = B$JIT.UNAME;
+     NAMEBUF = ' ';
+     CALL M$READ (READ_NAMEFILE) ALTRET (MISSED);
+     GOTO GOTIT;
+MISSED:
+     NAME_KEY.NAME = ' ';
+     CALL M$READ (READ_NAMEFILE) ALTRET (NOMAILBOX);
+GOTIT:
+     CALL INDEX (I,'  ',NAMEBUF);
+ 
+     FULLNAME = NAMEBUF;
+ 
+     DO J = 0 TO I;
+        IF FULLNB.BITE (J) ~= ' ' THEN
+           FULLNB.BITE (J) = BITASC (ASCBIT (SUBSTR(FULLNAME,J,J)) & '111011111'B);
+        END;
+ 
+GETFOLDER: ENTRY (FULLNAME,I);          /*  ENTRY POINT for names */
+ 
+     CALL CONCAT (NAMEBUF,'P',SUBSTR(FULLNAME,0,I));
+ 
+     CENTRAL_KEY.LEN = I+1;
+     CENTRAL_KEY.NAME = NAMEBUF;
+     CALL M$OPEN (OPEN_CENTRAL) ALTRET (NOMAILBOX);
+     CALL M$READ (READ_CENTRAL) ALTRET (NOMAILBOX);
+     REGISTERED = '1'B;
+     ACCOUNT = CENTRALBUF.ACCOUNT;
+     IF CENTRALBUF.FOLDER = ' ' THEN CENTRALBUF.FOLDER = 'CENTRAL';
+ 
+     CALL CONCAT (MAIL_NAME,':MAIL_',CENTRALBUF.FOLDER);
+     CALL INDEX (I,' ',CENTRALBUF.FOLDER);
+     MAIL_LEN = I + 6;
+     GOTO CLOSE_FILES;
+NOMAILBOX:
+     MAIL_NAME = %MAILNAME#;
+     MAIL_LEN = %MAILLEN#;
+     ACCOUNT = B$JIT.ACCN;
+CLOSE_FILES:
+     CALL M$CLOSE (CLOSE_NAMEFILE);
+     CALL M$CLOSE (CLOSE_CENTRAL);
+     RETURN;
+END DETERMINE_MAILBOX;
+ 
+%EJECT;
+FORMAT_OPTION: PROC;
+DCL J UBIN;
+ 
+     IF USER_TABLE.MESSAGE_FORMAT = %LONGFORM_OPTION THEN
+        STRING_BUFFER = 'Long Message';
+     ELSE IF USER_TABLE.MESSAGE_FORMAT = %MESSAGELINE_OPTION THEN
+           STRING_BUFFER = 'Message Line';
+        ELSE
+           STRING_BUFFER = 'Short Message';
+ 
+     CALL INDEX (J, '  ', STRING_BUFFER);
+ 
+     IF USER_TABLE.CALENDAR_SCAN THEN DO;
+        SUBSTR (STRING_BUFFER, J) = ', Calendar (Alert:';
+        CALL INDEX(J,'  ',STRING_BUFFER);
+        DO I=0 TO USER_TABLE.ALERT_COUNT-1;
+           CALL BINCHAR(ALERT_TIME,USER_TABLE.ALERT_TIMES(I));
+           SUBSTR (STRING_BUFFER,J+1+I*4,3) = ALERT_TIME;
+           SUBSTR (STRING_BUFFER,J+4+I*4,1) = ',';
+           END;
+        SUBSTR (STRING_BUFFER,J+(4*USER_TABLE.ALERT_COUNT),1) = ')';
+        END;
+ 
+     IF USER_TABLE.BELL_ENABLED THEN
+     DO;
+        CALL INDEX(J,'  ',STRING_BUFFER);
+        CALL CONCAT (SUBSTR(STRING_BUFFER,J,7), ', Bell', BITASC ('007'O));
+        END;
+ 
+     IF USER_TABLE.MAIL_SCAN THEN
+     DO;
+        CALL INDEX(J,'  ',STRING_BUFFER);
+        CALL INDEX(I,'  ',USER_TABLE.MAIL_NAME);
+        CALL CONCAT(STRING_BUFFER,SUBSTR(STRING_BUFFER,0,J),', Mail = /',SUBSTR(USER_TABLE.MAIL_NAME,6,I-6),'.',USER_TABLE.ACCOUNT);
+        END;
+ 
+END FORMAT_OPTION;
+ 
+%EJECT;
+CHECK_OPEN: PROC ALTRET;
+ 
+     CALL M$RPRIV (SET_SPCLMM);
+     MAILBOX_NAME.NAME# = MAIL_NAME;
+     MAILBOX_NAME.L# = MAIL_LEN;
+     USER_ACCOUNT.ACCT# = ACCOUNT;
+     CALL M$OPEN (OPEN_MAILBOX) ALTRET (UNEXPECTED_ALTRETURN);
+     CALL M$CLOSE (CLOSE_MAILBOX);
+     RETURN;
+ 
+UNEXPECTED_ALTRETURN:
+     ALTRETURN;
+ 
+END CHECK_OPEN;
+ 
+END THING;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+THING_EVENT_HANDLER: PROC ASYNC;
+ 
+%INCLUDE CP_6_SUBS;
+ 
+DCL EVENT_HAS_OCCURRED BIT (36) SYMREF;
+ 
+     EVENT_HAS_OCCURRED = %YES#;
+ 
+     RETURN;
+ 
+END THING_EVENT_HANDLER;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+THING_TRAP_HANDLER: PROC ASYNC NOAUTO;
+ 
+/*D*  NAME:       THING_TRAP_HANDLER
+      CALL:       by monitor
+      DESCRIPTION: This routine is invoked by the CP-6 monitor if the
+                  THING program traps.  It will print the error code, then
+                  associate DELTA to print the faulting instruction and
+                  the procedure-call history ("PLUGH").
+*/
+ 
+%INCLUDE CP_6.:LIBRARY;
+%INCLUDE CP_6_SUBS;
+ 
+%FPT_ERRMSG   (FPTN=PRINT_ERROR_MESSAGE,
+               STCLASS=CONSTANT,
+               CODE=ERROR_CODE,
+               BUF=ERRMSG_BUFFER,
+               OUTDCB1=M$LO,
+               OUTDCB2=M$DO,
+               FLAGLEV=4,
+               RESULTS=VLR_ERRMSG);
+ 
+%VLR_ERRMSG   (STCLASS=STATIC);
+ 
+%FPT_KEYIN (FPTN=REPORT_TRAP_TO_OPER,
+            STCLASS=CONSTANT,
+            MESS=KEYIN_THING_TRAPPED,
+            OCTYPE=SYSTEM);
+ 
+%FPT_ALIB  (FPTN=GET_DELTA,
+            STCLASS=CONSTANT,
+            CMD=DELTA_COMMAND,
+            ECHO=YES,
+            LIBNAME=DELTA);
+ 
+%VLP_NAME  (FPTN=DELTA,
+            STCLASS=CONSTANT,
+            NAME='DELTA');
+ 
+%FPT_EXIT  (STCLASS=CONSTANT,
+            CODE=ERROR_CODE,
+            STEPCC=ERROR);
+ 
+%VLP_ERRCODE  (FPTN=ERROR_CODE,
+               STCLASS=STATIC);
+ 
+%B$TCB  (STCLASS="BASED(B$TCB$)");
+%B$EXCFR;
+ 
+DCL M$DO DCB;
+DCL M$LO DCB;
+ 
+DCL B$TCB$ PTR SYMREF;
+DCL BAILOUT REMEMBER SYMREF;
+DCL BAILOUT_ENABLED BIT (1) SYMREF;
+DCL DELTA_COMMAND CHAR (80) STATIC;
+DCL ERRMSG_BUFFER CHAR (120) STATIC;
+DCL KEYIN_THING_TRAPPED CHAR (0) CONSTANT INIT ('*** THING has trapped! ***');
+DCL TRAP_COUNT UBIN WORD SYMREF;
+DCL TRAP_LIMIT UBIN WORD SYMREF READONLY;
+ 
+%EJECT;
+     CALL M$KEYIN (REPORT_TRAP_TO_OPER) ALTRET (GET_ERROR_CODE);
+ 
+GET_ERROR_CODE:
+ 
+     ERROR_CODE = B$TCB.STK$ -> B$EXCFR.ERR;
+ 
+     CALL M$ERRMSG (PRINT_ERROR_MESSAGE) ALTRET (BAD_MESSAGE);
+ 
+BAD_MESSAGE:
+ 
+     DELTA_COMMAND = 'M xxxxxx\I "instruction on which trap occurred"';
+ 
+     CALL BINCHAR (SUBSTR (DELTA_COMMAND, 2, 6), B$TCB.STK$ -> B$EXCFR.IC);
+ 
+     CALL M$ALIB (GET_DELTA) ALTRET (ALTRET_FROM_DELTA);
+ 
+     DELTA_COMMAND = 'Plugh';
+ 
+     CALL M$ALIB (GET_DELTA) ALTRET (ALTRET_FROM_DELTA);
+ 
+     DELTA_COMMAND = 'Dump $LS15->1->.20,8 "Pointer registers"';
+ 
+     CALL M$ALIB (GET_DELTA) ALTRET (ALTRET_FROM_DELTA);
+ 
+     DELTA_COMMAND = 'Dump $LS15->1->.30,16 "Descriptor registers"';
+ 
+     CALL M$ALIB (GET_DELTA) ALTRET (ALTRET_FROM_DELTA);
+ 
+     DELTA_COMMAND = 'Dump $LS15->1->.50,6\C "Xn, A, Q registers"';
+ 
+     CALL M$ALIB (GET_DELTA) ALTRET (ALTRET_FROM_DELTA);
+ 
+ALTRET_FROM_DELTA:
+ 
+     IF NOT BAILOUT_ENABLED
+     THEN
+        CALL M$EXIT (FPT_EXIT);
+ 
+     TRAP_COUNT = TRAP_COUNT + 1;
+ 
+     CALL M$CLRSTK;
+ 
+     UNWIND TO BAILOUT;
+ 
+END THING_TRAP_HANDLER;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+THING_ITEM_TESTER: PROC (PARSE_PARAM);
+ 
+/*D*  NAME:       THING_ITEM_TESTER
+      CALL:       CALL THING_ITEM_TESTER (parse_param);
+      INPUT:      "parse_param" is a %PARSE_PARAM structure as defined by
+                  the X$PARSE interface specification.
+      OUTPUT:     Various changes to "parse_param" will have been made.
+      DESCRIPTION: This routine is called during the parsing of date/time/place
+                  information contained in a MAILgram header.  It performs
+                  certain on-the-fly checks to ensure that the parser is
+                  accepting only correct, meaningful information in certain
+                  tricky cases (e.g., that a year-month-day string "yymmdd"
+                  is exactly six digits).
+*/
+ 
+%INCLUDE CP_6_SUBS;
+%INCLUDE THING_C61;
+%INCLUDE XU_MACRO_C;
+ 
+%PARSE_PARAM  (NAME=PARSE_PARAM, STCLASS="");
+%PARSE$OUT    (NAME=OUT$BLK, STCLASS=BASED);
+%PARSE$SYM    (NAME=OUT$SYM, STCLASS=BASED);
+ 
+     DO CASE (PARSE_PARAM.OUT$ -> OUT$BLK.CODE);
+ 
+     CASE (%YYMMDD);
+ 
+        IF PARSE_PARAM.OUT$ -> OUT$SYM.COUNT = 6
+        THEN
+           PARSE_PARAM.ACCEPT = %YES#;
+ 
+     CASE (%YEAR_NUMBER);
+ 
+        DO CASE (PARSE_PARAM.OUT$ -> OUT$SYM.COUNT);
+ 
+        CASE (2);
+ 
+           IF (PARSE_PARAM.OUT$ -> OUT$SYM.TEXT >= '78'
+              AND PARSE_PARAM.OUT$ -> OUT$SYM.TEXT <= '99')
+              OR
+              (PARSE_PARAM.OUT$ -> OUT$SYM.TEXT >= '00'
+              AND PARSE_PARAM.OUT$ -> OUT$SYM.TEXT <= '20')
+ 
+           THEN
+              PARSE_PARAM.ACCEPT = %YES#;
+           ELSE
+              PARSE_PARAM.REJECT = %YES#;
+ 
+        CASE (4);
+ 
+           IF PARSE_PARAM.OUT$ -> OUT$SYM.TEXT >= '1978'
+              AND PARSE_PARAM.OUT$ -> OUT$SYM.TEXT <= '2020'
+           THEN
+              PARSE_PARAM.ACCEPT = %YES#;
+           ELSE
+              PARSE_PARAM.REJECT = %YES#;
+ 
+        CASE (ELSE);
+ 
+           PARSE_PARAM.REJECT = %YES#;
+ 
+        END;
+ 
+     CASE (ELSE);
+ 
+        PARSE_PARAM.ACCEPT = %YES#;
+ 
+     END;
+ 
+     IF NOT PARSE_PARAM.ACCEPT
+     THEN DO;
+ 
+        PARSE_PARAM.REJECT = %YES#;
+        PARSE_PARAM.CHARPOS = PARSE_PARAM.OUT$ -> OUT$BLK.CPOS;
+ 
+        END;
+ 
+     RETURN;
+ 
+END THING_ITEM_TESTER;

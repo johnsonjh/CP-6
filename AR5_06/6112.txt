@@ -1,0 +1,1869 @@
+/*M* XSQ - Screen driven Queue munger.
+ 
+     XSQ provides a screen driven subset of the display features
+     of RQ.X .  Note:  We're talking small subset, here.
+                                                                */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+XSQ:PROC MAIN ALTRET;
+ 
+/* --------------------------- Includes --------------------------- */
+ 
+%INCLUDE CP_6;        /* Monitor calls and FPT's */
+%INCLUDE XU_MACRO_C;  /* Parser structures */
+%INCLUDE U$JIT_C;     /* User portion of the JIT */
+%INCLUDE B_SEGIDS_C;  /* Segid subs */
+%INCLUDE B_MICROPS_C; /* EDITSTR subs -- GMAP magic. */
+%INCLUDE B_ERRORS_C;  /* CP-6 error EQUs */
+%INCLUDE CP_6_SUBS;   /* General Subs */
+%INCLUDE SQ_C61;    /* XSQ's Partrge subs */
+%INCLUDE XU_SUBS_C;  /* Partrge subs   */
+ 
+/* --------------------------- SUBs & EQUs ------------------------ */
+ 
+%EQU MAIL_HDR# = '010'O; /* B03 (Prototype) HDR flag for MAIL
+                            message records.                        */
+ 
+%EQU OUTPUT_QUEUE# = 1;
+%EQU BOTH_QUEUES#  = 2;
+%EQU JOB_QUEUE#    = 0;
+ 
+%EQU CR# = %BITASC('015'O);
+%EQU LF# = %BITASC('012'O);
+%EQU ESC#= %BITASC('033'O);
+%EQU TAB#= %BITASC('011'O);
+ 
+%EJECT;
+/* ----------------------------- Entrys --------------------------- */
+ 
+DCL INIT_TAPES ENTRY(1);
+DCL GET_TAPES ENTRY(5);
+DCL SCREENIN ENTRY(2);
+DCL SCREENUP ENTRY(1);
+DCL CURSOR ENTRY(2);
+DCL SCREECH ENTRY;
+DCL CRTFLSHX ENTRY;
+DCL WRITE ENTRY(2);
+DCL CRT ENTRY(1);
+ 
+DCL X$PARSE ENTRY(1) ALTRET;  /* CP-6 parser */
+ 
+DCL BREAK_BACK ENTRY ASYNC;   /* Break Handlers */
+DCL NOBREAKS   ENTRY ASYNC;
+ 
+/* ------------------------------ Macros -------------------------- */
+ 
+%P_PCB         (WSZ=1024,
+                R=XSQ_NODES,
+                STCLASS="STATIC SYMDEF");
+ 
+%PARSE$OUT     (NAME=OUT,STCLASS="BASED(P$)");
+%PARSE$SYM     (NAME=SYM,STCLASS="BASED(P$)");
+ 
+%F$DCB         (STCLASS="BASED(M$MAIL$)");
+ 
+%B$ALT;
+%B$TCB         (STCLASS="BASED(B$TCB$)");
+ 
+%EJECT;
+/* --------------------------- FPTs & VLPs ------------------------ */
+ 
+ 
+%FPT_INT       (FPTN=BB_INT,
+                UENTRY=BREAK_BACK,
+                STCLASS=CONSTANT);
+%FPT_INT       (FPTN=NB_INT,
+                UENTRY=NOBREAKS,
+                STCLASS=CONSTANT);
+ 
+%FPT_TRMCTL    (TRMCTL=VLP_TRMCTL,STCLASS=CONSTANT);
+ 
+%FPT_GDS       (FPTN=DS4,
+                SEGSIZE=1024,
+                RESULTS=DS4_MEM);
+%FPT_GDS       (FPTN=DS5,
+                SEGSIZE=1024,
+                RESULTS=DS5_MEM);
+ 
+%FPT_READ      (DCB=M$UC,
+                BUF=KEYIN_BUF,
+                TRANS=YES,
+                STCLASS=CONSTANT);
+ 
+%FPT_WRITE     (FPTN=DO_WRITE,
+                DCB=M$DO,
+                BUF=BAD_PROFILE);
+ 
+%FPT_EOM       (UTYPE=SEC,TIMEOUT=20);
+ 
+%FPT_TIME      (FPTN=SCREEN_TIME,
+                DEST=EXT,
+                DATE=NEW_STRING.DATE,
+                TIME=NEW_STRING.TIME,
+                STCLASS=CONSTANT);
+%FPT_TIME      (FPTN=TIME_STAMP,
+                DEST=UTS,
+                TSTAMP=UTS_TIME#,
+                STCLASS=CONSTANT);
+ 
+%FPT_DISPLAY   (RESULTS=VLR_DISPLAY,STCLASS=CONSTANT);
+ 
+%FPT_JOBSTATS  (FPTN=O_JOBSTATS,
+                CRITERIA=O_CRITERIA,
+                OUTPUT=YES,
+                ORDER=SRCH);
+%FPT_JOBSTATS  (FPTN=J_JOBSTATS,
+                CRITERIA=J_CRITERIA,
+                OUTPUT=NO,
+                ORDER=SRCH);
+ 
+%VLP_CRITERIA  (FPTN=O_CRITERIA);
+%VLP_CRITERIA  (FPTN=J_CRITERIA);
+ 
+%VLR_JOBSTATS_OSRCH (FPTN=OSRCH,STCLASS="BASED(DS5_MEM.PTR$)");
+%VLR_JOBSTATS_ISRCH (FPTN=ISRCH,STCLASS="BASED(DS4_MEM.PTR$)");
+ 
+%VLA_JOBSTATS_OSRCH (FPTN=B$OSRCH,STCLASS="BASED(OUTPUT$)");
+%VLA_JOBSTATS_ISRCH (FPTN=B$ISRCH,STCLASS="BASED(JOB$)");
+ 
+%VLP_VECTOR    (FPTN=DS4_MEM,SEGID=%DS4SID);
+%VLP_VECTOR    (FPTN=DS5_MEM,SEGID=%DS5SID);
+ 
+%VLP_TRMCTL    (NOOPTMIZ=NO,STCLASS=CONSTANT);
+ 
+%VLR_DISPLAY;
+ 
+%EJECT;
+/* --------------------------- DCBs & PTRs ------------------------ */
+ 
+DCL M$DO     DCB;
+DCL M$LM     DCB;
+DCL M$MAIL   DCB;
+DCL M$HELPER DCB;
+ 
+DCL JOB$      PTR STATIC;
+DCL P$        PTR STATIC;
+DCL B$JIT$    PTR SYMREF;
+DCL B$TCB$    PTR SYMREF;
+DCL M$MAIL$   PTR STATIC;
+DCL OUTPUT$   PTR STATIC;
+DCL M$HELPER$ PTR STATIC;
+ 
+%EJECT;
+/* --------------------------- Misc. Scalars ---------------------- */
+ 
+DCL REMEMBER_LABEL REMEMBER STATIC SYMDEF;
+ 
+DCL CONVERT_STR0 (0:1) BIT(9) CONSTANT INIT(%MVZB3,%MVC1);
+DCL CONVERT_STR1 (0:1) BIT(9) CONSTANT INIT(%MVZB2,%MVC1);
+DCL CONVERT_STR2 (0:1) BIT(9) CONSTANT INIT(%MVZB6,%MVC1);
+DCL CONVERT_STR3 (0:1) BIT(9) CONSTANT INIT(%MVZB4,%MVC1);
+DCL CONVERT_STR4 (0:1) BIT(9) CONSTANT INIT(%MVZB5,%MVC1);
+DCL DISPJOB_ON#        BIT(1) WALIGNED STATIC INIT(%YES#);
+DCL USER_HAS_TAPE_PRIV BIT(1) WALIGNED;
+DCL DISPLAY_TAPES      BIT(1) WALIGNED STATIC INIT(%YES#);
+DCL XSQ_NODES           BIT(36) SYMREF;   /* Partrge nodes */
+DCL BITS_BUF           BIT(9) CALIGNED STATIC;
+DCL KEYIN_BUF          REDEF BITS_BUF UBIN(9) UNAL;
+ 
+DCL BUF         CHAR(256) STATIC INIT(' ');
+DCL BLANK_LINE  CHAR(80) CONSTANT INIT(' ');
+DCL BAD_SYNTAX  CHAR(0) CONSTANT INIT(
+       '***Syntax Error.  Type   !HELP (SQ.X)   for help.');
+DCL BAD_PROFILE CHAR(0) CONSTANT INIT(
+       '***XSQ only works with CRT-type profiles.');
+ 
+DCL OUTPUT_SCREEN CHAR(%(21*80));
+DCL JOB_SCREEN    CHAR(%(21*80));
+ 
+DCL WORK_STATION_ID CHAR (8) STATIC INIT ('LOCAL');
+ 
+DCL HEIGHT# STATIC SBIN; /* Height of user's terminal. 0 if non-crt.*/
+DCL WIDTH#         SBIN; /* Width of user's terminal.               */
+DCL OUTPUT_FRAMES# UBIN STATIC;
+DCL JOB_FRAMES#    UBIN STATIC;
+DCL FRAMES_AVAIL#  SBIN STATIC INIT(21); /* Frames avail to be filled
+                                            with job/output info.   */
+DCL SCREEN_SIZE#   SBIN STATIC;
+DCL JPSN#          SBIN STATIC INIT(0);  /* Jobs scroll position*/
+DCL OPSN#          SBIN STATIC INIT(0);  /* Ouptut scroll position*/
+DCL MAX_TAPES#     SBIN STATIC INIT(5);  /* Maximum possible tapes
+                                            displayed on screen.    */
+DCL TAPE_FRAMES#   SBIN STATIC INIT(0);
+DCL MAX_JOBS#      UBIN STATIC INIT(5); /* Max Jobs displayed on screen
+                                           when BOTH Job and Output queues
+                                           are simultaneously displayed
+                                           on screen.                 */
+DCL MAIL_INTERVAL# SBIN STATIC INIT(%(15*60*100)); /* Ck mail every 15
+                                                      minutes -- time stamp
+                                                      minutes, that is.  */
+ 
+DCL UTS_TIME#      UBIN STATIC;
+DCL MBEGIN_TIME#    UBIN STATIC INIT(0);
+DCL PBEGIN_TIME#    UBIN STATIC INIT(0);
+DCL Q_FLAG#        UBIN STATIC INIT(%BOTH_QUEUES#);
+ 
+%EJECT;
+/* ---------------------------- Structures ------------------------ */
+ 
+DCL 1 NEW_STRING WALIGNED STATIC,
+       2 *           CHAR(0) INIT('ETMF:'),
+       2 ETMF        CHAR(4),
+       2 *           CHAR(4) INIT(' '),
+       2 *           CHAR(0) INIT('Online:'),
+       2 ONLINE      CHAR(4),
+       2 *           CHAR(4) INIT(' '),
+       2 *           CHAR(0) INIT('Ghost:'),
+       2 GHOST       CHAR(4),
+       2 *           CHAR(4) INIT(' '),
+       2 *           CHAR(0) INIT('New Mail Msgs:'),
+       2 MAIL_MSGS   CHAR(4),
+       2 *           CHAR(1) INIT(' '),
+       2 FLAGS       CHAR(4),
+       2 *           CHAR(1) INIT(' '),
+       2 *           CHAR(3) INIT(' '),
+       2 DATE        CHAR(10),
+       2 *           CHAR(1) INIT(' '),   /* End 1st line of screen*/
+       2 *           CHAR(0) INIT('RT90:'),
+       2 RT90        CHAR(4),
+       2 *           CHAR(5) INIT(' '),
+       2 *           CHAR(0) INIT('Batch:'),
+       2 BATCH       CHAR(4),
+       2 *           CHAR(7) INIT(' '),
+       2 *           CHAR(0) INIT('TP:'),
+       2 TP          CHAR(4),
+       2 *           CHAR(4) INIT(' '),
+       2 *           CHAR(0) INIT('  Total Users:'),
+       2 USERS       CHAR(4),
+       2 *           CHAR(8) INIT(' '),
+       2 TIME        CHAR(11),
+       2 *           CHAR(1) INIT(' '),        /* 2nd line of screen */
+       2 * (0:79)    CHAR(1) INIT('-'*79,' '), /* 3rd line of screen */
+       2 Q           CHAR(1680) INIT(' ');     /* The rest of screen */
+DCL NEW_STRING_REDEF REDEF NEW_STRING CHAR(1920);
+ 
+DCL 1 OTITLE STATIC,
+       2 * CHAR(3) INIT(' '),
+       2 * CHAR(6) INIT('STATUS'),
+       2 * CHAR(2) INIT(' '),
+       2 * CHAR(5) INIT('SYSID'),
+       2 * CHAR(4) INIT(' '),
+       2 * CHAR(7) INIT('ACCOUNT'),
+       2 * CHAR(2) INIT(' '),
+       2 * CHAR(4) INIT('CPYs'),
+       2 * CHAR(1) INIT(' '),
+       2 * CHAR(5) INIT('GRANS'),
+       2 * CHAR(1) INIT(' '),
+       2 * CHAR(4) INIT('FORM'),
+       2 * CHAR(3) INIT(' '),
+       2 * CHAR(7) INIT('TrmNAME'),
+       2 * CHAR(5) INIT(' '),
+       2 * CHAR(8) INIT('JOB NAME');
+DCL OTITLE_HDR REDEF OTITLE CHAR(67);
+ 
+DCL 1 JTITLE STATIC,
+       2 * CHAR(3) INIT(' '),
+       2 * CHAR(6) INIT('STATUS'),
+       2 * CHAR(1) INIT(' '),
+       2 * CHAR(2) INIT('IP'),
+       2 * CHAR(2) INIT(' '),
+       2 * CHAR(5) INIT('SYSID'),
+       2 * CHAR(1) INIT(' '),
+       2 * CHAR(7) INIT('ACCOUNT'),
+       2 * CHAR(2) INIT(' '),
+       2 * CHAR(8) INIT('O A D F '),
+       2 * CHAR(9) INIT(' MAX TIME'),
+       2 * CHAR(2) INIT(' '),
+       2 * CHAR(3) INIT('MEM'),
+       2 * CHAR(1) INIT(' '),
+       2 * CHAR(7) INIT('9T SP  '),
+       2 * CHAR(19) INIT('JOB NAME/DEFER DATE');
+DCL JTITLE_HDR REDEF JTITLE CHAR(78);
+ 
+DCL 1 JFRAME STATIC,
+       2 AA,
+           3 NAHEAD CHAR(3),
+           3 A      CHAR(6),
+       2 STATUS REDEF AA CHAR(9),
+       2 IPRIO CHAR(3),
+       2 SYSID CHAR(7),
+       2 *     CHAR(1) INIT(' '),
+       2 ACCN  CHAR(8),
+       2 *     CHAR(1) INIT(' '),
+       2 FLG,
+           3 O     CHAR(2),
+           3 A     CHAR(2),
+           3 D     CHAR(2),
+           3 F     CHAR(2),
+       2 RFLG REDEF FLG CHAR(8),
+       2 TIME  CHAR(9),
+       2 MEM   CHAR(5),
+       2 T9    CHAR(3),
+       2 SP    CHAR(3),
+       2 *     CHAR(2) INIT(' '),
+       2 JNAME CHAR(21);
+DCL JFRAME_REDEF REDEF JFRAME CHAR(80);
+ 
+DCL 1 OFRAME STATIC,
+       2 A,
+           3 NAHEAD CHAR(3),
+           3 A      CHAR(6),
+       2 STATUS REDEF A CHAR(9),
+       2 SYSID CHAR(7),
+       2 *     CHAR(1) INIT('-'),
+       2 NUM   CHAR(3),
+       2 ACCN  CHAR(8),
+       2 CPYS  CHAR(5),
+       2 GRANS CHAR(6),
+       2 *     CHAR(1) INIT(' '),
+       2 FORM  CHAR(6),
+       2 *     CHAR(1) INIT(' '),
+       2 DEV   CHAR(2),
+       2 D,
+           3 AT    CHAR(1),
+           3 TNAME CHAR(8),
+       2 PRINT_DEV REDEF D CHAR(9),
+       2 *     CHAR(1) INIT(' '),
+       2 JNAME CHAR(21);
+DCL OFRAME_REDEF REDEF OFRAME CHAR(80);
+ 
+DCL 1 TAPE_FLAGS STATIC ALIGNED,
+       2 SHOW_FREE_DRIVES BIT(1) UNAL INIT(%NO#),
+       2 SHOW_PARTN_DRIVES BIT(1) UNAL INIT(%YES#),
+       2 * BIT(34) UNAL;
+ 
+/*                     CHANGE TO ASCII UPPERCASE TABLE
+ 
+              leave BLANKS, UPPER CASE, NUMBERS and "$:" as they are,
+                   change LOWER CASE to UPPER CASE,
+                   all else change to "?"
+       */
+DCL 1 UPPER_CASE CONSTANT,
+   2 * (0:31) CHAR (1) INIT ('?'*0),
+   2 * CHAR (1) INIT (' '),
+   2 * (0:2) CHAR (1) INIT ('?'*0),
+   2 * CHAR (1) INIT ('$'),
+   2 * (0:10) CHAR (1) INIT ('?'*0),
+   2 * CHAR (10) INIT ('0123456789'),
+   2 * CHAR (1) INIT (':'),
+   2 * (0:5) CHAR (1) INIT ('?'*0),
+   2 * CHAR (26) INIT ('ABCDEFGHIJKLMNOPQRSTUVWXYZ'),
+   2 * (0:5) CHAR (1) INIT ('?'*0),
+   2 * CHAR (26) INIT ('ABCDEFGHIJKLMNOPQRSTUVWXYZ'),
+   2 * (0:4) CHAR (1) INIT ('?'*0);
+ 
+%EJECT;
+       CALL M$GDS(DS4)                 /* Get some dynamic memory for */
+           WHENALTRETURN DO;           /* CP-6 parser.                */
+PMMEALT:       ALTRETURN;
+               END;
+ 
+       CALL M$GDS(DS5) ALTRET(PMMEALT);
+       P_PCB.WORK$ = DS4_MEM.PTR$;     /* Set up the parser's PCB     */
+       P_PCB.TEXT$ = ADDR(B$JIT.CCBUF);
+       P_PCB.NCHARS= B$JIT.CCARS;      /* Parse user's command line.  */
+       CALL X$PARSE(P_PCB) ALTRET(SYN_ERROR);
+       IF P_PCB.OUT$->OUT.NSUBLKS ~= 0 THEN
+ 
+           /* User specified some kind of option(s) on the
+              command line.  Go get 'em.                 */
+ 
+           CALL PARSER;
+ 
+       /* Make sure this user's terminal supports cursor positioning.
+          If not, throw out an error message and stop.             */
+ 
+       CALL SCREENIN(WIDTH#,HEIGHT#);
+       IF HEIGHT# = 0 THEN
+           DO;
+           CALL M$WRITE(DO_WRITE);
+           ALTRETURN;
+           END;
+ 
+       M$MAIL$   = DCBADDR(DCBNUM(M$MAIL));
+       M$HELPER$ = DCBADDR(DCBNUM(M$HELPER));
+ 
+       CALL M$EOM (FPT_EOM);               /* Set up timeout for reads.*/
+ 
+       /* Set up memory management.  Init results vectors for
+          calls to M$JOBSTATS.                               */
+ 
+       J_JOBSTATS.RESULTS_ = DS4_MEM;
+       O_JOBSTATS.RESULTS_ = DS5_MEM;
+ 
+       /* Set up tape display initialization stuff. */
+ 
+       CALL INIT_TAPES(USER_HAS_TAPE_PRIV);
+ 
+       /* Upon return from the above procedure call, USER_HAS_TAPE_PRIV
+          will be set if the s/he can look at the monitor's tape tables.
+          Otherwise, this var will be reset.                          */
+ 
+       /* If the user wants DISPJOB activated, do that too. */
+ 
+       IF DISPJOB_ON# THEN
+           CALL PRIVIT(1);
+       ELSE
+           CALL PRIVIT(0);
+ 
+       /* Take break control */
+ 
+       REMEMBER LOOP_END_ALL IN REMEMBER_LABEL;
+       CALL M$INT(BB_INT);
+ 
+%EJECT;
+LOOP_LABEL:
+       DO WHILE('1'B);
+           CALL M$DISPLAY(FPT_DISPLAY);
+           CALL M$TIME(SCREEN_TIME);
+           CALL M$TIME(TIME_STAMP);
+ 
+           /* Ck to see if it's time to look in :MAILBOX.FMA
+              for new mail msgs.                            */
+ 
+           IF (MBEGIN_TIME#=0)OR(UTS_TIME#-MBEGIN_TIME#>=MAIL_INTERVAL#) THEN
+               DO;
+               CALL CK_FOR_NEW_MAIL;
+               MBEGIN_TIME# = UTS_TIME#;
+               END;
+ 
+           /* How about them tape drives?  */
+ 
+           IF USER_HAS_TAPE_PRIV THEN
+               IF DISPLAY_TAPES THEN DO;
+                   CALL GET_TAPES(,MAX_TAPES#,TAPE_FRAMES#,NEW_STRING.Q,TAPE_FLAGS);
+ 
+                   /* Upon return from the above procedure call,
+                      TAPE_FRAMES# will be set to the number of drives
+                      found in the monitor's tables.                */
+ 
+                   IF TAPE_FRAMES# = 0 THEN
+                       FRAMES_AVAIL# = 21;
+                   ELSE
+                       FRAMES_AVAIL# = MAXIMUM(0,21-TAPE_FRAMES#);
+                   END;
+               ELSE
+                   TAPE_FRAMES# = 0;
+ 
+           /* Ck queues according to Q_FLAG# */
+ 
+           DO CASE(Q_FLAG#);
+               CASE(%BOTH_QUEUES#);
+                   CALL GET_OUTPUTQ;
+                   CALL GET_JOBXSQ;
+                   IF JOB_FRAMES# > 0 THEN
+                       CALL FMT_JOBXSQ(SCREEN_SIZE#);
+                   ELSE
+                       SCREEN_SIZE# = FRAMES_AVAIL# - 3;
+                   IF OUTPUT_FRAMES# > 0 THEN
+                       CALL FMT_OUTPUTQ(SCREEN_SIZE#);
+                   CALL PASTE_SCREEN;
+               CASE(%OUTPUT_QUEUE#);
+                   CALL GET_OUTPUTQ;
+                   IF OUTPUT_FRAMES# > 0 THEN
+                       DO;
+                       SCREEN_SIZE# = FRAMES_AVAIL# - 1;
+                       CALL FMT_OUTPUTQ(SCREEN_SIZE#);
+                       END;
+ 
+                   SUBSTR(NEW_STRING.Q,TAPE_FRAMES# * 80) = OUTPUT_SCREEN;
+               CASE(%JOB_QUEUE#);
+                   CALL GET_JOBXSQ;
+                   IF JOB_FRAMES# > 0 THEN
+                       CALL FMT_JOBXSQ(SCREEN_SIZE#);
+ 
+                   SUBSTR(NEW_STRING.Q,TAPE_FRAMES# * 80) = JOB_SCREEN;
+               END; /* Do Case */
+ 
+           CALL UPDATE_DISPLAY;
+           CALL CURSOR(0,HEIGHT# - 1);  /* Stow the cursor.     */
+           CALL CRTFLSHX;               /* Flush display.       */
+           CALL M$READ(FPT_READ) ALTRET(LOOP_LABEL);
+ 
+           /* No time out on the read.  User must have typed
+              something.  Branch on the value of the user's
+              keystroke.                                    */
+ 
+           BITS_BUF = BITS_BUF & '177'O;  /* Strip parity. */
+           DO CASE(KEYIN_BUF);
+               CASE(%ASCBIN('0'));
+ 
+                   /* User wants to look at items in the output
+                      queue with priority 0 - 15, inclusive.
+                      This keyin excludes output items currently
+                      in the Hold, Multi-File Wait, Other Q, and
+                      Spilled states.                          */
+ 
+                   O_CRITERIA.PRIO#  = 0;
+                   O_CRITERIA.PRIO1# = 15;
+               CASE(%ASCBIN('1'));
+ 
+                   /* Same as '0' above, except that the user
+                      wants to look at items in the output queue
+                      with priority 1-15, inclusive.           */
+ 
+                   O_CRITERIA.PRIO#  = 1;
+                   O_CRITERIA.PRIO1# = 15;
+               CASE(%ASCBIN('2'));
+ 
+                   /* User does not want output priorities
+                      restricted.  That is, items in the output
+                      queue in any priority state are eligible
+                      for display (subject to TNAME and FORM
+                      keyins).                                 */
+ 
+                   O_CRITERIA.PRIO#  = 255;
+                   O_CRITERIA.PRIO1# = 255;
+               CASE(%ASCBIN('3'));
+ 
+                   /* User wants a maximum of 3 jobs displayed on the
+                      screen.                                       */
+ 
+                   MAX_JOBS# = 3;
+               CASE(%ASCBIN('4'));
+                   MAX_JOBS# = 4;
+               CASE(%ASCBIN('5'));
+                   MAX_JOBS# = 5;
+               CASE(%ASCBIN('6'));
+                   MAX_JOBS# = 6;
+               CASE(%ASCBIN('7'));
+                   MAX_JOBS# = 7;
+               CASE(%ASCBIN('8'));
+                   MAX_JOBS# = 8;
+               CASE(%ASCBIN('9'));
+                   MAX_JOBS# = 9;
+               CASE(%ASCBIN(%BITASC('001'O)));    /* <cntl>A */
+                   MAX_JOBS# = 10;
+               CASE(%ASCBIN(%BITASC('002'O)));    /* <cntl>B */
+                   MAX_JOBS# = 11;
+               CASE(%ASCBIN(%BITASC('003'O)));    /* <cntl>C */
+                   MAX_JOBS# = 12;
+               CASE(%ASCBIN(%BITASC('004'O)));    /* <cntl>D */
+                   MAX_JOBS# = 13;
+               CASE(%ASCBIN(%BITASC('005'O)));    /* <cntl>E */
+                   MAX_JOBS# = 14;
+               CASE(%ASCBIN(%BITASC('006'O)));    /* <cntl>F */
+ 
+                   /* User does not want to look at FREE tape drives. */
+ 
+                   TAPE_FLAGS.SHOW_FREE_DRIVES = %NO#;
+               CASE(%ASCBIN(%BITASC('013'O)),%ASCBIN(%BITASC('020'O)));  /* <cntl>K <cntl>P */
+ 
+                   /* User does not want to look at partitioned
+                      tape drives.                                 */
+ 
+                   TAPE_FLAGS.SHOW_PARTN_DRIVES = %NO#;
+               CASE(%ASCBIN(%TAB#));
+ 
+                   /* User wants scroll position for OUTPUT reset
+                      to beginning of OUTPUT queue.              */
+ 
+                   OPSN# = 0;
+               CASE(%ASCBIN(%BITASC('024'O)));    /* <cntl>T */
+ 
+                   /* User doesn't want to look at tape drives.  */
+ 
+                   FRAMES_AVAIL# = 21;
+                   DISPLAY_TAPES = %NO#;
+               CASE(%ASCBIN(%ESC#));
+ 
+                   /* User wants scroll position for JOBS reset to
+                      beginning of JOBS queue.                  */
+ 
+                   JPSN# = 0;
+               CASE(%ASCBIN('+'),%ASCBIN('='));
+ 
+                   /* User wants JOBs scroll position incremented. */
+ 
+                   JPSN# = JPSN# + 1;
+               CASE(%ASCBIN('-'),%ASCBIN('_'));
+ 
+                   /* User wants JOBS scroll position decremented. */
+ 
+                   JPSN# = MAXIMUM(0,JPSN# - 1);
+               CASE(%ASCBIN('<'),%ASCBIN(','));
+ 
+                   /* Decrement OUTPUT scroll position. */
+ 
+                   OPSN# = MAXIMUM(0,OPSN# - 1);
+               CASE(%ASCBIN('>'),%ASCBIN('.'));
+ 
+                   /* Increment OUTPUT scroll position. */
+ 
+                   OPSN# = OPSN# + 1;
+               CASE(%ASCBIN('@'));
+ 
+                   /* User wants there defined Tnames for output displays. */
+ 
+                   O_CRITERIA.TNAME# = WORK_STATION_ID;
+               CASE(%ASCBIN('?'));
+ 
+                   /* User wants a screen full of help.  */
+ 
+                   CALL HELP;
+                   CALL SCREENIN;
+               CASE(%ASCBIN('A'),%ASCBIN('a'));
+ 
+                   /* User wants to look at ALL forms.   */
+ 
+                   O_CRITERIA.FORM# = ' ';
+                   O_CRITERIA.NOTFORM# = %NO#;
+               CASE(%ASCBIN('B'),%ASCBIN('b'));
+ 
+                   /* User wants to look at BOTH queues. */
+ 
+                   Q_FLAG# = %BOTH_QUEUES#;
+               CASE(%ASCBIN('C'),%ASCBIN('c'));
+ 
+                   /* User wants his/her mail CKD right now.  */
+ 
+                   MBEGIN_TIME# = 0;
+               CASE(%ASCBIN('D'),%ASCBIN('d'));
+ 
+                   /* User wants DISPJOB on.           */
+ 
+                   CALL PRIVIT(1);
+               CASE(%ASCBIN('E'),%ASCBIN('e'));
+ 
+                   /* User wants to look at EXECUTING jobs only. */
+ 
+                   J_CRITERIA.RUNNING#  = %YES#;
+                   J_CRITERIA.RUNAFTER# = %NO#;
+                   J_CRITERIA.NORUN#    = %NO#;
+                   J_CRITERIA.PRIO#     = 255;
+                   J_CRITERIA.PRIO1#    = 255;
+               CASE(%ASCBIN('F'),%ASCBIN('f'));
+ 
+                   /* User wants to look at FREE tape drives. */
+ 
+                   TAPE_FLAGS.SHOW_FREE_DRIVES = %YES#;
+               CASE(%ASCBIN('H'),%ASCBIN('h'));
+ 
+                   /* User wants to look at HIBERNATING jobs only.
+                      That is, jobs in the RUNAFTER# state.      */
+ 
+                   J_CRITERIA.RUNNING#  = %NO#;
+                   J_CRITERIA.RUNAFTER# = %YES#;
+                   J_CRITERIA.NORUN#    = %NO#;
+                   J_CRITERIA.PRIO#     = 255;
+                   J_CRITERIA.PRIO1#    = 255;
+               CASE(%ASCBIN('I'),%ASCBIN('i'));
+ 
+                   /* User wants to look at INCUBATING jobs only.
+                      That is, jobs that would run if the batch
+                      queue was empty.                        */
+ 
+                   J_CRITERIA.RUNNING#  = %NO#;
+                   J_CRITERIA.RUNAFTER# = %NO#;
+                   J_CRITERIA.NORUN#    = %NO#;
+                   J_CRITERIA.PRIO#     = 0;
+                   J_CRITERIA.PRIO1#    = 15;
+               CASE(%ASCBIN('J'),%ASCBIN('j'));
+ 
+                   /* User wants to look at JOBS queue only */
+ 
+                   Q_FLAG# = %JOB_QUEUE#;
+               CASE(%ASCBIN('K'),%ASCBIN('k'),%ASCBIN('P'),%ASCBIN ('p'));
+ 
+                   /* User wants to look at KAPUT (partitioned)
+                      tape drives.                                */
+ 
+                   TAPE_FLAGS.SHOW_PARTN_DRIVES = %YES#;
+               CASE(%ASCBIN('L'),%ASCBIN('l'));
+ 
+                   /* User wants LOCAL Tnames for output displays. */
+ 
+                   O_CRITERIA.TNAME# = 'LOCAL';
+               CASE(%ASCBIN('M'),%ASCBIN('m'));
+ 
+                   /* User wants to look at his/her jobs
+                      (ME) only.                            */
+ 
+                   CALL PRIVIT(0);
+               CASE(%ASCBIN('N'),%ASCBIN('n'));
+ 
+                   /* User wants to look at NSFORMs only.  */
+ 
+                   O_CRITERIA.FORM# = 'STDLP';
+                   O_CRITERIA.NOTFORM# = %YES#;
+               CASE(%ASCBIN('O'),%ASCBIN('o'));
+ 
+                   /* User wants to look at OUTPUT queue only */
+ 
+                   Q_FLAG# = %OUTPUT_QUEUE#;
+               CASE(%ASCBIN('R'),%ASCBIN('r'));
+ 
+                   /* User wants the screen REDRAWN right now.  */
+ 
+                   CALL SCREENIN;
+               CASE(%ASCBIN('S'),%ASCBIN('s'));
+ 
+                   /* User wants to look at STDLP forms only. */
+ 
+                   O_CRITERIA.FORM# = 'STDLP';
+                   O_CRITERIA.NOTFORM# = %NO#;
+               CASE(%ASCBIN('T'),%ASCBIN('t'));
+ 
+                   /* User wants to look at tape drives. */
+ 
+                   DISPLAY_TAPES = %YES#;
+                   FRAMES_AVAIL# = 21;
+               CASE(%ASCBIN('U'),%ASCBIN('u'));
+ 
+                   /* User wants to look at the UNIVERSE of all jobs. */
+ 
+                   J_CRITERIA.RUNNING#  = %NO#;
+                   J_CRITERIA.RUNAFTER# = %NO#;
+                   J_CRITERIA.WPS#      = %NO#;
+                   J_CRITERIA.NORUN#    = %NO#;
+                   J_CRITERIA.PRIO#     = 255;
+                   J_CRITERIA.PRIO1#    = 255;
+               CASE(%ASCBIN('W'),%ASCBIN('w'));
+ 
+                   /* User wants the WORLD's Output Tname's displayed. */
+ 
+                   O_CRITERIA.TNAME# = ' ';
+               CASE(%ASCBIN('Z'),%ASCBIN('z'));
+ 
+                   /* User wants to look at jobs ZAPPED into a
+                      norun partition.                        */
+ 
+                   J_CRITERIA.RUNAFTER# = %NO#;
+                   J_CRITERIA.RUNNING#  = %NO#;
+                   J_CRITERIA.WPS#      = %NO#;
+                   J_CRITERIA.NORUN#    = %YES#;
+                   J_CRITERIA.PRIO#     = 255;
+                   J_CRITERIA.PRIO1#    = 255;
+               CASE(%ASCBIN(%CR#),%ASCBIN(%LF#),%ASCBIN('Q'),
+                    %ASCBIN('q'),%ASCBIN('X'),%ASCBIN('x'));
+ 
+LOOP_END_ALL:
+                   /* Time to split. */
+                   CALL CURSOR(0,HEIGHT# - 1);
+ 
+                   /* Erase last line from screen. */
+ 
+                   CALL CRT(5);
+ 
+                   CALL M$STRMCTL(FPT_TRMCTL);  /* Make sure that CRT
+                                                   optimization is turned
+                                                   back on!             */
+ 
+                   CALL SCREECH;                /* Bye.                 */
+               END; /* Do Select */
+           END;  /* Do while '1'B */
+ 
+%EJECT;
+SYN_ERROR:
+ 
+       /* Ye old parser detected a syntax error.  Time to put a
+          a finger under the offending syntax and dump out the
+          correct syntax alternatives.                         */
+ 
+       SUBSTR(BUF,P_PCB.HI_CHAR+1,1) = '^';
+       DO_WRITE.BUF_ = VECTOR(BUF);
+       CALL M$WRITE(DO_WRITE);
+       P_PCB.NXT = '1'B;                   /* Force parser to dump */
+       CALL X$PARSE(P_PCB) ALTRET(NEXT);   /* syntax alternatives. */
+NEXT:  DO_WRITE.BUF_ = VECTOR(BAD_SYNTAX); /* State the obvious.   */
+       CALL M$WRITE(DO_WRITE);
+       ALTRETURN;
+ 
+%EJECT;
+PARSER:PROC;
+ 
+       /* Extracts user's command line options from the output
+          tree built by X$PARSE.                               */
+ 
+DCL I SBIN;  DCL J SBIN;  DCL K SBIN;  DCL Q$ PTR STATIC;  DCL R$ PTR STATIC;
+ 
+ 
+       P$ = P_PCB.OUT$;
+ 
+       DO I = 0 TO OUT.NSUBLKS - 1;
+           DO CASE(OUT.SUBLK$(I)->OUT.CODE);
+               CASE(DISPJOB_FLAG);
+                   IF OUT.SUBLK$(I)->OUT.SUBLK$(0)->OUT.CODE = 0 THEN
+                       DISPJOB_ON# = %NO#;
+                   ELSE
+                       DISPJOB_ON# = %YES#;
+               CASE(REPORT_INTERVAL);
+                   CALL CHARBIN(J,OUT.SUBLK$(I)->OUT.SUBLK$(0)->SYM.TEXT);
+                   FPT_EOM.V.TIMEOUT# = J;
+                   IF FPT_EOM.V.TIMEOUT# = 0 THEN
+                       FPT_EOM.V.TIMEOUT# = 255;
+               CASE(MAIL_INTERVAL);
+                   CALL CHARBIN(MAIL_INTERVAL#,
+                                OUT.SUBLK$(I)->OUT.SUBLK$(0)->SYM.TEXT);
+                   MAIL_INTERVAL# = MAIL_INTERVAL# * 60 * 100;
+               CASE(MAX_JOBS);
+                   CALL CHARBIN(MAX_JOBS#,
+                                OUT.SUBLK$(I)->OUT.SUBLK$(0)->SYM.TEXT);
+                   IF MAX_JOBS# > 14 THEN
+                       MAX_JOBS# = 14;
+                   ELSE
+                       IF MAX_JOBS# < 3 THEN
+                           MAX_JOBS# = 3;
+               CASE(MAX_TAPES);
+                   CALL CHARBIN(MAX_TAPES#,
+                                OUT.SUBLK$(I)->OUT.SUBLK$(0)->SYM.TEXT);
+                   IF MAX_TAPES# > 20 THEN
+                       MAX_TAPES# = 20;
+                   ELSE
+                       IF MAX_TAPES# < 1 THEN
+                           MAX_TAPES# = 1;
+               CASE(FREE_DRIVES);
+                   IF OUT.SUBLK$(I)->OUT.SUBLK$(0)->OUT.CODE = 0 THEN
+                       TAPE_FLAGS.SHOW_FREE_DRIVES = %YES#;
+                   ELSE
+                       TAPE_FLAGS.SHOW_FREE_DRIVES = %NO#;
+               CASE(PARTN_DRIVES);
+                   IF OUT.SUBLK$(I)->OUT.SUBLK$(0)->OUT.CODE = 0 THEN
+                       TAPE_FLAGS.SHOW_PARTN_DRIVES = %YES#;
+                   ELSE
+                       TAPE_FLAGS.SHOW_PARTN_DRIVES = %NO#;
+               CASE(SHOW_TAPES);
+                   IF OUT.SUBLK$(I)->OUT.SUBLK$(0)->OUT.CODE = 0 THEN
+                       DISPLAY_TAPES = %YES#;
+                   ELSE
+                       DISPLAY_TAPES = %NO#;
+               CASE(QUEUE_TYPE);
+                   Q$ = OUT.SUBLK$(I);
+                   DO CASE(Q$->OUT.SUBLK$(0)->OUT.CODE);
+                       CASE(0);
+                           Q_FLAG# = %JOB_QUEUE#;
+                           IF Q$->OUT.NSUBLKS > 1 THEN
+                               CALL EXTRACT_JOBQ(Q$);
+                       CASE(1);
+                           Q_FLAG# = %OUTPUT_QUEUE#;
+                           IF Q$->OUT.NSUBLKS > 1 THEN
+                               CALL EXTRACT_OUTPUTQ(Q$);
+                       CASE(2);
+                           Q_FLAG# = %BOTH_QUEUES#;
+                           IF Q$->OUT.NSUBLKS > 1 THEN
+                               DO K = 1 TO Q$->OUT.NSUBLKS - 1;
+                                   R$ = Q$->OUT.SUBLK$(K);
+                                   DO CASE(R$->OUT.SUBLK$(0)->OUT.CODE);
+                                       CASE(0);
+                                           CALL EXTRACT_JOBQ(R$);
+                                       CASE(1);
+                                           CALL EXTRACT_OUTPUTQ(R$);
+                                       END;  /* Do case */
+                               END;  /* Do to */
+                       END; /* Do Case */
+               END; /* Do case */
+           END; /* Do to */
+ 
+%EJECT;
+EXTRACT_OUTPUTQ:PROC(Q$);
+ 
+DCL Q$ PTR;
+ 
+       DO J = 1 TO Q$->OUT.NSUBLKS - 1;
+           DO CASE(Q$->OUT.SUBLK$(J)->OUT.CODE);
+               CASE(0);
+                   IF Q$->OUT.SUBLK$(J)->OUT.NDTYPE = %ALPHA#
+                   THEN
+                       O_CRITERIA.TNAME# = Q$->OUT.SUBLK$(J)->SYM.TEXT;
+                   ELSE
+                       O_CRITERIA.TNAME# = 'LOCAL';
+                   CALL XLATE (O_CRITERIA.TNAME#,UPPER_CASE,O_CRITERIA.TNAME#);
+                   WORK_STATION_ID = O_CRITERIA.TNAME#;
+               CASE(1);
+                   O_CRITERIA.TNAME# = ' ';
+               CASE(2);
+                   O_CRITERIA.FORM# = 'STDLP';
+                   O_CRITERIA.NOTFORM# = %NO#;
+               CASE(3);
+                   O_CRITERIA.NOTFORM# = %YES#;
+                   O_CRITERIA.FORM# = 'STDLP';
+               CASE(4);
+                   O_CRITERIA.FORM# = ' ';
+                   O_CRITERIA.NOTFORM# = %NO#;
+               CASE(5);
+                   O_CRITERIA.PRIO# = 0;
+                   O_CRITERIA.PRIO1#=15;
+               CASE(6);
+                   O_CRITERIA.PRIO# = 1;
+                   O_CRITERIA.PRIO1#=15;
+               CASE(7);
+                   O_CRITERIA.PRIO# = 255;
+                   O_CRITERIA.PRIO1#= 255;
+               END;  /* Do Case */
+           END;   /* Do To */
+ 
+END EXTRACT_OUTPUTQ;
+ 
+%EJECT;
+EXTRACT_JOBQ:PROC(Q$);
+ 
+DCL Q$ PTR;
+ 
+       DO CASE(Q$->OUT.SUBLK$(1)->OUT.CODE);
+            CASE(0);
+                J_CRITERIA.RUNNING# = %YES#;
+                J_CRITERIA.RUNAFTER#= %NO#;
+                J_CRITERIA.NORUN#   = %NO#;
+                J_CRITERIA.PRIO#    = 255;
+                J_CRITERIA.PRIO1#   = 255;
+            CASE(1);
+                J_CRITERIA.RUNNING# = %NO#;
+                J_CRITERIA.RUNAFTER#= %YES#;
+                J_CRITERIA.NORUN#   = %NO#;
+                J_CRITERIA.PRIO#    = 255;
+                J_CRITERIA.PRIO1#   = 255;
+            CASE(2);
+                J_CRITERIA.RUNNING# = %NO#;
+                J_CRITERIA.RUNAFTER#= %NO#;
+                J_CRITERIA.NORUN#   = %NO#;
+                J_CRITERIA.PRIO#    = 0;
+                J_CRITERIA.PRIO1#   = 15;
+            CASE(3);
+                J_CRITERIA.RUNNING# = %NO#;
+                J_CRITERIA.RUNAFTER#= %NO#;
+                J_CRITERIA.NORUN#   = %NO#;
+                J_CRITERIA.WPS#     = %NO#;
+                J_CRITERIA.PRIO#    = 255;
+                J_CRITERIA.PRIO1#   = 255;
+            CASE(4);
+                J_CRITERIA.RUNNING# = %NO#;
+                J_CRITERIA.RUNAFTER#= %NO#;
+                J_CRITERIA.NORUN#   = %YES#;
+                J_CRITERIA.PRIO#    = 255;
+                J_CRITERIA.PRIO1#   = 255;
+            END; /* Do case */
+ 
+END EXTRACT_JOBQ;
+ 
+END PARSER;
+ 
+%EJECT;
+UPDATE_DISPLAY:PROC;
+ 
+       /* Purpose:  Displays only those bytes of NEW_STRING that
+                    have changed value since UPDATE_DISPLAY was
+                    last called.                                  */
+ 
+ 
+       CALL BINCHAR(NEW_STRING.ETMF,VLR_DISPLAY.ETMF);
+       CALL EDITSTR(NEW_STRING.ETMF,,,CONVERT_STR0,NEW_STRING.ETMF);
+ 
+       CALL BINCHAR(NEW_STRING.RT90,VLR_DISPLAY.RESP);
+       CALL EDITSTR(NEW_STRING.RT90,,,CONVERT_STR0,NEW_STRING.RT90);
+ 
+       CALL BINCHAR(NEW_STRING.ONLINE,VLR_DISPLAY.OUSERS);
+       CALL EDITSTR(NEW_STRING.ONLINE,,,CONVERT_STR0,NEW_STRING.ONLINE);
+ 
+       CALL BINCHAR(NEW_STRING.BATCH,VLR_DISPLAY.BUSERS);
+       CALL EDITSTR(NEW_STRING.BATCH,,,CONVERT_STR0,NEW_STRING.BATCH);
+ 
+       CALL BINCHAR(NEW_STRING.GHOST,VLR_DISPLAY.GUSERS);
+       CALL EDITSTR(NEW_STRING.GHOST,,,CONVERT_STR0,NEW_STRING.GHOST);
+ 
+       CALL BINCHAR(NEW_STRING.TP,VLR_DISPLAY.TPUSERS);
+       CALL EDITSTR(NEW_STRING.TP,,,CONVERT_STR0,NEW_STRING.TP);
+ 
+       CALL BINCHAR(NEW_STRING.USERS,VLR_DISPLAY.USERS);
+       CALL EDITSTR(NEW_STRING.USERS,,,CONVERT_STR0,NEW_STRING.USERS);
+ 
+       CALL SCREENUP(NEW_STRING);
+ 
+END UPDATE_DISPLAY;
+ 
+%EJECT;
+CK_FOR_NEW_MAIL:PROC;
+ 
+       /* Dig thru :MAILBOX.FMA to see if it contains new mail messages.*/
+ 
+%FPT_OPEN      (DCB=M$MAIL,
+                ASN=FILE,
+                FUN=IN,
+                NAME=VLP_NAME,
+                STCLASS=CONSTANT);
+ 
+%VLP_NAME      (NAME=':MAILBOX',STCLASS=CONSTANT);
+ 
+%FPT_CLOSE     (DCB=M$MAIL,
+                DISP=SAVE,
+                STCLASS=CONSTANT);
+ 
+%FPT_PRECORD   (DCB=M$MAIL,
+                KEYR=YES,
+                KEY=MAIL_KEY);
+ 
+DCL 1 MAIL_KEY STATIC,
+       2 L# UBIN BYTE UNAL,
+       2 JUNK (0:10) BIT(9) UNAL,
+       2 FLAGS,
+           3 * BIT(6) UNAL,
+           3 OLD# BIT(1) UNAL,
+           3 * BIT(2) UNAL,
+       2 * (0:243) UBIN BYTE UNAL;
+ 
+DCL COUNTER# SBIN;
+ 
+%EJECT;
+       COUNTER# = 0;
+       IF ~F$DCB.FCD# THEN   /* Open :MAILBOX.FMA */
+           CALL M$OPEN(FPT_OPEN) ALTRET(ERR);
+       FPT_PRECORD.V.KEYS# = %YES#;
+       FPT_PRECORD.V.N#    = 0;
+       MAIL_KEY.L#         = 13;
+       MAIL_KEY.JUNK       = %MAIL_HDR#;
+       CALL M$PRECORD(FPT_PRECORD) ALTRET(NEXT);
+ 
+NEXT:  IF MAIL_KEY.L# = 0 THEN   /* Ye old mailbox is empty. */
+           GOTO DONE;
+       FPT_PRECORD.V.KEYS# = %NO#;
+       FPT_PRECORD.V.N#    = 1;
+       DO WHILE('1'B);
+           IF MAIL_KEY.JUNK(0) = %MAIL_HDR# THEN
+               IF ~MAIL_KEY.FLAGS.OLD# THEN
+                   COUNTER# = COUNTER# + 1;
+               ELSE
+                   ;
+           ELSE
+               GOTO DONE;
+           CALL M$PRECORD(FPT_PRECORD) ALTRET(DONE);
+           END;
+ 
+DONE:  CALL M$CLOSE(FPT_CLOSE);
+ 
+       /* Convert counter to an appropriate character string. */
+ 
+       CALL BINCHAR(NEW_STRING.MAIL_MSGS,COUNTER#);
+       CALL EDITSTR(NEW_STRING.MAIL_MSGS,,,CONVERT_STR0,NEW_STRING.MAIL_MSGS);
+       IF COUNTER# > 0 THEN   /* Tell the user what's new. */
+           NEW_STRING.FLAGS = '****';
+       ELSE
+           NEW_STRING.FLAGS = ' ';
+       RETURN;
+ 
+ERR:   NEW_STRING.MAIL_MSGS = ' ???';
+       NEW_STRING.FLAGS     = ' ';
+ 
+END CK_FOR_NEW_MAIL;
+ 
+%EJECT;
+PRIVIT:PROC(WHAT#);
+ 
+       /* Sets or resets DISPJOB priv, depending on value of WHAT# */
+ 
+DCL WHAT# SBIN;
+ 
+%FPT_PRIV      (AUTH=YES,PPRIV=NO);
+ 
+       IF WHAT# = 1 THEN
+           DO;
+           FPT_PRIV.V.PRIV# = B$JIT.PRIV.ACTIVE | %PR_DISPJOB#;
+           CALL M$SPRIV(FPT_PRIV) ALTRET(SO_WHAT);
+SO_WHAT:   END;
+       ELSE
+           DO;
+           FPT_PRIV.V.PRIV# = %PR_DISPJOB#;
+           CALL M$RPRIV(FPT_PRIV) ALTRET(SO);
+SO:        END;
+ 
+END PRIVIT;
+ 
+%EJECT;
+ 
+HELP:PROC;
+ 
+       /* Spit out a screen of help.  Help is stored inside the
+          run unit! (of all things)           */
+ 
+%FPT_OPEN      (FPTN=HELP_OPEN,
+                DCB=M$HELPER,
+                ASN=FILE,
+                FUN=IN,
+                STCLASS=STATIC);
+ 
+%FPT_READ      (FPTN=HELP_READ,
+                DCB=M$HELPER,
+                BUF=BUF,
+                KEY=AKEY,
+                KEYS=YES,
+                STCLASS=CONSTANT);
+ 
+DCL Y SBIN;
+DCL SAVED_TIMEOUT# SBIN;
+DCL 1 AKEY STATIC CALIGNED,
+     2 * UBIN BYTE CALIGNED INIT(3),
+     2 KEY_ UBIN(27) CALIGNED;
+ 
+DCL HELP_PROBLEM CHAR(0) CONSTANT INIT(
+       '***Error reading help file.  (Any Key To Continue)');
+ 
+%EJECT;
+       /* Kill the break key and blank the screen. */
+ 
+       CALL M$INT(NB_INT);
+       CALL CRT(2);
+       CALL CRTFLSHX;
+ 
+       /* Kill pending timeout via M$READ in driver. */
+ 
+       SAVED_TIMEOUT# = FPT_EOM.V.TIMEOUT# ;
+       FPT_EOM.V.TIMEOUT# = 0;
+       CALL M$EOM(FPT_EOM);
+ 
+       /* If help file not open, open it. */
+ 
+       IF NOT M$HELPER$->F$DCB.FCD# THEN DO;
+           HELP_OPEN.NAME_ =
+               VECTOR(DCBADDR(DCBNUM(M$LM))->F$DCB.NAME#);
+           HELP_OPEN.ACCT_ =
+               VECTOR(DCBADDR(DCBNUM(M$LM))->F$DCB.ACCT#);
+           CALL M$OPEN(HELP_OPEN)  ALTRET(OOPS);
+           END;
+ 
+       Y = 0;
+       AKEY.KEY_ = 1000;
+       DO WHILE('1'B);
+           SUBSTR(BUF,,80) = ' ';
+           CALL M$READ(HELP_READ)  ALTRET(CK);
+           CALL CURSOR(0,Y);
+           CALL WRITE(BUF,M$HELPER$->F$DCB.ARS#);
+           CALL CRTFLSHX;
+           Y = Y + 1;
+           AKEY.KEY_ = AKEY.KEY_ + 1000;
+           END;
+ 
+CK:    IF B$TCB.ALT$->B$ALT.ERR.CODE = %E$NOKEY THEN
+           DO;
+ 
+           /* Get one char from the user, any char at all. */
+ 
+           CALL M$READ(FPT_READ);
+           END;
+ 
+       ELSE
+ 
+           /* Some problem reading the help file. Output an
+              appropriate message                          */
+ 
+OOPS:      DO;
+           CALL CRT(2);
+           CALL CURSOR(0,HEIGHT# - 1);
+           CALL WRITE(HELP_PROBLEM,LENGTHC(HELP_PROBLEM));
+           CALL CRTFLSHX;
+ 
+           /* Get one char from the user, any char at all. */
+ 
+           CALL M$READ(FPT_READ);
+           END;
+ 
+ 
+       /* Restore break key and pending timeout on read.   */
+ 
+       FPT_EOM.V.TIMEOUT# = SAVED_TIMEOUT#;
+       CALL M$EOM(FPT_EOM);
+       CALL M$INT(BB_INT);
+ 
+END HELP;
+ 
+%EJECT;
+FMT_OUTPUTQ:PROC(SIZE#);
+ 
+DCL SIZE# SBIN;             /* Max # of output items that can be
+                               displayed on screen.             */
+DCL TEMP# SBIN;
+DCL OFFSET# SBIN;
+DCL MAX_SCROLL# SBIN;
+ 
+%EJECT;
+       OUTPUT_FRAMES# = 0;   /* Init var */
+ 
+       /* Make sure we aren't wasting our time. */
+ 
+       IF SIZE# <= 0 THEN DO;
+           OUTPUT_SCREEN = ' ';
+           RETURN;
+           END;
+       ELSE
+           OUTPUT_SCREEN = OTITLE_HDR;
+ 
+       /* Compute scroll parameters. */
+ 
+       MAX_SCROLL# = OSRCH.FOUND / SIZE#;
+       IF (MOD(OSRCH.FOUND,SIZE#) = 0) AND (OPSN# >= MAX_SCROLL#) THEN
+           DO;
+           OPSN# = MAXIMUM(0,MAX_SCROLL# - 1);
+           OFFSET# = SIZE#;
+           END;
+       ELSE
+           IF OPSN# < MAX_SCROLL# THEN
+               OFFSET# = SIZE#;
+           ELSE
+               DO;
+               OFFSET# = MOD(OSRCH.FOUND,SIZE#);
+               OPSN# = MAX_SCROLL#;
+               END;
+ 
+       /* FMT available output queue frames. */
+ 
+       DO TEMP# = OPSN# * SIZE# + 1 TO OPSN# * SIZE# + OFFSET#;
+           OUTPUT_FRAMES# = OUTPUT_FRAMES# + 1;
+           OUTPUT$        = ADDR(OSRCH.F(TEMP# - 1));
+           OFRAME.ACCN    = B$OSRCH.ACCT;
+           OFRAME.FORM    = B$OSRCH.FORM;
+           OFRAME.DEV     = B$OSRCH.DEVTYP;
+           OFRAME.D.AT    = '@';
+           OFRAME.D.TNAME = B$OSRCH.TNAME;
+           OFRAME.JNAME   = B$OSRCH.JNAME;
+ 
+           CALL BINCHAR(OFRAME.SYSID,B$OSRCH.SYSID);
+           CALL EDITSTR(OFRAME.SYSID,,,CONVERT_STR2,OFRAME.SYSID);
+ 
+           OFRAME.NUM = ' ';
+           IF B$OSRCH.NUM < 10 THEN
+               CALL BINCHAR(SUBSTR(OFRAME.NUM,0,1),B$OSRCH.NUM);
+           ELSE
+               IF B$OSRCH.NUM < 100 THEN
+                   CALL BINCHAR(SUBSTR(OFRAME.NUM,0,2),B$OSRCH.NUM);
+               ELSE
+                   IF B$OSRCH.NUM < 1000 THEN
+                       CALL BINCHAR(OFRAME.NUM,B$OSRCH.NUM);
+                   ELSE
+ 
+                       /* Number won't fit.  Fill with '**'. */
+ 
+                       OFRAME.NUM = '**';
+ 
+           CALL BINCHAR(OFRAME.CPYS,B$OSRCH.COPIES);
+           CALL EDITSTR(OFRAME.CPYS,,,CONVERT_STR3,OFRAME.CPYS);
+ 
+           CALL BINCHAR(OFRAME.GRANS,B$OSRCH.GRANS);
+           CALL EDITSTR(OFRAME.GRANS,,,CONVERT_STR4,OFRAME.GRANS);
+ 
+           DO CASE(B$OSRCH.PRIO);
+               CASE(0);            /* This will never print.  Say so.  */
+                   OFRAME.STATUS = '   Prio 0';
+               CASE(%FP_HOLD#);
+                   OFRAME.STATUS = '     Hold';
+               CASE(%FP_MFW#);
+                   OFRAME.STATUS = ' M-F Wait';
+               CASE(%FP_SPILLED#);
+                   OFRAME.STATUS = '  Spilled';
+               CASE(%FP_OTHER#);
+                   OFRAME.STATUS = '  Other Q';
+               CASE(ELSE);
+                   IF B$OSRCH.DEVNAME ~= ' ' THEN
+                       DO;
+                       OFRAME.STATUS = ' Printing';
+                       OFRAME.PRINT_DEV = B$OSRCH.DEVNAME;
+                       END;
+                   ELSE
+                       DO;
+                       CALL BINCHAR(OFRAME.A.NAHEAD,B$OSRCH.AHEAD);
+                       CALL EDITSTR(OFRAME.A.NAHEAD,,,
+                                    CONVERT_STR1,OFRAME.A.NAHEAD);
+                       OFRAME.A.A = ' Ahead';
+                       END;
+               END; /* Do Case */
+ 
+           SUBSTR(OUTPUT_SCREEN,OUTPUT_FRAMES# * 80, 80) = OFRAME_REDEF;
+           END;
+ 
+END FMT_OUTPUTQ;
+ 
+%EJECT;
+GET_OUTPUTQ:PROC;
+ 
+RETRY:
+       CALL M$JOBSTATS(O_JOBSTATS) ALTRET(ERR);
+       OUTPUT_FRAMES# = OSRCH.FOUND;
+       RETURN;
+ 
+ERR:   DO CASE(B$TCB.ALT$->B$ALT.ERR.CODE);
+           CASE(%E$NOTFND,%E$FNOTFND);
+               OUTPUT_FRAMES# = 0;
+               OUTPUT_SCREEN = '...None (Output Queue)';
+           CASE(%E$JSIRAS);
+               CALL M$GDS(DS5);
+               O_JOBSTATS.RESULTS_ = DS5_MEM;
+               GOTO RETRY;
+           CASE(ELSE);
+               CALL M$MERC;
+           END;
+ 
+END GET_OUTPUTQ;
+ 
+%EJECT;
+FMT_JOBXSQ:PROC(SIZE#);
+ 
+DCL SIZE# SBIN;      /* Procedure FMT_JOBXSQ uses SIZE# to compute the
+                        max # of Job items that may be displayed on
+                        the screen.
+ 
+                        When FMT_JOBXSQ returns, SIZE# will contain
+                        the max # of Output items that may be displayed
+                        on the screen.  This info is then available for
+                        procedure FMT_OUTPUTQ.                      */
+ 
+DCL TEMP# SBIN;
+DCL OFFSET# SBIN;
+DCL MAX_SCROLL# SBIN;
+ 
+DCL DFR_DATE CHAR(10) STATIC;
+DCL DFR_TIME CHAR(11) STATIC;
+ 
+%FPT_TIME      (FPTN=DFR_UNTIME,
+                DEST=EXT,
+                DATE=DFR_DATE,
+                TIME=DFR_TIME,
+                SOURCE=UTS);
+ 
+%FPT_STATE     (BUF=STATE_BUF);
+ 
+DCL 1 STATE_BUF STATIC,
+       2 * (0:1) UBIN,
+       2 CPU_REMAINING UBIN,
+       2 * UBIN;
+ 
+%EJECT;
+       JOB_FRAMES# = 0;   /* Init var */
+ 
+       /* Compute max # of Jobs that can be displayed on screen. */
+ 
+       IF Q_FLAG# = %JOB_QUEUE# THEN
+           SIZE# = FRAMES_AVAIL# - 1;
+       ELSE
+           IF OUTPUT_FRAMES# = 0 THEN
+               IF FRAMES_AVAIL# > 3 THEN
+                   SIZE# = FRAMES_AVAIL# - 3;
+               ELSE
+                   SIZE# = FRAMES_AVAIL# - 1;
+           ELSE
+               IF OUTPUT_FRAMES# >= (FRAMES_AVAIL# - 3 - MAX_JOBS#) THEN
+                   SIZE# = MINIMUM(MAX_JOBS#,FRAMES_AVAIL# - 1);
+               ELSE
+                   SIZE# = FRAMES_AVAIL# - 3 - OUTPUT_FRAMES#;
+ 
+       /* Make sure we aren't wasting our time. */
+ 
+       IF SIZE# <= 0 THEN DO;
+           JOB_SCREEN = ' ';
+           SIZE# = 0;
+           RETURN;
+           END;
+ 
+ 
+       /* Compute scroll parameters. */
+ 
+       MAX_SCROLL# = ISRCH.FOUND / SIZE#;
+       IF (MOD(ISRCH.FOUND,SIZE#) = 0) AND (JPSN# >= MAX_SCROLL#) THEN
+           DO;
+           JPSN# = MAXIMUM(0,MAX_SCROLL# - 1);
+           OFFSET# = SIZE#;
+           END;
+       ELSE
+           IF JPSN# < MAX_SCROLL# THEN
+               OFFSET# = SIZE#;
+           ELSE
+               DO;
+               OFFSET# = MOD(ISRCH.FOUND,SIZE#);
+               JPSN# = MAX_SCROLL#;
+               END;
+ 
+       /* FMT available job queue frames. */
+ 
+       JOB_SCREEN = JTITLE_HDR;
+       DO TEMP# = JPSN# * SIZE# + 1 TO JPSN# * SIZE# + OFFSET#;
+           JOB_FRAMES# = JOB_FRAMES# + 1;
+           JOB$        = ADDR(ISRCH.J(TEMP# - 1));
+           JFRAME.ACCN = B$ISRCH.ACCT;
+ 
+           IF B$ISRCH.PRIO ~= %JP_RUNAFTER# THEN
+               JFRAME.JNAME = B$ISRCH.JNAME;
+ 
+           IF B$ISRCH.PRIO ~= %JP_RUN# THEN
+               CALL UNBLOCK(B$ISRCH.TIM,JFRAME.TIME);
+           ELSE
+               DO;
+               FPT_STATE.V.SYSID# = B$ISRCH.SYSID;
+               CALL M$STATE(FPT_STATE);
+               CALL UNBLOCK(STATE_BUF.CPU_REMAINING,JFRAME.TIME);
+               END;
+ 
+           CALL BINCHAR(JFRAME.IPRIO,B$ISRCH.IPRIO);
+           CALL EDITSTR(JFRAME.IPRIO,,,CONVERT_STR1,JFRAME.IPRIO);
+ 
+           CALL BINCHAR(JFRAME.SYSID,B$ISRCH.SYSID);
+           CALL EDITSTR(JFRAME.SYSID,,,CONVERT_STR2,JFRAME.SYSID);
+ 
+           CALL BINCHAR(JFRAME.MEM,B$ISRCH.RRT(0));
+           CALL EDITSTR(JFRAME.MEM,,,CONVERT_STR3,JFRAME.MEM);
+ 
+           CALL BINCHAR(JFRAME.T9,B$ISRCH.RRT(2));
+           CALL EDITSTR(JFRAME.T9,,,CONVERT_STR1,JFRAME.T9);
+ 
+           CALL BINCHAR(JFRAME.SP,B$ISRCH.RRT(1));
+           CALL EDITSTR(JFRAME.SP,,,CONVERT_STR1,JFRAME.SP);
+ 
+           JFRAME.RFLG = ' ';
+           IF B$ISRCH.FLG.O3 THEN
+               JFRAME.FLG.F = 'Y ';
+           IF B$ISRCH.FLG.O1 THEN
+               JFRAME.FLG.O = 'Y ';
+           IF B$ISRCH.FLG.RA THEN
+               JFRAME.FLG.D = 'Y ';
+           IF B$ISRCH.FLG.ACC THEN
+               JFRAME.FLG.A = 'Y';
+ 
+           DO CASE(B$ISRCH.PRIO);
+               CASE(%JP_RUN#);
+                   JFRAME.STATUS = '  Running';
+               CASE(%JP_FOLL#);
+                   JFRAME.STATUS = '  Follows';
+               CASE(%JP_RUNAFTER#);
+                   JFRAME.STATUS = ' Deferred';
+                   DFR_UNTIME.TSTAMP_ = VECTOR(B$ISRCH.RATIM);
+                   CALL M$TIME(DFR_UNTIME);
+                   CALL CONCAT(JFRAME.JNAME,DFR_DATE,
+                               '  ',SUBSTR(DFR_TIME,,5));
+               CASE(%JP_WPART#);
+                   JFRAME.STATUS = '  Part''nd';
+               CASE(%JP_OTHER#);
+                   JFRAME.STATUS = '  Other Q';
+               CASE(%JP_WPS#);
+                   JFRAME.STATUS = ' PSN Wait';
+               CASE(ELSE);
+                   JFRAME.AA.A = ' Ahead';
+                   CALL BINCHAR(JFRAME.AA.NAHEAD,B$ISRCH.AHEAD);
+                   CALL EDITSTR(JFRAME.AA.NAHEAD,,,
+                                CONVERT_STR1,JFRAME.AA.NAHEAD);
+               END; /* Do Case */
+ 
+           SUBSTR(JOB_SCREEN,JOB_FRAMES# * 80, 80) = JFRAME_REDEF;
+           END;
+ 
+       /* Compute max screen size for procedure FMT_OUTPUTQ. */
+ 
+       IF (Q_FLAG# = %BOTH_QUEUES#) AND (OUTPUT_FRAMES# > 0) THEN
+           IF FRAMES_AVAIL# - JOB_FRAMES# <= 3 THEN
+               SIZE# = 0;
+           ELSE
+               SIZE# = FRAMES_AVAIL# - JOB_FRAMES# - 3;
+ 
+END FMT_JOBXSQ;
+ 
+%EJECT;
+GET_JOBXSQ:PROC;
+ 
+RETRY:
+       CALL M$JOBSTATS(J_JOBSTATS) ALTRET(ERR);
+       JOB_FRAMES# = ISRCH.FOUND;
+       RETURN;
+ 
+ERR:
+       DO CASE(B$TCB.ALT$->B$ALT.ERR.CODE);
+           CASE(%E$NOTFND,%E$FNOTFND);
+               JOB_FRAMES# = 0;
+               JOB_SCREEN = '...None (Job Queue)';
+           CASE(%E$JSIRAS);
+               CALL M$GDS(DS4);
+               J_JOBSTATS.RESULTS_ = DS4_MEM;
+               GOTO RETRY;
+           CASE(ELSE);
+               CALL M$MERC;
+           END;
+ 
+END GET_JOBXSQ;
+ 
+%EJECT;
+UNBLOCK:PROC(TSTAMP,STRING);
+ 
+       /* Turns a timestamp into a readable character string. */
+ 
+DCL TEMP# UBIN;
+DCL TSTAMP UBIN;
+ 
+DCL STRING CHAR(9);
+ 
+DCL CONVERT_STR5 (0:8) BIT(9) CONSTANT INIT(
+       %MVZB3,%INSB0,%ASCBIT(':'),%MVZB1,%MVC1,%SES10,%INSB0,%ASCBIT(':'),%MVC2);
+ 
+       TEMP# = TSTAMP / 360000;
+       TSTAMP = MOD(TSTAMP,360000);
+ 
+       CALL BINCHAR(SUBSTR(STRING,,3),TEMP#);
+ 
+       TEMP# = TSTAMP / 6000;
+       TSTAMP = MOD(TSTAMP,6000);
+ 
+       CALL BINCHAR(SUBSTR(STRING,3,2),TEMP#);
+ 
+       TEMP# = TSTAMP / 100;
+ 
+       CALL BINCHAR(SUBSTR(STRING,5,2),TEMP#);
+       CALL EDITSTR(STRING,,,CONVERT_STR5,STRING);
+ 
+END UNBLOCK;
+ 
+%EJECT;
+PASTE_SCREEN:PROC;
+ 
+       /* Piece job and output screens on to the user's CRT. */
+ 
+       IF (OUTPUT_FRAMES# = 0) AND (JOB_FRAMES# = 0) THEN
+           CALL CONCAT(SUBSTR(NEW_STRING.Q,TAPE_FRAMES# * 80),
+                       SUBSTR(JOB_SCREEN,,80),
+                       SUBSTR(OUTPUT_SCREEN,,80));
+       ELSE
+           IF OUTPUT_FRAMES# = 0 THEN
+               CALL CONCAT(SUBSTR(NEW_STRING.Q,TAPE_FRAMES# * 80),
+                           SUBSTR(JOB_SCREEN,,(JOB_FRAMES# + 1) * 80),
+                           BLANK_LINE,SUBSTR(OUTPUT_SCREEN,,80));
+           ELSE
+               IF JOB_FRAMES# = 0 THEN
+                   CALL CONCAT(SUBSTR(NEW_STRING.Q,TAPE_FRAMES# * 80),
+                               SUBSTR(JOB_SCREEN,,160),
+                               OUTPUT_SCREEN);
+               ELSE
+                   CALL CONCAT(SUBSTR(NEW_STRING.Q,TAPE_FRAMES# * 80),
+                               SUBSTR(JOB_SCREEN,,(JOB_FRAMES# +1) * 80),
+                               BLANK_LINE,OUTPUT_SCREEN);
+ 
+END PASTE_SCREEN;
+ 
+END XSQ;
+%EOD;
+/*M* GET_TAPES - format tape drive tables found in monitor LS.
+ 
+       Dedication: To MLH and JTA, may you never be struck down before
+                   scheduled retirement.                            */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+GET_TAPES:PROC(PRIV,MAX_TAPES#,TAPE_FRAMES#,SCREEN,FLGS);
+ 
+DCL PRIV BIT(1) WALIGNED;
+DCL MAX_TAPES# SBIN;
+DCL TAPE_FRAMES# SBIN;
+DCL 1 FLGS ALIGNED,
+       2 SHOW_FREE BIT(1) UNAL,
+       2 SHOW_PART BIT(1) UNAL,
+       2 * BIT(34) UNAL;
+DCL 1 SCREEN CALIGNED,
+       2 HDR CHAR(80),
+       2 ADEVC (0:19) CHAR(80);
+ 
+%INCLUDE CP_6;
+%INCLUDE B_MICROPS_C;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B_SEGIDS_C;
+DCL B$JIT$ PTR SYMREF;
+%INCLUDE B$JIT;
+DCL DAM$MAP ENTRY(5) ALTRET;
+DCL DAM$INIT ENTRY ALTRET;
+DCL I SBIN STATIC;
+DCL J SBIN STATIC;
+DCL DCT$$ PTR STATIC;
+DCL EDIT1 (0:1) BIT(9) CONSTANT INIT(%MVZB6,%MVC1);
+DCL EDIT2 (0:1) BIT(9) CONSTANT INIT(%MVZB4,%MVC1);
+DCL DCT$ PTR STATIC;
+DCL DDT$ PTR STATIC;
+DCL RAT$ PTR STATIC;
+DCL PTR$ PTR BASED;
+DCL 1 P BASED ALIGNED,
+       2 A BIT(24) UNAL,
+       2 S BIT(12) UNAL;
+DCL N$DCT$(0:0) PTR BASED(DCT$$);
+%INCLUDE FT_SUBS;
+%INCLUDE FT$DDT;
+%INCLUDE FR$RAT;
+%INCLUDE NI$TABLES;
+%NI$DCT(NAME=DCT,STCLASS="BASED(DCT$)");
+%FR$RAT(NAME=FR$RAT,STCLASS="BASED(RAT$)");
+%EQU HDR# ='DEVC DDTFLGS  SYSID ACCOUNT  STATUS SERNUM RNG DENS V BLOCKS CFSN FFSN OWNER';
+DCL SYSID SBIN;
+%FPT_PRIV (PRIV=%PR_SPCLMM#,AUTH=YES);
+%FPT_MONINFO (MONPTRS=VLR_MONPTRS);
+%VLR_MONPTRS;
+ 
+%EJECT;
+       J = 0;
+       I = 1;
+SRCHR: DO WHILE('1'B);
+           IF ADDR(N$DCT$(I))->P.S ~= %TIGRSID THEN
+               EXIT;
+           ELSE DO;
+               DCT$ = N$DCT$(I);
+               ADDR(DCT$)->P.S = %SPCL8SID;
+               IF DCT.DDT$ ~= ADDR(NIL) THEN DO;
+                   CALL MAKE_FRAME;
+                   IF J >= MAX_TAPES# THEN
+                       EXIT SRCHR;
+                   END;
+               END;
+           I = I + 1;
+           END;
+ 
+       IF J = 0 THEN
+           TAPE_FRAMES# = 0;
+       ELSE
+           TAPE_FRAMES# = J;
+ 
+       IF TAPE_FRAMES# > 0 THEN DO;
+           SCREEN.HDR = %HDR#;
+           TAPE_FRAMES# = TAPE_FRAMES# + 1;
+           IF TAPE_FRAMES# < 20 THEN DO;
+               SCREEN.ADEVC(J) = ' ';
+               TAPE_FRAMES# = TAPE_FRAMES# + 1;
+               END;
+           END;
+ 
+       RETURN;
+ 
+%EJECT;
+INIT_TAPES:ENTRY(PRIV);
+ 
+       PRIV = '0'B;
+       CALL M$SPRIV(FPT_PRIV)
+              WHENALTRETURN DO;
+                  FPT_PRIV.V.PRIV# = %PR_EXMM#;
+                  CALL M$SPRIV(FPT_PRIV)
+                      WHENALTRETURN DO;
+       NOPRIV:            RETURN;
+                          END;
+                  END;
+ 
+       CALL DAM$INIT ALTRET(NOPRIV);
+       CALL M$MONINFO(FPT_MONINFO) ALTRET(NOPRIV);
+       DCT$$ = VLR_MONPTRS.N$DCT$$;
+       ADDR(DCT$$)->P.S = %SPCL8SID;
+       PRIV = %YES#;
+       RETURN;
+ 
+ 
+%EJECT;
+MAKE_FRAME:PROC;
+ 
+DCL 1 FRAME CALIGNED,
+       2 DEVC CHAR(4),
+       2 * CHAR(1),
+       2 F,
+           3 A CHAR(1),
+           3 S CHAR(1),
+           3 E CHAR(1),
+           3 W CHAR(1),
+           3 L CHAR(1),
+           3 F CHAR(1),
+           3 X CHAR(1),
+       2 SYSID CHAR(7),
+       2 * CHAR(1),
+       2 ACCOUNT CHAR(8),
+       2 * CHAR(1),
+       2 STATUS CHAR(6),
+       2 * CHAR(1),
+       2 SERNUM CHAR(6),
+       2 * CHAR(1),
+       2 RNG CHAR(3),
+       2 * CHAR(1),
+       2 DENS CHAR(4),
+       2 * CHAR(1),
+       2 VOLA CHAR(1),
+       2 BLOCKS CHAR(7),
+       2 CFSN CHAR(5),
+       2 FFSN CHAR(5),
+       2 * CHAR(1),
+       2 OWNER CHAR(8);
+DCL RFRAME REDEF FRAME CHAR(79);
+ 
+%EJECT;
+DDT$ = DCT.DDT$;  RAT$ = DCT.RAT$;
+ADDR(DDT$)->P.S = %SPCL8SID;
+ADDR(RAT$)->P.S = %SPCL8SID;
+ 
+RFRAME = '  ';
+FRAME.DEVC = DCT.DEVNM;
+IF DCT.STATUS.DOWN THEN
+       IF NOT FLGS.SHOW_PART THEN
+           RETURN;
+       ELSE
+           FRAME.STATUS = '*Part*';
+ELSE IF FR$RAT.REEL.ASID = 0 AND FR$RAT.RES.SISID = 0 AND FR$RAT.FLG = '0'B THEN
+       IF NOT FLGS.SHOW_FREE THEN
+           RETURN;
+       ELSE
+           FRAME.STATUS = 'Free';
+ELSE IF FR$RAT.REEL.ASID ~= 0 THEN DO;
+       IF FR$RAT.REEL.ASID > 1 THEN DO;
+           SYSID = FR$RAT.REEL.ASID;
+           CALL FMTSYSID;
+           END;
+ 
+       CALL FMTDDT;
+       END;
+ELSE IF FR$RAT.FLG.RUP THEN DO;
+       CALL FMTDDT;
+ 
+       /* The following section of code was suggested by Terry
+          Koral.  Nice suggestion, Terry.                     */
+ 
+       IF FR$RAT.FLG.MBIT.MTSC AND DDT$->FT$DDT.SCRTCH AND DDT$->FT$DDT.SN = ' ' THEN DO;
+           FRAME.SERNUM = 'Scrtch';
+           GOTO SKPID;
+           END;
+       ELSE
+           IF FR$RAT.REEL.ASID = 0 AND FR$RAT.REEL.SER ~= ' ' THEN DO;
+               FRAME.SERNUM = FR$RAT.REEL.SER;
+               GOTO SKPID;
+               END;
+ 
+       IF FR$RAT.RES.SISID ~= 0 AND (~FR$RAT.FLG.MBIT.SOL) THEN DO;
+           SYSID = FR$RAT.RES.SISID;
+           CALL FMTSYSID;
+           END;
+SKPID: END;
+ELSE IF FR$RAT.RES.SISID ~= 0 THEN DO;
+       SYSID = FR$RAT.RES.SISID;
+       CALL FMTSYSID;
+       IF FR$RAT.FLG = '0'B THEN
+           FRAME.STATUS = 'Alloc';
+       ELSE IF FR$RAT.FLG.MBIT.SOL THEN DO;
+           FRAME.STATUS = 'Mount';
+           FRAME.SERNUM = FR$RAT.SSER;
+           END;
+       END;
+ 
+SCREEN.ADEVC(J) = RFRAME;
+J = J + 1;
+RETURN;
+ 
+%EJECT;
+FMTDDT:PROC;
+ 
+ 
+IF DDT$->FT$DDT.FRSTFSN > 99999 THEN
+       FRAME.FFSN = ' ****';
+ELSE DO;
+       CALL BINCHAR(FRAME.FFSN,DDT$->FT$DDT.FRSTFSN);
+       CALL EDITCHAR(FRAME.FFSN,,,EDIT2,FRAME.FFSN);
+       END;
+ 
+IF DDT$->FT$DDT.FSN > 99999 THEN
+       FRAME.CFSN = ' ****';
+ELSE DO;
+       CALL BINCHAR(FRAME.CFSN,DDT$->FT$DDT.FSN);
+       CALL EDITCHAR(FRAME.CFSN,,,EDIT2,FRAME.CFSN);
+       END;
+ 
+IF DCT.MT.POS.CRECCNT > 9999999 THEN
+       FRAME.BLOCKS = ' ******';
+ELSE DO;
+       CALL BINCHAR(FRAME.BLOCKS,DCT.MT.POS.CRECCNT);
+       CALL EDITCHAR(FRAME.BLOCKS,,,EDIT1,FRAME.BLOCKS);
+       END;
+ 
+FRAME.OWNER = DDT$->FT$DDT.ACCT;
+FRAME.SERNUM = DDT$->FT$DDT.SN;
+ 
+IF DDT$->FT$DDT.RINGIN THEN
+       FRAME.RNG = '*Y*';
+ELSE
+       FRAME.RNG = '-N-';
+ 
+IF DDT$->FT$DDT.ANST THEN
+       FRAME.F.A = 'A';
+IF DDT$->FT$DDT.SCRTCH  THEN
+       FRAME.F.S = 'S';
+IF DDT$->FT$DDT.EBCDIC THEN
+       FRAME.F.E = 'E';
+IF DDT$->FT$DDT.WRITE THEN
+       FRAME.F.W = 'W';
+IF DDT$->FT$DDT.POSLOST THEN
+       FRAME.F.L = 'L';
+IF DDT$->FT$DDT.FUNNYPOS THEN
+       FRAME.F.F = 'F';
+IF DDT$->FT$DDT.EXPIRED THEN
+       FRAME.F.X = 'X';
+ 
+DO CASE(DDT$->FT$DDT.POS);
+       CASE(FTP_UND#); FRAME.STATUS = 'Undetr';
+       CASE(FTP_BOV#); FRAME.STATUS = 'BgnVol';
+       CASE(FTP_HDR#); FRAME.STATUS = 'Header';
+       CASE(FTP_BOD#); FRAME.STATUS = 'BgnDat';
+       CASE(FTP_EOV#); FRAME.STATUS = 'EndVol';
+       CASE(FTP_CHK#); FRAME.STATUS = 'ChkLab';
+       CASE(ELSE);     FRAME.STATUS = '**??**';
+       END;
+ 
+DO CASE(DDT$->FT$DDT.VOLACCESS);
+       CASE(%ALL#) ;   FRAME.VOLA = 'A';
+       CASE(%IN#)  ;   FRAME.VOLA = 'I';
+       CASE(%NONE#);   FRAME.VOLA = 'N';
+       CASE(ELSE)  ;                      ;
+       END;
+ 
+DO CASE(DDT$->FT$DDT.DENSITY);
+       CASE(%D800#) ;  FRAME.DENS = ' 800';
+       CASE(%D1600#);  FRAME.DENS = '1600';
+       CASE(%D6250#);  FRAME.DENS = '6250';
+       CASE(0)      ;  FRAME.DENS = '   0';
+       CASE(ELSE);     CALL BINCHAR(FRAME.DENS,DDT$->FT$DDT.DENSITY);
+       END;
+ 
+RETURN;
+END FMTDDT;
+ 
+%EJECT;
+FMTSYSID:PROC;
+ 
+DCL JIT$ PTR;
+ 
+CALL BINCHAR(FRAME.SYSID,SYSID);
+CALL EDITCHAR(FRAME.SYSID,,,EDIT1,FRAME.SYSID);
+CALL DAM$MAP(B$JIT$,JIT$,SYSID,0) ALTRET(OUT_OF_HERE);
+FRAME.ACCOUNT = JIT$->B$JIT.ACCN;
+OUT_OF_HERE:RETURN;
+ 
+END FMTSYSID;
+ 
+END MAKE_FRAME;
+ 
+END GET_TAPES;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+BREAK_BACK:PROC ASYNC;
+%INCLUDE CP_6;
+%FPT_TRMPRG        (RSTBRK=YES,STCLASS="CONSTANT SYMDEF");
+ 
+DCL REMEMBER_LABEL REMEMBER SYMREF;
+ 
+       DO INHIBIT;
+           CALL M$TRMPRG(FPT_TRMPRG);
+           CALL M$CLRSTK;
+           UNWIND TO REMEMBER_LABEL;
+           END;
+ 
+END BREAK_BACK;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+NOBREAKS:PROC ASYNC;
+%INCLUDE CP_6;
+%FPT_TRMPRG        (STCLASS=SYMREF);
+ 
+ 
+       DO INHIBIT;
+           CALL M$TRMPRG(FPT_TRMPRG);
+           RETURN;
+       END;
+ 
+END NOBREAKS;

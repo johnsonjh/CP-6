@@ -1,0 +1,1638 @@
+VERSION E05
+
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:1    
+        1        1        /*M* KYD$DISCON - routines associated with disconnection */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+        8        8               ECI=0,DIN=7,CSU=3,AND      */
+        9        9        /*P* NAME: KYD$DISCON - routines associated with disconnection */
+       10       10
+       11       11        KYD$DISCON: PROC ( KY$CTX );
+       12       12        /*
+       13       13               EXTERNAL OVERVIEW
+       14       14
+       15       15            KYD$DISCON is called from KYV$VDI when VDH is releasing it's
+       16       16            KV$VDI structure.  This meams that we are supposed to clean up
+       17       17            our act, release our context, and go away.  Also, if the dis-
+       18       18            connect is not the result of a logon reject or DISABLE/KILL from
+       19       19            handler common, we try to log the device on again.  This is the
+       20       20            case when the host crashes, and we try to get the devices started
+       21       21            again.
+       22       22        */
+       23       23        /*
+       24       24               INTERNAL OVERVIEW
+       25       25
+       26       26            KYD$FLUSH is called to stop any outstanding I/O.  For LPs and
+       27       27            CPs, the Q is released; for CRs, the input buffer is released.
+       28       28            The context is deleted from the chain of contexts.  If the
+       29       29            device is supposed to log on again, a call is made to the
+       30       30            enable routine (KYM$ADM_ENABLE_P) as if the call was from
+       31       31            handdler common.  Finally, the context is released.
+       32       32        */
+       33       33        /*
+       34       34            Include files
+       35       35        */
+       36       36        %INCLUDE LCP_6;
+       37     4315        %INCLUDE KY_SCODE_C;
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:2    
+       38     4329        %VLP_SCODE ( FPTN = U_WRGCTX, FCG = KY, MID = D, ERR# = S$KY_WRGCTX, STCLASS =
+              4329            CONSTANT);
+       39     4390        %INCLUDE GH_HARDWARE_M;
+       40     4488        %INCLUDE KL_AFCN_C;
+       41     4589        %INCLUDE KL_MACRO_C;
+       42     7941        %INCLUDE K_ID_E;
+       43     7991        %K#ENTID_E;
+       44     8010        %K#LYRID_E;
+       45     8017        %INCLUDE KV_GLBCNS_E;
+       46     8358        %INCLUDE KV_PRMID_E;
+       47     8532        %INCLUDE KV$GLBCTX;
+       48     8977        %INCLUDE KV$GLB;
+       49     9396        %INCLUDE KV$PRM;
+       50     9609        %INCLUDE KH$CHN;
+       51     9731        %INCLUDE KY_URP_M;
+       52    10026        %INCLUDE KY_SUBS_C;
+       53    10115        %INCLUDE KH$STT;
+       54    10145        %INCLUDE KV_GLB_M;
+       55    10267        %INCLUDE KY_DATA_R;
+       56    11062        %INCLUDE OC_SUBS_C;
+       57    11793        %INCLUDE KH_SCREECH_M;
+       58    11804        %INCLUDE KHC_MAC_C;
+       59    11845        %INCLUDE KH_MACRO_C;
+       60    12588        /*
+       61    12589            External interfaces
+       62    12590        */
+       63    12591    1          DCL KYN$ENABLE ENTRY;
+       64    12592    1          DCL KYK$OPCON ENTRY(2);
+       65    12593    1          DCL KYN$DISABLE ENTRY;
+       66    12594    1          DCL KVB$RLS2NSYS ENTRY(2) ALTRET;
+       67    12595    1          DCL KYD$FLUSH ENTRY(1);
+       68    12596    1          DCL KYA$ENABLE ENTRY(1) ALTRET;
+       69    12597    1          DCL KYQ$KILL ENTRY(1);
+       70    12598    1          DCL KHD$SCREECH ENTRY(1);
+       71    12599        /*
+       72    12600            Parameters
+       73    12601        */
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:3    
+       74    12602        %KY$CTX  ( NAME = KY$CTX, STCLASS = );
+       75    12779        /*
+       76    12780            Auto
+       77    12781        */
+       78    12782    1          DCL CHN$ PTR;
+       79    12783    1          DCL CTX$ PTR;
+       80    12784        /*
+       81    12785            Based
+       82    12786        */
+       83    12787        %KV$VDI  ( NAME = KV$VDI, STCLASS = BASED );
+       84    12858        %KY$CTX  ( NAME = KY$SEARCHCTX, STCLASS = BASED );
+       85    13035        %KH$CHN (STCLASS=BASED);
+       86    13159        %INHIBIT_DCLS;
+       87    13171        %KH$CTLTBL (FPTN=KH$CTLTBL,STCLASS="BASED(KH_CTLTBL$)");
+       88    13383    1          DCL KH_CTLTBL$ PTR SYMREF;
+       89    13384    1          DCL ONEWORD UBIN BASED;
+       90    13385        /**/
+       91    13386        /* EQUs */
+       92    13387        %KV_DSCRSN_E;
+       93    13396        %KV_PRMID_E;
+       94    13552        /**/
+       95    13553        /*
+       96    13554            Call FLUSH.
+       97    13555            CR:
+       98    13556               Release the input buffer.
+       99    13557            CP and LP:
+      100    13558               Release the Q.
+      101    13559            Disable.
+      102    13560               Remove this context from the chain.
+      103    13561               Should this ddevice try to log on again?
+      104    13562                  YES:
+      105    13563                     Simulate a call to ENABLE from handler common.
+      106    13564               Release the context.
+      107    13565            Enable.
+      108    13566        */
+      109    13567    1          CALL KYD$FLUSH ( KY$CTX );
+      110    13568    1          KY_STT_URP.NUMDVC(KY$CTX.DVCTYP) = KY_STT_URP.NUMDVC(KY$CTX.DVCTYP) - 1;
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:4    
+      111    13569
+      112    13570    1          IF KY$CTX.DVCTYP = %KY#TYP_CR THEN
+      113    13571    2             DO;
+      114    13572    2                IF KY$CTX.INPUT.BUF$ ~= ADDR(NIL) THEN
+      115    13573    3                   DO;
+      116    13574    3                      CALL KVB$RLS2NSYS(KY$CTX.INPUT.BUF_SIZE,KY$CTX.INPUT.BUF$);
+      117    13575    3                      KY_STT_URP.USRSTT.INPBFRBYTUTL = KY_STT_URP.USRSTT.INPBFRBYTUTL -
+             13575                               KY$CTX.INPUT.BUF_SIZE * 2;
+      118    13576    3                   END;                    /* IF BUF$ ~= ADDR(NIL) */
+      119    13577    2             END;                          /* IF DVCTYP = %KY#TYP_CR */
+      120    13578    1          ELSE
+      121    13579                                                /*  CP and LP  */
+      122    13580    2             DO;
+      123    13581    2                CALL KYQ$KILL ( KY$CTX );
+      124    13582    2             END;
+      125    13583
+      126    13584    1          CALL KYN$DISABLE;
+      127    13585
+      128    13586    1          CTX$ = KY_FIRSTCTX$;
+      129    13587    2          DO WHILE CTX$ ~= ADDR ( NIL ) AND CTX$ ~= ADDR ( KY$CTX );
+      130    13588    2             CTX$ = CTX$ -> KY$SEARCHCTX.NEXT$;
+      131    13589    2          END;
+      132    13590    1          IF CTX$ ~= ADDR ( KY$CTX ) AND
+      133    13591    1             KY$CTX.VDI$->KV$VDI.SSN$ ~= ADDR(NIL) THEN
+      134    13592    2             DO;
+      135    13593                      /*S* SCREECH_CODE: KYD-S$KY_WRGCTX
+      136    13594               MESSAGE: UNITREC has encountered a discrpency between its context and vdhs */
+      137    13595                     %KH$SCREECH ( COD = U_WRGCTX );
+      138    13599    2             END;
+      139    13600    1          IF KY$CTX.PRIOR$ = ADDR ( NIL ) THEN
+      140    13601    2             DO;
+      141    13602    2                KY_FIRSTCTX$ = KY$CTX.NEXT$;
+      142    13603    2             END;
+      143    13604    1          ELSE
+      144    13605    2             DO;
+      145    13606    2                KY$CTX.PRIOR$ -> KY$SEARCHCTX.NEXT$ = KY$CTX.NEXT$;
+      146    13607    2             END;
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:5    
+      147    13608    1          IF KY$CTX.NEXT$ ~= ADDR ( NIL ) THEN
+      148    13609    2             DO;
+      149    13610    2                KY$CTX.NEXT$ -> KY$SEARCHCTX.PRIOR$ = KY$CTX.PRIOR$;
+      150    13611    2             END;
+      151    13612    1          KY$CTX.VDI$->KV$VDI.CHN$->KH$CHN.CTX$ = ADDR(NIL);
+      152    13613    1          IF KY$CTX.DSCRSN ~= %KV_DSCRSN_FRG AND
+      153    13614    1             NOT KY$CTX.Q.THRTL.OUTAMEM AND
+      154    13615    1             KY$CTX.DSCRSN ~= %KV_DSCRSN_RSRSHR THEN
+      155    13616    2             DO;
+      156    13617    2                CHN$ = KY$CTX.VDI$ -> KV$VDI.CHN$;
+      157    13618    2                CALL KYA$ENABLE(CHN$);
+      158    13619    2             END;
+      159    13620
+      160    13621    1          CALL KYK$OPCON(KY$CTX,OC_STTM);
+      161    13622    1          CALL KVB$RLS2NSYS(%KY#CTXBLKSIZ,ADDR(KY$CTX));
+      162    13623    1          KY_STT_URP.USRSTT.CTXBYTUTL = KY_STT_URP.USRSTT.CTXBYTUTL - SIZEW(KY$CTX) * 2
+             13623                   ;
+      163    13624
+      164    13625    1          CALL KYN$ENABLE;
+      165    13626
+      166    13627    1   END KYD$DISCON;
+      167    13628        %EOD;
+
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:6    
+--  Include file information  --
+
+   KH_MACRO_C.:E05TOU  is referenced.
+   KHC_MAC_C.:E05TOU  is referenced.
+   KH_SCREECH_M.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KH$CHN.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   KY_SCODE_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure KYD$DISCON.
+
+   Procedure KYD$DISCON requires 246 words for executable code.
+   Procedure KYD$DISCON requires 18 words of local(AUTO) storage.
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:7    
+
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:8    
+
+ Object Unit name= KYD$DISCON                                 File name= KYD$DISCON.:E05TOU
+ UTS= JUL 30 '97 02:41:24.40 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0  RoData even  UTS      3      3  KYD$DISCON
+    1   Proc  even  none   246     F6  KYD$DISCON
+    2  RoData even  none     2      2  KYD$DISCON
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        1  KYD$DISCON
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       1 KYD$FLUSH
+ yes     yes           Std       2 KVB$RLS2NSYS
+         yes           Std       1 KYQ$KILL
+         yes           Std       2 KYK$OPCON
+         yes           Std       0 KYN$DISABLE
+ yes     yes           Std       1 KYA$ENABLE
+         yes           Std       0 KYN$ENABLE
+         yes           Std       1 KHD$SCREECH
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6A_ARET
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:9    
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KY_FIRSTCTX$                          KY_STT_URP                            KH_CTLTBL$
+r    G$ROS$
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:10   
+
+
+        1        1        /*M* KYD$DISCON - routines associated with disconnection */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+        8        8               ECI=0,DIN=7,CSU=3,AND      */
+        9        9        /*P* NAME: KYD$DISCON - routines associated with disconnection */
+       10       10
+       11       11        KYD$DISCON: PROC ( KY$CTX );
+
+     11   1 000000  D380 0000 0000  xent KYD$DISCON      LNJ,B5   X6A_AUTO_1
+          1 000003       0012 0001                       DC       18,1
+
+       12       12        /*
+       13       13               EXTERNAL OVERVIEW
+       14       14
+       15       15            KYD$DISCON is called from KYV$VDI when VDH is releasing it's
+       16       16            KV$VDI structure.  This meams that we are supposed to clean up
+       17       17            our act, release our context, and go away.  Also, if the dis-
+       18       18            connect is not the result of a logon reject or DISABLE/KILL from
+       19       19            handler common, we try to log the device on again.  This is the
+       20       20            case when the host crashes, and we try to get the devices started
+       21       21            again.
+       22       22        */
+       23       23        /*
+       24       24               INTERNAL OVERVIEW
+       25       25
+       26       26            KYD$FLUSH is called to stop any outstanding I/O.  For LPs and
+       27       27            CPs, the Q is released; for CRs, the input buffer is released.
+       28       28            The context is deleted from the chain of contexts.  If the
+       29       29            device is supposed to log on again, a call is made to the
+       30       30            enable routine (KYM$ADM_ENABLE_P) as if the call was from
+       31       31            handdler common.  Finally, the context is released.
+       32       32        */
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:11   
+       33       33        /*
+       34       34            Include files
+       35       35        */
+       36       36        %INCLUDE LCP_6;
+       37     4315        %INCLUDE KY_SCODE_C;
+       38     4329        %VLP_SCODE ( FPTN = U_WRGCTX, FCG = KY, MID = D, ERR# = S$KY_WRGCTX, STCLASS =
+              4329            CONSTANT);
+       39     4390        %INCLUDE GH_HARDWARE_M;
+       40     4488        %INCLUDE KL_AFCN_C;
+       41     4589        %INCLUDE KL_MACRO_C;
+       42     7941        %INCLUDE K_ID_E;
+       43     7991        %K#ENTID_E;
+       44     8010        %K#LYRID_E;
+       45     8017        %INCLUDE KV_GLBCNS_E;
+       46     8358        %INCLUDE KV_PRMID_E;
+       47     8532        %INCLUDE KV$GLBCTX;
+       48     8977        %INCLUDE KV$GLB;
+       49     9396        %INCLUDE KV$PRM;
+       50     9609        %INCLUDE KH$CHN;
+       51     9731        %INCLUDE KY_URP_M;
+       52    10026        %INCLUDE KY_SUBS_C;
+       53    10115        %INCLUDE KH$STT;
+       54    10145        %INCLUDE KV_GLB_M;
+       55    10267        %INCLUDE KY_DATA_R;
+       56    11062        %INCLUDE OC_SUBS_C;
+       57    11793        %INCLUDE KH_SCREECH_M;
+       58    11804        %INCLUDE KHC_MAC_C;
+       59    11845        %INCLUDE KH_MACRO_C;
+       60    12588        /*
+       61    12589            External interfaces
+       62    12590        */
+       63    12591    1          DCL KYN$ENABLE ENTRY;
+       64    12592    1          DCL KYK$OPCON ENTRY(2);
+       65    12593    1          DCL KYN$DISABLE ENTRY;
+       66    12594    1          DCL KVB$RLS2NSYS ENTRY(2) ALTRET;
+       67    12595    1          DCL KYD$FLUSH ENTRY(1);
+       68    12596    1          DCL KYA$ENABLE ENTRY(1) ALTRET;
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:12   
+       69    12597    1          DCL KYQ$KILL ENTRY(1);
+       70    12598    1          DCL KHD$SCREECH ENTRY(1);
+       71    12599        /*
+       72    12600            Parameters
+       73    12601        */
+       74    12602        %KY$CTX  ( NAME = KY$CTX, STCLASS = );
+       75    12779        /*
+       76    12780            Auto
+       77    12781        */
+       78    12782    1          DCL CHN$ PTR;
+       79    12783    1          DCL CTX$ PTR;
+       80    12784        /*
+       81    12785            Based
+       82    12786        */
+       83    12787        %KV$VDI  ( NAME = KV$VDI, STCLASS = BASED );
+       84    12858        %KY$CTX  ( NAME = KY$SEARCHCTX, STCLASS = BASED );
+       85    13035        %KH$CHN (STCLASS=BASED);
+       86    13159        %INHIBIT_DCLS;
+       87    13171        %KH$CTLTBL (FPTN=KH$CTLTBL,STCLASS="BASED(KH_CTLTBL$)");
+       88    13383    1          DCL KH_CTLTBL$ PTR SYMREF;
+       89    13384    1          DCL ONEWORD UBIN BASED;
+       90    13385        /**/
+       91    13386        /* EQUs */
+       92    13387        %KV_DSCRSN_E;
+       93    13396        %KV_PRMID_E;
+       94    13552        /**/
+       95    13553        /*
+       96    13554            Call FLUSH.
+       97    13555            CR:
+       98    13556               Release the input buffer.
+       99    13557            CP and LP:
+      100    13558               Release the Q.
+      101    13559            Disable.
+      102    13560               Remove this context from the chain.
+      103    13561               Should this ddevice try to log on again?
+      104    13562                  YES:
+      105    13563                     Simulate a call to ENABLE from handler common.
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:13   
+      106    13564               Release the context.
+      107    13565            Enable.
+      108    13566        */
+      109    13567    1          CALL KYD$FLUSH ( KY$CTX );
+
+  13567   1 000005  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          1 000007  CBF0 0100                            LAB,B4   256,IMO
+          1 000009  E380 0000 0000  xent                 LNJ,B6   KYD$FLUSH
+          1 00000C       0001                            DC       s:13568,PREL
+
+      110    13568    1          KY_STT_URP.NUMDVC(KY$CTX.DVCTYP) = KY_STT_URP.NUMDVC(KY$CTX.DVCTYP) - 1;
+
+  13568   1 00000D  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 00000F  B2C6 000B                            LLH,R3   11,B6
+          1 000011  8CB0 0000 0022  xsym                 LDI      KY_STT_URP+34,R3
+          1 000014  8470 FFFF FFFF                       AID      -1,IMO
+          1 000017  8D30 0000 0022  xsym                 SDI      KY_STT_URP+34,R3
+
+      111    13569
+      112    13570    1          IF KY$CTX.DVCTYP = %KY#TYP_CR THEN
+
+  13570   1 00001A  E2C6 000B                            LLH,R6   11,B6
+          1 00001C  6D03                                 CMV,R6   3
+          1 00001D  0981 0028                            BNE      s:13581,PREL
+
+      113    13571    2             DO;
+
+      114    13572    2                IF KY$CTX.INPUT.BUF$ ~= ADDR(NIL) THEN
+
+  13572   1 00001F  8DC6 001A                            CMN      26,B6
+          1 000021  0901 002C                            BE       s:13584,PREL
+
+      115    13573    3                   DO;
+
+      116    13574    3                      CALL KVB$RLS2NSYS(KY$CTX.INPUT.BUF_SIZE,KY$CTX.INPUT.BUF$);
+
+  13574   1 000023  DBC6 001A                            LAB,B5   26,B6
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:14   
+          1 000025  DFC7 000E                            STB,B5   CTX$+6,AUTO
+          1 000027  CBC6 001C                            LAB,B4   28,B6
+          1 000029  CFC7 000C                            STB,B4   CTX$+4,AUTO
+          1 00002B  BBC7 000C                            LAB,B3   CTX$+4,AUTO
+          1 00002D  CBF0 0200                            LAB,B4   512,IMO
+          1 00002F  E380 0000 0000  xent                 LNJ,B6   KVB$RLS2NSYS
+          1 000032       0001                            DC       s:13575,PREL
+
+      117    13575    3                     KY_STT_URP.USRSTT.INPBFRBYTUTL = KY_STT_URP.USRSTT.INPBFRBYTUTL -
+             13575                               KY$CTX.INPUT.BUF_SIZE * 2;
+
+  13575   1 000033  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 000035  F846 001C                            LDR,R7   28,B6
+          1 000037  6C00                                 LDV,R6   0
+          1 000038  7081                                 DOL,R7   1
+          1 000039  8656                                 CPL      R6
+          1 00003A  8657                                 CPL      R7
+          1 00003B  8470 0000 0001                       AID      1,IMO
+          1 00003E  8400 0000 001C  xsym                 AID      KY_STT_URP+28
+          1 000041  8D00 0000 001C  xsym                 SDI      KY_STT_URP+28
+
+      118    13576    3                   END;                    /* IF BUF$ ~= ADDR(NIL) */
+
+      119    13577    2             END;                          /* IF DVCTYP = %KY#TYP_CR */
+
+  13577   1 000044  0F81 0009                            B        s:13584,PREL
+
+      120    13578    1          ELSE
+      121    13579                                                /*  CP and LP  */
+      122    13580    2             DO;
+
+      123    13581    2                CALL KYQ$KILL ( KY$CTX );
+
+  13581   1 000046  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          1 000048  CBF0 0100                            LAB,B4   256,IMO
+          1 00004A  E380 0000 0000  xent                 LNJ,B6   KYQ$KILL
+          1 00004D       0001                            DC       s:13584,PREL
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:15   
+
+      124    13582    2             END;
+
+      125    13583
+      126    13584    1          CALL KYN$DISABLE;
+
+  13584   1 00004E  CBF0 0000                            LAB,B4   0,IMO
+          1 000050  E380 0000 0000  xent                 LNJ,B6   KYN$DISABLE
+          1 000053       0001                            DC       s:13586,PREL
+
+      127    13585
+      128    13586    1          CTX$ = KY_FIRSTCTX$;
+
+  13586   1 000054  EC80 0000 0000  xsym                 LDB,B6   KY_FIRSTCTX$
+          1 000057  EFC7 0008                            STB,B6   CTX$,AUTO
+
+      129    13587    2          DO WHILE CTX$ ~= ADDR ( NIL ) AND CTX$ ~= ADDR ( KY$CTX );
+
+  13587   1 000059  0F81 0006                            B        s:13589,PREL
+
+      130    13588    2             CTX$ = CTX$ -> KY$SEARCHCTX.NEXT$;
+
+  13588   1 00005B  ECC7 0008                            LDB,B6   CTX$,AUTO
+          1 00005D  DC86                                 LDB,B5   ,B6
+          1 00005E  DFC7 0008                            STB,B5   CTX$,AUTO
+
+      131    13589    2          END;
+
+  13589   1 000060  8DC7 0008                            CMN      CTX$,AUTO
+          1 000062  0901 0006                            BE       s:13590,PREL
+          1 000064  ECC7 0008                            LDB,B6   CTX$,AUTO
+          1 000066  EDC7 0004                            CMB,B6   @KY$CTX,AUTO
+          1 000068  09F3                                 BNE      s:13588,SPREL
+
+      132    13590    1          IF CTX$ ~= ADDR ( KY$CTX ) AND
+
+  13590   1 000069  ECC7 0008                            LDB,B6   CTX$,AUTO
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:16   
+          1 00006B  EDC7 0004                            CMB,B6   @KY$CTX,AUTO
+          1 00006D  0901 0012                            BE       s:13600,PREL
+          1 00006F  DCC7 0004                            LDB,B5   @KY$CTX,AUTO
+          1 000071  CCC5 0008                            LDB,B4   8,B5
+          1 000073  8DC4 0004                            CMN      4,B4
+          1 000075  0901 000A                            BE       s:13600,PREL
+
+      133    13591    1             KY$CTX.VDI$->KV$VDI.SSN$ ~= ADDR(NIL) THEN
+      134    13592    2             DO;
+
+      135    13593                      /*S* SCREECH_CODE: KYD-S$KY_WRGCTX
+      136    13594              MESSAGE: UNITREC has encountered a discrpency between its context and vdhs */
+      137    13595                     %KH$SCREECH ( COD = U_WRGCTX );
+
+  13597   1 000077  BB80 0000 0000  02                   LAB,B3   0
+          1 00007A  CBF0 0100                            LAB,B4   256,IMO
+          1 00007C  E380 0000 0000  xent                 LNJ,B6   KHD$SCREECH
+          1 00007F       0001                            DC       s:13600,PREL
+
+      138    13599    2             END;
+
+      139    13600    1          IF KY$CTX.PRIOR$ = ADDR ( NIL ) THEN
+
+  13600   1 000080  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          1 000082  8DC6 0002                            CMN      2,B6
+          1 000084  0981 0007                            BNE      s:13606,PREL
+
+      140    13601    2             DO;
+
+      141    13602    2                KY_FIRSTCTX$ = KY$CTX.NEXT$;
+
+  13602   1 000086  DC86                                 LDB,B5   ,B6
+          1 000087  DF80 0000 0000  xsym                 STB,B5   KY_FIRSTCTX$
+
+      142    13603    2             END;
+
+  13603   1 00008A  0F81 0005                            B        s:13608,PREL
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:17   
+
+      143    13604    1          ELSE
+      144    13605    2             DO;
+
+      145    13606    2                KY$CTX.PRIOR$ -> KY$SEARCHCTX.NEXT$ = KY$CTX.NEXT$;
+
+  13606   1 00008C  DCC6 0002                            LDB,B5   2,B6
+          1 00008E  CC86                                 LDB,B4   ,B6
+          1 00008F  CF85                                 STB,B4   ,B5
+
+      146    13607    2             END;
+
+      147    13608    1          IF KY$CTX.NEXT$ ~= ADDR ( NIL ) THEN
+
+  13608   1 000090  8D86                                 CMN      ,B6
+          1 000091  0901 0006                            BE       s:13612,PREL
+
+      148    13609    2             DO;
+
+      149    13610    2                KY$CTX.NEXT$ -> KY$SEARCHCTX.PRIOR$ = KY$CTX.PRIOR$;
+
+  13610   1 000093  DC86                                 LDB,B5   ,B6
+          1 000094  CCC6 0002                            LDB,B4   2,B6
+          1 000096  CFC5 0002                            STB,B4   2,B5
+
+      150    13611    2             END;
+
+      151    13612    1          KY$CTX.VDI$->KV$VDI.CHN$->KH$CHN.CTX$ = ADDR(NIL);
+
+  13612   1 000098  DCC6 0008                            LDB,B5   8,B6
+          1 00009A  CC85                                 LDB,B4   ,B5
+          1 00009B  BB80 0000 0000                       LAB,B3   0
+          1 00009E  BFC4 000C                            STB,B3   12,B4
+
+      152    13613    1          IF KY$CTX.DSCRSN ~= %KV_DSCRSN_FRG AND
+
+  13613   1 0000A0  E846 0021                            LDR,R6   33,B6
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:18   
+          1 0000A2  E570 00FF                            AND,R6   255,IMO
+          1 0000A4  6D03                                 CMV,R6   3
+          1 0000A5  0901 001A                            BE       s:13621,PREL
+          1 0000A7  82C6 0016                            LB,'4000'X        22,B6
+          1 0000A9       4000
+          1 0000AA  0501 0015                            BBT      s:13621,PREL
+          1 0000AC  6D07                                 CMV,R6   7
+          1 0000AD  0901 0012                            BE       s:13621,PREL
+
+      153    13614    1             NOT KY$CTX.Q.THRTL.OUTAMEM AND
+      154    13615    1             KY$CTX.DSCRSN ~= %KV_DSCRSN_RSRSHR THEN
+      155    13616    2             DO;
+
+      156    13617    2                CHN$ = KY$CTX.VDI$ -> KV$VDI.CHN$;
+
+  13617   1 0000AF  DCC6 0008                            LDB,B5   8,B6
+          1 0000B1  CC85                                 LDB,B4   ,B5
+          1 0000B2  CFC7 0006                            STB,B4   CHN$,AUTO
+
+      157    13618    2                CALL KYA$ENABLE(CHN$);
+
+  13618   1 0000B4  BBC7 0006                            LAB,B3   CHN$,AUTO
+          1 0000B6  BFC7 000C                            STB,B3   CTX$+4,AUTO
+          1 0000B8  BBC7 000C                            LAB,B3   CTX$+4,AUTO
+          1 0000BA  CBF0 0100                            LAB,B4   256,IMO
+          1 0000BC  E380 0000 0000  xent                 LNJ,B6   KYA$ENABLE
+          1 0000BF       0001                            DC       s:13621,PREL
+
+      158    13619    2             END;
+
+      159    13620
+      160    13621    1          CALL KYK$OPCON(KY$CTX,OC_STTM);
+
+  13621   1 0000C0  EBF0 0001                            LAB,B6   1,IMO
+          1 0000C2  EFC7 000E                            STB,B6   CTX$+6,AUTO
+          1 0000C4  DCC7 0004                            LDB,B5   @KY$CTX,AUTO
+          1 0000C6  DFC7 000C                            STB,B5   CTX$+4,AUTO
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:19   
+          1 0000C8  BBC7 000C                            LAB,B3   CTX$+4,AUTO
+          1 0000CA  CBF0 0200                            LAB,B4   512,IMO
+          1 0000CC  E380 0000 0000  xent                 LNJ,B6   KYK$OPCON
+          1 0000CF       0001                            DC       s:13622,PREL
+
+      161    13622    1          CALL KVB$RLS2NSYS(%KY#CTXBLKSIZ,ADDR(KY$CTX));
+
+  13622   1 0000D0  EBF0 0040                            LAB,B6   64,IMO
+          1 0000D2  DCC7 0004                            LDB,B5   @KY$CTX,AUTO
+          1 0000D4  DFC7 000C                            STB,B5   CTX$+4,AUTO
+          1 0000D6  CBC7 000C                            LAB,B4   CTX$+4,AUTO
+          1 0000D8  CFC7 0010                            STB,B4   CTX$+8,AUTO
+          1 0000DA  EFC7 000E                            STB,B6   CTX$+6,AUTO
+          1 0000DC  BBC7 000E                            LAB,B3   CTX$+6,AUTO
+          1 0000DE  CBF0 0200                            LAB,B4   512,IMO
+          1 0000E0  E380 0000 0000  xent                 LNJ,B6   KVB$RLS2NSYS
+          1 0000E3       0001                            DC       s:13623,PREL
+
+      162    13623    1         KY_STT_URP.USRSTT.CTXBYTUTL = KY_STT_URP.USRSTT.CTXBYTUTL - SIZEW(KY$CTX) * 2
+             13623                   ;
+
+  13623   1 0000E4  8C80 0000 0020  xsym                 LDI      KY_STT_URP+32
+          1 0000E7  8470 FFFF FFB4                       AID      -76,IMO
+          1 0000EA  8D00 0000 0020  xsym                 SDI      KY_STT_URP+32
+
+      163    13624
+      164    13625    1          CALL KYN$ENABLE;
+
+  13625   1 0000ED  CBF0 0000                            LAB,B4   0,IMO
+          1 0000EF  E380 0000 0000  xent                 LNJ,B6   KYN$ENABLE
+          1 0000F2       0001                            DC       s:13627,PREL
+
+      165    13626
+      166    13627    1   END KYD$DISCON;
+
+  13627   1 0000F3  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      167    13628        %EOD;
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:20   
+
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:21   
+--  Include file information  --
+
+   KH_MACRO_C.:E05TOU  is referenced.
+   KHC_MAC_C.:E05TOU  is referenced.
+   KH_SCREECH_M.:E05TOU  is referenced.
+   OC_SUBS_C.:E05TOU  is referenced.
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KH$CHN.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   KY_SCODE_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure KYD$DISCON.
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:22   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData KYD$DISCON
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(48)    r     1 U_WRGCTX
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @KY$CTX                    6-0-0/w PTR         r     1 CHN$
+     8-0-0/w PTR         r     1 CTX$                      *0-0-0/w STRC(608)   r     1 KY$CTX
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 KH_CTLTBL$                 0-0-0/w PTR         r     1 KY_FIRSTCTX$
+     0-0-0/w STRC(672)   r     1 KY_STT_URP
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(512)   r     1 KH$CHN                     0-0-0/w STRC(512)   r     1 KV$VDI
+     0-0-0/w STRC(608)   r     1 KY$SEARCHCTX
+
+
+   Procedure KYD$DISCON requires 246 words for executable code.
+   Procedure KYD$DISCON requires 18 words of local(AUTO) storage.
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:23   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:24   
+          MINI XREF LISTING
+
+CHN$
+     12782**DCL     13617<<ASSIGN  13618<>CALL
+CTX$
+     12783**DCL     13586<<ASSIGN  13587>>DOWHILE 13587>>DOWHILE 13588<<ASSIGN  13588>>ASSIGN  13590>>IF
+KH$CHN.CTX$
+     13120**DCL     13612<<ASSIGN
+KH$CHN.TERMID.TERM
+     13146**DCL     13155--REDEF
+KHD$SCREECH
+     12598**DCL-ENT 13597--CALL
+KH_CTLTBL$
+     13383**DCL     13188--IMP-PTR
+KV$VDI.CHN$
+     12808**DCL     13612>>ASSIGN  13617>>ASSIGN
+KV$VDI.SSN$
+     12808**DCL     13590>>IF
+KVB$RLS2NSYS
+     12594**DCL-ENT 13574--CALL    13622--CALL
+KV_STT.REQSTATS.DSPMSK
+     10938**DCL     10944--REDEF
+KV_STT.REQSTATS.SLCMSK
+     10979**DCL     10986--REDEF
+KY$CTX
+     12613**DCL        11--PROC    13567<>CALL    13581<>CALL    13587--DOWHILE 13590--IF      13621<>CALL
+     13622--CALL    13623--ASSIGN
+KY$CTX.DEFRD.STATUSW
+     12755**DCL     12757--REDEF
+KY$CTX.DSCRSN
+     12768**DCL     13613>>IF      13613>>IF
+KY$CTX.DVCTYP
+     12701**DCL     13568>>ASSIGN  13568>>ASSIGN  13570>>IF
+KY$CTX.INPUT.BUF$
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:25   
+     12734**DCL     13572>>IF      13574<>CALL
+KY$CTX.INPUT.BUF_SIZE
+     12735**DCL     13574<>CALL    13575>>ASSIGN
+KY$CTX.MODE
+     12704**DCL     12712--REDEF
+KY$CTX.NEXT$
+     12614**DCL     13602>>ASSIGN  13606>>ASSIGN  13608>>IF      13610>>ASSIGN
+KY$CTX.PRIOR$
+     12615**DCL     13600>>IF      13606>>ASSIGN  13610>>ASSIGN
+KY$CTX.Q.THRTL.OUTAMEM
+     12725**DCL     13613>>IF
+KY$CTX.STATUSW
+     12631**DCL     12633--REDEF   12641--REDEF   12655--REDEF   12669--REDEF   12683--REDEF
+KY$CTX.VDI$
+     12698**DCL     13590>>IF      13612>>ASSIGN  13617>>ASSIGN
+KY$CTX.VDIENB
+     12769**DCL     12775--REDEF
+KY$SEARCHCTX.DEFRD.STATUSW
+     13011**DCL     13013--REDEF
+KY$SEARCHCTX.MODE
+     12960**DCL     12968--REDEF
+KY$SEARCHCTX.NEXT$
+     12870**DCL     13588>>ASSIGN  13606<<ASSIGN
+KY$SEARCHCTX.PRIOR$
+     12871**DCL     13610<<ASSIGN
+KY$SEARCHCTX.STATUSW
+     12887**DCL     12889--REDEF   12897--REDEF   12911--REDEF   12925--REDEF   12939--REDEF
+KY$SEARCHCTX.VDIENB
+     13025**DCL     13031--REDEF
+KYA$ENABLE
+     12596**DCL-ENT 13618--CALL
+KYD$FLUSH
+     12595**DCL-ENT 13567--CALL
+KYK$OPCON
+     12592**DCL-ENT 13621--CALL
+KYN$DISABLE
+PL6.E3A0      #001=KYD$DISCON File=KYD$DISCON.:E05TSI                            WED 07/30/97 02:41 Page:26   
+     12593**DCL-ENT 13584--CALL
+KYN$ENABLE
+     12591**DCL-ENT 13625--CALL
+KYQ$KILL
+     12597**DCL-ENT 13581--CALL
+KY_FIRSTCTX$
+     10326**DCL     13586>>ASSIGN  13602<<ASSIGN
+KY_STT_URP.NUMDVC
+     10663**DCL     13568<<ASSIGN  13568>>ASSIGN
+KY_STT_URP.REQSTATS.DSPMSK
+     10587**DCL     10593--REDEF
+KY_STT_URP.REQSTATS.SLCMSK
+     10628**DCL     10635--REDEF
+KY_STT_URP.USRSTT.CTXBYTUTL
+     10660**DCL     13623<<ASSIGN  13623>>ASSIGN
+KY_STT_URP.USRSTT.INPBFRBYTUTL
+     10659**DCL     13575<<ASSIGN  13575>>ASSIGN
+U_WRGCTX
+      4356**DCL     13597<>CALL
+
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:27   
+      168        1        /*T***********************************************************/
+      169        2        /*T*                                                         */
+      170        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      171        4        /*T*                                                         */
+      172        5        /*T***********************************************************/
+      173        6        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      174        7               ECI=0,DIN=7,CSU=3,AND      */
+      175        8        KYD$FLUSH: PROC ( KY$CTX );
+      176        9        /*
+      177       10               EXTERNAL OVERVIEW
+      178       11
+      179       12            KYD$FLUSH is called from EVT.CLS or a disconnect routine
+      180       13            to empty the queue, stop the device, set the device state
+      181       14            to idle, and ( for LPs ) to update VDI context for the
+      182       15            new buffer.
+      183       16        */
+      184       17        /*
+      185       18               INTERNAL OVERVIEW
+      186       19
+      187       20            The internal overview is about the same as the external
+      188       21            overview.  The code runs disabled to prevent anything
+      189       22            from happening between the call to KYI$IO and the
+      190       23            call to KYQ$RESET.  If the call to KYI$IO altrets,
+      191       24            an interrupt is pending.  I think everything falls out
+      192       25            when the interrupt is serviced.
+      193       26        */
+      194       27        %EJECT;
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:28   
+      195       28        /*
+      196       29               INCLUDE FILES
+      197       30        */
+      198       31        %INCLUDE GH_HARDWARE_M;
+      199      129        %INCLUDE LCP_6;
+      200     4408        %INCLUDE KL_AFCN_C;
+      201     4509        %INCLUDE KL_MACRO_C;
+      202     7861        %INCLUDE K_ID_E;
+      203     7911        %K#ENTID_E;
+      204     7930        %K#LYRID_E;
+      205     7937        %INCLUDE KV_GLBCNS_E;
+      206     8278        %INCLUDE KV_PRMID_E;
+      207     8452        %INCLUDE KV$GLBCTX;
+      208     8897        %INCLUDE KV$GLB;
+      209     9316        %INCLUDE KV$PRM;
+      210     9529        %INCLUDE KY_URP_M;
+      211     9824        %INCLUDE KY_SUBS_C;
+      212     9913        %INCLUDE KH$STT;
+      213     9943        %INCLUDE KV_GLB_M;
+      214    10065        %INCLUDE KY_DATA_R;
+      215    10860        /*
+      216    10861               EXTERNAL REFERENCES
+      217    10862        */
+      218    10863    1          DCL KYN$ENABLE ENTRY;
+      219    10864    1          DCL KYN$DISABLE ENTRY;
+      220    10865    1          DCL KYI$IO ENTRY(2) ALTRET;
+      221    10866    1          DCL KYQ$RESET ENTRY(1);
+      222    10867        /*
+      223    10868               PARAMETERS
+      224    10869        */
+      225    10870        %KY$CTX  ( STCLASS = );
+      226    11047        /**/
+      227    11048        %GH_LEV (FPTN=DISABLE,TYPE=INHIBIT);
+      228    11070        %GH_LEV (FPTN=ENABLE,TYPE=ENABLE);
+      229    11092        /*
+      230    11093               BASED
+      231    11094        */
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:29   
+      232    11095        %KY$REC;
+      233    11134        %KV$VDI  ( STCLASS = BASED );
+      234    11205        /**/
+      235    11206        %KV_PRMID_E;
+      236    11362        /**/
+      237    11363        /*
+      238    11364               CONSTANT
+      239    11365        */
+      240    11366        %KY$REC  ( NAME = KY_DUMMY_REC, STCLASS = CONSTANT );
+      241    11405        /*
+      242    11406               POINTER SUBS
+      243    11407        */
+      244    11408        %SUB KY$REC = "KY$CTX.Q.INPUT$->KY$REC";
+      245    11409        %SUB KV$VDI  = "KY$CTX.VDI$->KV$VDI";
+      246    11410        %EJECT;
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:30   
+      247    11411        /*
+      248    11412            Disable.
+      249    11413               Stop any I/O in progress.
+      250    11414               Set device state to idle.
+      251    11415               Reset any pending device time-out.
+      252    11416               LP and CP:
+      253    11417                  Empty out the Q.
+      254    11418                  LP:
+      255    11419                     Insert a dummy header.
+      256    11420                     Update VDH output buffer info.
+      257    11421        */
+      258    11422    1          CALL KYN$DISABLE;
+      259    11423
+      260    11424    1          CALL KYI$IO ( KY$CTX, %KY#STOP );
+      261    11425    1          KY$CTX.DVC_STATE = %KY#ST_IDLE;
+      262    11426    1          KY$CTX.RESCHEDULE.TIMER = '0'B;
+      263    11427    1          IF KY$CTX.DVCTYP ~= %KY#TYP_CR AND KY$CTX.Q.FIRST$ ~= ADDR(NIL) THEN
+      264    11428    2             DO;
+      265    11429    2                CALL KYQ$RESET ( KY$CTX );
+      266    11430    2                IF KY$CTX.DVCTYP = %KY#TYP_LP THEN
+      267    11431    3                   DO;
+      268    11432    3                      KY$REC.RECSIZE = 0;
+      269    11433    3                      KY$REC = KY_DUMMY_REC;
+      270    11434
+      271    11435    3                      KV$VDI.OTPBFR_.ADR$ = ADDR ( KY$REC.TXT );
+      272    11436    3                      KV$VDI.OTPBFR_.BYTX = 0;
+      273    11437    3                      KV$VDI.OTPBFR_.BYTSIZ = %KY#MAXTEXT_SIZEB;
+      274    11438    3                   END;
+      275    11439    2             END;
+      276    11440
+      277    11441    1          CALL KYN$ENABLE;
+      278    11442
+      279    11443    1   END KYD$FLUSH;
+      280    11444        %EOD;
+
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:31   
+--  Include file information  --
+
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYD$FLUSH.
+
+   Procedure KYD$FLUSH requires 114 words for executable code.
+   Procedure KYD$FLUSH requires 10 words of local(AUTO) storage.
+
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:32   
+
+ Object Unit name= KYD$FLUSH                                  File name= KYD$DISCON.:E05TOU
+ UTS= JUL 30 '97 02:42:22.80 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Data  even  none     2      2  KYD$FLUSH
+    1  RoData even  UTS      6      6  KYD$FLUSH
+    2   Proc  even  none   114     72  KYD$FLUSH
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes            yes      Std        1  KYD$FLUSH
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       0 KYN$DISABLE
+ yes     yes           Std       2 KYI$IO
+         yes           Std       1 KYQ$RESET
+         yes           Std       0 KYN$ENABLE
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6C_ALRZ
+                       nStd      0 X6A_ARET
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:33   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+r    G$ROS$
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:34   
+
+
+      168        1        /*T***********************************************************/
+      169        2        /*T*                                                         */
+      170        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      171        4        /*T*                                                         */
+      172        5        /*T***********************************************************/
+      173        6        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      174        7               ECI=0,DIN=7,CSU=3,AND      */
+      175        8        KYD$FLUSH: PROC ( KY$CTX );
+
+      8   2 000000  D380 0000 0000  xent KYD$FLUSH       LNJ,B5   X6A_AUTO_1
+          2 000003       000A 0001                       DC       10,1
+
+      176        9        /*
+      177       10               EXTERNAL OVERVIEW
+      178       11
+      179       12            KYD$FLUSH is called from EVT.CLS or a disconnect routine
+      180       13            to empty the queue, stop the device, set the device state
+      181       14            to idle, and ( for LPs ) to update VDI context for the
+      182       15            new buffer.
+      183       16        */
+      184       17        /*
+      185       18               INTERNAL OVERVIEW
+      186       19
+      187       20            The internal overview is about the same as the external
+      188       21            overview.  The code runs disabled to prevent anything
+      189       22            from happening between the call to KYI$IO and the
+      190       23            call to KYQ$RESET.  If the call to KYI$IO altrets,
+      191       24            an interrupt is pending.  I think everything falls out
+      192       25            when the interrupt is serviced.
+      193       26        */
+      194       27        %EJECT;
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:35   
+      195       28        /*
+      196       29               INCLUDE FILES
+      197       30        */
+      198       31        %INCLUDE GH_HARDWARE_M;
+      199      129        %INCLUDE LCP_6;
+      200     4408        %INCLUDE KL_AFCN_C;
+      201     4509        %INCLUDE KL_MACRO_C;
+      202     7861        %INCLUDE K_ID_E;
+      203     7911        %K#ENTID_E;
+      204     7930        %K#LYRID_E;
+      205     7937        %INCLUDE KV_GLBCNS_E;
+      206     8278        %INCLUDE KV_PRMID_E;
+      207     8452        %INCLUDE KV$GLBCTX;
+      208     8897        %INCLUDE KV$GLB;
+      209     9316        %INCLUDE KV$PRM;
+      210     9529        %INCLUDE KY_URP_M;
+      211     9824        %INCLUDE KY_SUBS_C;
+      212     9913        %INCLUDE KH$STT;
+      213     9943        %INCLUDE KV_GLB_M;
+      214    10065        %INCLUDE KY_DATA_R;
+      215    10860        /*
+      216    10861               EXTERNAL REFERENCES
+      217    10862        */
+      218    10863    1          DCL KYN$ENABLE ENTRY;
+      219    10864    1          DCL KYN$DISABLE ENTRY;
+      220    10865    1          DCL KYI$IO ENTRY(2) ALTRET;
+      221    10866    1          DCL KYQ$RESET ENTRY(1);
+      222    10867        /*
+      223    10868               PARAMETERS
+      224    10869        */
+      225    10870        %KY$CTX  ( STCLASS = );
+      226    11047        /**/
+      227    11048        %GH_LEV (FPTN=DISABLE,TYPE=INHIBIT);
+      228    11070        %GH_LEV (FPTN=ENABLE,TYPE=ENABLE);
+      229    11092        /*
+      230    11093               BASED
+      231    11094        */
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:36   
+      232    11095        %KY$REC;
+      233    11134        %KV$VDI  ( STCLASS = BASED );
+      234    11205        /**/
+      235    11206        %KV_PRMID_E;
+      236    11362        /**/
+      237    11363        /*
+      238    11364               CONSTANT
+      239    11365        */
+      240    11366        %KY$REC  ( NAME = KY_DUMMY_REC, STCLASS = CONSTANT );
+      241    11405        /*
+      242    11406               POINTER SUBS
+      243    11407        */
+      244    11408        %SUB KY$REC = "KY$CTX.Q.INPUT$->KY$REC";
+      245    11409        %SUB KV$VDI  = "KY$CTX.VDI$->KV$VDI";
+      246    11410        %EJECT;
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:37   
+      247    11411        /*
+      248    11412            Disable.
+      249    11413               Stop any I/O in progress.
+      250    11414               Set device state to idle.
+      251    11415               Reset any pending device time-out.
+      252    11416               LP and CP:
+      253    11417                  Empty out the Q.
+      254    11418                  LP:
+      255    11419                     Insert a dummy header.
+      256    11420                     Update VDH output buffer info.
+      257    11421        */
+      258    11422    1          CALL KYN$DISABLE;
+
+  11422   2 000005  CBF0 0000                            LAB,B4   0,IMO
+          2 000007  E380 0000 0000  xent                 LNJ,B6   KYN$DISABLE
+          2 00000A       0001                            DC       s:11424,PREL
+
+      259    11423
+      260    11424    1          CALL KYI$IO ( KY$CTX, %KY#STOP );
+
+  11424   2 00000B  EBF0 0001                            LAB,B6   1,IMO
+          2 00000D  EFC7 0008                            STB,B6   @KY$CTX+4,AUTO
+          2 00000F  DCC7 0004                            LDB,B5   @KY$CTX,AUTO
+          2 000011  DFC7 0006                            STB,B5   @KY$CTX+2,AUTO
+          2 000013  BBC7 0006                            LAB,B3   @KY$CTX+2,AUTO
+          2 000015  CBF0 0200                            LAB,B4   512,IMO
+          2 000017  E380 0000 0000  xent                 LNJ,B6   KYI$IO
+          2 00001A       0001                            DC       s:11425,PREL
+
+      261    11425    1          KY$CTX.DVC_STATE = %KY#ST_IDLE;
+
+  11425   2 00001B  6C01                                 LDV,R6   1
+          2 00001C  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          2 00001E  E7C6 0004                            STH,R6   4,B6
+
+      262    11426    1          KY$CTX.RESCHEDULE.TIMER = '0'B;
+
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:38   
+  11426   2 000020  8846 0021                            LBF,'8000'X       33,B6
+  11426   2 000022       8000
+
+      263    11427    1          IF KY$CTX.DVCTYP ~= %KY#TYP_CR AND KY$CTX.Q.FIRST$ ~= ADDR(NIL) THEN
+
+  11427   2 000023  D2C6 000B                            LLH,R5   11,B6
+          2 000025  5D03                                 CMV,R5   3
+          2 000026  0901 0042                            BE       s:11441,PREL
+          2 000028  8DC6 000E                            CMN      14,B6
+          2 00002A  0901 003E                            BE       s:11441,PREL
+
+      264    11428    2             DO;
+
+      265    11429    2                CALL KYQ$RESET ( KY$CTX );
+
+  11429   2 00002C  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          2 00002E  CBF0 0100                            LAB,B4   256,IMO
+          2 000030  E380 0000 0000  xent                 LNJ,B6   KYQ$RESET
+          2 000033       0001                            DC       s:11430,PREL
+
+      266    11430    2                IF KY$CTX.DVCTYP = %KY#TYP_LP THEN
+
+  11430   2 000034  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          2 000036  E2C6 000B                            LLH,R6   11,B6
+          2 000038  6D01                                 CMV,R6   1
+          2 000039  0981 002F                            BNE      s:11441,PREL
+
+      267    11431    3                   DO;
+
+      268    11432    3                      KY$REC.RECSIZE = 0;
+
+  11432   2 00003B  DCC6 0012                            LDB,B5   18,B6
+          2 00003D  8805                                 LBF,'00FF'X       ,B5
+          2 00003E       00FF
+
+      269    11433    3                      KY$REC = KY_DUMMY_REC;
+
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:39   
+  11433   2 00003F  DCC6 0012                            LDB,B5   18,B6
+          2 000041  E805                                 LDR,R6   ,B5
+          2 000042  E570 00FF                            AND,R6   255,IMO
+          2 000044  EF47 0006                            STR,R6   @KY$CTX+2,AUTO
+          2 000046  DFC7 0007                            STB,B5   @KY$CTX+3,AUTO
+          2 000048  AB80 0000 0000  01                   LAB,B2   KY_DUMMY_REC
+          2 00004B  2C00                                 LDV,R2   0
+          2 00004C  6C0C                                 LDV,R6   12
+          2 00004D  BB85                                 LAB,B3   ,B5
+          2 00004E  3C00                                 LDV,R3   0
+          2 00004F  F847 0006                            LDR,R7   @KY$CTX+2,AUTO
+          2 000051  7E0A                                 ADV,R7   10
+          2 000052  D380 0000 0000  xent                 LNJ,B5   X6C_ALRZ
+
+      270    11434
+      271    11435    3                      KV$VDI.OTPBFR_.ADR$ = ADDR ( KY$REC.TXT );
+
+  11435   2 000055  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          2 000057  DCC6 0008                            LDB,B5   8,B6
+          2 000059  CCC6 0012                            LDB,B4   18,B6
+          2 00005B  BBC4 0005                            LAB,B3   5,B4
+          2 00005D  BFC5 000A                            STB,B3   10,B5
+
+      272    11436    3                      KV$VDI.OTPBFR_.BYTX = 0;
+
+  11436   2 00005F  DCC6 0008                            LDB,B5   8,B6
+          2 000061  8745 000C                            CL       12,B5
+
+      273    11437    3                      KV$VDI.OTPBFR_.BYTSIZ = %KY#MAXTEXT_SIZEB;
+
+  11437   2 000063  DCC6 0008                            LDB,B5   8,B6
+          2 000065  E870 00A0                            LDR,R6   160,IMO
+          2 000067  EF45 000D                            STR,R6   13,B5
+
+      274    11438    3                   END;
+
+      275    11439    2             END;
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:40   
+
+      276    11440
+      277    11441    1          CALL KYN$ENABLE;
+
+  11441   2 000069  CBF0 0000                            LAB,B4   0,IMO
+          2 00006B  E380 0000 0000  xent                 LNJ,B6   KYN$ENABLE
+          2 00006E       0001                            DC       s:11443,PREL
+
+      278    11442
+      279    11443    1   END KYD$FLUSH;
+
+  11443   2 00006F  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      280    11444        %EOD;
+
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:41   
+--  Include file information  --
+
+   KY_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KV_GLB_M.:E05TOU  is referenced.
+   KH$STT.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+   KV$PRM.:E05TOU  is referenced.
+   KV$GLB.:E05TOU  is referenced.
+   KV$GLBCTX.:E05TOU  is referenced.
+   KV_PRMID_E.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   K_ID_E.:E05TOU  is referenced.
+   KL_MACRO_C.:E05TOU  is referenced.
+   KL_AFCN_C.:E05TOU  is referenced.
+   G_LCP6_E.:E05TOU  is referenced.
+   GT_LCP6_M.:E05TOU  is referenced.
+   KI_CP6.:E05TOU  is referenced.
+   GF_LCP6_M.:E05TOU  is referenced.
+   GM_LCP6_M.:E05TOU  is referenced.
+   GU_LCP6_M.:E05TOU  is referenced.
+   GJ_LCP6_M.:E05TOU  is referenced.
+   GH_LCP6_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYD$FLUSH.
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:42   
+
+ **** Variables and constants ****
+
+  ****  Section 001 RoData KYD$FLUSH
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(96)    r     1 KY_DUMMY_REC
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @KY$CTX                   *0-0-0/w STRC(608)   r     1 KY$CTX
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(512)   r     1 KV$VDI                     0-0-0/w ASTR(80)    r     1 KY$REC
+
+
+   Procedure KYD$FLUSH requires 114 words for executable code.
+   Procedure KYD$FLUSH requires 10 words of local(AUTO) storage.
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:43   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:44   
+          MINI XREF LISTING
+
+KV$VDI.OTPBFR_.ADR$
+     11181**DCL     11435<<ASSIGN
+KV$VDI.OTPBFR_.BYTSIZ
+     11181**DCL     11437<<ASSIGN
+KV$VDI.OTPBFR_.BYTX
+     11181**DCL     11436<<ASSIGN
+KV_STT.REQSTATS.DSPMSK
+     10736**DCL     10742--REDEF
+KV_STT.REQSTATS.SLCMSK
+     10777**DCL     10784--REDEF
+KY$CTX
+     10881**DCL         8--PROC    11424<>CALL    11429<>CALL
+KY$CTX.DEFRD.STATUSW
+     11023**DCL     11025--REDEF
+KY$CTX.DVCTYP
+     10969**DCL     11427>>IF      11430>>IF
+KY$CTX.DVC_STATE
+     10884**DCL     11425<<ASSIGN
+KY$CTX.MODE
+     10972**DCL     10980--REDEF
+KY$CTX.Q.FIRST$
+     10984**DCL     11427>>IF
+KY$CTX.Q.INPUT$
+     10986**DCL     11432>>ASSIGN  11433>>ASSIGN  11433>>ASSIGN  11435>>ASSIGN
+KY$CTX.RESCHEDULE.TIMER
+     11031**DCL     11426<<ASSIGN
+KY$CTX.STATUSW
+     10899**DCL     10901--REDEF   10909--REDEF   10923--REDEF   10937--REDEF   10951--REDEF
+KY$CTX.VDI$
+     10966**DCL     11435>>ASSIGN  11436>>ASSIGN  11437>>ASSIGN
+KY$CTX.VDIENB
+     11037**DCL     11043--REDEF
+PL6.E3A0      #002=KYD$FLUSH File=KYD$DISCON.:E05TSI                             WED 07/30/97 02:42 Page:45   
+KY$REC
+     11119**DCL     11433<<ASSIGN
+KY$REC.RECSIZE
+     11122**DCL     11132--IMP-SIZ 11432<<ASSIGN  11433>>ASSIGN
+KY$REC.TXT
+     11132**DCL     11435--ASSIGN
+KY$REC.TXTARRAY
+     11131**DCL     11132--REDEF
+KYI$IO
+     10865**DCL-ENT 11424--CALL
+KYN$DISABLE
+     10864**DCL-ENT 11422--CALL
+KYN$ENABLE
+     10863**DCL-ENT 11441--CALL
+KYQ$RESET
+     10866**DCL-ENT 11429--CALL
+KY_DUMMY_REC
+     11390**DCL     11433>>ASSIGN
+KY_STT_URP.REQSTATS.DSPMSK
+     10385**DCL     10391--REDEF
+KY_STT_URP.REQSTATS.SLCMSK
+     10426**DCL     10433--REDEF
+
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:46   
+      281        1        /*T***********************************************************/
+      282        2        /*T*                                                         */
+      283        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      284        4        /*T*                                                         */
+      285        5        /*T***********************************************************/
+      286        6        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      287        7               ECI=0,DIN=7,CSU=3,AND      */
+      288        8        KYD$INIT_DISCON: PROC ( KY$CTX );
+      289        9
+      290       10        %INCLUDE KY_URP_M;
+      291      305        %INCLUDE KY_SUBS_C;
+      292      394        /*
+      293      395               EXTERNAL OVERVIEW
+      294      396
+      295      397            INIT_DISCON is called to start the disconnect sequence with VDH.
+      296      398            The effects of disconnecting are not guaranteed to be immediate,
+      297      399            since the state of VDH is unknown.  It can be assumed that any
+      298      400            I/O will be stopped, data currently queued is deleted, and the
+      299      401            device state is set to idle.
+      300      402        */
+      301      403        /*
+      302      404               INTERNAL OVERVIEW
+      303      405
+      304      406            VDH is called with a KV$VDH_DSC structure to begin the good
+      305      407            stuff, then FLUSH is called to do most of the stuff mentioned in
+      306      408            the external overview.  I just love routines that are stupid
+      307      409            fronts for other routines.
+      308      410        */
+      309      411        %EJECT;
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:47   
+      310      412        /*
+      311      413            Include files
+      312      414        */
+      313      415        %INCLUDE KV_GLBCNS_E;
+      314      756        %INCLUDE KV$VDH;
+      315     1187        /*
+      316     1188            External interfaces
+      317     1189        */
+      318     1190    1          DCL KVV$VDI ENTRY(1) ALTRET;
+      319     1191    1          DCL KYD$FLUSH ENTRY(1);
+      320     1192        /*
+      321     1193            Parameters
+      322     1194        */
+      323     1195        %KY$CTX  ( NAME = KY$CTX, STCLASS = );
+      324     1372        /*
+      325     1373            Auto
+      326     1374        */
+      327     1375        %KV$VDH_DSC  ( NAME = KV$VDH_DSC, STCLASS = );
+      328     1411        /*
+      329     1412            Symrefs
+      330     1413        */
+      331     1414        %KV$VDH_DSC  ( NAME = KV_VDH_DSC, STCLASS = SYMREF );
+      332     1450        %EJECT;
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:48   
+      333     1451    1          KV$VDH_DSC = KV_VDH_DSC;
+      334     1452    1          KV$VDH_DSC.RSN = KY$CTX.DSCRSN;
+      335     1453    1          KV$VDH_DSC.NO_IO = '1'B;
+      336     1454    1          KV$VDH_DSC.ALLSSN = '1'B;
+      337     1455
+      338     1456    1          KY$CTX.DSCPND = '1'B;
+      339     1457    1          CALL KVV$VDI ( KV$VDH_DSC );
+      340     1458
+      341     1459    1          CALL KYD$FLUSH ( KY$CTX );
+      342     1460
+      343     1461    1   END KYD$INIT_DISCON;
+
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:49   
+--  Include file information  --
+
+   KV$VDH.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYD$INIT_DISCON.
+
+   Procedure KYD$INIT_DISCON requires 49 words for executable code.
+   Procedure KYD$INIT_DISCON requires 10 words of local(AUTO) storage.
+
+    No errors detected in file KYD$DISCON.:E05TSI    .
+
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:50   
+
+ Object Unit name= KYD$INIT_DISCON                            File name= KYD$DISCON.:E05TOU
+ UTS= JUL 30 '97 02:43:06.28 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   Proc  even  none    49     31  KYD$INIT_DISCON
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  KYD$INIT_DISCON
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 KVV$VDI
+         yes           Std       1 KYD$FLUSH
+                       nStd      0 X6A_AUTO_1
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KV_VDH_DSC                       r    G$ROS$
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:51   
+
+
+      281        1        /*T***********************************************************/
+      282        2        /*T*                                                         */
+      283        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      284        4        /*T*                                                         */
+      285        5        /*T***********************************************************/
+      286        6        /*X*   DMR,PLM=7,IND=3,CTI=3,SDI=3,MCL=10,CSI=3,DTI=3,DCI=6,
+      287        7               ECI=0,DIN=7,CSU=3,AND      */
+      288        8        KYD$INIT_DISCON: PROC ( KY$CTX );
+
+      8   0 000000  D380 0000 0000  xent KYD$INIT_DISCON LNJ,B5   X6A_AUTO_1
+          0 000003       000A 0001                       DC       10,1
+
+      289        9
+      290       10        %INCLUDE KY_URP_M;
+      291      305        %INCLUDE KY_SUBS_C;
+      292      394        /*
+      293      395               EXTERNAL OVERVIEW
+      294      396
+      295      397            INIT_DISCON is called to start the disconnect sequence with VDH.
+      296      398            The effects of disconnecting are not guaranteed to be immediate,
+      297      399            since the state of VDH is unknown.  It can be assumed that any
+      298      400            I/O will be stopped, data currently queued is deleted, and the
+      299      401            device state is set to idle.
+      300      402        */
+      301      403        /*
+      302      404               INTERNAL OVERVIEW
+      303      405
+      304      406            VDH is called with a KV$VDH_DSC structure to begin the good
+      305      407            stuff, then FLUSH is called to do most of the stuff mentioned in
+      306      408            the external overview.  I just love routines that are stupid
+      307      409            fronts for other routines.
+      308      410        */
+      309      411        %EJECT;
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:52   
+      310      412        /*
+      311      413            Include files
+      312      414        */
+      313      415        %INCLUDE KV_GLBCNS_E;
+      314      756        %INCLUDE KV$VDH;
+      315     1187        /*
+      316     1188            External interfaces
+      317     1189        */
+      318     1190    1          DCL KVV$VDI ENTRY(1) ALTRET;
+      319     1191    1          DCL KYD$FLUSH ENTRY(1);
+      320     1192        /*
+      321     1193            Parameters
+      322     1194        */
+      323     1195        %KY$CTX  ( NAME = KY$CTX, STCLASS = );
+      324     1372        /*
+      325     1373            Auto
+      326     1374        */
+      327     1375        %KV$VDH_DSC  ( NAME = KV$VDH_DSC, STCLASS = );
+      328     1411        /*
+      329     1412            Symrefs
+      330     1413        */
+      331     1414        %KV$VDH_DSC  ( NAME = KV_VDH_DSC, STCLASS = SYMREF );
+      332     1450        %EJECT;
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:53   
+      333     1451    1          KV$VDH_DSC = KV_VDH_DSC;
+
+   1451   0 000005  8C80 0000 0000  xsym                 LDI      KV_VDH_DSC
+          0 000008  8D47 0006                            SDI      KV$VDH_DSC,AUTO
+
+      334     1452    1          KV$VDH_DSC.RSN = KY$CTX.DSCRSN;
+
+   1452   0 00000A  ECC7 0004                            LDB,B6   @KY$CTX,AUTO
+          0 00000C  D846 0021                            LDR,R5   33,B6
+          0 00000E  DAC7 0006                            SRM,R5,'00FF'X    KV$VDH_DSC,AUTO
+          0 000010       00FF
+
+      335     1453    1          KV$VDH_DSC.NO_IO = '1'B;
+
+   1453   0 000011  8947 0007                            LBT,'8000'X       KV$VDH_DSC+1,AUTO
+   1453   0 000013       8000
+
+      336     1454    1          KV$VDH_DSC.ALLSSN = '1'B;
+
+   1454   0 000014  8947 0007                            LBT,'4000'X       KV$VDH_DSC+1,AUTO
+   1454   0 000016       4000
+
+      337     1455
+      338     1456    1          KY$CTX.DSCPND = '1'B;
+
+   1456   0 000017  8946 0005                            LBT,'0080'X       5,B6
+   1456   0 000019       0080
+
+      339     1457    1          CALL KVV$VDI ( KV$VDH_DSC );
+
+   1457   0 00001A  DBC7 0006                            LAB,B5   KV$VDH_DSC,AUTO
+          0 00001C  DFC7 0008                            STB,B5   KV$VDH_DSC+2,AUTO
+          0 00001E  BBC7 0008                            LAB,B3   KV$VDH_DSC+2,AUTO
+          0 000020  CBF0 0100                            LAB,B4   256,IMO
+          0 000022  E380 0000 0000  xent                 LNJ,B6   KVV$VDI
+          0 000025       0001                            DC       s:1459,PREL
+
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:54   
+      340     1458
+      341     1459    1          CALL KYD$FLUSH ( KY$CTX );
+
+   1459   0 000026  BBC7 0004                            LAB,B3   @KY$CTX,AUTO
+          0 000028  CBF0 0100                            LAB,B4   256,IMO
+          0 00002A  E380 0000 0000  xent                 LNJ,B6   KYD$FLUSH
+          0 00002D       0001                            DC       s:1461,PREL
+
+      342     1460
+      343     1461    1   END KYD$INIT_DISCON;
+
+   1461   0 00002E  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:55   
+--  Include file information  --
+
+   KV$VDH.:E05TOU  is referenced.
+   KV_GLBCNS_E.:E05TOU  is referenced.
+   KY_SUBS_C.:E05TOU  is referenced.
+   KY_URP_M.:E05TOU  is referenced.
+      No diagnostics issued in procedure KYD$INIT_DISCON.
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:56   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @KY$CTX                    6-0-0/w STRC(32)    r     1 KV$VDH_DSC
+    *0-0-0/w STRC(608)   r     1 KY$CTX
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(32)    r     1 KV_VDH_DSC
+
+
+   Procedure KYD$INIT_DISCON requires 49 words for executable code.
+   Procedure KYD$INIT_DISCON requires 10 words of local(AUTO) storage.
+
+    No errors detected in file KYD$DISCON.:E05TSI    .
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:57   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #003=KYD$INIT_DISCON File=KYD$DISCON.:E05TSI                       WED 07/30/97 02:43 Page:58   
+          MINI XREF LISTING
+
+KV$VDH_DSC
+      1402**DCL      1451<<ASSIGN   1457<>CALL
+KV$VDH_DSC.ALLSSN
+      1408**DCL      1454<<ASSIGN
+KV$VDH_DSC.NO_IO
+      1408**DCL      1453<<ASSIGN
+KV$VDH_DSC.RSN
+      1408**DCL      1452<<ASSIGN
+KVV$VDI
+      1190**DCL-ENT  1457--CALL
+KV_VDH_DSC
+      1441**DCL      1451>>ASSIGN
+KY$CTX
+      1206**DCL         8--PROC     1459<>CALL
+KY$CTX.DEFRD.STATUSW
+      1348**DCL      1350--REDEF
+KY$CTX.DSCPND
+      1215**DCL      1456<<ASSIGN
+KY$CTX.DSCRSN
+      1361**DCL      1452>>ASSIGN
+KY$CTX.MODE
+      1297**DCL      1305--REDEF
+KY$CTX.STATUSW
+      1224**DCL      1226--REDEF    1234--REDEF    1248--REDEF    1262--REDEF    1276--REDEF
+KY$CTX.VDIENB
+      1362**DCL      1368--REDEF
+KYD$FLUSH
+      1191**DCL-ENT  1459--CALL

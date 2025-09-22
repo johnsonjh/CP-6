@@ -1,0 +1,318 @@
+/*M* SKUNK Keeps stinkers off your terminal */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMR,PLM=5,IND=5,CTI=5,SDI=5,MCL=10,CSI=0,ECI=0 */
+ 
+ 
+%SET LISTSUB='1'B;
+ 
+/*****************************************************************/
+/*   'SKUNK' - This routine holds the terminal until the user   */
+/*   returns.                                                   */
+/*   Revision history:                                          */
+/*        04/03/81 - Dennis Griesser - initial version          */
+/*        10/14/81 - DG - added M$LINK to IMP to eat breaks     */
+/*        11/16/83 - DG - ALTRET taken on PMMEs that didnt      */
+/*        02/02/84 - DG - Use M$LINK CP_CMD option to call IMP. */
+/*****************************************************************/
+ 
+SKUNK: PROC MAIN;
+/**/
+/*  INCLUDE FILES */
+/**/
+%INCLUDE CP_6_SUBS;
+%INCLUDE KL_SUPER_C;
+%INCLUDE B_ERRORS_C;
+%INCLUDE CP_6;
+/**/
+/*  EQUATES */
+/**/
+%EQU NO = '0'B /* NO */;
+%EQU YES = '1'B /* YES */;
+/**/
+/*  BASED DATA */
+/**/
+%B$TCB;
+%B$ALT;
+%INCLUDE B$JIT_C;
+%B$JIT0;
+%U$JIT1;
+%M$JIT2;
+%F$JIT3;
+%S$JIT4;
+%J$JIT5;
+         2 * BIT(1);                    /* Rest of JIT not needed  */
+%F$DCB;
+/**/
+/*  SYMREFS */
+/**/
+DCL B$JIT$ PTR SYMREF;
+DCL B$TCB$ PTR SYMREF;
+/**/
+/* ALLOCATION */
+/**/
+/*     FPT creation */
+/**/
+/*         M$UC */
+%FPT_OPEN   (FPTN=FPT_OPEN_TERM,
+          STCLASS=STATIC,
+          DCB=M$UC);
+%FPT_READ    (FPTN=FPT_READ_TERM,
+          STCLASS=STATIC,
+          TRANS = YES,                  /* SWALLOW ESCAPE SEQUENCES */
+          DCB=M$UC,
+          BUF=SKUNK_BUF);
+%FPT_WRITE   (FPTN=FPT_WRITE_TERM,
+          BUF=SKUNK_BUF,
+          WAIT=YES,
+          STCLASS=STATIC,
+          DCB=M$UC);
+%FPT_EOM (FPTN = FPT_EOM_TERM,
+          TIMEOUT = 0,                  /* (to be set later) */
+          EOMTABLE = VLP_EOMTABLE,      /* SET ACTIVATION CHARACTERS */
+          STCLASS = STATIC,
+          UTYPE = MIN);
+%FPT_TRMCTL (FPTN = FPT_GTRMCTL_TERM,
+             DCB = M$UC,
+             TRMCTL = SAVE_TERM);
+%FPT_TRMCTL (FPTN = FPT_STRMCTL_TERM,
+             DCB = M$UC,
+             TRMCTL = VLP_TRMCTL);
+%FPT_TRMCTL (FPTN = FPT_STRMCTL2_TERM,
+             DCB = M$UC,
+             TRMCTL = SAVE_TERM);
+/**/
+/*         M$HLP */
+%FPT_OPEN   (FPTN=FPT_OPEN_HLP,
+          STCLASS=STATIC,
+          SHARE=ALL,
+          ASN=FILE,
+          NAME=HLP_NAME,
+          ACCT=HLP_ACCT,
+          DCB=M$HLP);
+%FPT_READ    (FPTN=FPT_READ_HLP,
+          STCLASS=STATIC,
+          DCB=M$HLP,
+          KEYS=YES,
+          KEY=HLP_KEY,
+          BUF=KL_DREC);
+%FPT_CLOSE   (FPTN=FPT_CLOSE_HLP,
+          STCLASS=STATIC,
+          DCB=M$HLP);
+/**/
+/*         ASSORTED MONITOR SERVICES */
+/**/
+%FPT_XCON (FPTN = FPT_XCON,UENTRY = XCON);
+%FPT_INT (FPTN = FPT_INT,UENTRY = INT);
+%FPT_LINK (FPTN = FPT_LINK,
+           TEXTC = YES,
+           CP_CMD = NIL,                /* To be altered */
+           STCLASS = STATIC);
+%FPT_ERRMSG (FPTN = FPT_ERRMSG,
+             BUF = ERROR_BUF,
+             CODE = ERR,
+             OUTDCB1 = M$UC,
+             STCLASS = CONSTANT);
+/**/
+/*     BUFFERS */
+/**/
+DCL SKUNK_BUF CHAR(65) STATIC SYMDEF;
+DCL ERROR_BUF CHAR(120) STATIC;
+DCL ERR BIT(36) STATIC;
+DCL GOOD_PASS CHAR(8) STATIC;
+DCL TRY_PASS CHAR(8) STATIC;
+DCL TP_ARY (0:7) REDEF TRY_PASS BIT(9) UNAL;
+DCL 1 HLP_KEY STATIC,
+         2 SIZE UBIN(9) UNAL,
+         2 TEXT CHAR(31) UNAL;
+%KL_DREC (LAST=",");
+  %KL_FEBLK (LVL=2,STCLASS=STATIC,RCNT=31);
+%VLP_TRMCTL (FPTN = SAVE_TERM,STCLASS = "STATIC SYMDEF");
+/**/
+/*     POINTERS, COUNTERS, AND FLAGS */
+/**/
+DCL QUIT_OK BIT(1) STATIC SYMDEF INIT(%NO#);
+DCL TOT_TIME SBIN WORD STATIC SYMDEF INIT(0); /* Count of time delayed */
+DCL I SBIN WORD STATIC;
+DCL BAD_TRIES SBIN WORD STATIC SYMDEF INIT(0);
+DCL M$UC$ PTR STATIC;
+/**/
+/*     CONSTANTS */
+/**/
+%VLP_NAME(FPTN = HLP_NAME,NAME = ':HLP',STCLASS = CONSTANT);
+%VLP_ACCT(FPTN = HLP_ACCT,ACCT = ':SYS',STCLASS = CONSTANT);
+%VLP_NAME(FPTN = LINK_NAME,NAME = 'IMP',STCLASS = CONSTANT);
+%VLP_ACCT(FPTN = LINK_ACCT,ACCT = ':SYS',STCLASS = CONSTANT);
+%VLP_NAME(FPTN = KILL_BREAK,
+          NAME = "'IMP (ADD BREAK T=CR IN IM)'",
+          STCLASS = CONSTANT);
+%VLP_NAME(FPTN = RESTORE_BREAK,
+          NAME = "'IMP (DEL BREAK)'",
+          STCLASS = CONSTANT);
+%FPT_YC (FPTN = FPT_YC,
+         CMD = YC_CMD,
+         ECHO = YES,
+         STCLASS = CONSTANT);
+DCL YC_CMD CHAR(0) CONSTANT INIT('!OFF');
+%VLP_EOMTABLE (FPTN = VLP_EOMTABLE,
+               STCLASS = CONSTANT,
+               VALUES = "0,4,0*14");    /* CR only */
+%VLP_TRMCTL (FPTN = VLP_TRMCTL,
+             ACTONTRN = YES,            /* USE ACTIVATION CHARS ON TRANS READ */
+             STCLASS = CONSTANT,
+             DISPINPUT = NO);           /* ECHO OFF */
+DCL M$HLP DCB;
+DCL TIME_OUT SBIN WORD CONSTANT INIT(60); /* Total time-out in minutes */
+DCL SNORE_TIME SBIN WORD CONSTANT INIT(5); /* Snore interval in minutes */
+/**/
+/*     ENTRY POINTS */
+/**/
+DCL INT ENTRY ASYNC;
+DCL XCON ENTRY ASYNC;
+DCL ASZ$SCRAMBLE ENTRY(1);
+/**/
+%EJECT;
+/* PROCEDURE */
+/**/
+/*     MAIN ROUTINE */
+/**/
+BEGIN: ;
+/**/
+     B$JIT$ -> B$JIT.JUNK = B$JIT.JUNK | %JJ_EXONLY#; /* Prevent use of DELTA */
+/**/
+     M$UC$ = DCBADDR(DCBNUM(M$UC));
+/**/
+     CALL INSERT(HLP_KEY.TEXT,0,20,B$JIT$ -> B$JIT.ACCN,B$JIT$ -> B$JIT.UNAME);
+     I = 19;
+     DO WHILE (SUBSTR(HLP_KEY.TEXT,I,1) = ' ');
+          I = I -1;
+        END;
+     HLP_KEY.SIZE = I+1;
+     CALL M$OPEN (FPT_OPEN_HLP) ALTRET(CROAK);
+     CALL M$READ (FPT_READ_HLP) ALTRET(CROAK);
+     CALL M$CLOSE (FPT_CLOSE_HLP) ALTRET(CROAK);
+     GOOD_PASS = KL_DREC.PASSWORD;      /* Good scrambled password */
+/**/
+     IF NOT M$UC$ -> F$DCB.FCD#
+     THEN
+          CALL M$OPEN(FPT_OPEN_TERM) ALTRET(CROAK);
+/**/
+     SKUNK_BUF = 'SKUNK B03 here.';
+     CALL M$WRITE(FPT_WRITE_TERM) ALTRET(CROAK);
+     SKUNK_BUF = '                               ';
+     CALL M$WRITE(FPT_WRITE_TERM) ALTRET(CROAK);
+/**/
+     CALL M$XCON (FPT_XCON) ALTRET(CROAK); /* TAKE EXIT CONTROL*/
+     CALL M$INT (FPT_INT) ALTRET(CROAK); /* TAKE BREAK CONTROL   */
+     FPT_LINK.CP_CMD_ = VECTOR(KILL_BREAK);
+     CALL M$LINK (FPT_LINK) ALTRET(CROAK);
+/**/
+     CALL M$GTRMCTL(FPT_GTRMCTL_TERM) ALTRET(CROAK); /* SAVE TERM ATTRIBUTES */
+     CALL M$STRMCTL(FPT_STRMCTL_TERM) ALTRET(CROAK); /* KILL ECHO, USE TRANS ACTIVATION */
+     FPT_EOM_TERM.V.TIMEOUT# = SNORE_TIME;
+     CALL M$EOM (FPT_EOM_TERM) ALTRET(CROAK); /* SET TIMEOUT/EOM   */
+%EJECT;
+SLEEP: ;
+     SKUNK_BUF = 'ZZZzzz...';          /* SNORE    */
+     CALL M$WRITE (FPT_WRITE_TERM) ALTRET(LOGOFF);
+/**/
+     SKUNK_BUF = ' ';
+     CALL M$READ(FPT_READ_TERM) ALTRET(BAD_TRY);
+     DO WHILE (%NO#);
+BAD_TRY:  IF B$TCB$ -> B$TCB.ALT$ -> B$ALT.ERR.CODE = %E$LDSC
+          THEN                          /* Terminal disconnected   */
+               GOTO LOGOFF;
+          TOT_TIME = TOT_TIME + SNORE_TIME; /* Tally this timeout */
+          IF TOT_TIME >= TIME_OUT
+          THEN                          /* Too long! */
+               GOTO LOGOFF;
+          GOTO SLEEP;
+        END;
+/**/
+     TRY_PASS = SKUNK_BUF;
+     DO I = 0 TO 7;                     /* For each typed character */
+          TP_ARY(I) = TP_ARY(I) & '177'O; /* Reset any high parity bits */
+        END;
+     CALL ASZ$SCRAMBLE(TRY_PASS);
+/**/
+     IF TRY_PASS = GOOD_PASS
+     THEN
+     DO;
+          CALL M$STRMCTL(FPT_STRMCTL2_TERM) ALTRET(SIGH1); /* RESTORE TERM ATTR */
+SIGH1:    ;
+          FPT_LINK.CP_CMD_ = VECTOR(RESTORE_BREAK);
+          CALL M$LINK(FPT_LINK) ALTRET(SIGH2);
+SIGH2:    ;
+          GOTO FINIS;
+        END;
+     ELSE                               /* NO MATCH */
+     DO;
+          SKUNK_BUF = 'FRAUD!';
+          CALL M$WRITE(FPT_WRITE_TERM) ALTRET(LOGOFF);
+          BAD_TRIES = BAD_TRIES +1;
+          GOTO SLEEP;
+        END;
+/**/
+LOGOFF: ;
+     QUIT_OK = %YES#;
+     CALL M$YC(FPT_YC);
+/**/
+CROAK: ;
+     ERR = B$TCB$ -> B$TCB.ALT$ -> B$ALT.ERR;
+     CALL M$ERRMSG (FPT_ERRMSG) ALTRET(FRACK);
+FRACK: ;
+/**/
+FINIS: ;
+     QUIT_OK = %YES#;
+     CALL M$EXIT;
+/**/
+END SKUNK;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+INT: PROC ASYNC;
+/**/
+/*  INCLUDES */
+/**/
+%INCLUDE CP_6;
+/**/
+/*  CONSTANTS */
+/**/
+%FPT_TRMPRG (FPTN = FPT_TRMPRG_TERM,
+             DCB = M$UC,
+             RSTBRK = YES,
+             STCLASS = CONSTANT);
+/**/
+     CALL M$TRMPRG(FPT_TRMPRG_TERM) ALTRET(OOPS); /* RESET BREAK COUNT */
+OOPS: ;
+     RETURN;
+/**/
+END INT;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+XCON: PROC ASYNC;
+/**/
+/*  INCLUDES */
+/**/
+%INCLUDE CP_6;
+/**/
+/*  SYMREFS */
+/**/
+DCL QUIT_OK BIT(1) SYMREF;
+/**/
+     IF QUIT_OK
+     THEN
+          CALL M$EXIT;
+     ELSE
+          RETURN;
+END XCON;

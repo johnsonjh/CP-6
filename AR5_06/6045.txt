@@ -1,0 +1,827 @@
+/*M* SEAGULL_SIc04 -- XUU interface module (zbm$input$inp_package:c) */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+/*P*    NAME:     SEAGULL_SIc04
+        PURPOSE:  This file contains "stolen" code (shhhhh).  It was
+                  borrowed directly from the B00 C compiler accounts.
+                  The routines within serve as an XUU interface.
+ 
+        DESCRIPTION:
+          The extractable comments were kept in tact for all the
+          functions, so have a look below for any details needed.
+          The comments not needed for extraction were changed as
+          follows:  *M* -> *zbM*, etc.
+*/
+/********************************************************************/
+ 
+ 
+#pragma LIST EJECT
+/*zbM*        zb_input$inp_package:c     */
+/*zbT*/
+/*zbP*        NAME:       zb_input$inp_package:c
+            PURPOSE:    This routine feeds a character stream to the user
+            DESCRIPTION:These routines serve as an interface to input
+                        characters from an input stream.  It allows
+                        the user to choose how the input should be
+                        read from files or text and it gives the
+                        data to the user one character at a time.
+*/
+#include    <stdlib:h>
+#include    <errno:h>
+#include    <string:h>
+/* #include    <inp_types:h>  Replace by file below: */
+#include    "SEAGULL04:h"
+ 
+#ifndef     INP_NPUSHBACK
+#define     INP_NPUSHBACK     2
+#endif
+ 
+#ifndef     DEBUG_NUM
+int   debug_num = 1;
+#define     DEBUG_NUM   debug_num++
+#endif
+ 
+#if         INP_NPUSHBACK <   1
+#define     INP_NPUSHBACK     1
+#endif
+ 
+#ifndef     INP_BUFSIZE
+#define     INP_BUFSIZE      511
+#endif
+ 
+#if         INP_NPUSHBACK >   INP_BUFSIZE/2
+this is ridiculous!  You deserve what you get!!
+#endif
+ 
+#ifdef      INP_TYPE
+extern      INP_TYPE          INP_VAR;
+#endif
+ 
+ 
+struct      buffer_header {
+               struct buffer_header    *next;
+               int                     bh_size;   /* buf size    */
+               char                    *bh_text;  /* ptr to text */
+               char                    *bh_ipp;   /* stacked ipp */
+#ifdef      INP_TYPE
+               INP_TYPE                bh_i;      /* user defined*/
+#endif
+               int                     bh_file;   /* file flag   */
+               char                    bh_eofreturned; /*eof flag*/
+               int                     LS_flag;  /*Listing on/off*/
+            };
+ 
+struct      i_buf {
+               struct   i_buf *next;
+               char           ib_text[INP_BUFSIZE + INP_NPUSHBACK];
+            };
+ 
+/* Global data */
+SGFILEINFO              sg4_fileinfo;
+struct   buffer_header *sg4_Head = 0;
+struct   i_buf         *sg4_i_ptr = 0;
+int                     sg4_StdinFlag = 0;
+int                     sg4_NoBaseFile = 1;
+char                   *sg4_ipp = 0;
+char                   *sg4_BaseName = 0;
+char                   *sg4_UpdateName = 0;
+ 
+/* Function prototypes (locally used funcs)*/
+char                   *sg4__pushbuf();
+struct  buffer_header  *sg4__push_bh();
+int                     sg4__pop_bh();
+#ifdef __SOMEDAY__
+int   sg4__InsertFile( char *, char **, char **);
+int   sg4__InsertText( char *, int);
+int   sg4__loadbuf();
+#endif
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*F*     NAME:       sg4__xuu_Open
+         PURPOSE:    Open source file using XUU services.
+         DESCRIPTION:  This routine opens a file using the XUU library
+                       services of CP-6.  It uses an interface function
+                       provided by some PL-6 code.
+*/
+/*D*     NAME:    sg4__xuu_Open
+         CALL:    sg4__xuu_Open( (SGFILEINFO *) &fileinfo)
+         INPUT:
+                  int           fileinfo->filetype - open file as:
+                                             =1   Open as a base file
+                                             =2   Open a base + update
+                                             =3   Open as an include
+                  unsigned int  fileinfo->optui - optional update file
+                  unsigned int  fileinfo->list_update - tell XUU to list updates
+         OUTPUT:
+            char  *sg4_BaseName    - contains M$SI base file name
+            char  *sg4_UpdateName  - contains M$UI base file name
+                  *N* ???
+         DESCRIPTION:
+            This routine calls the PL-6 routines that interface with
+            the XUU library services.  We basically just want to open
+            up a base file, with a possible update file as well.
+*/
+/********************************************************************/
+ 
+ 
+int
+sg4__xuu_Open( SGFILEINFO  *FileInfo)
+{
+   /* Setup params needed for the open */
+   sg4_fileinfo.filetype = FileInfo->filetype;
+   sg4_fileinfo.optui = FileInfo->optui;
+   sg4_fileinfo.list_update = FileInfo->list_update;
+   sg4_fileinfo.si_fid = FileInfo->si_fid;
+   sg4_fileinfo.ui_fid = FileInfo->ui_fid;
+   sg4_fileinfo.ou_fid = FileInfo->ou_fid;
+ 
+   sg4_BaseName = malloc( 132);
+   sg4_UpdateName = malloc( 132);
+   sg4_NoBaseFile = 0;
+   sg4_fileinfo.key = malloc( 12 * sizeof(char));
+ 
+   if (!SG5_INPUT_OPEN( &sg4_fileinfo))
+      goto No_such_file;
+   if (sg4_fileinfo.open_flag) {
+      register struct   buffer_header  *bh = sg4__push_bh();
+      if (!bh) {
+         if (!sg4_StdinFlag)
+            SG5_INPUT_CLOSE( &sg4_fileinfo);
+         goto No_such_file;
+      }
+      if (!SG5_GETFILENAME( &(FileInfo->filetype),
+                            sg4_BaseName, sg4_UpdateName) ) {
+         sg4_BaseName = (char *) 0;
+         sg4_UpdateName = (char *) 0;
+      }
+      if (FileInfo->filetype == SG4_IN_BASE)
+         sg4_UpdateName = (char *) 0;
+      if (!(sg4_ipp = bh->bh_text = sg4__pushbuf() ))  {
+         *sg4_ipp = '\0';
+         /*N* maybe errmsg & return an error here... ? */
+      }
+      bh->bh_file = sg4_fileinfo.filetype;
+      return 1;
+   }
+No_such_file:
+   sg4_BaseName = (char *) 0;
+   sg4_UpdateName = (char *) 0;
+   return 0;
+}
+ 
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*F*     NAME:       sg4__xuu_Read
+         PURPOSE:    Read the next record from the current input source
+         DESCRIPTION:This routine reads the next input source from the
+                     current input file using the read routine
+                     that uses XUU services
+*/
+/*D*     NAME:    sg4__xuu_Read
+         CALL:    sg4__xuu_Read( (SGFILEINFO *) &fileinfo)
+         INPUT:
+                  char  * fileinfo->buffer - A pointer to a buffer
+         OUTPUT:
+                  char  * fileinfo->buffer - An array that contains the record
+                                that was read from the input file
+                  int   fileinfo->nbytes  - The number of bytes in the current
+                                record
+                  This routine returns a 1 on a successful read and
+                  a 0 on an unsuccessful read (like EOF)
+         DESCRIPTION:
+            This routine calls and gets the next record from the input
+            file and puts a '\0' at the end of the record on a
+            successful read and returns a 1 else it returns a 0
+*/
+/********************************************************************/
+ 
+ 
+int
+sg4__xuu_Read( SGFILEINFO  *FileInfo)
+{
+ 
+   int   ret_val = 0;
+   char  *result;
+   char  *errmsg;
+ 
+   sg4_fileinfo.bufsize = INP_BUFSIZE;    /*N* i guess */
+   sg4_fileinfo.buffer = FileInfo->buffer;
+   if ((ret_val = SG5_INPUT_READ( &sg4_fileinfo)) == 0) {
+      FileInfo->nbytes = 0;
+      return 0;
+   }
+   else if (ret_val < 0) {
+      result = strerror( errno);
+      errmsg = malloc( strlen( result));
+      strcpy( errmsg, result);
+      /*N* maybe do something with the message ?? */
+      free( errmsg);
+      FileInfo->nbytes = 0;
+      return 0;
+   }
+   FileInfo->buffer = sg4_fileinfo.buffer;
+   FileInfo->nbytes = sg4_fileinfo.nbytes;
+   FileInfo->buffer[ FileInfo->nbytes] = '\0';
+   return   1;
+}
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*F*     NAME:       sg4__xuu_Close
+         PURPOSE:    Close all the DCBs opened by the XUU interface.
+         DESCRIPTION:  This routine simply closes up the input source
+                       currently open by interfacing with routines
+                       that call XUU services (XUU$CLOSE).
+*/
+/*D*     NAME:    sg4__xuu_Close
+         CALL:    sg4__xuu_Close( (SGFILEINFO *) &fileinfo)
+         INPUT:
+            none
+         OUTPUT:
+            none
+         DESCRIPTION:
+            This routine closes the input source currently opened to
+            the XUU library.
+*/
+/********************************************************************/
+ 
+ 
+int
+sg4__xuu_Close( SGFILEINFO  *FileInfo)
+{
+ 
+   int   ret_val = 0;
+   char  *result;
+   char  *errmsg;
+ 
+   FileInfo ;   /* not used presently */
+   if ((ret_val = SG5_INPUT_CLOSE( &sg4_fileinfo)) == 0) {
+      ;  /*N* do something about the error */
+      return 0;
+   }
+   else if (ret_val < 0) {
+      result = strerror( errno);
+      errmsg = malloc( strlen( result));
+      strcpy( errmsg, result);
+      /*N* maybe do something with the message ?? */
+      free( errmsg);
+      return 0;
+   }
+ 
+   /* lookin' good, man. */
+   return   1;
+}
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*F*     NAME:       sg4__MakeFid
+         PURPOSE:    This routine concatenates a dir and a filename
+         DESCRIPTION:This routine concatenates a dir and a filename
+*/
+/*D*     NAME:    sg4__MakeFid
+         CALL:    sg4__MakeFid( dir, file, newname)
+         INPUT:
+                  char  *dir  - the directory part for newname
+                  char  *file - the file name part for newname
+         OUTPUT:
+                  char **newname - A pointer to the new filename
+                                   that was created with dir and file
+         DESCRIPTION:
+            This routine creates the next filename that needs to
+            be opened by the sg4__InsertFile. The variables dir and file
+            can come in several different varieties:
+               1) file '.' dir
+               2) dir (up to '.') file rest of dir
+               3) replace ? in dir with file
+            If a newname can be created a 1 is returned else a 0
+*/
+/********************************************************************/
+ 
+ 
+int
+sg4__MakeFid( char *dir, char *file, char **newname)
+{
+   int dirtype, newlen;
+   char *p, *strindex();
+   register char *dst;
+   char  *q = 0;
+   int   dirlen = 0;
+   int   fillen = 0;
+ 
+   dirtype = 0, newlen = 2;
+   dirlen = strlen( dir) + 1;
+   fillen = strlen( file);
+   p = memchr( dir, '.', dirlen);
+   if (p) dirtype = 1;
+   if (q = memchr( dir, '?', dirlen)) dirtype = 2;
+ 
+   newlen += dirlen + fillen;
+   dst = malloc( newlen);
+   if (!dst) return 0;
+   *newname = dst;
+ 
+   switch( dirtype)    {
+ 
+   case 0:   /***  file '.' dir   ***/
+      memcpy( dst, file, fillen);
+      dst[fillen] = '.';
+      memcpy( dst+fillen+1, dir, dirlen);
+      break;
+ 
+   case 1:   /***  dir (up to '.') file (rest of dir)  ***/
+      newlen = p - dir;
+      memcpy( dst, dir, newlen);
+      memcpy( dst+newlen, file, fillen);
+      memcpy( dst+newlen+fillen, p, dirlen-newlen);
+      break;
+ 
+   case 2:   /**   Replace '?' in dir with file        ***/
+      newlen = q - dir;
+      memcpy( dst, dir, newlen);
+      memcpy( dst+newlen, file, fillen);
+      memcpy( dst+newlen+fillen, q+1, dirlen-newlen-1);
+      break;
+   }
+   return 1;
+}
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*zbF*     NAME:       sg4__pushbuf
+         PURPOSE:    Allocate a buffer for each file to be read
+         DESCRIPTION:This routine allocates a buffer for each file
+                     to be read so input can be suspended in the
+                     middle of a buffers input
+*/
+/*zbD*     NAME:    sg4__pushbuf
+         CALL:    sg4__pushbuf()
+         INPUT:   None
+         OUTPUT:
+                  This routine returns a pointer to the buffer
+                  allocated minus the number of characters that
+                  the user wants to be able to pushback onto the
+                  input stream
+         DESCRIPTION:
+            This routine simply allocates a buffer that is to
+            contain the input stream of the current file that is
+            open. Note that not all of the buffer is given to the
+            user. This so that if the user wants to be able to push
+            characters back onto the input stream it will still
+            work as advertised.
+*/
+/********************************************************************/
+ 
+ 
+char *
+sg4__pushbuf()
+{
+   register struct   i_buf *ib =
+   (struct i_buf *) malloc( sizeof (struct i_buf));
+ 
+   if (!ib) return 0;
+   ib->next = sg4_i_ptr;
+   sg4_i_ptr = ib;
+ 
+/*    Keep part of the buffer for a good PUSHBACK           */
+   return &(ib->ib_text[INP_NPUSHBACK-1]);
+}
+ 
+ 
+/********************************************************************/
+/*zbF*        NAME:       sg4__push_bh
+            PURPOSE:    Pushes off information when input sources change
+            DESCRIPTION:Pushes off information when input sources change
+                        so that they can be restored when input
+                        returns to the old input source
+*/
+/*zbD*        NAME:    sg4__push_bh
+            CALL:    sg4__push_bh()
+            INPUT:   None
+            OUTPUT:
+                     This routine returns the top position of the
+                     stack of input saved information
+            DESCRIPTION:
+               This routine pushes off all the necessary information
+               about the current input source that is being read from.
+               This includes:
+                  The current buffer in use
+                  The position being read in the current buffer
+                  User supplied variable
+                  The size of the current buffer
+*/
+/********************************************************************/
+ 
+ 
+struct   buffer_header *
+sg4__push_bh()
+{
+   register struct   buffer_header *bh;
+ 
+   if (bh = sg4_Head) {
+      bh->bh_ipp = sg4_ipp;
+#ifdef   INP_TYPE
+      if (bh->bh_file) { bh->bh_i = INP_VAR; }
+#endif   INP_TYPE
+   }
+ 
+   if (!(bh = (struct buffer_header *) malloc(  sizeof(struct buffer_header))))
+       return 0;
+   bh->next = sg4_Head;
+   bh->bh_eofreturned = 0;
+   sg4_Head = bh;
+   return bh;
+}
+ 
+ 
+/********************************************************************/
+/*zbF*        NAME:       sg4__pop_bh
+            PURPOSE:    Restores information about a previous input source
+            DESCRIPTION:Restores information about a previous input source
+                        that was suspended by the user
+*/
+/*zbD*        NAME:    sg4__pop_bh
+            CALL:    sg4__pop_bh()
+            INPUT:   None
+            OUTPUT:
+                     This routine returns a 1 if there was a information
+                     to be restored from the stack else it returns a 0
+            DESCRIPTION:
+               This routine pops off all the information that was
+               saved by the routine sg4__push_bh().
+*/
+/********************************************************************/
+ 
+ 
+int
+sg4__pop_bh()
+{
+   register struct   buffer_header  *bh = sg4_Head;
+#ifdef INP_TYPE
+   int PopFile = 0;
+#endif
+ 
+   if (bh->bh_file) {   /* Unstack a file */
+      struct   i_buf *ib;
+ 
+      ib = sg4_i_ptr->next;
+      free( (char *) sg4_i_ptr);
+      sg4_i_ptr = ib;
+#ifdef INP_TYPE
+      PopFile = 1;
+#endif
+   }
+ 
+   bh = bh->next;
+   free( (char *) sg4_Head);
+   sg4_Head = bh;
+ 
+   if (!bh) {  /* No more entries   */
+      sg4_Head = (struct buffer_header *) 0;
+      return 0;
+   }
+ 
+   sg4_ipp = bh->bh_ipp;   /* Restore previous input pointer   */
+#ifdef   INP_TYPE
+   if (PopFile) { INP_VAR = bh->bh_i; }
+#endif   INP_TYPE
+ 
+   return 1;
+}
+ 
+ 
+#ifdef __SOMEDAY__
+/********************************************************************/
+/*zbF*     NAME:       sg4__InsertFile
+         PURPOSE:    Suspend current input and start input from a file
+         DESCRIPTION:Suspend current input and start input from a file
+                     supplied by the caller
+*/
+/*zbD*     NAME:    sg4__InsertFile
+         CALL:    sg4__InsertFile( filnam, table, result)
+         INPUT:
+                  char *filnam   - The name of the file to open
+                  char *table[]  - A table of directories that are
+                                   to be searched for filnam
+         OUTPUT:
+                  char **result  - Contains the entire filename
+                                   that was opened (comes from sg4__MakeFid)
+         DESCRIPTION:
+            This routine suspends input from the current input source
+            and starts input from the file supplied by the user.
+            It opens the new file and allocates the buffer needed for
+            reading the data from the file. If the file is opened
+            ok, the routine returns a 1 else it returns a 0.
+*/
+/********************************************************************/
+ 
+ 
+int
+sg4__InsertFile( char  *filnam,
+                char  *table[],
+                char  **result
+              )
+{
+   char  *newfn = 0;
+   char  *acctloc = 0;
+   char  *slashloc = 0;
+   int   len = 0;
+ 
+   if (!filnam) {
+      if (!sg4__xuu_Open (SG4_IN_BASE, 0, 0))
+         return 0;
+      *result = sg4_BaseName;
+      return 1;
+   }
+   sg4_fileinfo.filetype = SG4_IN_INCLUDE;
+   sg4_fileinfo.optui = 0;
+   if (sg4_NoBaseFile) {
+      sg4_fileinfo.key = malloc( 12 * sizeof (char));
+   }
+   if (!filnam) sg4_StdinFlag = 1;
+   else {
+      len = strlen( filnam);
+      slashloc = memchr( filnam, '/', len);
+      if (slashloc) {           /* check to see if '/' goes to '$'  */
+         char     *pos = filnam;
+         if ((!memcmp( pos, "DP", 2)) ||
+            (!memcmp( pos, "dp", 2)) ||
+            (!memcmp( pos, "LT", 2)) ||
+            (!memcmp( pos, "lt", 2))) {
+            pos += 2;
+            if ((pos == slashloc) || (*pos == '#') ||
+               (((pos + 1) <= slashloc) && (isdigit(*pos)) &&
+                  (isdigit(*(pos + 1))) && ((*(pos + 2) == '#') ||
+                     (*(pos + 2) == '/')))) {   /* Dont change this
+                                                   slash */
+               slashloc++;
+               slashloc = memchr( slashloc, '/', len - (slashloc - filnam - 1));
+            }
+         }
+         while (slashloc) {
+            *slashloc++ = '$';
+            slashloc = memchr( slashloc, '/', len - (slashloc - filnam - 1));
+         }
+      }
+      if ((table == 0) || (acctloc = strindex (filnam, '.')) != 0) {
+         /* Do not look in table (yet) */
+         sg4_fileinfo.filename = filnam;
+         if (!SG5_INPUT_OPEN( &sg4_fileinfo)) {
+            if (table) {
+               *acctloc++ = ':';
+               while (acctloc = strchr(acctloc, '.')) {
+                  *acctloc++ = ':';
+               }
+               goto look_in_table;
+            }
+            return 0;
+         }
+      }
+      else {
+look_in_table:
+         while (*table) {
+            if (!sg4__MakeFid (*table++, filnam, &newfn)) {
+               return 0;
+            }
+            sg4_fileinfo.filename = newfn;
+            if (SG5_INPUT_OPEN( &sg4_fileinfo)) {
+               filnam = sg4_fileinfo.filename;
+               break;
+            }
+            free( newfn);
+            newfn = 0;
+         }
+      }
+   }
+ 
+   if (sg4_fileinfo.open_flag) {
+      register struct   buffer_header  *bh = sg4__push_bh();
+ 
+      if (!bh) {
+         if (!sg4_StdinFlag) SG5_INPUT_CLOSE( &sg4_fileinfo);
+         return 0;
+      }
+ 
+      if (sg4_NoBaseFile) {
+         sg4_NoBaseFile = 0;
+      }
+      else {
+      }
+ 
+      if (!(sg4_ipp = bh->bh_text = sg4__pushbuf()) ||
+          !sg4__xuu_Read( sg4_ipp, &(bh->bh_size))  ) {
+/* Dont fail here it could have been an empty file */
+         *sg4_ipp = '\0';
+      }
+      bh->bh_file = sg4_fileinfo.filetype;
+      *result = filnam;
+      return 1;
+   }
+   return 0;
+}
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*zbF*     NAME:       sg4__InsertText
+         PURPOSE:    Changes input from current source to a text string
+         DESCRIPTION:  Changes input from current source to a text
+            string that is a user supplied parameter
+*/
+/*zbD*     NAME:    sg4__InsertText
+         CALL:    sg4__InsertText( text,length)
+         INPUT:
+                  char *text  - The text that is to be used as the
+                                input source
+                  int  length - The length of the text string
+         OUTPUT:  None
+         DESCRIPTION:
+            This routine suspends input from the current source
+            and makes the new input source a text string. This
+            routine returns a 1 if everything worked ok else it
+            returns a 0.
+*/
+/********************************************************************/
+ 
+ 
+int
+sg4__InsertText( char *text, int length)
+{
+   register struct   buffer_header  *bh = sg4__push_bh();
+ 
+   if (!bh) return 0;
+   bh->bh_size = length;
+   sg4_ipp = bh->bh_text = text;
+   bh->bh_file = SG4_IN_TEXT;
+   return 1;
+}
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*zbF*     NAME:       sg4__loadbuf
+         PURPOSE:    This routine loads the buffer with the next record from the current input source
+         DESCRIPTION:This routine loads the buffer with the next record from the current input source
+*/
+/*zbD*     NAME:    sg4__loadbuf
+         CALL:    sg4__loadbuf()
+         INPUT:   None
+         OUTPUT:  None
+         DESCRIPTION:
+            This routine is called whenever the defined routine
+            loadchar encounters a '\0'. This character either means
+            the end of the buffer has been found or there is actually
+            a '\0' in the input (not likely). If a file is the
+            current input source the last INP_PUSHBACK characters must
+            be saved off so a good pushback can be implemented.
+            Once this is done the next record is read from the
+            current file. If this read fails the routine calls
+            AtEoIF. And the next time this routine is called it pops
+            the last input source that was found.
+*/
+/*  sg4__loadbuf() is called if LoadChar meets a '\0' character
+    which may be the end-of-buffer mark of the current input
+    buffer.  The '\0' could be genuine although not likely.
+    Note: this routine is exported due to its occurence in the definition
+    of LoadChar [input.h], that is defined as a macro.
+*/
+/********************************************************************/
+ 
+ 
+int
+sg4__loadbuf()
+{
+   register struct buffer_header *bh = sg4_Head;
+   static   char buf[INP_NPUSHBACK + 1];
+   int      FromFile;
+ 
+   if (!bh) {      /* stack exhausted, EOF on sourcefile */
+      return EOI;
+   }
+ 
+   if (sg4_ipp < &(bh->bh_text[bh->bh_size])) {
+          /* a genuine '\0' character has been seen */
+      return '\0';
+   }
+ 
+   FromFile = bh->bh_file;
+ 
+   if (FromFile) {
+#if INP_NPUSHBACK > 1
+      register char *so = &(bh->bh_text[bh->bh_size]);
+      register char *de = bh->bh_text;
+      register int i = INP_NPUSHBACK - 1;
+ 
+      while (i-- > 0) {
+          /* make sure PushBack will work */
+         *--de = *--so;
+      }
+#endif
+      if (
+          sg4__xuu_Read(bh->bh_text, &(bh->bh_size))
+          &&
+          bh->bh_size > 0
+             )  {
+         sg4_ipp = bh->bh_text;
+         return *sg4_ipp++;
+      }
+   }
+ 
+ 
+   if (!bh->bh_eofreturned) {
+      bh->bh_eofreturned = 1;
+      sg4_ipp--;
+      if (FromFile) {
+         if (AtEoIF()) return EOI;
+      }
+      else {
+         if (AtEoIT()) return EOI;
+      }
+   }
+ 
+ 
+   if (sg4__pop_bh()) {
+      if (*sg4_ipp) return *sg4_ipp++;
+      if (sg4_fileinfo.level != -1) return sg4__loadbuf();
+   }
+   sg4_ipp = &buf[INP_NPUSHBACK];
+   return EOI;
+}
+ 
+/*if __SOMEDAY__ */
+#endif
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*zbM*     zb_input$fastio:c */
+/*zbT*/
+/*zbP*     NAME:       zb_input$fastio:c
+         PURPOSE:    These routines allocate and free memory for XUU
+         DESCRIPTION:These routines allocate and free memory for XUU
+                     services and serve as an interface between PL6
+                     and C routines
+*/
+/********************************************************************/
+/*F*     NAME:       SG4__MALLOC
+         PURPOSE:    This routine calls malloc and allocates storage
+         DESCRIPTION:This routine calls malloc and allocates storage
+*/
+/*D*     NAME:    SG4__MALLOC
+         CALL:    SG4__MALLOC( ptrptr, size)
+         INPUT:
+                  int size      - The number of bytes to allocate
+         OUTPUT:
+                  char **ptrptr - Points at a pointer that contains
+                                  the memory that was allocated
+         DESCRIPTION:
+            This routine allocates an area of memory for XUU services
+            so it can use its fast sequential I/O capabilities.
+            It does this my using the C function malloc.
+*/
+/********************************************************************/
+ 
+#include    <stdlib.h>
+ 
+void
+SG4__MALLOC( char **ptrptr, int *size)
+{
+      *ptrptr = malloc( *size);
+      return;
+}
+ 
+ 
+#pragma LIST EJECT
+/********************************************************************/
+/*F*     NAME:       SG4__FREE
+         PURPOSE:    This routine calls free and frees storage
+         DESCRIPTION:This routine calls free and frees storage
+*/
+/*D*     NAME:    SG4__FREE
+         CALL:    SG4__FREE( ptrptr)
+         INPUT:
+                  char **ptrptr - Points at the area of memory to
+                                  release
+         OUTPUT: None
+         DESCRIPTION:
+            This routine releases an area of memory for XUU services
+            It does this my using the C function free.
+*/
+/********************************************************************/
+ 
+void
+SG4__FREE( char  **ptrptr)
+{
+      free( *ptrptr);
+      return;
+}

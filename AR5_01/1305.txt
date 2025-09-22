@@ -1,0 +1,1510 @@
+VERSION E05
+
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:1    
+        1        1        /*M*  KUR$RESUS - monitor write to station via CG/CSCG and wait for reply    */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        KUR$RESUS: PROC (BUF,LEN,STA,RCVBUF,RCVLEN);
+        8        8        /*X* DTI=2,DCI=4,THI=2,CSI=2,ECI=2,STI=2,IND=2,ENI=2 */
+        9        9        /*D* NAME:        KUR$RESUS
+       10       10             PURPOSE:     To provide a 'send then wait for reply' function for monitor
+       11       11                          to CG/CSCG station and back interactions.
+       12       12             CALL:        CALL KUR$RESUS (BUF,LEN,STA,RCVBUF,RCVLEN);
+       13       13                           where:
+       14       14                             BUF is the buffer containing the message to send
+       15       15                             LEN is the byte length of BUF
+       16       16                             STA is an 8 character name of STATION to send to
+       17       17                             RCVBUF is the buffer in which to place the response
+       18       18                             RCVLEN is the byte length of RCVBUF. It will be set
+       19       19                             on return to the actual length of the response
+       20       20             DESCRIPTION: KUR$RESUS writes a message, BUF, of length, LEN,
+       21       21                          to station, STA, on CG/CSCG and waits for a response
+       22       22                          to this message. The response of maximum length, RCVLEN,
+       23       23                          is read into RCVBUF. The actual length of the response
+       24       24                          is then placed into RCVLEN.
+       25       25
+       26       26                          The ASR at entry to KUR$RESUS is restored on exit.
+       27       27
+       28       28                          Implementation is as follows:
+       29       29                             Monitor STATION 'RESUS   ' on CG/CSCG is initialized
+       30       30                             on system startup to have a zero-byte anonymous read
+       31       31                             on CG/CSCG. KUR$RESUS writes a message to the specified
+       32       32                             station of MSGTYP 'RESUSnnn' where nnn is the textual
+       33       33                             representation of the caller's user number.
+       34       34                             The caller is now put to sleep.
+       35       35                             Eventually, some message is written to station
+       36       36                             RESUS satisfying the outstanding zero-byte read
+       37       37                             and allowing KUR$EA end-action routine to obtain
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:2    
+       38       38                             nnn from the 'RESUSnnn' MSGTYP allowing KUR$EA to
+       39       39                             wake up the correct sleeping user.
+       40       40                             The sleeping user wakes up in KUR$RESUS and does
+       41       41                             a directed read of MSGTYP 'RESUSnnn' where nnn is
+       42       42                             his own user number. On return from the read, RCVLEN
+       43       43                             is set to the actual response length and the RESUS's
+       44       44                             zero-byte read is re-queued.
+       45       45
+       46       46                             For this to all work, the STATION, STA, must ALWAYS
+       47       47                             write his response back to the same MSGTYP that he
+       48       48                             read (and to the originating STATION).
+       49       49        */
+       50       50    1   DCL BUF CHAR(LEN) UNAL;
+       51       51    1   DCL LEN UBIN WORD;
+       52       52    1   DCL STA CHAR(8) UNAL;
+       53       53    1   DCL RCVBUF CHAR(RCVLEN) UNAL;
+       54       54    1   DCL RCVLEN UBIN WORD;
+       55       55        /*  */
+       56       56        %INCLUDE KC_CP6;
+       57      616        %INCLUDE N$REQ;
+       58      690        %INCLUDE N_FC_C;
+       59      727        %INCLUDE SS_SCHED_C;
+       60      960        %INCLUDE CP_6_SUBS;
+       61     1500        /*  */
+       62     1501    1   DCL RESUS_MSGTYP CHAR(8);
+       63     1502    1   DCL 1 RESUS_TYP REDEF RESUS_MSGTYP,
+       64     1503    1         2 RESUS CHAR(5),
+       65     1504    1         2 USER CHAR(3);
+       66     1505    1   DCL ASRTEMP BIT(72) DALIGNED;
+       67     1506        /*  */
+       68     1507    1   DCL KUR_IOQ_HLP$ PTR SYMREF;
+       69     1508    1   DCL NK_RESUSLDX_HLP UBIN WORD SYMREF;   /* LDCTX of station RESUS             */
+       70     1509    1   DCL KUR_IOQ$ PTR SYMREF;
+       71     1510    1   DCL NK_RESUSLDX UBIN WORD SYMREF;       /* LDCTX of station RESUS             */
+       72     1511        %VLP_STATION (FPTN=KUR_STA,STCLASS=SYMREF);
+       73     1538    1   DCL S_CUN UBIN WORD SYMREF;
+       74     1539        %VLP_STATION (FPTN=KC_VLPSTATION,STCLASS=SYMREF);
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:3    
+       75     1566        %VLP_STATION (FPTN=ASTA,STCLASS="");
+       76     1593        %N$REQ;
+       77     1651        /*  */
+       78     1652    1   DCL KQX$SAVASR ENTRY(1);
+       79     1653    1   DCL KQX$RESASR ENTRY(1);
+       80     1654    1   DCL NIO$QUE ENTRY(1) ALTRET;
+       81     1655    1   DCL NIQ$GET ENTRY(1) ALTRET;
+       82     1656    1   DCL NIQ$REL ENTRY(1) ALTRET;
+       83     1657    1   DCL SSR$REG ENTRY(3) ALTRET;
+       84     1658    1   DCL SC_RESUS ENTRY CONV(2,0);
+       85     1659    1   DCL Q$ PTR;
+       86     1660    1   DCL IOQ$ PTR;
+       87     1661    1   DCL LDCTX UBIN;
+       88     1662    1   DCL TYC BIT(36);
+       89     1663        /*  */
+       90     1664        %EJECT;
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:4    
+       91     1665    1           IOQ$ = KUR_IOQ$;
+       92     1666    1           LDCTX = NK_RESUSLDX;
+       93     1667    1           GOTO CMN;
+       94     1668
+       95     1669
+       96     1670        /*D* NAME:        KUR$RESUS_HLP
+       97     1671             PURPOSE:     To provide a 'send then wait for reply' function for momitor
+       98     1672             DESCRIPTION: Same as KUR$RESUS except this RESUS station is on CG/HLPCG
+       99     1673                          instead of on CG/CSCG and will therefore be much more
+      100     1674                          useful to network management functions; i.e. interfacing
+      101     1675                          with the Network Manager.
+      102     1676        */
+      103     1677
+      104     1678    1   KUR$RESUS_HLP: ENTRY(BUF,LEN,STA,RCVBUF,RCVLEN);
+      105     1679
+      106     1680    1           IOQ$ = KUR_IOQ_HLP$;
+      107     1681    1           LDCTX = NK_RESUSLDX_HLP;
+      108     1682
+      109     1683    1   CMN:    ;
+      110     1684    1   GETQ:   CALL NIQ$GET (Q$)               /* Get an IOQ packet                  */
+      111     1685    2             WHENALTRETURN DO;
+      112     1686    2               CALL SSR$REG(%SS_SW,,1);    /* Wait for a second and try again    */
+      113     1687    2               GOTO GETQ;
+      114     1688    2               END;
+      115     1689    1           Q$ -> N$REQ.OPFLG = OP_BPF|OP_USER; /* Set BPF and USER               */
+      116     1690    1           Q$ -> N$REQ.DLA.DCTX = LDCTX;   /* Set DCT index                      */
+      117     1691    1           Q$ -> N$REQ.FC = %N_WRITE;      /*  Function is write                 */
+      118     1692    1           Q$ -> N$REQ.BUF$ = ADDR (BUF);  /* Buffer pointer                     */
+      119     1693    1           Q$ -> N$REQ.BUFSIZE = LEN;      /* Buffer length                      */
+      120     1694    1           Q$->N$REQ.NOALT='1'B;
+      121     1695    1           ASTA=KC_VLPSTATION;
+      122     1696    1           ASTA.STATION#=STA;
+      123     1697    1           RESUS_TYP.RESUS = 'RESUS';
+      124     1698    1           CALL BINCHAR(RESUS_TYP.USER,S_CUN);
+      125     1699    1           ASTA.MSGTYP#=RESUS_MSGTYP;
+      126     1700    1           Q$->N$REQ.STATION.LSTA$=ADDR(ASTA);
+      127     1701    1           CALL KQX$SAVASR (ASRTEMP);
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:5    
+      128     1702    1           CALL NIO$QUE (Q$->N$REQ);       /* WRITE THRU CSCG OR HLPCG           */
+      129     1703    1           CALL KQX$RESASR (ASRTEMP);
+      130     1704        /**/
+      131     1705        /* REG this user until awakened by KUR$EA on end action response to sent msg */
+      132     1706        /**/
+      133     1707    1           CALL SSR$REG(%SS_QA);
+      134     1708        /**/
+      135     1709        /* Now read the response */
+      136     1710        /**/
+      137     1711    1   GETQ2:  CALL NIQ$GET (Q$)               /* Get an IOQ packet                  */
+      138     1712    2             WHENALTRETURN DO;
+      139     1713    2               CALL SSR$REG(%SS_SW,,1);
+      140     1714    2               GOTO GETQ2;
+      141     1715    2               END;
+      142     1716    1           Q$ -> N$REQ.OPFLG = OP_BPF|OP_USER|OP_HOLD|OP_WAIT;
+      143     1717    1           Q$ -> N$REQ.DLA.DCTX = LDCTX;   /* Set DCT index                      */
+      144     1718    1           Q$ -> N$REQ.FC = %N_RDASC;      /*  Function is read                  */
+      145     1719    1           Q$ -> N$REQ.BUF$ = ADDR (RCVBUF); /* Buffer pointer                   */
+      146     1720    1           Q$ -> N$REQ.BUFSIZE = RCVLEN;   /* Buffer length                      */
+      147     1721    1           Q$ -> N$REQ.DVE.DVBYTE.CONT='1'B; /* CONT to read rest of msg         */
+      148     1722    1           Q$->N$REQ.NOALT='1'B;
+      149     1723    1           ASTA.CTL.DIRONLY# = '1'B;
+      150     1724    1           ASTA.CTL.EOFNONE# = '1'B;
+      151     1725    1           Q$->N$REQ.STATION.LSTA$=ADDR(ASTA);
+      152     1726    1           CALL NIO$QUE (Q$->N$REQ);       /* READ THRU CSCG                     */
+      153     1727    1           TYC=Q$->N$REQ.TYC;
+      154     1728    1           RCVLEN = Q$->N$REQ.ARSIZE;
+      155     1729    1           CALL NIQ$REL(Q$);
+      156     1730        /**/
+      157     1731        /* Now re-post the always-pending zero-byte read for RESUS */
+      158     1732        /**/
+      159     1733    1           IOQ$->N$REQ.STATION.LSTA$ = ADDR(KUR_STA);
+      160     1734    1           CALL NIO$QUE(IOQ$->N$REQ);
+      161     1735        /**/
+      162     1736        /* And put the ASR framing the current comgroup back to how we found it */
+      163     1737        /**/
+      164     1738    1           IF TYC & %TYC_EOF
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:6    
+      165     1739    2             THEN DO;
+      166     1740                     /*    Got EOF on the
+      167     1741                      *    read, meaning no message
+      168     1742                      *    was found.  Flick it in.
+      169     1743                      */
+      170     1744    2               CALL SC_RESUS;
+      171     1745        /*S* SCREECH_CODE: KUR-S$RESUS
+      172     1746             TYPE:         SUA
+      173     1747             MESSAGE:      Inconsistency reading CSCG for a monitor process
+      174     1748             REMARKS:      The user cannot find the message that is supposed
+      175     1749                           to be waiting for him at the RESUS station on
+      176     1750                           the CSCG. */
+      177     1751    2               END;
+      178     1752    1           CALL KQX$RESASR (ASRTEMP);
+      179     1753    1           RETURN;
+      180     1754    1   END KUR$RESUS;
+      181     1755        %EOD;
+
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:7    
+--  Include file information  --
+
+   CP_6_SUBS.:E05TOU  is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+      No diagnostics issued in procedure KUR$RESUS.
+
+   Procedure KUR$RESUS requires 183 words for executable code.
+   Procedure KUR$RESUS requires 28 words of local(AUTO) storage.
+
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:8    
+
+ Object Unit name= KUR$RESUS                                  File name= KUR$RESUS.:E05TOU
+ UTS= JUL 30 '97 01:53:41.24 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS      3      3  KUR$RESUS
+    1   Proc  even  none   183    267  KUR$RESUS
+    2  RoData even  none     6      6  KUR$RESUS
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        5  KUR$RESUS
+     1      7                  yes      Std        5  KUR$RESUS_HLP
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 NIQ$GET
+ yes     yes           Std       3 SSR$REG
+         yes           Std       1 KQX$SAVASR
+ yes     yes           Std       1 NIO$QUE
+ yes     yes           Std       1 NIQ$REL
+         yes           Std       1 KQX$RESASR
+                       nStd      0 X66_AUTO_5
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:9    
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_RESUS                              KUR_IOQ_HLP$                          NK_RESUSLDX_HLP
+     KUR_IOQ$                              NK_RESUSLDX                           KUR_STA
+     S_CUN                                 KC_VLPSTATION                         B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ASLENTSID                             ISSID
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:10   
+
+
+        1        1        /*M*  KUR$RESUS - monitor write to station via CG/CSCG and wait for reply    */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        KUR$RESUS: PROC (BUF,LEN,STA,RCVBUF,RCVLEN);
+
+      7  1 000000   000000 700200 xent  KUR$RESUS    TSX0  ! X66_AUTO_5
+         1 000001   000034 000005                    ZERO    28,5
+
+        8        8        /*X* DTI=2,DCI=4,THI=2,CSI=2,ECI=2,STI=2,IND=2,ENI=2 */
+        9        9        /*D* NAME:        KUR$RESUS
+       10       10             PURPOSE:     To provide a 'send then wait for reply' function for monitor
+       11       11                          to CG/CSCG station and back interactions.
+       12       12             CALL:        CALL KUR$RESUS (BUF,LEN,STA,RCVBUF,RCVLEN);
+       13       13                           where:
+       14       14                             BUF is the buffer containing the message to send
+       15       15                             LEN is the byte length of BUF
+       16       16                             STA is an 8 character name of STATION to send to
+       17       17                             RCVBUF is the buffer in which to place the response
+       18       18                             RCVLEN is the byte length of RCVBUF. It will be set
+       19       19                             on return to the actual length of the response
+       20       20             DESCRIPTION: KUR$RESUS writes a message, BUF, of length, LEN,
+       21       21                          to station, STA, on CG/CSCG and waits for a response
+       22       22                          to this message. The response of maximum length, RCVLEN,
+       23       23                          is read into RCVBUF. The actual length of the response
+       24       24                          is then placed into RCVLEN.
+       25       25
+       26       26                          The ASR at entry to KUR$RESUS is restored on exit.
+       27       27
+       28       28                          Implementation is as follows:
+       29       29                             Monitor STATION 'RESUS   ' on CG/CSCG is initialized
+       30       30                             on system startup to have a zero-byte anonymous read
+       31       31                             on CG/CSCG. KUR$RESUS writes a message to the specified
+       32       32                             station of MSGTYP 'RESUSnnn' where nnn is the textual
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:11   
+       33       33                             representation of the caller's user number.
+       34       34                             The caller is now put to sleep.
+       35       35                             Eventually, some message is written to station
+       36       36                             RESUS satisfying the outstanding zero-byte read
+       37       37                             and allowing KUR$EA end-action routine to obtain
+       38       38                             nnn from the 'RESUSnnn' MSGTYP allowing KUR$EA to
+       39       39                             wake up the correct sleeping user.
+       40       40                             The sleeping user wakes up in KUR$RESUS and does
+       41       41                             a directed read of MSGTYP 'RESUSnnn' where nnn is
+       42       42                             his own user number. On return from the read, RCVLEN
+       43       43                             is set to the actual response length and the RESUS's
+       44       44                             zero-byte read is re-queued.
+       45       45
+       46       46                             For this to all work, the STATION, STA, must ALWAYS
+       47       47                             write his response back to the same MSGTYP that he
+       48       48                             read (and to the originating STATION).
+       49       49        */
+       50       50    1   DCL BUF CHAR(LEN) UNAL;
+       51       51    1   DCL LEN UBIN WORD;
+       52       52    1   DCL STA CHAR(8) UNAL;
+       53       53    1   DCL RCVBUF CHAR(RCVLEN) UNAL;
+       54       54    1   DCL RCVLEN UBIN WORD;
+       55       55        /*  */
+       56       56        %INCLUDE KC_CP6;
+       57      616        %INCLUDE N$REQ;
+       58      690        %INCLUDE N_FC_C;
+       59      727        %INCLUDE SS_SCHED_C;
+       60      960        %INCLUDE CP_6_SUBS;
+       61     1500        /*  */
+       62     1501    1   DCL RESUS_MSGTYP CHAR(8);
+       63     1502    1   DCL 1 RESUS_TYP REDEF RESUS_MSGTYP,
+       64     1503    1         2 RESUS CHAR(5),
+       65     1504    1         2 USER CHAR(3);
+       66     1505    1   DCL ASRTEMP BIT(72) DALIGNED;
+       67     1506        /*  */
+       68     1507    1   DCL KUR_IOQ_HLP$ PTR SYMREF;
+       69     1508    1   DCL NK_RESUSLDX_HLP UBIN WORD SYMREF;   /* LDCTX of station RESUS             */
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:12   
+       70     1509    1   DCL KUR_IOQ$ PTR SYMREF;
+       71     1510    1   DCL NK_RESUSLDX UBIN WORD SYMREF;       /* LDCTX of station RESUS             */
+       72     1511        %VLP_STATION (FPTN=KUR_STA,STCLASS=SYMREF);
+       73     1538    1   DCL S_CUN UBIN WORD SYMREF;
+       74     1539        %VLP_STATION (FPTN=KC_VLPSTATION,STCLASS=SYMREF);
+       75     1566        %VLP_STATION (FPTN=ASTA,STCLASS="");
+       76     1593        %N$REQ;
+       77     1651        /*  */
+       78     1652    1   DCL KQX$SAVASR ENTRY(1);
+       79     1653    1   DCL KQX$RESASR ENTRY(1);
+       80     1654    1   DCL NIO$QUE ENTRY(1) ALTRET;
+       81     1655    1   DCL NIQ$GET ENTRY(1) ALTRET;
+       82     1656    1   DCL NIQ$REL ENTRY(1) ALTRET;
+       83     1657    1   DCL SSR$REG ENTRY(3) ALTRET;
+       84     1658    1   DCL SC_RESUS ENTRY CONV(2,0);
+       85     1659    1   DCL Q$ PTR;
+       86     1660    1   DCL IOQ$ PTR;
+       87     1661    1   DCL LDCTX UBIN;
+       88     1662    1   DCL TYC BIT(36);
+       89     1663        /*  */
+       90     1664        %EJECT;
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:13   
+       91     1665    1           IOQ$ = KUR_IOQ$;
+
+   1665  1 000002   000000 236000 xsym               LDQ     KUR_IOQ$
+         1 000003   200025 756100                    STQ     IOQ$,,AUTO
+
+       92     1666    1           LDCTX = NK_RESUSLDX;
+
+   1666  1 000004   000000 235000 xsym               LDA     NK_RESUSLDX
+         1 000005   200026 755100                    STA     LDCTX,,AUTO
+
+       93     1667    1           GOTO CMN;
+
+   1667  1 000006   000015 710000 1                  TRA     CMN
+
+       94     1668
+       95     1669
+       96     1670        /*D* NAME:        KUR$RESUS_HLP
+       97     1671             PURPOSE:     To provide a 'send then wait for reply' function for momitor
+       98     1672             DESCRIPTION: Same as KUR$RESUS except this RESUS station is on CG/HLPCG
+       99     1673                          instead of on CG/CSCG and will therefore be much more
+      100     1674                          useful to network management functions; i.e. interfacing
+      101     1675                          with the Network Manager.
+      102     1676        */
+      103     1677
+      104     1678    1   KUR$RESUS_HLP: ENTRY(BUF,LEN,STA,RCVBUF,RCVLEN);
+
+   1678  1 000007   000000 700200 xent  KUR$RESUS_H* TSX0  ! X66_AUTO_5
+         1 000010   000034 000005                    ZERO    28,5
+
+      105     1679
+      106     1680    1           IOQ$ = KUR_IOQ_HLP$;
+
+   1680  1 000011   000000 236000 xsym               LDQ     KUR_IOQ_HLP$
+         1 000012   200025 756100                    STQ     IOQ$,,AUTO
+
+      107     1681    1           LDCTX = NK_RESUSLDX_HLP;
+
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:14   
+   1681  1 000013   000000 235000 xsym               LDA     NK_RESUSLDX_HLP
+         1 000014   200026 755100                    STA     LDCTX,,AUTO
+
+   1681  1 000015                       CMN          null
+      108     1682
+      109     1683    1   CMN:    ;
+      110     1684    1   GETQ:   CALL NIQ$GET (Q$)               /* Get an IOQ packet                  */
+
+   1684  1 000015   200024 630500       GETQ         EPPR0   Q$,,AUTO
+         1 000016   200030 450500                    STP0    TYC+1,,AUTO
+         1 000017   200030 630500                    EPPR0   TYC+1,,AUTO
+         1 000020   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000021   000000 701000 xent               TSX1    NIQ$GET
+         1 000022   000024 702000 1                  TSX2    s:1686
+         1 000023   000036 710000 1                  TRA     s:1689
+
+      111     1685    2             WHENALTRETURN DO;
+
+      112     1686    2               CALL SSR$REG(%SS_SW,,1);    /* Wait for a second and try again    */
+
+   1686  1 000024   000001 236000 2                  LDQ     1
+         1 000025   200032 756100                    STQ     TYC+3,,AUTO
+         1 000026   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000027   000002 235000 2                  LDA     2
+         1 000030   200030 757100                    STAQ    TYC+1,,AUTO
+         1 000031   200030 630500                    EPPR0   TYC+1,,AUTO
+         1 000032   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         1 000033   000000 701000 xent               TSX1    SSR$REG
+         1 000034   000000 011000                    NOP     0
+
+      113     1687    2               GOTO GETQ;
+
+   1687  1 000035   000015 710000 1                  TRA     CMN
+
+      114     1688    2               END;
+      115     1689    1           Q$ -> N$REQ.OPFLG = OP_BPF|OP_USER; /* Set BPF and USER               */
+
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:15   
+   1689  1 000036   200024 470500                    LDP0    Q$,,AUTO
+         1 000037   000410 236007                    LDQ     264,DL
+         1 000040   000004 552104                    STBQ    4,'04'O,PR0
+
+      116     1690    1           Q$ -> N$REQ.DLA.DCTX = LDCTX;   /* Set DCT index                      */
+
+   1690  1 000041   200024 470500                    LDP0    Q$,,AUTO
+         1 000042   200026 236100                    LDQ     LDCTX,,AUTO
+         1 000043   000025 736000                    QLS     21
+         1 000044   000001 676100                    ERQ     1,,PR0
+         1 000045   777770 376003                    ANQ     -8,DU
+         1 000046   000001 656100                    ERSQ    1,,PR0
+
+      117     1691    1           Q$ -> N$REQ.FC = %N_WRITE;      /*  Function is write                 */
+
+   1691  1 000047   200024 470500                    LDP0    Q$,,AUTO
+         1 000050   000015 236007                    LDQ     13,DL
+         1 000051   000003 552104                    STBQ    3,'04'O,PR0
+
+      118     1692    1           Q$ -> N$REQ.BUF$ = ADDR (BUF);  /* Buffer pointer                     */
+
+   1692  1 000052   200003 236100                    LDQ     @BUF,,AUTO
+         1 000053   200024 470500                    LDP0    Q$,,AUTO
+         1 000054   000005 756100                    STQ     5,,PR0
+
+      119     1693    1           Q$ -> N$REQ.BUFSIZE = LEN;      /* Buffer length                      */
+
+   1693  1 000055   200004 470500                    LDP0    @LEN,,AUTO
+         1 000056   200024 471500                    LDP1    Q$,,AUTO
+         1 000057   000000 236100                    LDQ     0,,PR0
+         1 000060   000020 736000                    QLS     16
+         1 000061   100004 676100                    ERQ     4,,PR1
+         1 000062   000034 376000 xsym               ANQ     B_VECTNIL+28
+         1 000063   100004 656100                    ERSQ    4,,PR1
+
+      120     1694    1           Q$->N$REQ.NOALT='1'B;
+
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:16   
+   1694  1 000064   200024 471500                    LDP1    Q$,,AUTO
+         1 000065   100000 236007                    LDQ     32768,DL
+         1 000066   100004 256100                    ORSQ    4,,PR1
+
+      121     1695    1           ASTA=KC_VLPSTATION;
+
+   1695  1 000067   000100 100400                    MLR     fill='000'O
+         1 000070   000000 000040 xsym               ADSC9   KC_VLPSTATION            cn=0,n=32
+         1 000071   200014 000040                    ADSC9   ASTA,,AUTO               cn=0,n=32
+
+      122     1696    1           ASTA.STATION#=STA;
+
+   1696  1 000072   200005 471500                    LDP1    @STA,,AUTO
+         1 000073   040100 100500                    MLR     fill='040'O
+         1 000074   100000 000010                    ADSC9   0,,PR1                   cn=0,n=8
+         1 000075   200014 000010                    ADSC9   ASTA,,AUTO               cn=0,n=8
+
+      123     1697    1           RESUS_TYP.RESUS = 'RESUS';
+
+   1697  1 000076   040100 100400                    MLR     fill='040'O
+         1 000077   000000 000005 0                  ADSC9   0                        cn=0,n=5
+         1 000100   200010 000005                    ADSC9   RESUS_MSGTYP,,AUTO       cn=0,n=5
+
+      124     1698    1           CALL BINCHAR(RESUS_TYP.USER,S_CUN);
+
+   1698  1 000101   000000 235000 xsym               LDA     S_CUN
+         1 000102   000044 773000                    LRL     36
+         1 000103   200030 757100                    STAQ    TYC+1,,AUTO
+         1 000104   000100 301500                    BTD
+         1 000105   200030 000010                    NDSC9   TYC+1,,AUTO              cn=0,s=lsgnf,sf=0,n=8
+         1 000106   200011 230003                    NDSC9   RESUS_MSGTYP+1,,AUTO     cn=1,s=nosgn,sf=0,n=3
+
+      125     1699    1           ASTA.MSGTYP#=RESUS_MSGTYP;
+
+   1699  1 000107   200010 237100                    LDAQ    RESUS_MSGTYP,,AUTO
+         1 000110   200016 757100                    STAQ    ASTA+2,,AUTO
+
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:17   
+      126     1700    1           Q$->N$REQ.STATION.LSTA$=ADDR(ASTA);
+
+   1700  1 000111   200014 633500                    EPPR3   ASTA,,AUTO
+         1 000112   200024 474500                    LDP4    Q$,,AUTO
+         1 000113   400013 453500                    STP3    11,,PR4
+
+      127     1701    1           CALL KQX$SAVASR (ASRTEMP);
+
+   1701  1 000114   200012 633500                    EPPR3   ASRTEMP,,AUTO
+         1 000115   200030 453500                    STP3    TYC+1,,AUTO
+         1 000116   200030 630500                    EPPR0   TYC+1,,AUTO
+         1 000117   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000120   000000 701000 xent               TSX1    KQX$SAVASR
+         1 000121   000000 011000                    NOP     0
+
+      128     1702    1           CALL NIO$QUE (Q$->N$REQ);       /* WRITE THRU CSCG OR HLPCG           */
+
+   1702  1 000122   200024 630500                    EPPR0   Q$,,AUTO
+         1 000123   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000124   000000 701000 xent               TSX1    NIO$QUE
+         1 000125   000000 011000                    NOP     0
+
+      129     1703    1           CALL KQX$RESASR (ASRTEMP);
+
+   1703  1 000126   200012 630500                    EPPR0   ASRTEMP,,AUTO
+         1 000127   200030 450500                    STP0    TYC+1,,AUTO
+         1 000130   200030 630500                    EPPR0   TYC+1,,AUTO
+         1 000131   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000132   000000 701000 xent               TSX1    KQX$RESASR
+         1 000133   000000 011000                    NOP     0
+
+      130     1704        /**/
+      131     1705        /* REG this user until awakened by KUR$EA on end action response to sent msg */
+      132     1706        /**/
+      133     1707    1           CALL SSR$REG(%SS_QA);
+
+   1707  1 000134   000004 630400 2                  EPPR0   4
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:18   
+         1 000135   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000136   000000 701000 xent               TSX1    SSR$REG
+         1 000137   000000 011000                    NOP     0
+
+      134     1708        /**/
+      135     1709        /* Now read the response */
+      136     1710        /**/
+      137     1711    1   GETQ2:  CALL NIQ$GET (Q$)               /* Get an IOQ packet                  */
+
+   1711  1 000140   200024 630500       GETQ2        EPPR0   Q$,,AUTO
+         1 000141   200030 450500                    STP0    TYC+1,,AUTO
+         1 000142   200030 630500                    EPPR0   TYC+1,,AUTO
+         1 000143   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000144   000000 701000 xent               TSX1    NIQ$GET
+         1 000145   000147 702000 1                  TSX2    s:1713
+         1 000146   000161 710000 1                  TRA     s:1716
+
+      138     1712    2             WHENALTRETURN DO;
+
+      139     1713    2               CALL SSR$REG(%SS_SW,,1);
+
+   1713  1 000147   000001 236000 2                  LDQ     1
+         1 000150   200032 756100                    STQ     TYC+3,,AUTO
+         1 000151   000001 236000 xsym               LDQ     B_VECTNIL+1
+         1 000152   000002 235000 2                  LDA     2
+         1 000153   200030 757100                    STAQ    TYC+1,,AUTO
+         1 000154   200030 630500                    EPPR0   TYC+1,,AUTO
+         1 000155   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         1 000156   000000 701000 xent               TSX1    SSR$REG
+         1 000157   000000 011000                    NOP     0
+
+      140     1714    2               GOTO GETQ2;
+
+   1714  1 000160   000140 710000 1                  TRA     GETQ2
+
+      141     1715    2               END;
+      142     1716    1           Q$ -> N$REQ.OPFLG = OP_BPF|OP_USER|OP_HOLD|OP_WAIT;
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:19   
+
+   1716  1 000161   200024 470500                    LDP0    Q$,,AUTO
+         1 000162   000434 236007                    LDQ     284,DL
+         1 000163   000004 552104                    STBQ    4,'04'O,PR0
+
+      143     1717    1           Q$ -> N$REQ.DLA.DCTX = LDCTX;   /* Set DCT index                      */
+
+   1717  1 000164   200024 470500                    LDP0    Q$,,AUTO
+         1 000165   200026 236100                    LDQ     LDCTX,,AUTO
+         1 000166   000025 736000                    QLS     21
+         1 000167   000001 676100                    ERQ     1,,PR0
+         1 000170   777770 376003                    ANQ     -8,DU
+         1 000171   000001 656100                    ERSQ    1,,PR0
+
+      144     1718    1           Q$ -> N$REQ.FC = %N_RDASC;      /*  Function is read                  */
+
+   1718  1 000172   200024 470500                    LDP0    Q$,,AUTO
+         1 000173   000004 236007                    LDQ     4,DL
+         1 000174   000003 552104                    STBQ    3,'04'O,PR0
+
+      145     1719    1           Q$ -> N$REQ.BUF$ = ADDR (RCVBUF); /* Buffer pointer                   */
+
+   1719  1 000175   200006 236100                    LDQ     @RCVBUF,,AUTO
+         1 000176   200024 470500                    LDP0    Q$,,AUTO
+         1 000177   000005 756100                    STQ     5,,PR0
+
+      146     1720    1           Q$ -> N$REQ.BUFSIZE = RCVLEN;   /* Buffer length                      */
+
+   1720  1 000200   200007 470500                    LDP0    @RCVLEN,,AUTO
+         1 000201   200024 471500                    LDP1    Q$,,AUTO
+         1 000202   000000 236100                    LDQ     0,,PR0
+         1 000203   000020 736000                    QLS     16
+         1 000204   100004 676100                    ERQ     4,,PR1
+         1 000205   000034 376000 xsym               ANQ     B_VECTNIL+28
+         1 000206   100004 656100                    ERSQ    4,,PR1
+
+      147     1721    1           Q$ -> N$REQ.DVE.DVBYTE.CONT='1'B; /* CONT to read rest of msg         */
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:20   
+
+   1721  1 000207   200024 471500                    LDP1    Q$,,AUTO
+         1 000210   001000 236003                    LDQ     512,DU
+         1 000211   100031 256100                    ORSQ    25,,PR1
+
+      148     1722    1           Q$->N$REQ.NOALT='1'B;
+
+   1722  1 000212   100000 236007                    LDQ     32768,DL
+         1 000213   100004 256100                    ORSQ    4,,PR1
+
+      149     1723    1           ASTA.CTL.DIRONLY# = '1'B;
+
+   1723  1 000214   004000 236003                    LDQ     2048,DU
+         1 000215   200020 256100                    ORSQ    ASTA+4,,AUTO
+
+      150     1724    1           ASTA.CTL.EOFNONE# = '1'B;
+
+   1724  1 000216   040000 236003                    LDQ     16384,DU
+         1 000217   200020 256100                    ORSQ    ASTA+4,,AUTO
+
+      151     1725    1           Q$->N$REQ.STATION.LSTA$=ADDR(ASTA);
+
+   1725  1 000220   200014 631500                    EPPR1   ASTA,,AUTO
+         1 000221   200024 473500                    LDP3    Q$,,AUTO
+         1 000222   300013 451500                    STP1    11,,PR3
+
+      152     1726    1           CALL NIO$QUE (Q$->N$REQ);       /* READ THRU CSCG                     */
+
+   1726  1 000223   200024 630500                    EPPR0   Q$,,AUTO
+         1 000224   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000225   000000 701000 xent               TSX1    NIO$QUE
+         1 000226   000000 011000                    NOP     0
+
+      153     1727    1           TYC=Q$->N$REQ.TYC;
+
+   1727  1 000227   200024 470500                    LDP0    Q$,,AUTO
+         1 000230   000021 236100                    LDQ     17,,PR0
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:21   
+         1 000231   200027 756100                    STQ     TYC,,AUTO
+
+      154     1728    1           RCVLEN = Q$->N$REQ.ARSIZE;
+
+   1728  1 000232   200007 471500                    LDP1    @RCVLEN,,AUTO
+         1 000233   000027 236100                    LDQ     23,,PR0
+         1 000234   000020 772000                    QRL     16
+         1 000235   100000 756100                    STQ     0,,PR1
+
+      155     1729    1           CALL NIQ$REL(Q$);
+
+   1729  1 000236   200024 630500                    EPPR0   Q$,,AUTO
+         1 000237   200030 450500                    STP0    TYC+1,,AUTO
+         1 000240   200030 630500                    EPPR0   TYC+1,,AUTO
+         1 000241   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000242   000000 701000 xent               TSX1    NIQ$REL
+         1 000243   000000 011000                    NOP     0
+
+      156     1730        /**/
+      157     1731        /* Now re-post the always-pending zero-byte read for RESUS */
+      158     1732        /**/
+      159     1733    1           IOQ$->N$REQ.STATION.LSTA$ = ADDR(KUR_STA);
+
+   1733  1 000244   000005 236000 2                  LDQ     5
+         1 000245   200025 470500                    LDP0    IOQ$,,AUTO
+         1 000246   000013 756100                    STQ     11,,PR0
+
+      160     1734    1           CALL NIO$QUE(IOQ$->N$REQ);
+
+   1734  1 000247   200025 630500                    EPPR0   IOQ$,,AUTO
+         1 000250   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000251   000000 701000 xent               TSX1    NIO$QUE
+         1 000252   000000 011000                    NOP     0
+
+      161     1735        /**/
+      162     1736        /* And put the ASR framing the current comgroup back to how we found it */
+      163     1737        /**/
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:22   
+      164     1738    1           IF TYC & %TYC_EOF
+
+   1738  1 000253   200027 236100                    LDQ     TYC,,AUTO
+         1 000254   000002 376000 0                  ANQ     2
+         1 000255   000260 600000 1                  TZE     s:1752
+
+      165     1739    2             THEN DO;
+
+      166     1740                     /*    Got EOF on the
+      167     1741                      *    read, meaning no message
+      168     1742                      *    was found.  Flick it in.
+      169     1743                      */
+      170     1744    2               CALL SC_RESUS;
+
+   1744  1 000256   000000 713400 xsym               CLIMB   SC_RESUS
+         1 000257   000000 600000 xsid               climb   nvectors=         0
+
+      171     1745        /*S* SCREECH_CODE: KUR-S$RESUS
+      172     1746             TYPE:         SUA
+      173     1747             MESSAGE:      Inconsistency reading CSCG for a monitor process
+      174     1748             REMARKS:      The user cannot find the message that is supposed
+      175     1749                           to be waiting for him at the RESUS station on
+      176     1750                           the CSCG. */
+      177     1751    2               END;
+
+      178     1752    1           CALL KQX$RESASR (ASRTEMP);
+
+   1752  1 000260   200012 630500                    EPPR0   ASRTEMP,,AUTO
+         1 000261   200030 450500                    STP0    TYC+1,,AUTO
+         1 000262   200030 630500                    EPPR0   TYC+1,,AUTO
+         1 000263   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000264   000000 701000 xent               TSX1    KQX$RESASR
+         1 000265   000000 011000                    NOP     0
+
+      179     1753    1           RETURN;
+
+   1753  1 000266   000000 702200 xent               TSX2  ! X66_ARET
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:23   
+
+(unnamed)
+ Sect OctLoc
+   0     000   122105 123125   123040 040040   004000 000000                    RESUS   ....
+
+(unnamed)
+ Sect OctLoc
+   2     000   000000 000021   000003 006000   000000 006000   000000 000033    ................
+   2     004   000003 006000   000000 006000                                    ........
+      180     1754    1   END KUR$RESUS;
+      181     1755        %EOD;
+
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:24   
+--  Include file information  --
+
+   CP_6_SUBS.:E05TOU  is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+      No diagnostics issued in procedure KUR$RESUS.
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:25   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @BUF                       4-0-0/w PTR         r     1 @LEN
+     6-0-0/w PTR         r     1 @RCVBUF                    7-0-0/w PTR         r     1 @RCVLEN
+     5-0-0/w PTR         r     1 @STA                      12-0-0/d BIT (72)    r     1 ASRTEMP
+    14-0-0/w STRC(288)   r     1 ASTA                      *0-0-0/c ACHR        r     1 BUF
+    25-0-0/w PTR         r     1 IOQ$                      26-0-0/w UBIN        r     1 LDCTX
+    *0-0-0/w UBIN        r     1 LEN                       24-0-0/w PTR         r     1 Q$
+    *0-0-0/c ACHR        r     1 RCVBUF                    *0-0-0/w UBIN        r     1 RCVLEN
+    10-0-0/c CHAR(8)     r     1 RESUS_MSGTYP              10-0-0/c STRC(72)    r     1 RESUS_TYP
+    *0-0-0/c CHAR(8)     r     1 STA                       27-0-0/b BIT         r     1 TYC
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(288)   r     1 KC_VLPSTATION              0-0-0/w PTR         r     1 KUR_IOQ$
+     0-0-0/w PTR         r     1 KUR_IOQ_HLP$               0-0-0/w STRC(288)   r     1 KUR_STA
+     0-0-0/w UBIN        r     1 NK_RESUSLDX                0-0-0/w UBIN        r     1 NK_RESUSLDX_HLP
+     0-0-0/w UBIN        r     1 S_CUN
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(1080)  r     1 N$REQ
+
+
+   Procedure KUR$RESUS requires 183 words for executable code.
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:26   
+   Procedure KUR$RESUS requires 28 words of local(AUTO) storage.
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:27   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:28   
+          MINI XREF LISTING
+
+ASRTEMP
+      1505**DCL      1701<>CALL     1703<>CALL     1752<>CALL
+ASTA
+      1578**DCL      1695<<ASSIGN   1700--ASSIGN   1725--ASSIGN
+ASTA.CTL.DIRONLY#
+      1585**DCL      1723<<ASSIGN
+ASTA.CTL.EOFNONE#
+      1584**DCL      1724<<ASSIGN
+ASTA.MSGIDXT
+      1588**DCL      1591--REDEF
+ASTA.MSGTYP#
+      1582**DCL      1699<<ASSIGN
+ASTA.STATION#
+      1582**DCL      1696<<ASSIGN
+BUF
+        50**DCL         7--PROC     1678--ENTRY    1692--ASSIGN
+CMN
+      1681**LABEL    1667--GOTO
+GETQ
+      1684**LABEL    1687--GOTO
+GETQ2
+      1711**LABEL    1714--GOTO
+IOQ$
+      1660**DCL      1665<<ASSIGN   1680<<ASSIGN   1733>>ASSIGN   1734>>CALL
+KC_VLPSTATION
+      1551**DCL      1695>>ASSIGN
+KC_VLPSTATION.MSGIDXT
+      1561**DCL      1564--REDEF
+KQX$RESASR
+      1653**DCL-ENT  1703--CALL     1752--CALL
+KQX$SAVASR
+      1652**DCL-ENT  1701--CALL
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:29   
+KUR_IOQ$
+      1509**DCL      1665>>ASSIGN
+KUR_IOQ_HLP$
+      1507**DCL      1680>>ASSIGN
+KUR_STA
+      1523**DCL      1733--ASSIGN
+KUR_STA.MSGIDXT
+      1533**DCL      1536--REDEF
+LDCTX
+      1661**DCL      1666<<ASSIGN   1681<<ASSIGN   1690>>ASSIGN   1717>>ASSIGN
+LEN
+        51**DCL         7--PROC       50--IMP-SIZ  1678--ENTRY    1693>>ASSIGN
+N$REQ
+      1602**DCL      1702<>CALL     1726<>CALL     1734<>CALL
+N$REQ.ARSIZE
+      1635**DCL      1728>>ASSIGN
+N$REQ.BUF$
+      1611**DCL      1692<<ASSIGN   1719<<ASSIGN
+N$REQ.BUFADDR
+      1611**DCL      1612--REDEF    1612--REDEF
+N$REQ.BUFSIZE
+      1605**DCL      1693<<ASSIGN   1720<<ASSIGN
+N$REQ.DLA.DCTX
+      1602**DCL      1690<<ASSIGN   1717<<ASSIGN
+N$REQ.DLA.DRELADDR
+      1603**DCL      1603--REDEF
+N$REQ.DVE.DVBYTE.CONT
+      1640**DCL      1721<<ASSIGN
+N$REQ.DVE.EOMCHAR
+      1640**DCL      1641--REDEF
+N$REQ.EAINFO
+      1634**DCL      1634--REDEF
+N$REQ.EAINFOX
+      1634**DCL      1635--REDEF
+N$REQ.EVNTINFO
+      1635**DCL      1635--REDEF
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:30   
+N$REQ.FC
+      1605**DCL      1691<<ASSIGN   1718<<ASSIGN
+N$REQ.NOALT
+      1605**DCL      1694<<ASSIGN   1722<<ASSIGN
+N$REQ.OPFLG
+      1608**DCL      1689<<ASSIGN   1716<<ASSIGN
+N$REQ.STATION.LSTA$
+      1615**DCL      1700<<ASSIGN   1725<<ASSIGN   1733<<ASSIGN
+N$REQ.STATUS
+      1616**DCL      1622--REDEF
+N$REQ.TYC
+      1624**DCL      1727>>ASSIGN
+NIO$QUE
+      1654**DCL-ENT  1702--CALL     1726--CALL     1734--CALL
+NIQ$GET
+      1655**DCL-ENT  1684--CALL     1711--CALL
+NIQ$REL
+      1656**DCL-ENT  1729--CALL
+NK_RESUSLDX
+      1510**DCL      1666>>ASSIGN
+NK_RESUSLDX_HLP
+      1508**DCL      1681>>ASSIGN
+Q$
+      1659**DCL      1684<>CALL     1689>>ASSIGN   1690>>ASSIGN   1691>>ASSIGN   1692>>ASSIGN   1693>>ASSIGN
+      1694>>ASSIGN   1700>>ASSIGN   1702>>CALL     1711<>CALL     1716>>ASSIGN   1717>>ASSIGN   1718>>ASSIGN
+      1719>>ASSIGN   1720>>ASSIGN   1721>>ASSIGN   1722>>ASSIGN   1725>>ASSIGN   1726>>CALL     1727>>ASSIGN
+      1728>>ASSIGN   1729<>CALL
+RCVBUF
+        53**DCL         7--PROC     1678--ENTRY    1719--ASSIGN
+RCVLEN
+        54**DCL         7--PROC       53--IMP-SIZ  1678--ENTRY    1720>>ASSIGN   1728<<ASSIGN
+RESUS_MSGTYP
+      1501**DCL      1502--REDEF    1699>>ASSIGN
+RESUS_TYP.RESUS
+      1503**DCL      1697<<ASSIGN
+RESUS_TYP.USER
+PL6.E3A0      #001=KUR$RESUS File=KUR$RESUS.:E05TSI                              WED 07/30/97 01:53 Page:31   
+      1504**DCL      1698<<CALLBLT
+SC_RESUS
+      1658**DCL-ENT  1744--CALL
+SSR$REG
+      1657**DCL-ENT  1686--CALL     1707--CALL     1713--CALL
+STA
+        52**DCL         7--PROC     1678--ENTRY    1696>>ASSIGN
+S_CUN
+      1538**DCL      1698>>CALLBLT
+TYC
+      1662**DCL      1727<<ASSIGN   1738>>IF
+
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:32   
+      182        1        /*T***********************************************************/
+      183        2        /*T*                                                         */
+      184        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      185        4        /*T*                                                         */
+      186        5        /*T***********************************************************/
+      187        6        KUR$EA: PROC (N$REQ);
+      188        7        %INCLUDE KC_CP6;
+      189      567        %INCLUDE N$REQ;
+      190      641        %INCLUDE SS_SCHED_C;
+      191      874        %N$REQ (STCLASS=" ");
+      192      932        %VLP_STATION (FPTN=VLP$STA,STCLASS=BASED);
+      193      959    1   DCL USRNUM SBIN;
+      194      960    1   DCL USR UBIN BYTE CALIGNED;
+      195      961    1   DCL SSR$RUE ENTRY(4);
+      196      962        /**/
+      197      963    1           CALL CHARBIN(USRNUM,SUBSTR(N$REQ.STATION.LSTA$->VLP$STA.MSGTYP#,5,3));
+      198      964    1           USR = USRNUM;
+      199      965    1           CALL SSR$RUE(%SS_UQA,USR);
+      200      966    1           RETURN;
+      201      967    1   END KUR$EA;
+      202      968        %EOD;
+
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:33   
+--  Include file information  --
+
+   SS_SCHED_C.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+      No diagnostics issued in procedure KUR$EA.
+
+   Procedure KUR$EA requires 19 words for executable code.
+   Procedure KUR$EA requires 8 words of local(AUTO) storage.
+
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:34   
+
+ Object Unit name= KUR$EA                                     File name= KUR$RESUS.:E05TOU
+ UTS= JUL 30 '97 01:54:01.72 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none    19     23  KUR$EA
+    1  RoData even  none     2      2  KUR$EA
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  KUR$EA
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       4 SSR$RUE
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     B_VECTNIL
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:35   
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:36   
+
+
+      182        1        /*T***********************************************************/
+      183        2        /*T*                                                         */
+      184        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      185        4        /*T*                                                         */
+      186        5        /*T***********************************************************/
+      187        6        KUR$EA: PROC (N$REQ);
+
+      6  0 000000   000000 700200 xent  KUR$EA       TSX0  ! X66_AUTO_1
+         0 000001   000010 000001                    ZERO    8,1
+
+      188        7        %INCLUDE KC_CP6;
+      189      567        %INCLUDE N$REQ;
+      190      641        %INCLUDE SS_SCHED_C;
+      191      874        %N$REQ (STCLASS=" ");
+      192      932        %VLP_STATION (FPTN=VLP$STA,STCLASS=BASED);
+      193      959    1   DCL USRNUM SBIN;
+      194      960    1   DCL USR UBIN BYTE CALIGNED;
+      195      961    1   DCL SSR$RUE ENTRY(4);
+      196      962        /**/
+      197      963    1           CALL CHARBIN(USRNUM,SUBSTR(N$REQ.STATION.LSTA$->VLP$STA.MSGTYP#,5,3));
+
+    963  0 000002   200003 470500                    LDP0    @N$REQ,,AUTO
+         0 000003   000013 471500                    LDP1    11,,PR0
+         0 000004   000100 305500                    DTB
+         0 000005   100003 230003                    NDSC9   3,,PR1                   cn=1,s=nosgn,sf=0,n=3
+         0 000006   200004 000004                    NDSC9   USRNUM,,AUTO             cn=0,s=lsgnf,sf=0,n=4
+
+      198      964    1           USR = USRNUM;
+
+    964  0 000007   200004 235100                    LDA     USRNUM,,AUTO
+         0 000010   000033 735000                    ALS     27
+         0 000011   200005 755100                    STA     USR,,AUTO
+
+      199      965    1           CALL SSR$RUE(%SS_UQA,USR);
+
+    965  0 000012   200005 633500                    EPPR3   USR,,AUTO
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:37   
+         0 000013   200007 453500                    STP3    USR+2,,AUTO
+         0 000014   000001 236000 1                  LDQ     1
+         0 000015   200006 756100                    STQ     USR+1,,AUTO
+         0 000016   200006 630500                    EPPR0   USR+1,,AUTO
+         0 000017   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000020   000000 701000 xent               TSX1    SSR$RUE
+         0 000021   000000 011000                    NOP     0
+
+      200      966    1           RETURN;
+
+    966  0 000022   000000 702200 xent               TSX2  ! X66_ARET
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 000034   000000 006000                                    ........
+      201      967    1   END KUR$EA;
+      202      968        %EOD;
+
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:38   
+--  Include file information  --
+
+   SS_SCHED_C.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+      No diagnostics issued in procedure KUR$EA.
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:39   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @N$REQ                    *0-0-0/d STRC(1080)  r     1 N$REQ
+     5-0-0/c UBIN(9)     r     1 USR                        4-0-0/w SBIN        r     1 USRNUM
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(288)   r     1 VLP$STA
+
+
+   Procedure KUR$EA requires 19 words for executable code.
+   Procedure KUR$EA requires 8 words of local(AUTO) storage.
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:40   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=KUR$EA File=KUR$RESUS.:E05TSI                                 WED 07/30/97 01:54 Page:41   
+          MINI XREF LISTING
+
+N$REQ
+       883**DCL         6--PROC
+N$REQ.BUFADDR
+       892**DCL       893--REDEF     893--REDEF
+N$REQ.DLA.DRELADDR
+       884**DCL       884--REDEF
+N$REQ.DVE.EOMCHAR
+       921**DCL       922--REDEF
+N$REQ.EAINFO
+       915**DCL       915--REDEF
+N$REQ.EAINFOX
+       915**DCL       916--REDEF
+N$REQ.EVNTINFO
+       916**DCL       916--REDEF
+N$REQ.STATION.LSTA$
+       896**DCL       963>>CALLBLT
+N$REQ.STATUS
+       897**DCL       903--REDEF
+SSR$RUE
+       961**DCL-ENT   965--CALL
+USR
+       960**DCL       964<<ASSIGN    965<>CALL
+USRNUM
+       959**DCL       963<<CALLBLT   964>>ASSIGN
+VLP$STA.MSGIDXT
+       954**DCL       957--REDEF
+VLP$STA.MSGTYP#
+       948**DCL       963>>CALLBLT
+
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:42   
+      203        1        /*T***********************************************************/
+      204        2        /*T*                                                         */
+      205        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      206        4        /*T*                                                         */
+      207        5        /*T***********************************************************/
+      208        6        KUR$INIT: PROC;
+      209        7        %INCLUDE KC_CP6;
+      210      567        %VLP_STATION (FPTN=KUR_STA,DIRONLY=YES,MSGTYP='RESUS?',STCLASS="CONSTANT SYMDEF");
+      211      594    1   DCL KUR$EA ENTRY(1);
+      212      595    1   DCL NIQ$GET ENTRY(1) ALTRET;
+      213      596    1   DCL NIO$QUE ENTRY(1) ALTRET;
+      214      597    1   DCL NK_RESUSLDX_HLP UBIN WORD SYMREF;
+      215      598    1   DCL NK_RESUSLDX UBIN WORD SYMREF;
+      216      599        %INCLUDE KUR_DATA_R;
+      217      608        %INCLUDE N_FC_C;
+      218      645        %INCLUDE N$REQ;
+      219      719        %N$REQ;
+      220      777        /*          */
+      221      778    1           CALL RINIT(KUR_IOQ$,NK_RESUSLDX);
+      222      779    1           RETURN;
+      223      780
+      224      781    1   KUR$INIT_HLP: ENTRY;
+      225      782
+      226      783    1           CALL RINIT(KUR_IOQ_HLP$,NK_RESUSLDX_HLP);
+      227      784    1           RETURN;
+      228      785
+      229      786
+      230      787    1   RINIT:  PROC(IOQ$,LDCTX);
+      231      788    2   DCL IOQ$ PTR;
+      232      789    2   DCL LDCTX UBIN;
+      233      790    2           CALL NIQ$GET (IOQ$);
+      234      791    2           IOQ$ -> N$REQ.OPFLG = OP_EA|OP_BPF|OP_HOLD; /* EA, BPF and HOLD       */
+      235      792    2           IOQ$ -> N$REQ.DLA.DCTX = LDCTX; /* LDCT index of station 'RESUS'      */
+      236      793    2           IOQ$ -> N$REQ.BUF$ = ADDR(KUR_IOQ$); /* Dummy buffer pointer          */
+      237      794    2           IOQ$ -> N$REQ.BUFSIZE = 0;      /* Zero byte read to get just MSGTYP  */
+      238      795    2           IOQ$ -> N$REQ.FC = %N_RDASC;    /* function is read                   */
+      239      796    2           IOQ$ -> N$REQ.EAENTRY = ENTADDR (KUR$EA); /* end-action routine       */
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:43   
+      240      797    2           IOQ$->N$REQ.STATION.LSTA$=ADDR(KUR_STA);
+      241      798    2           IOQ$->N$REQ.NOALT='1'B;
+      242      799    2           CALL NIO$QUE (IOQ$->N$REQ);
+      243      800    2           RETURN;
+      244      801    2   END RINIT;
+      245      802    1   END KUR$INIT;
+
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:44   
+--  Include file information  --
+
+   N$REQ.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   KUR_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KC_CP6.:E05TOU  is referenced.
+      No diagnostics issued in procedure KUR$INIT.
+
+   Procedure KUR$INIT requires 60 words for executable code.
+   Procedure KUR$INIT requires 10 words of local(AUTO) storage.
+
+    No errors detected in file KUR$RESUS.:E05TSI    .
+
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:45   
+
+ Object Unit name= KUR$INIT                                   File name= KUR$RESUS.:E05TOU
+ UTS= JUL 30 '97 01:54:11.96 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS      8     10  KUR$INIT
+    1   Proc  even  none    60     74  KUR$INIT
+    2  RoData even  none     5      5  KUR$INIT
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        0  KUR$INIT
+     1     11                  yes      Std        0  KUR$INIT_HLP
+
+  ****  Data defs  ****
+
+ Sect OctLoc  Name                           Sect OctLoc  Name
+    0      0  KUR_STA
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 NIQ$GET
+         yes           Std       1 KUR$EA
+ yes     yes           Std       1 NIO$QUE
+                       nStd      0 X66_AUTO_0
+                       nStd      0 X66_ARET
+                       Std       0 B_CONSPOOL_D
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:46   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     NK_RESUSLDX_HLP                       NK_RESUSLDX                           KUR_IOQ$
+     KUR_IOQ_HLP$                          B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:47   
+
+
+      203        1        /*T***********************************************************/
+      204        2        /*T*                                                         */
+      205        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      206        4        /*T*                                                         */
+      207        5        /*T***********************************************************/
+      208        6        KUR$INIT: PROC;
+
+      6  1 000000   000000 700200 xent  KUR$INIT     TSX0  ! X66_AUTO_0
+         1 000001   000012 000000                    ZERO    10,0
+
+      209        7        %INCLUDE KC_CP6;
+      210      567        %VLP_STATION (FPTN=KUR_STA,DIRONLY=YES,MSGTYP='RESUS?',STCLASS="CONSTANT SYMDEF");
+      211      594    1   DCL KUR$EA ENTRY(1);
+      212      595    1   DCL NIQ$GET ENTRY(1) ALTRET;
+      213      596    1   DCL NIO$QUE ENTRY(1) ALTRET;
+      214      597    1   DCL NK_RESUSLDX_HLP UBIN WORD SYMREF;
+      215      598    1   DCL NK_RESUSLDX UBIN WORD SYMREF;
+      216      599        %INCLUDE KUR_DATA_R;
+      217      608        %INCLUDE N_FC_C;
+      218      645        %INCLUDE N$REQ;
+      219      719        %N$REQ;
+      220      777        /*          */
+      221      778    1           CALL RINIT(KUR_IOQ$,NK_RESUSLDX);
+
+    778  1 000002   000000 236000 2                  LDQ     0
+         1 000003   200006 756100                    STQ     @IOQ$+1,,AUTO
+         1 000004   000001 236000 2                  LDQ     1
+         1 000005   200005 756100                    STQ     5,,AUTO
+         1 000006   000022 701000 1                  TSX1    RINIT
+         1 000007   000000 011000                    NOP     0
+
+      222      779    1           RETURN;
+
+    779  1 000010   000000 702200 xent               TSX2  ! X66_ARET
+
+      223      780
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:48   
+      224      781    1   KUR$INIT_HLP: ENTRY;
+
+    781  1 000011   000000 700200 xent  KUR$INIT_HLP TSX0  ! X66_AUTO_0
+         1 000012   000012 000000                    ZERO    10,0
+
+      225      782
+      226      783    1           CALL RINIT(KUR_IOQ_HLP$,NK_RESUSLDX_HLP);
+
+    783  1 000013   000002 236000 2                  LDQ     2
+         1 000014   200006 756100                    STQ     @IOQ$+1,,AUTO
+         1 000015   000003 236000 2                  LDQ     3
+         1 000016   200005 756100                    STQ     5,,AUTO
+         1 000017   000022 701000 1                  TSX1    RINIT
+         1 000020   000000 011000                    NOP     0
+
+      227      784    1           RETURN;
+
+    784  1 000021   000000 702200 xent               TSX2  ! X66_ARET
+
+      228      785
+      229      786
+      230      787    1   RINIT:  PROC(IOQ$,LDCTX);
+
+    787  1 000022   200004 741300       RINIT        STX1  ! 4,,AUTO
+
+      231      788    2   DCL IOQ$ PTR;
+      232      789    2   DCL LDCTX UBIN;
+      233      790    2           CALL NIQ$GET (IOQ$);
+
+    790  1 000023   200005 630500                    EPPR0   @IOQ$,,AUTO
+         1 000024   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000025   000000 701000 xent               TSX1    NIQ$GET
+         1 000026   000000 011000                    NOP     0
+
+      234      791    2           IOQ$ -> N$REQ.OPFLG = OP_EA|OP_BPF|OP_HOLD; /* EA, BPF and HOLD       */
+
+    791  1 000027   200005 470500                    LDP0    @IOQ$,,AUTO
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:49   
+         1 000030   000000 471500                    LDP1    0,,PR0
+         1 000031   000054 236007                    LDQ     44,DL
+         1 000032   100004 552104                    STBQ    4,'04'O,PR1
+
+      235      792    2           IOQ$ -> N$REQ.DLA.DCTX = LDCTX; /* LDCT index of station 'RESUS'      */
+
+    792  1 000033   000000 471500                    LDP1    0,,PR0
+         1 000034   200006 473500                    LDP3    @LDCTX,,AUTO
+         1 000035   300000 236100                    LDQ     0,,PR3
+         1 000036   000025 736000                    QLS     21
+         1 000037   100001 676100                    ERQ     1,,PR1
+         1 000040   777770 376003                    ANQ     -8,DU
+         1 000041   100001 656100                    ERSQ    1,,PR1
+
+      236      793    2           IOQ$ -> N$REQ.BUF$ = ADDR(KUR_IOQ$); /* Dummy buffer pointer          */
+
+    793  1 000042   000000 471500                    LDP1    0,,PR0
+         1 000043   000001 236000 2                  LDQ     1
+         1 000044   100005 756100                    STQ     5,,PR1
+
+      237      794    2           IOQ$ -> N$REQ.BUFSIZE = 0;      /* Zero byte read to get just MSGTYP  */
+
+    794  1 000045   000000 471500                    LDP1    0,,PR0
+         1 000046   177777 236007                    LDQ     65535,DL
+         1 000047   100004 356100                    ANSQ    4,,PR1
+
+      238      795    2           IOQ$ -> N$REQ.FC = %N_RDASC;    /* function is read                   */
+
+    795  1 000050   000000 471500                    LDP1    0,,PR0
+         1 000051   000004 236007                    LDQ     4,DL
+         1 000052   100003 552104                    STBQ    3,'04'O,PR1
+
+      239      796    2           IOQ$ -> N$REQ.EAENTRY = ENTADDR (KUR$EA); /* end-action routine       */
+
+    796  1 000053   000000 471500                    LDP1    0,,PR0
+         1 000054   000000 636000 xent               EAQ     KUR$EA
+         1 000055   100023 756100                    STQ     19,,PR1
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:50   
+
+      240      797    2           IOQ$->N$REQ.STATION.LSTA$=ADDR(KUR_STA);
+
+    797  1 000056   000000 471500                    LDP1    0,,PR0
+         1 000057   000004 236000 2                  LDQ     4
+         1 000060   100013 756100                    STQ     11,,PR1
+
+      241      798    2           IOQ$->N$REQ.NOALT='1'B;
+
+    798  1 000061   000000 471500                    LDP1    0,,PR0
+         1 000062   100000 236007                    LDQ     32768,DL
+         1 000063   100004 256100                    ORSQ    4,,PR1
+
+      242      799    2           CALL NIO$QUE (IOQ$->N$REQ);
+
+    799  1 000064   000000 471500                    LDP1    0,,PR0
+         1 000065   200010 451500                    STP1    @LDCTX+2,,AUTO
+         1 000066   200010 630500                    EPPR0   @LDCTX+2,,AUTO
+         1 000067   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000070   000000 701000 xent               TSX1    NIO$QUE
+         1 000071   000000 011000                    NOP     0
+
+      243      800    2           RETURN;
+
+    800  1 000072   200004 221300                    LDX1  ! 4,,AUTO
+         1 000073   000001 702211                    TSX2  ! 1,X1
+
+KUR_STA
+ Sect OctLoc
+   0     000   040040 040040   040040 040040   122105 123125   123077 040040            RESUS?
+   0     004   005000 000000   000000 000000   000000 000000   000000 000000    ................
+
+(unnamed)
+ Sect OctLoc
+   2     000   000000 006000   000000 006000   000000 006000   000000 006000    ................
+   2     004   000000 006000                                                    ....
+      244      801    2   END RINIT;
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:51   
+      245      802    1   END KUR$INIT;
+
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:52   
+--  Include file information  --
+
+   N$REQ.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   KUR_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KC_CP6.:E05TOU  is referenced.
+      No diagnostics issued in procedure KUR$INIT.
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:53   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData KUR$INIT
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(288)   r     1 KUR_STA
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     5-0-0/w PTR         r     1 @IOQ$                      6-0-0/w PTR         r     1 @LDCTX
+    *0-0-0/w PTR         r     1 IOQ$                      *0-0-0/w UBIN        r     1 LDCTX
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 KUR_IOQ$                   0-0-0/w PTR         r     1 KUR_IOQ_HLP$
+     0-0-0/w UBIN        r     1 NK_RESUSLDX                0-0-0/w UBIN        r     1 NK_RESUSLDX_HLP
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(1080)  r     1 N$REQ
+
+
+   Procedure KUR$INIT requires 60 words for executable code.
+   Procedure KUR$INIT requires 10 words of local(AUTO) storage.
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:54   
+
+    No errors detected in file KUR$RESUS.:E05TSI    .
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:55   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:56   
+          MINI XREF LISTING
+
+IOQ$ IN PROCEDURE RINIT
+       788**DCL       787--PROC      790<>CALL      791>>ASSIGN    792>>ASSIGN    793>>ASSIGN    794>>ASSIGN
+       795>>ASSIGN    796>>ASSIGN    797>>ASSIGN    798>>ASSIGN    799>>CALL
+KUR$EA
+       594**DCL-ENT   796--ASSIGN
+KUR_IOQ$
+       607**DCL       778<>CALL      793--ASSIGN
+KUR_IOQ_HLP$
+       607**DCL       783<>CALL
+KUR_STA
+       579**DCL       797--ASSIGN
+KUR_STA.MSGIDXT
+       589**DCL       592--REDEF
+LDCTX IN PROCEDURE RINIT
+       789**DCL       787--PROC      792>>ASSIGN
+N$REQ
+       728**DCL       799<>CALL
+N$REQ.BUF$
+       737**DCL       793<<ASSIGN
+N$REQ.BUFADDR
+       737**DCL       738--REDEF     738--REDEF
+N$REQ.BUFSIZE
+       731**DCL       794<<ASSIGN
+N$REQ.DLA.DCTX
+       728**DCL       792<<ASSIGN
+N$REQ.DLA.DRELADDR
+       729**DCL       729--REDEF
+N$REQ.DVE.EOMCHAR
+       766**DCL       767--REDEF
+N$REQ.EAENTRY
+       759**DCL       796<<ASSIGN
+N$REQ.EAINFO
+PL6.E3A0      #003=KUR$INIT File=KUR$RESUS.:E05TSI                               WED 07/30/97 01:54 Page:57   
+       760**DCL       760--REDEF
+N$REQ.EAINFOX
+       760**DCL       761--REDEF
+N$REQ.EVNTINFO
+       761**DCL       761--REDEF
+N$REQ.FC
+       731**DCL       795<<ASSIGN
+N$REQ.NOALT
+       731**DCL       798<<ASSIGN
+N$REQ.OPFLG
+       734**DCL       791<<ASSIGN
+N$REQ.STATION.LSTA$
+       741**DCL       797<<ASSIGN
+N$REQ.STATUS
+       742**DCL       748--REDEF
+NIO$QUE
+       596**DCL-ENT   799--CALL
+NIQ$GET
+       595**DCL-ENT   790--CALL
+NK_RESUSLDX
+       598**DCL       778<>CALL
+NK_RESUSLDX_HLP
+       597**DCL       783<>CALL
+RINIT
+       787**PROC      778--CALL      783--CALL

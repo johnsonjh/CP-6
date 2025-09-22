@@ -1,0 +1,3569 @@
+VERSION E05
+
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:1    
+        1        1        /*M* KCL$CGLCL Comgroup local device management routines*/
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMC,PLM=6,IND=0,IDT=2,SDI=2,CTI=0,ENU=0,AND,DCI=4,CSU=2,ECU=4,THI=0,DTI=0,STI=1
+                 7        ,IAD=0,PRB */
+        8        8        /**/
+        9        9        /*P* NAME:         KCL$CGLCL
+       10       10             PURPOSE:      To provide handling for local
+       11       11                           comgroup devices.
+       12       12             DESCRIPTION:  Contains many routines.
+       13       13                           They provide the special handling
+       14       14                           required for local comgroup terminals
+       15       15                           on the 'terminal' side of the comgroup.
+       16       16                           In brief, local devices do their 'real'
+       17       17                           I/O via the I/O system as opposed to
+       18       18                           through the circular queue mechanism
+       19       19                           to the FEP.
+       20       20
+       21       21                 Local devices are divided into 3 classes: consoles
+       22       22            (HOGs), INPUT devices (e.g. CRs), and output devices
+       23       23            (e.g. LPs).  Note that output symbiont devices are a
+       24       24            special case since OUTSYM manages their I/O himself,
+       25       25            via the M$SYMBIO service (see FOM$MOOS).
+       26       26                 INPUT devices have a single IOQ packet allocated
+       27       27            them by TIGR.  When one is activated, KCD$ACTRM calls
+       28       28            KCL$PUT to start the read sequence.  KCL$PUT calls
+       29       29            KQP$PUT to get a buffer in the comgroup.  When KQP$PUT
+       30       30            calls KCD$RDGO with the buffer, KCD$RDGO calls NIO$QUE
+       31       31            to read the device, specifying KCL$RDEA as endaction.
+       32       32            KCL$RDEA calls KQP$DONET to signify completion of the
+       33       33            I/O, telling him to take the record and send it as
+       34       34            a message into the comgroup.  When KQP$DONET returns,
+       35       35            KCL$RDEA calls KQP$PUT to repeat the cycle.  Thus
+       36       36            the device is read perpetually until it gives EOF.
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:2    
+       37       37                 OUTPUT devices also have a dedicated IOQ packet.
+       38       38            When one is activated, KCD$ACTRM calls KCL$GET to
+       39       39            start the sequence.  KCL$GET calls
+       40       40            KQG$GET to find an output message for the device.
+       41       41            When one is found, KQG$GET calls KCD$WRITE passing
+       42       42            the address of the buffer containing the message.
+       43       43            KCD$WRITE then writes it to the device via IOQ,
+       44       44            specifying KCL$WRTEA as endaction.  KCL$WRTEA
+       45       45            calls KQG$DONE to tell him to delete the message,
+       46       46            and then repeats the cycle by calling KCL$GET.
+       47       47            Thus KCL always has a 'get' pending to the comgroup,
+       48       48            that is, is always 'reading' the comgroup for data,
+       49       49            which, when it becomes available (signalled by the
+       50       50            call to KCD$WRITE), is instantly written to the
+       51       51            device via IOQ.
+       52       52                 HOGs are somewhat different.  They are the only
+       53       53            local devices that are both INPUT and OUTPUT.  The
+       54       54            OUTPUT side of a HOG is handled in the same way as
+       55       55            all other local OUTPUT devices (described above).
+       56       56            The INPUT side is different.  Basically, we receive
+       57       57            an interrupt when the operator wants to type something,
+       58       58            and this causes KCL$OCINT to be called.  If the HOG
+       59       59            is connected to the OCCG and is active, we call
+       60       60            KCL$CNSINT, which gets an IOQ packet & calls KQP$PUT
+       61       61            to get a buffer in the comgroup.  When KQP$PUT
+       62       62            calls KCD$RDGO with the buffer, KCL$CNSRD is called
+       63       63            to read the HOG via IOQ, specifying KCL$CNSEA as
+       64       64            endaction.  KCL$CNSEA calls KQP$DONET to send the
+       65       65            message into the comgroup, and then exits.  We
+       66       66            will remember up to two pending requests from the
+       67       67            operator.
+       68       68        */
+       69       69        /**/
+       70       70        /*F* NAME:         KCL$ININT
+       71       71             PURPOSE:      To field interrupts from local comgroup INPUT
+       72       72                           devices
+       73       73             DESCRIPTION:  This connection is established by ITX$INITS
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:3    
+       74       74                           for local input devices (e.g. CRs).  Called
+       75       75                           when the device interrupts.  Passes a break
+       76       76                           event to the comgroup if connected to one,
+       77       77                           else remembers the event for when the device
+       78       78                           does get connected.
+       79       79        */
+       80       80        KCL$ININT: PROC (DCTX,STATUS,LDCT$);
+       81       81        /**/
+       82       82
+       83       83
+       84       84
+       85       85        /**/
+       86       86        /* INCLUDES */
+       87       87        /**/
+       88       88        %INCLUDE NK$LDCT;
+       89      190        %INCLUDE KC_CP6;
+       90      750        %INCLUDE NK_SUBS;
+       91      775        %EQU_CG;
+       92      823
+       93      824
+       94      825
+       95      826        /**/
+       96      827        /* PARAMETERS */
+       97      828        /**/
+       98      829    1   DCL DCTX UBIN(15) UNAL;
+       99      830    1   DCL STATUS UBIN WORD;
+      100      831    1   DCL LDCT$ PTR;
+      101      832
+      102      833
+      103      834
+      104      835        /**/
+      105      836        /* BASED STRUCTURES */
+      106      837        /**/
+      107      838        %NK$LDCT;
+      108      884
+      109      885
+      110      886
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:4    
+      111      887        /**/
+      112      888        /* REFS */
+      113      889        /**/
+      114      890    1   DCL KCL$CNSINT    ENTRY(1);
+      115      891    1   DCL KQP$EVNT      ENTRY(2) ALTRET;
+      116      892    1   DCL OCI$SPINTCON  ENTRY(1);
+      117      893        /**/
+      118      894        /**/
+      119      895    1         IF LDCT$->LDCT.RESCOD~=NK_CGTRM AND LDCT$->LDCT.RESCOD~=NK_CGFPRG
+      120      896    1         THEN LDCT$->LDCT.BKPND=%CG_TBRK_RDY#;
+      121      897    1         ELSE CALL KQP$EVNT (LDCT$->LDCT,%CG_TBRK_RDY#);
+      122      898    1         RETURN;
+      123      899        /**/
+      124      900        /*F* NAME:         KCL$OCINT
+      125      901             PURPOSE:      To field interrupts from the local
+      126      902                           (IOM-connected) console (the HOG).
+      127      903             DESCRIPTION:  This connection is established by ITX$INITS.
+      128      904                           If the device is connected to the OCCG and
+      129      905                           is activated, call KCL$CNSINT, else call
+      130      906                           OCI$SPINTCON for special pre-KEYIN processing.
+      131      907        */
+      132      908    1   KCL$OCINT: ENTRY (DCTX,STATUS,LDCT$);
+      133      909        /**/
+      134      910    1         IF LDCT$->LDCT.LKFLG.ACTIVE THEN CALL KCL$CNSINT (LDCT$);
+      135      911    1         ELSE CALL OCI$SPINTCON (LDCT$->LDCT);
+      136      912    1         RETURN;
+      137      913        /**/
+      138      914    1   END;
+      139      915        /**/
+      140      916        /**/
+      141      917        %EOD;
+
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:5    
+--  Include file information  --
+
+   NK_SUBS.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$ININT.
+
+   Procedure KCL$ININT requires 39 words for executable code.
+   Procedure KCL$ININT requires 8 words of local(AUTO) storage.
+
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:6    
+
+ Object Unit name= KCL$ININT                                  File name= KCL$CGLCL.:E05TOU
+ UTS= JUL 30 '97 00:14:45.64 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none    39     47  KCL$ININT
+    1  RoData even  none     1      1  KCL$ININT
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        3  KCL$ININT
+     0     25                  yes      Std        3  KCL$OCINT
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       2 KQP$EVNT
+         yes           Std       1 KCL$CNSINT
+         yes           Std       1 OCI$SPINTCON
+                       nStd      0 X66_AUTO_3
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     B_VECTNIL
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:7    
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:8    
+
+
+        1        1        /*M* KCL$CGLCL Comgroup local device management routines*/
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7       /*X* DMC,PLM=6,IND=0,IDT=2,SDI=2,CTI=0,ENU=0,AND,DCI=4,CSU=2,ECU=4,THI=0,DTI=0,STI=1
+                 7        ,IAD=0,PRB */
+        8        8        /**/
+        9        9        /*P* NAME:         KCL$CGLCL
+       10       10             PURPOSE:      To provide handling for local
+       11       11                           comgroup devices.
+       12       12             DESCRIPTION:  Contains many routines.
+       13       13                           They provide the special handling
+       14       14                           required for local comgroup terminals
+       15       15                           on the 'terminal' side of the comgroup.
+       16       16                           In brief, local devices do their 'real'
+       17       17                           I/O via the I/O system as opposed to
+       18       18                           through the circular queue mechanism
+       19       19                           to the FEP.
+       20       20
+       21       21                 Local devices are divided into 3 classes: consoles
+       22       22            (HOGs), INPUT devices (e.g. CRs), and output devices
+       23       23            (e.g. LPs).  Note that output symbiont devices are a
+       24       24            special case since OUTSYM manages their I/O himself,
+       25       25            via the M$SYMBIO service (see FOM$MOOS).
+       26       26                 INPUT devices have a single IOQ packet allocated
+       27       27            them by TIGR.  When one is activated, KCD$ACTRM calls
+       28       28            KCL$PUT to start the read sequence.  KCL$PUT calls
+       29       29            KQP$PUT to get a buffer in the comgroup.  When KQP$PUT
+       30       30            calls KCD$RDGO with the buffer, KCD$RDGO calls NIO$QUE
+       31       31            to read the device, specifying KCL$RDEA as endaction.
+       32       32            KCL$RDEA calls KQP$DONET to signify completion of the
+       33       33            I/O, telling him to take the record and send it as
+       34       34            a message into the comgroup.  When KQP$DONET returns,
+       35       35            KCL$RDEA calls KQP$PUT to repeat the cycle.  Thus
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:9    
+       36       36            the device is read perpetually until it gives EOF.
+       37       37                 OUTPUT devices also have a dedicated IOQ packet.
+       38       38            When one is activated, KCD$ACTRM calls KCL$GET to
+       39       39            start the sequence.  KCL$GET calls
+       40       40            KQG$GET to find an output message for the device.
+       41       41            When one is found, KQG$GET calls KCD$WRITE passing
+       42       42            the address of the buffer containing the message.
+       43       43            KCD$WRITE then writes it to the device via IOQ,
+       44       44            specifying KCL$WRTEA as endaction.  KCL$WRTEA
+       45       45            calls KQG$DONE to tell him to delete the message,
+       46       46            and then repeats the cycle by calling KCL$GET.
+       47       47            Thus KCL always has a 'get' pending to the comgroup,
+       48       48            that is, is always 'reading' the comgroup for data,
+       49       49            which, when it becomes available (signalled by the
+       50       50            call to KCD$WRITE), is instantly written to the
+       51       51            device via IOQ.
+       52       52                 HOGs are somewhat different.  They are the only
+       53       53            local devices that are both INPUT and OUTPUT.  The
+       54       54            OUTPUT side of a HOG is handled in the same way as
+       55       55            all other local OUTPUT devices (described above).
+       56       56            The INPUT side is different.  Basically, we receive
+       57       57            an interrupt when the operator wants to type something,
+       58       58            and this causes KCL$OCINT to be called.  If the HOG
+       59       59            is connected to the OCCG and is active, we call
+       60       60            KCL$CNSINT, which gets an IOQ packet & calls KQP$PUT
+       61       61            to get a buffer in the comgroup.  When KQP$PUT
+       62       62            calls KCD$RDGO with the buffer, KCL$CNSRD is called
+       63       63            to read the HOG via IOQ, specifying KCL$CNSEA as
+       64       64            endaction.  KCL$CNSEA calls KQP$DONET to send the
+       65       65            message into the comgroup, and then exits.  We
+       66       66            will remember up to two pending requests from the
+       67       67            operator.
+       68       68        */
+       69       69        /**/
+       70       70        /*F* NAME:         KCL$ININT
+       71       71             PURPOSE:      To field interrupts from local comgroup INPUT
+       72       72                           devices
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:10   
+       73       73             DESCRIPTION:  This connection is established by ITX$INITS
+       74       74                           for local input devices (e.g. CRs).  Called
+       75       75                           when the device interrupts.  Passes a break
+       76       76                           event to the comgroup if connected to one,
+       77       77                           else remembers the event for when the device
+       78       78                           does get connected.
+       79       79        */
+       80       80        KCL$ININT: PROC (DCTX,STATUS,LDCT$);
+
+     80  0 000000   000000 700200 xent  KCL$ININT    TSX0  ! X66_AUTO_3
+         0 000001   000010 000003                    ZERO    8,3
+
+       81       81        /**/
+       82       82
+       83       83
+       84       84
+       85       85        /**/
+       86       86        /* INCLUDES */
+       87       87        /**/
+       88       88        %INCLUDE NK$LDCT;
+       89      190        %INCLUDE KC_CP6;
+       90      750        %INCLUDE NK_SUBS;
+       91      775        %EQU_CG;
+       92      823
+       93      824
+       94      825
+       95      826        /**/
+       96      827        /* PARAMETERS */
+       97      828        /**/
+       98      829    1   DCL DCTX UBIN(15) UNAL;
+       99      830    1   DCL STATUS UBIN WORD;
+      100      831    1   DCL LDCT$ PTR;
+      101      832
+      102      833
+      103      834
+      104      835        /**/
+      105      836        /* BASED STRUCTURES */
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:11   
+      106      837        /**/
+      107      838        %NK$LDCT;
+      108      884
+      109      885
+      110      886
+      111      887        /**/
+      112      888        /* REFS */
+      113      889        /**/
+      114      890    1   DCL KCL$CNSINT    ENTRY(1);
+      115      891    1   DCL KQP$EVNT      ENTRY(2) ALTRET;
+      116      892    1   DCL OCI$SPINTCON  ENTRY(1);
+      117      893        /**/
+      118      894        /**/
+      119      895    1         IF LDCT$->LDCT.RESCOD~=NK_CGTRM AND LDCT$->LDCT.RESCOD~=NK_CGFPRG
+
+    895  0 000002   200005 470500                    LDP0    @LDCT$,,AUTO
+         0 000003   000000 471500                    LDP1    0,,PR0
+         0 000004   100006 236100                    LDQ     6,,PR1
+         0 000005   000017 376007                    ANQ     15,DL
+         0 000006   000002 116007                    CMPQ    2,DL
+         0 000007   000015 600000 0                  TZE     s:897
+         0 000010   000011 116007                    CMPQ    9,DL
+         0 000011   000015 600000 0                  TZE     s:897
+
+      120      896    1         THEN LDCT$->LDCT.BKPND=%CG_TBRK_RDY#;
+
+    896  0 000012   012000 236003                    LDQ     5120,DU
+         0 000013   100014 552140                    STBQ    12,'40'O,PR1
+         0 000014   000024 710000 0                  TRA     s:898
+
+      121      897    1         ELSE CALL KQP$EVNT (LDCT$->LDCT,%CG_TBRK_RDY#);
+
+    897  0 000015   000000 236000 1                  LDQ     0
+         0 000016   200007 756100                    STQ     @LDCT$+2,,AUTO
+         0 000017   200006 451500                    STP1    @LDCT$+1,,AUTO
+         0 000020   200006 630500                    EPPR0   @LDCT$+1,,AUTO
+         0 000021   000020 631400 xsym               EPPR1   B_VECTNIL+16
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:12   
+         0 000022   000000 701000 xent               TSX1    KQP$EVNT
+         0 000023   000000 011000                    NOP     0
+
+      122      898    1         RETURN;
+
+    898  0 000024   000000 702200 xent               TSX2  ! X66_ARET
+
+      123      899        /**/
+      124      900        /*F* NAME:         KCL$OCINT
+      125      901             PURPOSE:      To field interrupts from the local
+      126      902                           (IOM-connected) console (the HOG).
+      127      903             DESCRIPTION:  This connection is established by ITX$INITS.
+      128      904                           If the device is connected to the OCCG and
+      129      905                           is activated, call KCL$CNSINT, else call
+      130      906                           OCI$SPINTCON for special pre-KEYIN processing.
+      131      907        */
+      132      908    1   KCL$OCINT: ENTRY (DCTX,STATUS,LDCT$);
+
+    908  0 000025   000000 700200 xent  KCL$OCINT    TSX0  ! X66_AUTO_3
+         0 000026   000010 000003                    ZERO    8,3
+
+      133      909        /**/
+      134      910    1         IF LDCT$->LDCT.LKFLG.ACTIVE THEN CALL KCL$CNSINT (LDCT$);
+
+    910  0 000027   200005 470500                    LDP0    @LDCT$,,AUTO
+         0 000030   000000 471500                    LDP1    0,,PR0
+         0 000031   100011 236100                    LDQ     9,,PR1
+         0 000032   000040 316003                    CANQ    32,DU
+         0 000033   000041 600000 0                  TZE     s:911
+
+    910  0 000034   200005 630500                    EPPR0   @LDCT$,,AUTO
+         0 000035   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000036   000000 701000 xent               TSX1    KCL$CNSINT
+         0 000037   000000 011000                    NOP     0
+         0 000040   000046 710000 0                  TRA     s:912
+
+      135      911    1         ELSE CALL OCI$SPINTCON (LDCT$->LDCT);
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:13   
+
+    911  0 000041   200006 451500                    STP1    @LDCT$+1,,AUTO
+         0 000042   200006 630500                    EPPR0   @LDCT$+1,,AUTO
+         0 000043   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000044   000000 701000 xent               TSX1    OCI$SPINTCON
+         0 000045   000000 011000                    NOP     0
+
+      136      912    1         RETURN;
+
+    912  0 000046   000000 702200 xent               TSX2  ! X66_ARET
+
+(unnamed)
+ Sect OctLoc
+   1     000   000014 006000                                                    ....
+      137      913        /**/
+      138      914    1   END;
+      139      915        /**/
+      140      916        /**/
+      141      917        %EOD;
+
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:14   
+--  Include file information  --
+
+   NK_SUBS.:E05TOU  is referenced.
+   KC_CP6.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$ININT.
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:15   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @DCTX                      5-0-0/w PTR         r     1 @LDCT$
+     4-0-0/w PTR         r     1 @STATUS                   *0-0-0/b UBIN(15)    r     1 DCTX
+    *0-0-0/w PTR         r     1 LDCT$                     *0-0-0/w UBIN        r     1 STATUS
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(864)   r     1 NK$LDCT
+
+
+   Procedure KCL$ININT requires 39 words for executable code.
+   Procedure KCL$ININT requires 8 words of local(AUTO) storage.
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:16   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:17   
+          MINI XREF LISTING
+
+DCTX
+       829**DCL        80--PROC      908--ENTRY
+KCL$CNSINT
+       890**DCL-ENT   910--CALL
+KQP$EVNT
+       891**DCL-ENT   897--CALL
+LDCT$
+       831**DCL        80--PROC      895>>IF        895>>IF        896>>ASSIGN    897>>CALL      908--ENTRY
+       910>>IF        910<>CALL      911>>CALL
+NK$LDCT
+       851**DCL       897<>CALL      911<>CALL
+NK$LDCT.BKPND
+       873**DCL       896<<ASSIGN
+NK$LDCT.DDT$
+       853**DCL       853--REDEF
+NK$LDCT.IOQ$
+       852**DCL       853--REDEF
+NK$LDCT.LDCTX
+       854**DCL       854--REDEF
+NK$LDCT.LKFLG.ABORTED
+       866**DCL       867--REDEF
+NK$LDCT.LKFLG.ACTIVE
+       870**DCL       910>>IF
+NK$LDCT.RESCOD
+       859**DCL       895>>IF        895>>IF
+NK$LDCT.RLCID.LDCTX
+       876**DCL       876--REDEF
+NK$LDCT.STA$
+       872**DCL       873--REDEF
+NK$LDCT.SYMB$
+       851**DCL       851--REDEF     851--REDEF     852--REDEF
+OCI$SPINTCON
+PL6.E3A0      #001=KCL$ININT File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:18   
+       892**DCL-ENT   911--CALL
+STATUS
+       830**DCL        80--PROC      908--ENTRY
+
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:19   
+      142        1        /*T***********************************************************/
+      143        2        /*T*                                                         */
+      144        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      145        4        /*T*                                                         */
+      146        5        /*T***********************************************************/
+      147        6        /**/
+      148        7        /**/
+      149        8        /*F* NAME:         KCL$CNSRD
+      150        9             PURPOSE:      To read the HOG
+      151       10             DESCRIPTION:  Called from KCD$RDGO when the comgroup
+      152       11                           has allocated a buffer.  Reads the
+      153       12                           device via NIO$QUE with endaction at
+      154       13                           KCL$CNSEA.
+      155       14        */
+      156       15        KCL$CNSRD: PROC (NK$LDCT,K$RWPARM);
+      157       16        /**/
+      158       17
+      159       18
+      160       19
+      161       20        /**/
+      162       21        /* INCLUDES */
+      163       22        /**/
+      164       23        %INCLUDE NK$LDCT;
+      165      125        %INCLUDE K$RWPARM;
+      166      511        %INCLUDE N$REQ;
+      167      585        %INCLUDE N_FC_C;
+      168      622        %INCLUDE NK_SUBS;
+      169      647
+      170      648
+      171      649
+      172      650        /**/
+      173      651        /* PARAMETERS */
+      174      652        /**/
+      175      653        %NK$LDCT (STCLASS="");
+      176      699        %K$RWPARM (STCLASS="",NAME=K$RWPARM);
+      177     1015
+      178     1016
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:20   
+      179     1017
+      180     1018        /**/
+      181     1019        /* BASED STRUCTURES */
+      182     1020        /**/
+      183     1021        %N$REQ;
+      184     1079    1   DCL VCHR1 CHAR(1) BASED;
+      185     1080
+      186     1081
+      187     1082
+      188     1083        /**/
+      189     1084        /* AUTO */
+      190     1085        /**/
+      191     1086    1   DCL IOQ$ PTR;
+      192     1087
+      193     1088
+      194     1089
+      195     1090        /**/
+      196     1091        /* CONSTANT */
+      197     1092        /**/
+      198     1093    1   DCL OCPMT CHAR(1) CONSTANT ALIGNED INIT('!');
+      199     1094
+      200     1095
+      201     1096
+      202     1097        /**/
+      203     1098        /* REFS */
+      204     1099        /**/
+      205     1100    1   DCL KCL$CNSEA     ENTRY(1);
+      206     1101    1   DCL KCL$WCG       ENTRY(1);
+      207     1102    1   DCL NIO$QUE       ENTRY(1) ALTRET;
+      208     1103    1   DCL NIO$REL       ENTRY(1) ALTRET;
+      209     1104    1   DCL NIQ$GET       ENTRY(1) ALTRET;
+      210     1105        /**/
+      211     1106        /**/
+      212     1107    1         CALL NIQ$GET (IOQ$) ALTRET (WAITQ);
+      213     1108    1         IOQ$->N$REQ.BUF$=K$RWPARM.MSG$;
+      214     1109    1         IOQ$->N$REQ.BUF$->VCHR1=OCPMT;
+      215     1110    1         IOQ$->N$REQ.BUFSIZE=K$RWPARM.MSGSZ;
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:21   
+      216     1111    1         IOQ$->N$REQ.NOALT='1'B;
+      217     1112    1         IOQ$->N$REQ.OPFLG=OP_EA|OP_BPF;
+      218     1113    1         IOQ$->N$REQ.DLA.DCTX=LDCT.RLCID.LDCTX;
+      219     1114    1         IOQ$->N$REQ.EAENTRY=ENTADDR(KCL$CNSEA);
+      220     1115    1         IOQ$->N$REQ.EAINFOP$=ADDR(LDCT);
+      221     1116    1         IOQ$->N$REQ.FC=%N_READ;
+      222     1117    1         CALL NIO$QUE (IOQ$->N$REQ);
+      223     1118    1         RETURN;
+      224     1119        /**/
+      225     1120    1   WAITQ:;
+      226     1121    1         CALL KCL$WCG (ADDR(LDCT));
+      227     1122    1         RETURN;
+      228     1123        /**/
+      229     1124    1   END;
+      230     1125        /**/
+      231     1126        /**/
+      232     1127        %EOD;
+
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:22   
+--  Include file information  --
+
+   NK_SUBS.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   K$RWPARM.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$CNSRD.
+
+   Procedure KCL$CNSRD requires 57 words for executable code.
+   Procedure KCL$CNSRD requires 8 words of local(AUTO) storage.
+
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:23   
+
+ Object Unit name= KCL$CNSRD                                  File name= KCL$CGLCL.:E05TOU
+ UTS= JUL 30 '97 00:14:53.96 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS      1      1  KCL$CNSRD
+    1   Proc  even  none    57     71  KCL$CNSRD
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        2  KCL$CNSRD
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 NIQ$GET
+ yes     yes           Std       1 NIO$QUE
+         yes           Std       1 KCL$WCG
+         yes           Std       1 KCL$CNSEA
+                       nStd      0 X66_AUTO_2
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     B_VECTNIL
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:24   
+
+
+      142        1        /*T***********************************************************/
+      143        2        /*T*                                                         */
+      144        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      145        4        /*T*                                                         */
+      146        5        /*T***********************************************************/
+      147        6        /**/
+      148        7        /**/
+      149        8        /*F* NAME:         KCL$CNSRD
+      150        9             PURPOSE:      To read the HOG
+      151       10             DESCRIPTION:  Called from KCD$RDGO when the comgroup
+      152       11                           has allocated a buffer.  Reads the
+      153       12                           device via NIO$QUE with endaction at
+      154       13                           KCL$CNSEA.
+      155       14        */
+      156       15        KCL$CNSRD: PROC (NK$LDCT,K$RWPARM);
+
+     15  1 000000   000000 700200 xent  KCL$CNSRD    TSX0  ! X66_AUTO_2
+         1 000001   000010 000002                    ZERO    8,2
+
+      157       16        /**/
+      158       17
+      159       18
+      160       19
+      161       20        /**/
+      162       21        /* INCLUDES */
+      163       22        /**/
+      164       23        %INCLUDE NK$LDCT;
+      165      125        %INCLUDE K$RWPARM;
+      166      511        %INCLUDE N$REQ;
+      167      585        %INCLUDE N_FC_C;
+      168      622        %INCLUDE NK_SUBS;
+      169      647
+      170      648
+      171      649
+      172      650        /**/
+      173      651        /* PARAMETERS */
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:25   
+      174      652        /**/
+      175      653        %NK$LDCT (STCLASS="");
+      176      699        %K$RWPARM (STCLASS="",NAME=K$RWPARM);
+      177     1015
+      178     1016
+      179     1017
+      180     1018        /**/
+      181     1019        /* BASED STRUCTURES */
+      182     1020        /**/
+      183     1021        %N$REQ;
+      184     1079    1   DCL VCHR1 CHAR(1) BASED;
+      185     1080
+      186     1081
+      187     1082
+      188     1083        /**/
+      189     1084        /* AUTO */
+      190     1085        /**/
+      191     1086    1   DCL IOQ$ PTR;
+      192     1087
+      193     1088
+      194     1089
+      195     1090        /**/
+      196     1091        /* CONSTANT */
+      197     1092        /**/
+      198     1093    1   DCL OCPMT CHAR(1) CONSTANT ALIGNED INIT('!');
+      199     1094
+      200     1095
+      201     1096
+      202     1097        /**/
+      203     1098        /* REFS */
+      204     1099        /**/
+      205     1100    1   DCL KCL$CNSEA     ENTRY(1);
+      206     1101    1   DCL KCL$WCG       ENTRY(1);
+      207     1102    1   DCL NIO$QUE       ENTRY(1) ALTRET;
+      208     1103    1   DCL NIO$REL       ENTRY(1) ALTRET;
+      209     1104    1   DCL NIQ$GET       ENTRY(1) ALTRET;
+      210     1105        /**/
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:26   
+      211     1106        /**/
+      212     1107    1         CALL NIQ$GET (IOQ$) ALTRET (WAITQ);
+
+   1107  1 000002   200005 630500                    EPPR0   IOQ$,,AUTO
+         1 000003   200006 450500                    STP0    IOQ$+1,,AUTO
+         1 000004   200006 630500                    EPPR0   IOQ$+1,,AUTO
+         1 000005   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000006   000000 701000 xent               TSX1    NIQ$GET
+         1 000007   000060 702000 1                  TSX2    WAITQ
+
+      213     1108    1         IOQ$->N$REQ.BUF$=K$RWPARM.MSG$;
+
+   1108  1 000010   200004 470500                    LDP0    @K$RWPARM,,AUTO
+         1 000011   000000 236100                    LDQ     0,,PR0
+         1 000012   200005 471500                    LDP1    IOQ$,,AUTO
+         1 000013   100005 756100                    STQ     5,,PR1
+
+      214     1109    1         IOQ$->N$REQ.BUF$->VCHR1=OCPMT;
+
+   1109  1 000014   200005 471500                    LDP1    IOQ$,,AUTO
+         1 000015   100005 473500                    LDP3    5,,PR1
+         1 000016   040100 100400                    MLR     fill='040'O
+         1 000017   000000 000001 0                  ADSC9   OCPMT                    cn=0,n=1
+         1 000020   300000 000001                    ADSC9   0,,PR3                   cn=0,n=1
+
+      215     1110    1         IOQ$->N$REQ.BUFSIZE=K$RWPARM.MSGSZ;
+
+   1110  1 000021   200005 471500                    LDP1    IOQ$,,AUTO
+         1 000022   000001 236100                    LDQ     1,,PR0
+         1 000023   000020 736000                    QLS     16
+         1 000024   100004 676100                    ERQ     4,,PR1
+         1 000025   000034 376000 xsym               ANQ     B_VECTNIL+28
+         1 000026   100004 656100                    ERSQ    4,,PR1
+
+      216     1111    1         IOQ$->N$REQ.NOALT='1'B;
+
+   1111  1 000027   200005 471500                    LDP1    IOQ$,,AUTO
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:27   
+         1 000030   100000 236007                    LDQ     32768,DL
+         1 000031   100004 256100                    ORSQ    4,,PR1
+
+      217     1112    1         IOQ$->N$REQ.OPFLG=OP_EA|OP_BPF;
+
+   1112  1 000032   200005 471500                    LDP1    IOQ$,,AUTO
+         1 000033   000050 236007                    LDQ     40,DL
+         1 000034   100004 552104                    STBQ    4,'04'O,PR1
+
+      218     1113    1         IOQ$->N$REQ.DLA.DCTX=LDCT.RLCID.LDCTX;
+
+   1113  1 000035   200005 471500                    LDP1    IOQ$,,AUTO
+         1 000036   200003 473500                    LDP3    @NK$LDCT,,AUTO
+         1 000037   300015 236100                    LDQ     13,,PR3
+         1 000040   000025 736000                    QLS     21
+         1 000041   100001 676100                    ERQ     1,,PR1
+         1 000042   777770 376003                    ANQ     -8,DU
+         1 000043   100001 656100                    ERSQ    1,,PR1
+
+      219     1114    1         IOQ$->N$REQ.EAENTRY=ENTADDR(KCL$CNSEA);
+
+   1114  1 000044   000000 636000 xent               EAQ     KCL$CNSEA
+         1 000045   200005 471500                    LDP1    IOQ$,,AUTO
+         1 000046   100023 756100                    STQ     19,,PR1
+
+      220     1115    1         IOQ$->N$REQ.EAINFOP$=ADDR(LDCT);
+
+   1115  1 000047   200003 236100                    LDQ     @NK$LDCT,,AUTO
+         1 000050   100024 756100                    STQ     20,,PR1
+
+      221     1116    1         IOQ$->N$REQ.FC=%N_READ;
+
+   1116  1 000051   000014 236007                    LDQ     12,DL
+         1 000052   100003 552104                    STBQ    3,'04'O,PR1
+
+      222     1117    1         CALL NIO$QUE (IOQ$->N$REQ);
+
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:28   
+   1117  1 000053   200005 630500                    EPPR0   IOQ$,,AUTO
+         1 000054   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000055   000000 701000 xent               TSX1    NIO$QUE
+         1 000056   000000 011000                    NOP     0
+
+      223     1118    1         RETURN;
+
+   1118  1 000057   000000 702200 xent               TSX2  ! X66_ARET
+
+   1116  1 000060                       WAITQ        null
+      224     1119        /**/
+      225     1120    1   WAITQ:;
+      226     1121    1         CALL KCL$WCG (ADDR(LDCT));
+
+   1121  1 000060   200003 236100                    LDQ     @NK$LDCT,,AUTO
+         1 000061   200006 756100                    STQ     IOQ$+1,,AUTO
+         1 000062   200006 630500                    EPPR0   IOQ$+1,,AUTO
+         1 000063   200007 450500                    STP0    IOQ$+2,,AUTO
+         1 000064   200007 630500                    EPPR0   IOQ$+2,,AUTO
+         1 000065   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000066   000000 701000 xent               TSX1    KCL$WCG
+         1 000067   000000 011000                    NOP     0
+
+      227     1122    1         RETURN;
+
+   1122  1 000070   000000 702200 xent               TSX2  ! X66_ARET
+
+OCPMT
+ Sect OctLoc
+   0     000   041*** ******                                                    !...
+      228     1123        /**/
+      229     1124    1   END;
+      230     1125        /**/
+      231     1126        /**/
+      232     1127        %EOD;
+
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:29   
+--  Include file information  --
+
+   NK_SUBS.:E05TOU  is referenced.
+   N_FC_C.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   K$RWPARM.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$CNSRD.
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:30   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData KCL$CNSRD
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w CHAR        r     1 OCPMT
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 @K$RWPARM                  3-0-0/w PTR         r     1 @NK$LDCT
+     5-0-0/w PTR         r     1 IOQ$                      *0-0-0/d STRC(1404)  r     1 K$RWPARM
+    *0-0-0/d STRC(864)   r     1 NK$LDCT
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(1080)  r     1 N$REQ                      0-0-0/c CHAR        r     1 VCHR1
+
+
+   Procedure KCL$CNSRD requires 57 words for executable code.
+   Procedure KCL$CNSRD requires 8 words of local(AUTO) storage.
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:31   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:32   
+          MINI XREF LISTING
+
+IOQ$
+      1086**DCL      1107<>CALL     1108>>ASSIGN   1109>>ASSIGN   1110>>ASSIGN   1111>>ASSIGN   1112>>ASSIGN
+      1113>>ASSIGN   1114>>ASSIGN   1115>>ASSIGN   1116>>ASSIGN   1117>>CALL
+K$RWPARM
+       720**DCL        15--PROC
+K$RWPARM.BLKREC
+       746**DCL       771--REDEF
+K$RWPARM.BLKREC.BLKU#
+       747**DCL       749--REDEF
+K$RWPARM.BLKREC.RECU#
+       759**DCL       761--REDEF
+K$RWPARM.DVE.DVBYTE.VFC
+       786**DCL       787--REDEF
+K$RWPARM.DVE.EOMCHAR
+       794**DCL       798--REDEF
+K$RWPARM.ERR
+       858**DCL       863--REDEF
+K$RWPARM.FC
+       822**DCL       823--REDEF
+K$RWPARM.FLDID
+      1004**DCL      1005--REDEF
+K$RWPARM.FPT$
+       885**DCL       892--REDEF
+K$RWPARM.KEYTYPE
+      1011**DCL      1012--REDEF
+K$RWPARM.MSG$
+       721**DCL       727--REDEF    1108>>ASSIGN
+K$RWPARM.MSGID
+       833**DCL       838--REDEF
+K$RWPARM.MSGIDXT
+       846**DCL       850--REDEF
+K$RWPARM.MSGSZ
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:33   
+       728**DCL      1110>>ASSIGN
+K$RWPARM.ORG
+       982**DCL       983--REDEF
+K$RWPARM.THDRSZ
+       926**DCL       930--REDEF
+K$RWPARM.VDOFLGS
+       984**DCL       995--REDEF
+KCL$CNSEA
+      1100**DCL-ENT  1114--ASSIGN
+KCL$WCG
+      1101**DCL-ENT  1121--CALL
+N$REQ
+      1030**DCL      1117<>CALL
+N$REQ.BUF$
+      1039**DCL      1108<<ASSIGN   1109>>ASSIGN
+N$REQ.BUFADDR
+      1039**DCL      1040--REDEF    1040--REDEF
+N$REQ.BUFSIZE
+      1033**DCL      1110<<ASSIGN
+N$REQ.DLA.DCTX
+      1030**DCL      1113<<ASSIGN
+N$REQ.DLA.DRELADDR
+      1031**DCL      1031--REDEF
+N$REQ.DVE.EOMCHAR
+      1068**DCL      1069--REDEF
+N$REQ.EAENTRY
+      1061**DCL      1114<<ASSIGN
+N$REQ.EAINFO
+      1062**DCL      1062--REDEF
+N$REQ.EAINFOP$
+      1062**DCL      1115<<ASSIGN
+N$REQ.EAINFOX
+      1062**DCL      1063--REDEF
+N$REQ.EVNTINFO
+      1063**DCL      1063--REDEF
+N$REQ.FC
+PL6.E3A0      #002=KCL$CNSRD File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:14 Page:34   
+      1033**DCL      1116<<ASSIGN
+N$REQ.NOALT
+      1033**DCL      1111<<ASSIGN
+N$REQ.OPFLG
+      1036**DCL      1112<<ASSIGN
+N$REQ.STATUS
+      1044**DCL      1050--REDEF
+NIO$QUE
+      1102**DCL-ENT  1117--CALL
+NIQ$GET
+      1104**DCL-ENT  1107--CALL
+NK$LDCT
+       666**DCL        15--PROC     1115--ASSIGN   1121--CALL
+NK$LDCT.DDT$
+       668**DCL       668--REDEF
+NK$LDCT.IOQ$
+       667**DCL       668--REDEF
+NK$LDCT.LDCTX
+       669**DCL       669--REDEF
+NK$LDCT.LKFLG.ABORTED
+       681**DCL       682--REDEF
+NK$LDCT.RLCID.LDCTX
+       691**DCL       691--REDEF    1113>>ASSIGN
+NK$LDCT.STA$
+       687**DCL       688--REDEF
+NK$LDCT.SYMB$
+       666**DCL       666--REDEF     666--REDEF     667--REDEF
+OCPMT
+      1093**DCL      1109>>ASSIGN
+VCHR1
+      1079**DCL      1109<<ASSIGN
+WAITQ
+      1116**LABEL    1107--CALLALT
+
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:35   
+      233        1        /*T***********************************************************/
+      234        2        /*T*                                                         */
+      235        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      236        4        /*T*                                                         */
+      237        5        /*T***********************************************************/
+      238        6        /**/
+      239        7        /**/
+      240        8        /*F* NAME:         KCL$PCG
+      241        9             PURPOSE:      To re-cycle the console read process
+      242       10                           when an I/O queue packet is not available.
+      243       11             DESCRIPTION:  When KCL$CNSRD can't get an IOQ packet,
+      244       12                           it MONTIMRs itself by calling KCL$WCG.
+      245       13                           When the time has elapsed, KCL$PCG is
+      246       14                           called.  We call KQP$PCG which calls
+      247       15                           KCD$RDGO which calls KCL$CNSRD thus
+      248       16                           giving him another shot at getting
+      249       17                           an IOQ packet. */
+      250       18        KCL$PCG: PROC (LDCT$);
+      251       19        /**/
+      252       20
+      253       21
+      254       22
+      255       23        /**/
+      256       24        /* INCLUDES */
+      257       25        /**/
+      258       26        %INCLUDE NK$LDCT;
+      259      128        %INCLUDE K$RWPARM;
+      260      514        %INCLUDE KQ_SUBS_C;
+      261      814        %INCLUDE NK_SUBS;
+      262      839
+      263      840
+      264      841
+      265      842        /**/
+      266      843        /* PARAMETERS */
+      267      844        /**/
+      268      845    1   DCL LDCT$ PTR;
+      269      846
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:36   
+      270      847
+      271      848
+      272      849        /**/
+      273      850        /* BASED STRUCTURES */
+      274      851        /**/
+      275      852        %NK$LDCT;
+      276      898
+      277      899
+      278      900
+      279      901        /**/
+      280      902        /* AUTO */
+      281      903        /**/
+      282      904    1   DCL CLBCK EPTR;
+      283      905        %K$RWPARM (STCLASS="",NAME=K$RWPARM);
+      284     1221
+      285     1222
+      286     1223
+      287     1224        /**/
+      288     1225        /* REFS */
+      289     1226        /**/
+      290     1227    1   DCL KQG$GET       ENTRY(2) ALTRET;
+      291     1228    1   DCL KQP$PCG       ENTRY(1) ALTRET;
+      292     1229    1   DCL KQP$PUT       ENTRY(2) ALTRET;
+      293     1230    1   DCL OCI$SPINTCON  ENTRY(1);
+      294     1231    1   DCL SSC$MONTIMR   ENTRY(3);
+      295     1232        %K$RWPARM (NAME=KC_CRWP,STCLASS=SYMREF);
+      296     1548        /**/
+      297     1549        /**/
+      298     1550    1         IF LDCT$->LDCT.LKFLG.ACTIVE THEN CALL KQP$PCG (LDCT$->LDCT) ALTRET (WCG);
+      299     1551    1         ELSE CALL OCI$SPINTCON;
+      300     1552    1         RETURN;
+      301     1553        /**/
+      302     1554        /*F* NAME:         KCL$WCG
+      303     1555             PURPOSE:      To hang KCL$CNSRD on MONTIMR when
+      304     1556                           he can't get an IOQ packet
+      305     1557             DESCRIPTION:  See KCL$PCG */
+      306     1558    1   KCL$WCG: ENTRY (LDCT$);
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:37   
+      307     1559        /**/
+      308     1560    1   WCG:  ;
+      309     1561    1         CLBCK=ENTADDR(KCL$PCG);
+      310     1562    1   WAIT: ;
+      311     1563    1         CALL SSC$MONTIMR (300,CLBCK,LDCT$);
+      312     1564    1         RETURN;
+      313     1565        /**/
+      314     1566        /*F* NAME:         KCL$PUT
+      315     1567             PURPOSE:      To initiate the read sequence for an INPUT
+      316     1568                           device.
+      317     1569             DESCRIPTION:  See the *P* for KCL$CGLCL */
+      318     1570    1   KCL$PUT: ENTRY (LDCT$);
+      319     1571        /**/
+      320     1572    1         CLBCK=ENTADDR(KCL$PUT);
+      321     1573    1         CALL PUTIT ALTRET (WAIT);
+      322     1574    1         RETURN;
+      323     1575        /**/
+      324     1576        /*F* NAME:         KCL$GET
+      325     1577             PURPOSE:      To initiate the write sequence for an OUTPUT
+      326     1578                           device.
+      327     1579             DESCRIPTION:  See the *P* for KCL$CGLCL */
+      328     1580    1   KCL$GET: ENTRY (LDCT$);
+      329     1581        /**/
+      330     1582    1         CLBCK=ENTADDR(KCL$GET);
+      331     1583    1         K$RWPARM=KC_CRWP;
+      332     1584    1         IF LDCT$->LDCT.LKFLG.ACTIVE THEN CALL KQG$GET (LDCT$->LDCT,K$RWPARM) ALTRET (
+              1584                  WAIT);
+      333     1585    1         RETURN;
+      334     1586        /**/
+      335     1587        /*F* NAME:         KCL$CNSINTW
+      336     1588             PURPOSE:      To pick up a delayed console read sequence
+      337     1589             DESCRIPTION:  See the *F* for KCL$CNSINT */
+      338     1590    1   KCL$CNSINTW: ENTRY (LDCT$);
+      339     1591        /**/
+      340     1592    2           DO INHIBIT;
+      341     1593    2           LDCT$->LDCT.DFLG.IQD='0'B;
+      342     1594    2           GOTO CINT;
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:38   
+      343     1595    2           END;
+      344     1596        /**/
+      345     1597    1   KCL$CNSINT: ENTRY (LDCT$);
+      346     1598        /*F* NAME:         KCL$CNSINT
+      347     1599             PURPOSE:      To start to read a HOG
+      348     1600             DESCRIPTION:  Called from KCL$OCINT when an interrupt is
+      349     1601                           received from a HOG which is on the OCCG
+      350     1602                           and is activated.  The idea is to start
+      351     1603                           the sequence to read the message that
+      352     1604                           the operator is saying he wants to type.
+      353     1605                           See the *P* for KCL$CGLCL.  If a read
+      354     1606                           is already in progress, we set IQD in
+      355     1607                           the LDCT and MONTIMR ourselves to
+      356     1608                           KCL$CNSINTW, thus remembering the
+      357     1609                           interrupt for later.  Otherwise we
+      358     1610                           start the read sequence. */
+      359     1611        /**/
+      360     1612    2           DO INHIBIT;
+      361     1613    2           IF LDCT$->LDCT.DFLG.IQD THEN RETURN;
+      362     1614    2   CINT:   ;
+      363     1615    2           IF LDCT$->LDCT.DFLG.PPND THEN
+      364     1616    3             DO;
+      365     1617    3             LDCT$->LDCT.DFLG.IQD='1'B;
+      366     1618    3             CLBCK=ENTADDR(KCL$CNSINTW);
+      367     1619    3             GOTO WAIT;
+      368     1620    3             END;
+      369     1621    2           LDCT$->LDCT.DFLG.PPND='1'B;
+      370     1622    2           END;
+      371     1623    1         IF LDCT$->LDCT.LKFLG.ACTIVE THEN CALL PUTITA ALTRET (SPNT);
+      372     1624    1         ELSE
+      373     1625    2           DO;
+      374     1626    2   SPNT:   ;
+      375     1627    3             DO INHIBIT;
+      376     1628    3             LDCT$->LDCT.DFLG.PPND='0'B;
+      377     1629    3             END;
+      378     1630    2           CALL OCI$SPINTCON (LDCT$->LDCT);
+      379     1631    2           END;
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:39   
+      380     1632    1         RETURN;
+      381     1633        /**/
+      382     1634    1   PUTIT: PROC ALTRET;
+      383     1635        /**/
+      384     1636    2         IF LDCT$->LDCT.LKFLG.ACTIVE='0'B THEN RETURN;
+      385     1637        /**/
+      386     1638    2   PUTITA: ENTRY ALTRET;
+      387     1639        /**/
+      388     1640    2         K$RWPARM=KC_CRWP;
+      389     1641    2         CALL KQP$PUT (LDCT$->LDCT,K$RWPARM) ALTRET (ALTRT);
+      390     1642    2         RETURN;
+      391     1643    2   ALTRT:;
+      392     1644    2         IF K$RWPARM.ERR=KQPE_NOBUF# THEN RETURN;
+      393     1645    2         ALTRETURN;
+      394     1646    2   END;
+      395     1647        /**/
+      396     1648    1   END;
+      397     1649        /**/
+      398     1650        /**/
+      399     1651        %EOD;
+
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:40   
+--  Include file information  --
+
+   NK_SUBS.:E05TOU  is referenced.
+   KQ_SUBS_C.:E05TOU  is referenced.
+   K$RWPARM.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$PCG.
+
+   Procedure KCL$PCG requires 134 words for executable code.
+   Procedure KCL$PCG requires 52 words of local(AUTO) storage.
+
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:41   
+
+ Object Unit name= KCL$PCG                                    File name= KCL$CGLCL.:E05TOU
+ UTS= JUL 30 '97 00:15:05.64 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   134    206  KCL$PCG
+    1  RoData even  none     4      4  KCL$PCG
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  KCL$PCG
+     0     21                  yes      Std        1  KCL$WCG
+     0     40                  yes      Std        1  KCL$PUT
+     0     47                  yes      Std        1  KCL$GET
+     0     73                  yes      Std        1  KCL$CNSINTW
+     0    103                  yes      Std        1  KCL$CNSINT
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:42   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       1 KQP$PCG
+         yes           Std       3 SSC$MONTIMR
+ yes     yes           Std       2 KQG$GET
+         yes           Std       1 OCI$SPINTCON
+ yes     yes           Std       2 KQP$PUT
+         yes           Std       1 KCL$PCG
+         yes           Std       1 KCL$PUT
+         yes           Std       1 KCL$GET
+         yes           Std       1 KCL$CNSINTW
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     KC_CRWP                               B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ISSID
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:43   
+
+
+      233        1        /*T***********************************************************/
+      234        2        /*T*                                                         */
+      235        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      236        4        /*T*                                                         */
+      237        5        /*T***********************************************************/
+      238        6        /**/
+      239        7        /**/
+      240        8        /*F* NAME:         KCL$PCG
+      241        9             PURPOSE:      To re-cycle the console read process
+      242       10                           when an I/O queue packet is not available.
+      243       11             DESCRIPTION:  When KCL$CNSRD can't get an IOQ packet,
+      244       12                           it MONTIMRs itself by calling KCL$WCG.
+      245       13                           When the time has elapsed, KCL$PCG is
+      246       14                           called.  We call KQP$PCG which calls
+      247       15                           KCD$RDGO which calls KCL$CNSRD thus
+      248       16                           giving him another shot at getting
+      249       17                           an IOQ packet. */
+      250       18        KCL$PCG: PROC (LDCT$);
+
+     18  0 000000   000000 700200 xent  KCL$PCG      TSX0  ! X66_AUTO_1
+         0 000001   000064 000001                    ZERO    52,1
+
+      251       19        /**/
+      252       20
+      253       21
+      254       22
+      255       23        /**/
+      256       24        /* INCLUDES */
+      257       25        /**/
+      258       26        %INCLUDE NK$LDCT;
+      259      128        %INCLUDE K$RWPARM;
+      260      514        %INCLUDE KQ_SUBS_C;
+      261      814        %INCLUDE NK_SUBS;
+      262      839
+      263      840
+      264      841
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:44   
+      265      842        /**/
+      266      843        /* PARAMETERS */
+      267      844        /**/
+      268      845    1   DCL LDCT$ PTR;
+      269      846
+      270      847
+      271      848
+      272      849        /**/
+      273      850        /* BASED STRUCTURES */
+      274      851        /**/
+      275      852        %NK$LDCT;
+      276      898
+      277      899
+      278      900
+      279      901        /**/
+      280      902        /* AUTO */
+      281      903        /**/
+      282      904    1   DCL CLBCK EPTR;
+      283      905        %K$RWPARM (STCLASS="",NAME=K$RWPARM);
+      284     1221
+      285     1222
+      286     1223
+      287     1224        /**/
+      288     1225        /* REFS */
+      289     1226        /**/
+      290     1227    1   DCL KQG$GET       ENTRY(2) ALTRET;
+      291     1228    1   DCL KQP$PCG       ENTRY(1) ALTRET;
+      292     1229    1   DCL KQP$PUT       ENTRY(2) ALTRET;
+      293     1230    1   DCL OCI$SPINTCON  ENTRY(1);
+      294     1231    1   DCL SSC$MONTIMR   ENTRY(3);
+      295     1232        %K$RWPARM (NAME=KC_CRWP,STCLASS=SYMREF);
+      296     1548        /**/
+      297     1549        /**/
+      298     1550    1         IF LDCT$->LDCT.LKFLG.ACTIVE THEN CALL KQP$PCG (LDCT$->LDCT) ALTRET (WCG);
+
+   1550  0 000002   200003 470500                    LDP0    @LDCT$,,AUTO
+         0 000003   000000 471500                    LDP1    0,,PR0
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:45   
+         0 000004   100011 236100                    LDQ     9,,PR1
+         0 000005   000040 316003                    CANQ    32,DU
+         0 000006   000015 600000 0                  TZE     s:1551
+
+   1550  0 000007   200060 451500                    STP1    K$RWPARM+42,,AUTO
+         0 000010   200060 630500                    EPPR0   K$RWPARM+42,,AUTO
+         0 000011   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000012   000000 701000 xent               TSX1    KQP$PCG
+         0 000013   000023 702000 0                  TSX2    WCG
+         0 000014   000020 710000 0                  TRA     s:1552
+
+      299     1551    1         ELSE CALL OCI$SPINTCON;
+
+   1551  0 000015   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000016   000000 701000 xent               TSX1    OCI$SPINTCON
+         0 000017   000000 011000                    NOP     0
+
+      300     1552    1         RETURN;
+
+   1552  0 000020   000000 702200 xent               TSX2  ! X66_ARET
+
+      301     1553        /**/
+      302     1554        /*F* NAME:         KCL$WCG
+      303     1555             PURPOSE:      To hang KCL$CNSRD on MONTIMR when
+      304     1556                           he can't get an IOQ packet
+      305     1557             DESCRIPTION:  See KCL$PCG */
+      306     1558    1   KCL$WCG: ENTRY (LDCT$);
+
+   1558  0 000021   000000 700200 xent  KCL$WCG      TSX0  ! X66_AUTO_1
+         0 000022   000064 000001                    ZERO    52,1
+
+   1550  0 000023                       WCG          null
+      307     1559        /**/
+      308     1560    1   WCG:  ;
+      309     1561    1         CLBCK=ENTADDR(KCL$PCG);
+
+   1561  0 000023   000000 636000 0                  EAQ     s:18
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:46   
+         0 000024   200004 756100                    STQ     CLBCK,,AUTO
+
+   1561  0 000025                       WAIT         null
+      310     1562    1   WAIT: ;
+      311     1563    1         CALL SSC$MONTIMR (300,CLBCK,LDCT$);
+
+   1563  0 000025   200003 236100                    LDQ     @LDCT$,,AUTO
+         0 000026   200062 756100                    STQ     K$RWPARM+44,,AUTO
+         0 000027   200004 630500                    EPPR0   CLBCK,,AUTO
+         0 000030   200061 450500                    STP0    K$RWPARM+43,,AUTO
+         0 000031   000001 236000 1                  LDQ     1
+         0 000032   200060 756100                    STQ     K$RWPARM+42,,AUTO
+         0 000033   200060 630500                    EPPR0   K$RWPARM+42,,AUTO
+         0 000034   000021 631400 xsym               EPPR1   B_VECTNIL+17
+         0 000035   000000 701000 xent               TSX1    SSC$MONTIMR
+         0 000036   000000 011000                    NOP     0
+
+      312     1564    1         RETURN;
+
+   1564  0 000037   000000 702200 xent               TSX2  ! X66_ARET
+
+      313     1565        /**/
+      314     1566        /*F* NAME:         KCL$PUT
+      315     1567             PURPOSE:      To initiate the read sequence for an INPUT
+      316     1568                           device.
+      317     1569             DESCRIPTION:  See the *P* for KCL$CGLCL */
+      318     1570    1   KCL$PUT: ENTRY (LDCT$);
+
+   1570  0 000040   000000 700200 xent  KCL$PUT      TSX0  ! X66_AUTO_1
+         0 000041   000064 000001                    ZERO    52,1
+
+      319     1571        /**/
+      320     1572    1         CLBCK=ENTADDR(KCL$PUT);
+
+   1572  0 000042   000040 636000 0                  EAQ     s:1570
+         0 000043   200004 756100                    STQ     CLBCK,,AUTO
+
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:47   
+      321     1573    1         CALL PUTIT ALTRET (WAIT);
+
+   1573  0 000044   000150 701000 0                  TSX1    PUTIT
+         0 000045   000025 702000 0                  TSX2    WAIT
+
+      322     1574    1         RETURN;
+
+   1574  0 000046   000000 702200 xent               TSX2  ! X66_ARET
+
+      323     1575        /**/
+      324     1576        /*F* NAME:         KCL$GET
+      325     1577             PURPOSE:      To initiate the write sequence for an OUTPUT
+      326     1578                           device.
+      327     1579             DESCRIPTION:  See the *P* for KCL$CGLCL */
+      328     1580    1   KCL$GET: ENTRY (LDCT$);
+
+   1580  0 000047   000000 700200 xent  KCL$GET      TSX0  ! X66_AUTO_1
+         0 000050   000064 000001                    ZERO    52,1
+
+      329     1581        /**/
+      330     1582    1         CLBCK=ENTADDR(KCL$GET);
+
+   1582  0 000051   000047 636000 0                  EAQ     s:1580
+         0 000052   200004 756100                    STQ     CLBCK,,AUTO
+
+      331     1583    1         K$RWPARM=KC_CRWP;
+
+   1583  0 000053   000100 100400                    MLR     fill='000'O
+         0 000054   000000 000234 xsym               ADSC9   KC_CRWP                  cn=0,n=156
+         0 000055   200006 000234                    ADSC9   K$RWPARM,,AUTO           cn=0,n=156
+
+      332     1584    1         IF LDCT$->LDCT.LKFLG.ACTIVE THEN CALL KQG$GET (LDCT$->LDCT,K$RWPARM) ALTRET (
+              1584                  WAIT);
+
+   1584  0 000056   200003 470500                    LDP0    @LDCT$,,AUTO
+         0 000057   000000 471500                    LDP1    0,,PR0
+         0 000060   100011 236100                    LDQ     9,,PR1
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:48   
+         0 000061   000040 316003                    CANQ    32,DU
+         0 000062   000072 600000 0                  TZE     s:1585
+
+   1584  0 000063   200006 633500                    EPPR3   K$RWPARM,,AUTO
+         0 000064   200061 453500                    STP3    K$RWPARM+43,,AUTO
+         0 000065   200060 451500                    STP1    K$RWPARM+42,,AUTO
+         0 000066   200060 630500                    EPPR0   K$RWPARM+42,,AUTO
+         0 000067   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000070   000000 701000 xent               TSX1    KQG$GET
+         0 000071   000025 702000 0                  TSX2    WAIT
+
+      333     1585    1         RETURN;
+
+   1585  0 000072   000000 702200 xent               TSX2  ! X66_ARET
+
+      334     1586        /**/
+      335     1587        /*F* NAME:         KCL$CNSINTW
+      336     1588             PURPOSE:      To pick up a delayed console read sequence
+      337     1589             DESCRIPTION:  See the *F* for KCL$CNSINT */
+      338     1590    1   KCL$CNSINTW: ENTRY (LDCT$);
+
+   1590  0 000073   000000 700200 xent  KCL$CNSINTW  TSX0  ! X66_AUTO_1
+         0 000074   000064 000001                    ZERO    52,1
+
+      339     1591        /**/
+      340     1592    2           DO INHIBIT;
+
+      341     1593    2           LDCT$->LDCT.DFLG.IQD='0'B;
+
+   1593  0 000075   200003 470700                    LDP0  ! @LDCT$,,AUTO
+         0 000076   000000 471700                    LDP1  ! 0,,PR0
+         0 000077   000002 236200 1                  LDQ   ! 2
+         0 000100   100006 356300                    ANSQ  ! 6,,PR1
+
+      342     1594    2           GOTO CINT;
+
+   1594  0 000101   000113 710200 0                  TRA   ! CINT
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:49   
+
+      343     1595    2           END;
+
+   1595  0 000102   000105 710000 0                  TRA     s:1613
+
+      344     1596        /**/
+      345     1597    1   KCL$CNSINT: ENTRY (LDCT$);
+
+   1597  0 000103   000000 700200 xent  KCL$CNSINT   TSX0  ! X66_AUTO_1
+         0 000104   000064 000001                    ZERO    52,1
+
+      346     1598        /*F* NAME:         KCL$CNSINT
+      347     1599             PURPOSE:      To start to read a HOG
+      348     1600             DESCRIPTION:  Called from KCL$OCINT when an interrupt is
+      349     1601                           received from a HOG which is on the OCCG
+      350     1602                           and is activated.  The idea is to start
+      351     1603                           the sequence to read the message that
+      352     1604                           the operator is saying he wants to type.
+      353     1605                           See the *P* for KCL$CGLCL.  If a read
+      354     1606                           is already in progress, we set IQD in
+      355     1607                           the LDCT and MONTIMR ourselves to
+      356     1608                           KCL$CNSINTW, thus remembering the
+      357     1609                           interrupt for later.  Otherwise we
+      358     1610                           start the read sequence. */
+      359     1611        /**/
+      360     1612    2           DO INHIBIT;
+
+      361     1613    2           IF LDCT$->LDCT.DFLG.IQD THEN RETURN;
+
+   1613  0 000105   200003 470700                    LDP0  ! @LDCT$,,AUTO
+         0 000106   000000 471700                    LDP1  ! 0,,PR0
+         0 000107   100006 236300                    LDQ   ! 6,,PR1
+         0 000110   000100 316207                    CANQ  ! 64,DL
+         0 000111   000113 600200 0                  TZE   ! CINT
+
+   1613  0 000112   000000 702200 xent               TSX2  ! X66_ARET
+
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:50   
+   1613  0 000113                       CINT         null
+      362     1614    2   CINT:   ;
+      363     1615    2           IF LDCT$->LDCT.DFLG.PPND THEN
+
+   1615  0 000113   000000 471700                    LDP1  ! 0,,PR0
+         0 000114   100006 236300                    LDQ   ! 6,,PR1
+         0 000115   000040 316207                    CANQ  ! 32,DL
+         0 000116   000124 600200 0                  TZE   ! s:1621
+
+      364     1616    3             DO;
+
+      365     1617    3             LDCT$->LDCT.DFLG.IQD='1'B;
+
+   1617  0 000117   000100 236207                    LDQ   ! 64,DL
+         0 000120   100006 256300                    ORSQ  ! 6,,PR1
+
+      366     1618    3             CLBCK=ENTADDR(KCL$CNSINTW);
+
+   1618  0 000121   000073 636200 0                  EAQ   ! s:1590
+         0 000122   200004 756300                    STQ   ! CLBCK,,AUTO
+
+      367     1619    3             GOTO WAIT;
+
+   1619  0 000123   000025 710200 0                  TRA   ! WAIT
+
+      368     1620    3             END;
+      369     1621    2           LDCT$->LDCT.DFLG.PPND='1'B;
+
+   1621  0 000124   000040 236207                    LDQ   ! 32,DL
+         0 000125   100006 256300                    ORSQ  ! 6,,PR1
+
+      370     1622    2           END;
+
+      371     1623    1         IF LDCT$->LDCT.LKFLG.ACTIVE THEN CALL PUTITA ALTRET (SPNT);
+
+   1623  0 000126   000000 471500                    LDP1    0,,PR0
+         0 000127   100011 236100                    LDQ     9,,PR1
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:51   
+         0 000130   000040 316003                    CANQ    32,DU
+         0 000131   000135 600000 0                  TZE     SPNT
+
+   1623  0 000132   000160 701000 0                  TSX1    PUTITA
+         0 000133   000135 702000 0                  TSX2    SPNT
+         0 000134   000147 710000 0                  TRA     s:1632
+
+      372     1624    1         ELSE
+      373     1625    2           DO;
+
+   1623  0 000135                       SPNT         null
+      374     1626    2   SPNT:   ;
+      375     1627    3             DO INHIBIT;
+
+      376     1628    3             LDCT$->LDCT.DFLG.PPND='0'B;
+
+   1628  0 000135   200003 470700                    LDP0  ! @LDCT$,,AUTO
+         0 000136   000000 471700                    LDP1  ! 0,,PR0
+         0 000137   000003 236200 1                  LDQ   ! 3
+         0 000140   100006 356300                    ANSQ  ! 6,,PR1
+
+      377     1629    3             END;
+
+      378     1630    2           CALL OCI$SPINTCON (LDCT$->LDCT);
+
+   1630  0 000141   000000 471500                    LDP1    0,,PR0
+         0 000142   200060 451500                    STP1    K$RWPARM+42,,AUTO
+         0 000143   200060 630500                    EPPR0   K$RWPARM+42,,AUTO
+         0 000144   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000145   000000 701000 xent               TSX1    OCI$SPINTCON
+         0 000146   000000 011000                    NOP     0
+
+      379     1631    2           END;
+
+      380     1632    1         RETURN;
+
+   1632  0 000147   000000 702200 xent               TSX2  ! X66_ARET
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:52   
+
+      381     1633        /**/
+      382     1634    1   PUTIT: PROC ALTRET;
+
+   1634  0 000150   200056 741300       PUTIT        STX1  ! K$RWPARM+40,,AUTO
+
+      383     1635        /**/
+      384     1636    2         IF LDCT$->LDCT.LKFLG.ACTIVE='0'B THEN RETURN;
+
+   1636  0 000151   200003 470500                    LDP0    @LDCT$,,AUTO
+         0 000152   000000 471500                    LDP1    0,,PR0
+         0 000153   100011 236100                    LDQ     9,,PR1
+         0 000154   000040 316003                    CANQ    32,DU
+         0 000155   000157 601000 0                  TNZ     s:1636+6
+
+   1636  0 000156   000001 702211                    TSX2  ! 1,X1
+         0 000157   000161 710000 0                  TRA     s:1640
+
+      385     1637        /**/
+      386     1638    2   PUTITA: ENTRY ALTRET;
+
+   1638  0 000160   200056 741300       PUTITA       STX1  ! K$RWPARM+40,,AUTO
+
+      387     1639        /**/
+      388     1640    2         K$RWPARM=KC_CRWP;
+
+   1640  0 000161   000100 100400                    MLR     fill='000'O
+         0 000162   000000 000234 xsym               ADSC9   KC_CRWP                  cn=0,n=156
+         0 000163   200006 000234                    ADSC9   K$RWPARM,,AUTO           cn=0,n=156
+
+      389     1641    2         CALL KQP$PUT (LDCT$->LDCT,K$RWPARM) ALTRET (ALTRT);
+
+   1641  0 000164   200003 470500                    LDP0    @LDCT$,,AUTO
+         0 000165   000000 471500                    LDP1    0,,PR0
+         0 000166   200006 633500                    EPPR3   K$RWPARM,,AUTO
+         0 000167   200061 453500                    STP3    K$RWPARM+43,,AUTO
+         0 000170   200060 451500                    STP1    K$RWPARM+42,,AUTO
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:53   
+         0 000171   200060 630500                    EPPR0   K$RWPARM+42,,AUTO
+         0 000172   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000173   000000 701000 xent               TSX1    KQP$PUT
+         0 000174   000177 702000 0                  TSX2    ALTRT
+
+      390     1642    2         RETURN;
+
+   1642  0 000175   200056 221300                    LDX1  ! K$RWPARM+40,,AUTO
+         0 000176   000001 702211                    TSX2  ! 1,X1
+
+   1640  0 000177                       ALTRT        null
+      391     1643    2   ALTRT:;
+      392     1644    2         IF K$RWPARM.ERR=KQPE_NOBUF# THEN RETURN;
+
+   1644  0 000177   200021 235100                    LDA     K$RWPARM+11,,AUTO
+         0 000200   000002 115007                    CMPA    2,DL
+         0 000201   000204 601000 0                  TNZ     s:1645
+
+   1644  0 000202   200056 221300                    LDX1  ! K$RWPARM+40,,AUTO
+         0 000203   000001 702211                    TSX2  ! 1,X1
+
+      393     1645    2         ALTRETURN;
+
+   1645  0 000204   200056 221300                    LDX1  ! K$RWPARM+40,,AUTO
+         0 000205   000000 702211                    TSX2  ! 0,X1
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 000454   000000 006000   777777 777677   777777 777737    ................
+      394     1646    2   END;
+      395     1647        /**/
+      396     1648    1   END;
+      397     1649        /**/
+      398     1650        /**/
+      399     1651        %EOD;
+
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:54   
+--  Include file information  --
+
+   NK_SUBS.:E05TOU  is referenced.
+   KQ_SUBS_C.:E05TOU  is referenced.
+   K$RWPARM.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$PCG.
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:55   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @LDCT$                     4-0-0/w EPTR        r     1 CLBCK
+     6-0-0/d STRC(1404)  r     1 K$RWPARM                  *0-0-0/w PTR         r     1 LDCT$
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(1404)  r     1 KC_CRWP
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(864)   r     1 NK$LDCT
+
+
+   Procedure KCL$PCG requires 134 words for executable code.
+   Procedure KCL$PCG requires 52 words of local(AUTO) storage.
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:56   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:57   
+          MINI XREF LISTING
+
+ALTRT IN PROCEDURE PUTIT
+      1640**LABEL    1641--CALLALT
+CINT
+      1613**LABEL    1594--GOTO
+CLBCK
+       904**DCL      1561<<ASSIGN   1563<>CALL     1572<<ASSIGN   1582<<ASSIGN   1618<<ASSIGN
+K$RWPARM
+       926**DCL      1583<<ASSIGN   1584<>CALL     1640<<ASSIGN   1641<>CALL
+K$RWPARM.BLKREC
+       952**DCL       977--REDEF
+K$RWPARM.BLKREC.BLKU#
+       953**DCL       955--REDEF
+K$RWPARM.BLKREC.RECU#
+       965**DCL       967--REDEF
+K$RWPARM.DVE.DVBYTE.VFC
+       992**DCL       993--REDEF
+K$RWPARM.DVE.EOMCHAR
+      1000**DCL      1004--REDEF
+K$RWPARM.ERR
+      1064**DCL      1069--REDEF    1644>>IF
+K$RWPARM.FC
+      1028**DCL      1029--REDEF
+K$RWPARM.FLDID
+      1210**DCL      1211--REDEF
+K$RWPARM.FPT$
+      1091**DCL      1098--REDEF
+K$RWPARM.KEYTYPE
+      1217**DCL      1218--REDEF
+K$RWPARM.MSG$
+       927**DCL       933--REDEF
+K$RWPARM.MSGID
+      1039**DCL      1044--REDEF
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:58   
+K$RWPARM.MSGIDXT
+      1052**DCL      1056--REDEF
+K$RWPARM.ORG
+      1188**DCL      1189--REDEF
+K$RWPARM.THDRSZ
+      1132**DCL      1136--REDEF
+K$RWPARM.VDOFLGS
+      1190**DCL      1201--REDEF
+KCL$CNSINTW
+      1590**ENTRY    1618--ASSIGN
+KCL$GET
+      1580**ENTRY    1582--ASSIGN
+KCL$PCG
+        18**PROC     1561--ASSIGN
+KCL$PUT
+      1570**ENTRY    1572--ASSIGN
+KC_CRWP
+      1253**DCL      1583>>ASSIGN   1640>>ASSIGN
+KC_CRWP.BLKREC
+      1279**DCL      1304--REDEF
+KC_CRWP.BLKREC.BLKU#
+      1280**DCL      1282--REDEF
+KC_CRWP.BLKREC.RECU#
+      1292**DCL      1294--REDEF
+KC_CRWP.DVE.DVBYTE.VFC
+      1319**DCL      1320--REDEF
+KC_CRWP.DVE.EOMCHAR
+      1327**DCL      1331--REDEF
+KC_CRWP.ERR
+      1391**DCL      1396--REDEF
+KC_CRWP.FC
+      1355**DCL      1356--REDEF
+KC_CRWP.FLDID
+      1537**DCL      1538--REDEF
+KC_CRWP.FPT$
+      1418**DCL      1425--REDEF
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:59   
+KC_CRWP.KEYTYPE
+      1544**DCL      1545--REDEF
+KC_CRWP.MSG$
+      1254**DCL      1260--REDEF
+KC_CRWP.MSGID
+      1366**DCL      1371--REDEF
+KC_CRWP.MSGIDXT
+      1379**DCL      1383--REDEF
+KC_CRWP.ORG
+      1515**DCL      1516--REDEF
+KC_CRWP.THDRSZ
+      1459**DCL      1463--REDEF
+KC_CRWP.VDOFLGS
+      1517**DCL      1528--REDEF
+KQG$GET
+      1227**DCL-ENT  1584--CALL
+KQP$PCG
+      1228**DCL-ENT  1550--CALL
+KQP$PUT
+      1229**DCL-ENT  1641--CALL
+LDCT$
+       845**DCL        18--PROC     1550>>IF       1550>>CALL     1558--ENTRY    1563<>CALL     1570--ENTRY
+      1580--ENTRY    1584>>IF       1584>>CALL     1590--ENTRY    1593>>ASSIGN   1597--ENTRY    1613>>IF
+      1615>>IF       1617>>ASSIGN   1621>>ASSIGN   1623>>IF       1628>>ASSIGN   1630>>CALL     1636>>IF
+      1641>>CALL
+NK$LDCT
+       865**DCL      1550<>CALL     1584<>CALL     1630<>CALL     1641<>CALL
+NK$LDCT.DDT$
+       867**DCL       867--REDEF
+NK$LDCT.DFLG.IQD
+       872**DCL      1593<<ASSIGN   1613>>IF       1617<<ASSIGN
+NK$LDCT.DFLG.PPND
+       873**DCL      1615>>IF       1621<<ASSIGN   1628<<ASSIGN
+NK$LDCT.IOQ$
+       866**DCL       867--REDEF
+NK$LDCT.LDCTX
+PL6.E3A0      #003=KCL$PCG File=KCL$CGLCL.:E05TSI                                WED 07/30/97 00:15 Page:60   
+       868**DCL       868--REDEF
+NK$LDCT.LKFLG.ABORTED
+       880**DCL       881--REDEF
+NK$LDCT.LKFLG.ACTIVE
+       884**DCL      1550>>IF       1584>>IF       1623>>IF       1636>>IF
+NK$LDCT.RLCID.LDCTX
+       890**DCL       890--REDEF
+NK$LDCT.STA$
+       886**DCL       887--REDEF
+NK$LDCT.SYMB$
+       865**DCL       865--REDEF     865--REDEF     866--REDEF
+OCI$SPINTCON
+      1230**DCL-ENT  1551--CALL     1630--CALL
+PUTIT
+      1634**PROC     1573--CALL
+PUTITA IN PROCEDURE PUTIT
+      1638**ENTRY    1623--CALL
+SPNT
+      1623**LABEL    1623--CALLALT
+SSC$MONTIMR
+      1231**DCL-ENT  1563--CALL
+WAIT
+      1561**LABEL    1573--CALLALT  1584--CALLALT  1619--GOTO
+WCG
+      1550**LABEL    1550--CALLALT
+
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:61   
+      400        1        /*T***********************************************************/
+      401        2        /*T*                                                         */
+      402        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      403        4        /*T*                                                         */
+      404        5        /*T***********************************************************/
+      405        6        /**/
+      406        7        /**/
+      407        8        /*F* NAME:         KCL$WRTEA
+      408        9             PURPOSE:      To receive WRITE endaction for local comgroup
+      409       10                           OUTPUT devices (including HOGs).
+      410       11             DESCRIPTION:  See the *P* for KCL$CGLCL. */
+      411       12        KCL$WRTEA: PROC (N$REQ);
+      412       13        /**/
+      413       14
+      414       15
+      415       16
+      416       17        /**/
+      417       18        /* INCLUDES */
+      418       19        /**/
+      419       20        %INCLUDE NK$LDCT;
+      420      122        %INCLUDE N$REQ;
+      421      196        %INCLUDE K$RWPARM;
+      422      582        %INCLUDE CP_6_SUBS;
+      423     1122        %INCLUDE KQ_SUBS_C;
+      424     1422        %INCLUDE OCI_DATA_R;
+      425     1434        %INCLUDE NK_SUBS;
+      426     1459
+      427     1460
+      428     1461
+      429     1462        /**/
+      430     1463        /* PARAMETERS */
+      431     1464        /**/
+      432     1465        %N$REQ (STCLASS="");
+      433     1523
+      434     1524
+      435     1525
+      436     1526        /**/
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:62   
+      437     1527        /* BASED STRUCTURES */
+      438     1528        /**/
+      439     1529    1   DCL VBF CHAR(MSGSZ) BASED;
+      440     1530    1   DCL VBFC1 CHAR(1) BASED;
+      441     1531    1   DCL 1 VBFC2 BASED,
+      442     1532    1         2 C1 CHAR(1) UNAL,
+      443     1533    1         2 C2 CHAR(1) UNAL;
+      444     1534    1   DCL DUMMY UBIN WORD BASED;
+      445     1535        %NK$LDCT;
+      446     1581
+      447     1582
+      448     1583
+      449     1584        /**/
+      450     1585        /* AUTO */
+      451     1586        /**/
+      452     1587        %K$RWPARM (STCLASS="",NAME=K$RWPARM);
+      453     1903    1   DCL LDCT$ PTR;
+      454     1904    1   DCL MSGSZ UBIN WORD;
+      455     1905
+      456     1906
+      457     1907
+      458     1908        /**/
+      459     1909        /* REFS */
+      460     1910        /**/
+      461     1911    1   DCL KCL$GET       ENTRY(1);
+      462     1912    1   DCL KCL$PUT       ENTRY(1);
+      463     1913    1   DCL KQG$DONE      ENTRY(2) ALTRET;
+      464     1914    1   DCL KQP$DONET     ENTRY(2) ALTRET;
+      465     1915    1   DCL KQX$LDASR     ENTRY(1);
+      466     1916    1   DCL OCI$KEYIN     ENTRY(1);
+      467     1917    1   DCL OCX$XDELTA    ENTRY;
+      468     1918        %K$RWPARM (NAME=KC_CRWP,STCLASS=SYMREF);
+      469     2234        %EJECT;
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:63   
+      470     2235        /**/
+      471     2236        /**/
+      472     2237    1         LDCT$=N$REQ.EAINFOP$;
+      473     2238    1         K$RWPARM=KC_CRWP;
+      474     2239    1         K$RWPARM.TYC=N$REQ.TYC;
+      475     2240    1         CALL KQG$DONE (LDCT$->LDCT,K$RWPARM);
+      476     2241    1         CALL KCL$GET (LDCT$);
+      477     2242    1         RETURN;
+      478     2243        /**/
+      479     2244        /*F* NAME:         KCL$RDEA
+      480     2245             PURPOSE:      To receive READ endaction for local comgroup
+      481     2246                           INPUT devices (excluding HOGs).
+      482     2247             DESCRIPTION:  See the *P* for KCL$CGLCL. */
+      483     2248    1   KCL$RDEA: ENTRY (N$REQ);
+      484     2249        /**/
+      485     2250    1         LDCT$=N$REQ.EAINFOP$;
+      486     2251    1         CALL RWSET;
+      487     2252    1         CALL KQP$DONET (LDCT$->LDCT,K$RWPARM);
+      488     2253    1         IF N$REQ.TYC.EOF='0'B THEN CALL KCL$PUT (LDCT$);
+      489     2254    1         RETURN;
+      490     2255        /**/
+      491     2256        /*F* NAME:         KCL$CNSEA
+      492     2257             PURPOSE:      To receive READ endaction for HOGs
+      493     2258             DESCRIPTION:  See the *P* for KCL$CGLCL.
+      494     2259                           If the keyin just read is an escape sequence,
+      495     2260                           then we tell the comgroup nothing was read,
+      496     2261                           and instead call OCI$KEYIN, or OCX$XDELTA
+      497     2262                           as appropriate. */
+      498     2263    1   KCL$CNSEA: ENTRY (N$REQ);
+      499     2264        /**/
+      500     2265    1         LDCT$=N$REQ.EAINFOP$;
+      501     2266    1         CALL RWSET;
+      502     2267    1         K$RWPARM.DVE.EOMCHAR=%EOM_EOR#;
+      503     2268    1         CALL KQX$LDASR (LDCT$->LDCT.CG$->DUMMY);
+      504     2269    1         IF N$REQ.BUF$->VBFC1=BITASC('033'O) OR
+      505     2270    1         N$REQ.BUF$->VBFC1=BITASC('031'O) THEN
+      506     2271    2           DO;
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:64   
+      507     2272    2           K$RWPARM.ERR=KQPE_NODATA#;
+      508     2273    2           IF N$REQ.BUF$->VBFC2.C2=BITASC('033'O) OR
+      509     2274    2           N$REQ.BUF$->VBFC2.C2=BITASC('031'O) THEN CALL OCX$XDELTA;
+      510     2275    2           ELSE
+      511     2276    3             DO;
+      512     2277    3             MSGSZ=N$REQ.ARSIZE-1;
+      513     2278    3             OCI_KEYIN=PINCRC(N$REQ.BUF$,1)->VBF;
+      514     2279    3             CALL OCI$KEYIN (N$REQ);
+      515     2280    3             END;
+      516     2281    2           END;
+      517     2282    1         CALL KQP$DONET (LDCT$->LDCT,K$RWPARM);
+      518     2283    2           DO INHIBIT;
+      519     2284    2           LDCT$->LDCT.DFLG.PPND='0'B;
+      520     2285    2           END;
+      521     2286    1         RETURN;
+      522     2287        /**/
+      523     2288    1   RWSET: PROC;
+      524     2289        /**/
+      525     2290    2         K$RWPARM=KC_CRWP;
+      526     2291    2         K$RWPARM.MSGSZ=N$REQ.ARSIZE;
+      527     2292    2         K$RWPARM.TYC=N$REQ.TYC;
+      528     2293    2         K$RWPARM.DVE=N$REQ.DVE;
+      529     2294    2         RETURN;
+      530     2295    2   END;
+      531     2296        /**/
+      532     2297    1   END;
+      533     2298        /**/
+      534     2299        /**/
+      535     2300        %EOD;
+
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:65   
+--  Include file information  --
+
+   NK_SUBS.:E05TOU  is referenced.
+   OCI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KQ_SUBS_C.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   K$RWPARM.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$WRTEA.
+
+   Procedure KCL$WRTEA requires 129 words for executable code.
+   Procedure KCL$WRTEA requires 50 words of local(AUTO) storage.
+
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:66   
+
+ Object Unit name= KCL$WRTEA                                  File name= KCL$CGLCL.:E05TOU
+ UTS= JUL 30 '97 00:15:17.96 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   129    201  KCL$WRTEA
+    1  RoData even  none     3      3  KCL$WRTEA
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes            yes      Std        1  KCL$WRTEA
+     0     31                  yes      Std        1  KCL$RDEA
+     0     63                  yes      Std        1  KCL$CNSEA
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       2 KQG$DONE
+         yes           Std       1 KCL$GET
+ yes     yes           Std       2 KQP$DONET
+         yes           Std       1 KCL$PUT
+         yes           Std       1 KQX$LDASR
+         yes           Std       0 OCX$XDELTA
+         yes           Std       1 OCI$KEYIN
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:67   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+r    OCI_ROUTINE                           OCI_KEYIN                             KC_CRWP
+     B_VECTNIL
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:68   
+
+
+      400        1        /*T***********************************************************/
+      401        2        /*T*                                                         */
+      402        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      403        4        /*T*                                                         */
+      404        5        /*T***********************************************************/
+      405        6        /**/
+      406        7        /**/
+      407        8        /*F* NAME:         KCL$WRTEA
+      408        9             PURPOSE:      To receive WRITE endaction for local comgroup
+      409       10                           OUTPUT devices (including HOGs).
+      410       11             DESCRIPTION:  See the *P* for KCL$CGLCL. */
+      411       12        KCL$WRTEA: PROC (N$REQ);
+
+     12  0 000000   000000 700200 xent  KCL$WRTEA    TSX0  ! X66_AUTO_1
+         0 000001   000062 000001                    ZERO    50,1
+
+      412       13        /**/
+      413       14
+      414       15
+      415       16
+      416       17        /**/
+      417       18        /* INCLUDES */
+      418       19        /**/
+      419       20        %INCLUDE NK$LDCT;
+      420      122        %INCLUDE N$REQ;
+      421      196        %INCLUDE K$RWPARM;
+      422      582        %INCLUDE CP_6_SUBS;
+      423     1122        %INCLUDE KQ_SUBS_C;
+      424     1422        %INCLUDE OCI_DATA_R;
+      425     1434        %INCLUDE NK_SUBS;
+      426     1459
+      427     1460
+      428     1461
+      429     1462        /**/
+      430     1463        /* PARAMETERS */
+      431     1464        /**/
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:69   
+      432     1465        %N$REQ (STCLASS="");
+      433     1523
+      434     1524
+      435     1525
+      436     1526        /**/
+      437     1527        /* BASED STRUCTURES */
+      438     1528        /**/
+      439     1529    1   DCL VBF CHAR(MSGSZ) BASED;
+      440     1530    1   DCL VBFC1 CHAR(1) BASED;
+      441     1531    1   DCL 1 VBFC2 BASED,
+      442     1532    1         2 C1 CHAR(1) UNAL,
+      443     1533    1         2 C2 CHAR(1) UNAL;
+      444     1534    1   DCL DUMMY UBIN WORD BASED;
+      445     1535        %NK$LDCT;
+      446     1581
+      447     1582
+      448     1583
+      449     1584        /**/
+      450     1585        /* AUTO */
+      451     1586        /**/
+      452     1587        %K$RWPARM (STCLASS="",NAME=K$RWPARM);
+      453     1903    1   DCL LDCT$ PTR;
+      454     1904    1   DCL MSGSZ UBIN WORD;
+      455     1905
+      456     1906
+      457     1907
+      458     1908        /**/
+      459     1909        /* REFS */
+      460     1910        /**/
+      461     1911    1   DCL KCL$GET       ENTRY(1);
+      462     1912    1   DCL KCL$PUT       ENTRY(1);
+      463     1913    1   DCL KQG$DONE      ENTRY(2) ALTRET;
+      464     1914    1   DCL KQP$DONET     ENTRY(2) ALTRET;
+      465     1915    1   DCL KQX$LDASR     ENTRY(1);
+      466     1916    1   DCL OCI$KEYIN     ENTRY(1);
+      467     1917    1   DCL OCX$XDELTA    ENTRY;
+      468     1918        %K$RWPARM (NAME=KC_CRWP,STCLASS=SYMREF);
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:70   
+      469     2234        %EJECT;
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:71   
+      470     2235        /**/
+      471     2236        /**/
+      472     2237    1         LDCT$=N$REQ.EAINFOP$;
+
+   2237  0 000002   200003 470500                    LDP0    @N$REQ,,AUTO
+         0 000003   000024 236100                    LDQ     20,,PR0
+         0 000004   200054 756100                    STQ     LDCT$,,AUTO
+
+      473     2238    1         K$RWPARM=KC_CRWP;
+
+   2238  0 000005   000100 100400                    MLR     fill='000'O
+         0 000006   000000 000234 xsym               ADSC9   KC_CRWP                  cn=0,n=156
+         0 000007   200004 000234                    ADSC9   K$RWPARM,,AUTO           cn=0,n=156
+
+      474     2239    1         K$RWPARM.TYC=N$REQ.TYC;
+
+   2239  0 000010   000021 236100                    LDQ     17,,PR0
+         0 000011   200012 756100                    STQ     K$RWPARM+6,,AUTO
+
+      475     2240    1         CALL KQG$DONE (LDCT$->LDCT,K$RWPARM);
+
+   2240  0 000012   200004 631500                    EPPR1   K$RWPARM,,AUTO
+         0 000013   200061 451500                    STP1    MSGSZ+4,,AUTO
+         0 000014   200054 236100                    LDQ     LDCT$,,AUTO
+         0 000015   200060 756100                    STQ     MSGSZ+3,,AUTO
+         0 000016   200060 630500                    EPPR0   MSGSZ+3,,AUTO
+         0 000017   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000020   000000 701000 xent               TSX1    KQG$DONE
+         0 000021   000000 011000                    NOP     0
+
+      476     2241    1         CALL KCL$GET (LDCT$);
+
+   2241  0 000022   200054 630500                    EPPR0   LDCT$,,AUTO
+         0 000023   200060 450500                    STP0    MSGSZ+3,,AUTO
+         0 000024   200060 630500                    EPPR0   MSGSZ+3,,AUTO
+         0 000025   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000026   000000 701000 xent               TSX1    KCL$GET
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:72   
+         0 000027   000000 011000                    NOP     0
+
+      477     2242    1         RETURN;
+
+   2242  0 000030   000000 702200 xent               TSX2  ! X66_ARET
+
+      478     2243        /**/
+      479     2244        /*F* NAME:         KCL$RDEA
+      480     2245             PURPOSE:      To receive READ endaction for local comgroup
+      481     2246                           INPUT devices (excluding HOGs).
+      482     2247             DESCRIPTION:  See the *P* for KCL$CGLCL. */
+      483     2248    1   KCL$RDEA: ENTRY (N$REQ);
+
+   2248  0 000031   000000 700200 xent  KCL$RDEA     TSX0  ! X66_AUTO_1
+         0 000032   000062 000001                    ZERO    50,1
+
+      484     2249        /**/
+      485     2250    1         LDCT$=N$REQ.EAINFOP$;
+
+   2250  0 000033   200003 470500                    LDP0    @N$REQ,,AUTO
+         0 000034   000024 236100                    LDQ     20,,PR0
+         0 000035   200054 756100                    STQ     LDCT$,,AUTO
+
+      486     2251    1         CALL RWSET;
+
+   2251  0 000036   000164 701000 0                  TSX1    RWSET
+         0 000037   000000 011000                    NOP     0
+
+      487     2252    1         CALL KQP$DONET (LDCT$->LDCT,K$RWPARM);
+
+   2252  0 000040   200004 630500                    EPPR0   K$RWPARM,,AUTO
+         0 000041   200061 450500                    STP0    MSGSZ+4,,AUTO
+         0 000042   200054 236100                    LDQ     LDCT$,,AUTO
+         0 000043   200060 756100                    STQ     MSGSZ+3,,AUTO
+         0 000044   200060 630500                    EPPR0   MSGSZ+3,,AUTO
+         0 000045   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000046   000000 701000 xent               TSX1    KQP$DONET
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:73   
+         0 000047   000000 011000                    NOP     0
+
+      488     2253    1         IF N$REQ.TYC.EOF='0'B THEN CALL KCL$PUT (LDCT$);
+
+   2253  0 000050   200003 470500                    LDP0    @N$REQ,,AUTO
+         0 000051   000021 236100                    LDQ     17,,PR0
+         0 000052   004000 316003                    CANQ    2048,DU
+         0 000053   000062 601000 0                  TNZ     s:2254
+
+   2253  0 000054   200054 631500                    EPPR1   LDCT$,,AUTO
+         0 000055   200060 451500                    STP1    MSGSZ+3,,AUTO
+         0 000056   200060 630500                    EPPR0   MSGSZ+3,,AUTO
+         0 000057   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000060   000000 701000 xent               TSX1    KCL$PUT
+         0 000061   000000 011000                    NOP     0
+
+      489     2254    1         RETURN;
+
+   2254  0 000062   000000 702200 xent               TSX2  ! X66_ARET
+
+      490     2255        /**/
+      491     2256        /*F* NAME:         KCL$CNSEA
+      492     2257             PURPOSE:      To receive READ endaction for HOGs
+      493     2258             DESCRIPTION:  See the *P* for KCL$CGLCL.
+      494     2259                           If the keyin just read is an escape sequence,
+      495     2260                           then we tell the comgroup nothing was read,
+      496     2261                           and instead call OCI$KEYIN, or OCX$XDELTA
+      497     2262                           as appropriate. */
+      498     2263    1   KCL$CNSEA: ENTRY (N$REQ);
+
+   2263  0 000063   000000 700200 xent  KCL$CNSEA    TSX0  ! X66_AUTO_1
+         0 000064   000062 000001                    ZERO    50,1
+
+      499     2264        /**/
+      500     2265    1         LDCT$=N$REQ.EAINFOP$;
+
+   2265  0 000065   200003 470500                    LDP0    @N$REQ,,AUTO
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:74   
+         0 000066   000024 236100                    LDQ     20,,PR0
+         0 000067   200054 756100                    STQ     LDCT$,,AUTO
+
+      501     2266    1         CALL RWSET;
+
+   2266  0 000070   000164 701000 0                  TSX1    RWSET
+         0 000071   000000 011000                    NOP     0
+
+      502     2267    1         K$RWPARM.DVE.EOMCHAR=%EOM_EOR#;
+
+   2267  0 000072   000501 236003                    LDQ     321,DU
+         0 000073   200014 552120                    STBQ    K$RWPARM+8,'20'O,AUTO
+
+      503     2268    1         CALL KQX$LDASR (LDCT$->LDCT.CG$->DUMMY);
+
+   2268  0 000074   200054 470500                    LDP0    LDCT$,,AUTO
+         0 000075   000027 471500                    LDP1    23,,PR0
+         0 000076   200060 451500                    STP1    MSGSZ+3,,AUTO
+         0 000077   200060 630500                    EPPR0   MSGSZ+3,,AUTO
+         0 000100   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000101   000000 701000 xent               TSX1    KQX$LDASR
+         0 000102   000000 011000                    NOP     0
+
+      504     2269    1         IF N$REQ.BUF$->VBFC1=BITASC('033'O) OR
+
+   2269  0 000103   200003 470500                    LDP0    @N$REQ,,AUTO
+         0 000104   000005 471500                    LDP1    5,,PR0
+         0 000105   040000 106500                    CMPC    fill='040'O
+         0 000106   100000 000001                    ADSC9   0,,PR1                   cn=0,n=1
+         0 000107   000000 000001 1                  ADSC9   0                        cn=0,n=1
+         0 000110   000115 600000 0                  TZE     s:2272
+         0 000111   040000 106500                    CMPC    fill='040'O
+         0 000112   100000 000001                    ADSC9   0,,PR1                   cn=0,n=1
+         0 000113   000001 000001 1                  ADSC9   1                        cn=0,n=1
+         0 000114   000150 601000 0                  TNZ     s:2282
+
+      505     2270    1         N$REQ.BUF$->VBFC1=BITASC('031'O) THEN
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:75   
+      506     2271    2           DO;
+
+      507     2272    2           K$RWPARM.ERR=KQPE_NODATA#;
+
+   2272  0 000115   000007 235007                    LDA     7,DL
+         0 000116   200017 755100                    STA     K$RWPARM+11,,AUTO
+
+      508     2273    2           IF N$REQ.BUF$->VBFC2.C2=BITASC('033'O) OR
+
+   2273  0 000117   000005 471500                    LDP1    5,,PR0
+         0 000120   040000 106500                    CMPC    fill='040'O
+         0 000121   100000 200001                    ADSC9   0,,PR1                   cn=1,n=1
+         0 000122   000000 000001 1                  ADSC9   0                        cn=0,n=1
+         0 000123   000130 600000 0                  TZE     s:2274
+         0 000124   040000 106500                    CMPC    fill='040'O
+         0 000125   100000 200001                    ADSC9   0,,PR1                   cn=1,n=1
+         0 000126   000001 000001 1                  ADSC9   1                        cn=0,n=1
+         0 000127   000134 601000 0                  TNZ     s:2277
+
+      509     2274    2           N$REQ.BUF$->VBFC2.C2=BITASC('031'O) THEN CALL OCX$XDELTA;
+
+   2274  0 000130   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         0 000131   000000 701000 xent               TSX1    OCX$XDELTA
+         0 000132   000000 011000                    NOP     0
+         0 000133   000150 710000 0                  TRA     s:2282
+
+      510     2275    2           ELSE
+      511     2276    3             DO;
+
+      512     2277    3             MSGSZ=N$REQ.ARSIZE-1;
+
+   2277  0 000134   000027 236100                    LDQ     23,,PR0
+         0 000135   000020 772000                    QRL     16
+         0 000136   000001 136007                    SBLQ    1,DL
+         0 000137   200055 756100                    STQ     MSGSZ,,AUTO
+
+      513     2278    3             OCI_KEYIN=PINCRC(N$REQ.BUF$,1)->VBF;
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:76   
+
+   2278  0 000140   000000 620006                    EAX0    0,QL
+         0 000141   040000 100540                    MLR     fill='040'O
+         0 000142   100000 200010                    ADSC9   0,,PR1                   cn=1,n=*X0
+         0 000143   000000 000120 xsym               ADSC9   OCI_KEYIN                cn=0,n=80
+
+      514     2279    3             CALL OCI$KEYIN (N$REQ);
+
+   2279  0 000144   200003 630500                    EPPR0   @N$REQ,,AUTO
+         0 000145   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000146   000000 701000 xent               TSX1    OCI$KEYIN
+         0 000147   000000 011000                    NOP     0
+
+      515     2280    3             END;
+
+      516     2281    2           END;
+
+      517     2282    1         CALL KQP$DONET (LDCT$->LDCT,K$RWPARM);
+
+   2282  0 000150   200004 630500                    EPPR0   K$RWPARM,,AUTO
+         0 000151   200061 450500                    STP0    MSGSZ+4,,AUTO
+         0 000152   200054 236100                    LDQ     LDCT$,,AUTO
+         0 000153   200060 756100                    STQ     MSGSZ+3,,AUTO
+         0 000154   200060 630500                    EPPR0   MSGSZ+3,,AUTO
+         0 000155   000020 631400 xsym               EPPR1   B_VECTNIL+16
+         0 000156   000000 701000 xent               TSX1    KQP$DONET
+         0 000157   000000 011000                    NOP     0
+
+      518     2283    2           DO INHIBIT;
+
+      519     2284    2           LDCT$->LDCT.DFLG.PPND='0'B;
+
+   2284  0 000160   200054 470700                    LDP0  ! LDCT$,,AUTO
+         0 000161   000002 236200 1                  LDQ   ! 2
+         0 000162   000006 356300                    ANSQ  ! 6,,PR0
+
+      520     2285    2           END;
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:77   
+
+      521     2286    1         RETURN;
+
+   2286  0 000163   000000 702200 xent               TSX2  ! X66_ARET
+
+      522     2287        /**/
+      523     2288    1   RWSET: PROC;
+
+   2288  0 000164   200056 741300       RWSET        STX1  ! MSGSZ+1,,AUTO
+
+      524     2289        /**/
+      525     2290    2         K$RWPARM=KC_CRWP;
+
+   2290  0 000165   000100 100400                    MLR     fill='000'O
+         0 000166   000000 000234 xsym               ADSC9   KC_CRWP                  cn=0,n=156
+         0 000167   200004 000234                    ADSC9   K$RWPARM,,AUTO           cn=0,n=156
+
+      526     2291    2         K$RWPARM.MSGSZ=N$REQ.ARSIZE;
+
+   2291  0 000170   200003 470500                    LDP0    @N$REQ,,AUTO
+         0 000171   000027 236100                    LDQ     23,,PR0
+         0 000172   000020 772000                    QRL     16
+         0 000173   200005 756100                    STQ     K$RWPARM+1,,AUTO
+
+      527     2292    2         K$RWPARM.TYC=N$REQ.TYC;
+
+   2292  0 000174   000021 236100                    LDQ     17,,PR0
+         0 000175   200012 756100                    STQ     K$RWPARM+6,,AUTO
+
+      528     2293    2         K$RWPARM.DVE=N$REQ.DVE;
+
+   2293  0 000176   000031 220100                    LDX0    25,,PR0
+         0 000177   200014 740100                    STX0    K$RWPARM+8,,AUTO
+
+      529     2294    2         RETURN;
+
+   2294  0 000200   000001 702211                    TSX2  ! 1,X1
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:78   
+
+(unnamed)
+ Sect OctLoc
+   1     000   033040 040040   031040 040040   777777 777737                    .   .   ....
+      530     2295    2   END;
+      531     2296        /**/
+      532     2297    1   END;
+      533     2298        /**/
+      534     2299        /**/
+      535     2300        %EOD;
+
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:79   
+--  Include file information  --
+
+   NK_SUBS.:E05TOU  is referenced.
+   OCI_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   KQ_SUBS_C.:E05TOU  is referenced.
+   CP_6_SUBS.:E05TOU  is referenced.
+   K$RWPARM.:E05TOU  is referenced.
+   N$REQ.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$WRTEA.
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:80   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @N$REQ                     4-0-0/d STRC(1404)  r     1 K$RWPARM
+    54-0-0/w PTR         r     1 LDCT$                     55-0-0/w UBIN        r     1 MSGSZ
+    *0-0-0/d STRC(1080)  r     1 N$REQ
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(1404)  r     1 KC_CRWP                    0-0-0/c CHAR(80)    r     1 OCI_KEYIN
+     0-0-0/w EPTR        r     1 OCI_ROUTINE(0:8191)
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w UBIN        r     1 DUMMY                      0-0-0/d STRC(864)   r     1 NK$LDCT
+     0-0-0/c ACHR        r     1 VBF                        0-0-0/c CHAR        r     1 VBFC1
+     0-0-0/c STRC(18)    r     1 VBFC2
+
+
+   Procedure KCL$WRTEA requires 129 words for executable code.
+   Procedure KCL$WRTEA requires 50 words of local(AUTO) storage.
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:81   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:82   
+          MINI XREF LISTING
+
+DUMMY
+      1534**DCL      2268<>CALL
+K$RWPARM
+      1608**DCL      2238<<ASSIGN   2240<>CALL     2252<>CALL     2282<>CALL     2290<<ASSIGN
+K$RWPARM.BLKREC
+      1634**DCL      1659--REDEF
+K$RWPARM.BLKREC.BLKU#
+      1635**DCL      1637--REDEF
+K$RWPARM.BLKREC.RECU#
+      1647**DCL      1649--REDEF
+K$RWPARM.DVE
+      1665**DCL      2293<<ASSIGN
+K$RWPARM.DVE.DVBYTE.VFC
+      1674**DCL      1675--REDEF
+K$RWPARM.DVE.EOMCHAR
+      1682**DCL      1686--REDEF    2267<<ASSIGN
+K$RWPARM.ERR
+      1746**DCL      1751--REDEF    2272<<ASSIGN
+K$RWPARM.FC
+      1710**DCL      1711--REDEF
+K$RWPARM.FLDID
+      1892**DCL      1893--REDEF
+K$RWPARM.FPT$
+      1773**DCL      1780--REDEF
+K$RWPARM.KEYTYPE
+      1899**DCL      1900--REDEF
+K$RWPARM.MSG$
+      1609**DCL      1615--REDEF
+K$RWPARM.MSGID
+      1721**DCL      1726--REDEF
+K$RWPARM.MSGIDXT
+      1734**DCL      1738--REDEF
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:83   
+K$RWPARM.MSGSZ
+      1616**DCL      2291<<ASSIGN
+K$RWPARM.ORG
+      1870**DCL      1871--REDEF
+K$RWPARM.THDRSZ
+      1814**DCL      1818--REDEF
+K$RWPARM.TYC
+      1630**DCL      2239<<ASSIGN   2292<<ASSIGN
+K$RWPARM.VDOFLGS
+      1872**DCL      1883--REDEF
+KCL$GET
+      1911**DCL-ENT  2241--CALL
+KCL$PUT
+      1912**DCL-ENT  2253--CALL
+KC_CRWP
+      1939**DCL      2238>>ASSIGN   2290>>ASSIGN
+KC_CRWP.BLKREC
+      1965**DCL      1990--REDEF
+KC_CRWP.BLKREC.BLKU#
+      1966**DCL      1968--REDEF
+KC_CRWP.BLKREC.RECU#
+      1978**DCL      1980--REDEF
+KC_CRWP.DVE.DVBYTE.VFC
+      2005**DCL      2006--REDEF
+KC_CRWP.DVE.EOMCHAR
+      2013**DCL      2017--REDEF
+KC_CRWP.ERR
+      2077**DCL      2082--REDEF
+KC_CRWP.FC
+      2041**DCL      2042--REDEF
+KC_CRWP.FLDID
+      2223**DCL      2224--REDEF
+KC_CRWP.FPT$
+      2104**DCL      2111--REDEF
+KC_CRWP.KEYTYPE
+      2230**DCL      2231--REDEF
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:84   
+KC_CRWP.MSG$
+      1940**DCL      1946--REDEF
+KC_CRWP.MSGID
+      2052**DCL      2057--REDEF
+KC_CRWP.MSGIDXT
+      2065**DCL      2069--REDEF
+KC_CRWP.ORG
+      2201**DCL      2202--REDEF
+KC_CRWP.THDRSZ
+      2145**DCL      2149--REDEF
+KC_CRWP.VDOFLGS
+      2203**DCL      2214--REDEF
+KQG$DONE
+      1913**DCL-ENT  2240--CALL
+KQP$DONET
+      1914**DCL-ENT  2252--CALL     2282--CALL
+KQX$LDASR
+      1915**DCL-ENT  2268--CALL
+LDCT$
+      1903**DCL      2237<<ASSIGN   2240>>CALL     2241<>CALL     2250<<ASSIGN   2252>>CALL     2253<>CALL
+      2265<<ASSIGN   2268>>CALL     2282>>CALL     2284>>ASSIGN
+MSGSZ
+      1904**DCL      1529--IMP-SIZ  2277<<ASSIGN   2278>>ASSIGN
+N$REQ
+      1474**DCL        12--PROC     2248--ENTRY    2263--ENTRY    2279<>CALL
+N$REQ.ARSIZE
+      1507**DCL      2277>>ASSIGN   2291>>ASSIGN
+N$REQ.BUF$
+      1483**DCL      2269>>IF       2269>>IF       2273>>IF       2273>>IF       2278>>ASSIGN
+N$REQ.BUFADDR
+      1483**DCL      1484--REDEF    1484--REDEF
+N$REQ.DLA.DRELADDR
+      1475**DCL      1475--REDEF
+N$REQ.DVE
+      1509**DCL      2293>>ASSIGN
+N$REQ.DVE.EOMCHAR
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:85   
+      1512**DCL      1513--REDEF
+N$REQ.EAINFO
+      1506**DCL      1506--REDEF
+N$REQ.EAINFOP$
+      1506**DCL      2237>>ASSIGN   2250>>ASSIGN   2265>>ASSIGN
+N$REQ.EAINFOX
+      1506**DCL      1507--REDEF
+N$REQ.EVNTINFO
+      1507**DCL      1507--REDEF
+N$REQ.STATUS
+      1488**DCL      1494--REDEF
+N$REQ.TYC
+      1496**DCL      2239>>ASSIGN   2292>>ASSIGN
+N$REQ.TYC.EOF
+      1498**DCL      2253>>IF
+NK$LDCT
+      1548**DCL      2240<>CALL     2252<>CALL     2282<>CALL
+NK$LDCT.CG$
+      1579**DCL      2268>>CALL
+NK$LDCT.DDT$
+      1550**DCL      1550--REDEF
+NK$LDCT.DFLG.PPND
+      1556**DCL      2284<<ASSIGN
+NK$LDCT.IOQ$
+      1549**DCL      1550--REDEF
+NK$LDCT.LDCTX
+      1551**DCL      1551--REDEF
+NK$LDCT.LKFLG.ABORTED
+      1563**DCL      1564--REDEF
+NK$LDCT.RLCID.LDCTX
+      1573**DCL      1573--REDEF
+NK$LDCT.STA$
+      1569**DCL      1570--REDEF
+NK$LDCT.SYMB$
+      1548**DCL      1548--REDEF    1548--REDEF    1549--REDEF
+OCI$KEYIN
+PL6.E3A0      #004=KCL$WRTEA File=KCL$CGLCL.:E05TSI                              WED 07/30/97 00:15 Page:86   
+      1916**DCL-ENT  2279--CALL
+OCI_KEYIN
+      1432**DCL      2278<<ASSIGN
+OCX$XDELTA
+      1917**DCL-ENT  2274--CALL
+RWSET
+      2288**PROC     2251--CALL     2266--CALL
+VBF
+      1529**DCL      2278>>ASSIGN
+VBFC1
+      1530**DCL      2269>>IF       2269>>IF
+VBFC2.C2
+      1533**DCL      2273>>IF       2273>>IF
+
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:87   
+      536        1        /*T***********************************************************/
+      537        2        /*T*                                                         */
+      538        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      539        4        /*T*                                                         */
+      540        5        /*T***********************************************************/
+      541        6        /**/
+      542        7        /**/
+      543        8        /*F* NAME:         KCL$HOOKUP
+      544        9             PURPOSE:      To hook special stations to comgroups
+      545       10             DESCRIPTION:  FEPs and monitor DCB stations all require
+      546       11                           special logic to connect them to their
+      547       12                           respective comgroups.
+      548       13                           These routines perform that connection.   */
+      549       14
+      550       15        /*F* NAME:         KCL$HOOKUPM
+      551       16             PURPOSE:      To connect the monitor DCB stations to the CSCG
+      552       17             DESCRIPTION:  For each monitor DCB station, calls the magic
+      553       18                           interface KCO$MONCON to connect it to the CSCG,
+      554       19                           and then calls its particular init routine.
+      555       20
+      556       21                           Called from KQC$CTL when the CSCG becomes available
+      557       22                           for connects. */
+      558       23        KCL$HOOKUPM: PROC (NK$LDCT) ALTRET; /* !!Doesn't ALTRET!! */
+      559       24        /**/
+      560       25
+      561       26
+      562       27
+      563       28        /**/
+      564       29        /* INCLUDES */
+      565       30        /**/
+      566       31        %INCLUDE NK$LDCT;
+      567      133        %INCLUDE KC$CGBLK;
+      568      181        %INCLUDE KC_CP6;
+      569      741        %INCLUDE NK_LDCT_R;
+      570      750        %INCLUDE NK_SUBS;
+      571      775        %INCLUDE JG_GHOSTS_C;
+      572      865        %INCLUDE B$USER;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:88   
+      573     1081
+      574     1082
+      575     1083
+      576     1084        /**/
+      577     1085        /* PARAMETERS */
+      578     1086        /**/
+      579     1087        %NK$LDCT (STCLASS="");
+      580     1133
+      581     1134
+      582     1135
+      583     1136        /**/
+      584     1137        /* BASED STRUCTURES */
+      585     1138        /**/
+      586     1139    1   DCL B$$PTR PTR BASED ALIGNED;
+      587     1140        %NK$LDCT (NAME=VLDCT,STCLASS=BASED);
+      588     1186
+      589     1187
+      590     1188
+      591     1189        /**/
+      592     1190        /* CONSTANT */
+      593     1191        /**/
+      594     1192        %B$CGAUCI (FPTN=CINFO,STCLASS=CONSTANT,INFOSZ=0,NM='*',AC='LOCAL');
+      595     1214    1   DCL SLUG# UBIN(9) CONSTANT INIT(JG_SLUG#);
+      596     1215
+      597     1216
+      598     1217
+      599     1218        /**/
+      600     1219        /* AUTO */
+      601     1220        /**/
+      602     1221    1   DCL FEX UBIN WORD;
+      603     1222    1   DCL ERR UBIN WORD;
+      604     1223    1   DCL LDCT$ PTR;
+      605     1224    1   DCL LDCT$R REDEF LDCT$ UBIN;
+      606     1225        %B$CGAUCI (FPTN=INFO,STCLASS="");
+      607     1247
+      608     1248
+      609     1249
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:89   
+      610     1250        /**/
+      611     1251        /* REFS */
+      612     1252        /**/
+      613     1253    1   DCL KCF$EXHUME ENTRY(1);
+      614     1254    1   DCL KCO$MONCON    ENTRY(4) ALTRET;
+      615     1255    1   DCL KCO$TRMCON    ENTRY(4) ALTRET;
+      616     1256    1   DCL KCO$TRMGO ENTRY(1) ALTRET;
+      617     1257    1   DCL KQP$EVNT      ENTRY(2) ALTRET;
+      618     1258    1   DCL KUB$INIT      ENTRY;
+      619     1259    1   DCL KUR$INIT      ENTRY;
+      620     1260    1   DCL KUR$INIT_HLP  ENTRY;
+      621     1261    1   DCL OCI$INIT      ENTRY;
+      622     1262    1   DCL SC_MONCON     ENTRY    CONV(2,0);
+      623     1263    1   DCL SSV$EVENT     ENTRY(7);
+      624     1264
+      625     1265    1   DCL NK_MONKLDX UBIN WORD SYMREF;
+      626     1266    1   DCL NK_RESUSLDX UBIN WORD SYMREF;
+      627     1267    1   DCL NK_RESUSLDX_HLP UBIN WORD SYMREF;
+      628     1268    1   DCL NK_BABOONLDX UBIN WORD SYMREF;
+      629     1269        %KC$CGID (FPTN=KC_HLPID,STCLASS=SYMREF);
+      630     1295        %KC$CGID (FPTN=KC_CSID ,STCLASS=SYMREF);
+      631     1321    1   DCL KC_HOG$ PTR SYMREF;
+      632     1322        %B$CGAUCI (FPTN=KC_HOG_INFO,STCLASS=SYMREF);
+      633     1344    1   DCL KC_NOCG$ PTR SYMREF;
+      634     1345        %KC$CGID (FPTN=KC_OCID ,STCLASS=SYMREF);
+      635     1371        %EJECT;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:90   
+      636     1372        /**/
+      637     1373        /**/
+      638     1374        /**/
+      639     1375    1         IF NK$LDCT$(NK_MONKLDX)->VLDCT.LKFLG.ACTIVE = '0'B THEN
+      640     1376    2           DO;
+      641     1377    2           INFO=CINFO;
+      642     1378    2           INFO.WHO.ACCT=':SYS';
+      643     1379    2           INFO.WHO.NAME='MONKEY';
+      644     1380    2           INFO.FLG.INPUT='1'B;
+      645     1381    2           INFO.FLG.OUTPUT='1'B;
+      646     1382    2           CALL KCO$MONCON (NK$LDCT$(NK_MONKLDX),KC_CSID,INFO,ERR) ALTRET (MERR);
+      647     1383    2           CALL OCI$INIT;
+      648     1384    2           END;
+      649     1385    1         IF NK$LDCT$(NK_RESUSLDX)->VLDCT.LKFLG.ACTIVE = '0'B THEN
+      650     1386    2           DO;
+      651     1387    2           INFO=CINFO;
+      652     1388    2           INFO.WHO.ACCT=':SYS';
+      653     1389    2           INFO.WHO.NAME='RESUS';
+      654     1390    2           INFO.FLG.INPUT='1'B;
+      655     1391    2           INFO.FLG.OUTPUT='1'B;
+      656     1392    2           CALL KCO$MONCON (NK$LDCT$(NK_RESUSLDX),KC_CSID,INFO,ERR) ALTRET(MERR);
+      657     1393    2           CALL KUR$INIT;
+      658     1394    2           END;
+      659     1395    1         RETURN;
+      660     1396        %EJECT;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:91   
+      661     1397        /*F* NAME:        KCL$HOOKUPMB
+      662     1398             PURPOSE:     To connect BABOON and RESUS monitor DCB stations to HLPCG
+      663     1399             DESCRIPTION: Like KCL$HOOKUPM except that BABOON and RESUS are on HLPCG
+      664     1400                          and KCL$HOOKUPMB is called from KQC$CTL when NETCG
+      665     1401                          becomes available. */
+      666     1402    1   KCL$HOOKUPMB: ENTRY ALTRET; /* !!Doesn't ALTRET!! */
+      667     1403    1         IF NK$LDCT$(NK_RESUSLDX_HLP)->VLDCT.LKFLG.ACTIVE = '0'B THEN
+      668     1404    2           DO;
+      669     1405    2           INFO=CINFO;
+      670     1406    2           INFO.WHO.ACCT=':SYS';
+      671     1407    2           INFO.WHO.NAME='RESUS';
+      672     1408    2           INFO.FLG.INPUT='1'B;
+      673     1409    2           INFO.FLG.OUTPUT='1'B;
+      674     1410    2           CALL KCO$MONCON (NK$LDCT$(NK_RESUSLDX_HLP),KC_HLPID,INFO,ERR) ALTRET(MERR);
+      675     1411    2           CALL KUR$INIT_HLP;
+      676     1412    2           END;
+      677     1413    1         IF NK$LDCT$(NK_BABOONLDX)->VLDCT.LKFLG.ACTIVE = '0'B THEN
+      678     1414    2           DO;
+      679     1415    2           INFO=CINFO;
+      680     1416    2           INFO.WHO.ACCT=':SYS';
+      681     1417    2           INFO.WHO.NAME='BABOON';
+      682     1418    2           INFO.FLG.INPUT='1'B;
+      683     1419    2           INFO.FLG.OUTPUT='1'B;
+      684     1420    2           CALL KCO$MONCON (NK$LDCT$(NK_BABOONLDX),KC_HLPID,INFO,ERR) ALTRET(MERR);
+      685     1421    2           CALL KUB$INIT;
+      686     1422    2           END;
+      687     1423    1   RTN:  ;
+      688     1424    1         RETURN;
+      689     1425        %EJECT;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:92   
+      690     1426
+      691     1427             /*F* NAME:   KCL$HOOKUPH
+      692     1428                  PURPOSE: To connect the HOG to OCCG.
+      693     1429                  DESCRIPTION: On the open of OCCG, the hog is connect to
+      694     1430                               the CG.
+      695     1431          */
+      696     1432    1   KCL$HOOKUPH: ENTRY ALTRET;
+      697     1433    1         IF KC_HOG$->VLDCT.LKFLG.ACTIVE
+      698     1434    1         THEN
+      699     1435    1          RETURN;
+      700     1436    1         KC_HOG$->VLDCT.RESCOD = NK_CGTRM;
+      701     1437    1         CALL KCF$EXHUME(KC_HOG$->VLDCT);
+      702     1438    1         CALL KCO$TRMCON(KC_HOG$,KC_OCID,KC_HOG_INFO,ERR)
+      703     1439    2         WHENRETURN DO;
+      704     1440    2           CALL KCO$TRMGO(KC_HOG$);
+      705     1441    2           END;
+      706     1442    2         WHENALTRETURN DO;
+      707     1443    2           KC_HOG$->VLDCT.RESCOD = NK_NOCG;
+      708     1444    2           KC_HOG$->VLDCT.LNK$ = KC_NOCG$;
+      709     1445    2           KC_NOCG$ = KC_HOG$;
+      710     1446    2           END;
+      711     1447
+      712     1448    1         RETURN;
+      713     1449    1   MERR: CALL SC_MONCON;
+      714     1450        /*S* SCREECH_CODE: KCL-S$MONCON
+      715     1451             TYPE:         SCREECH
+      716     1452             MESSAGE:      Can't connect MONKEY to the CSCG
+      717     1453             REMARKS:      One of the monitor DCB stations on the CSCG has
+      718     1454                           failed to connect. */
+      719     1455    1         RETURN;
+      720     1456        /**/
+      721     1457    1   END;
+      722     1458        /**/
+      723     1459        /**/
+
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:93   
+--  Include file information  --
+
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+   JG_GHOSTS_C.:E05TOU  is referenced.
+   NK_SUBS.:E05TOU  is referenced.
+   NK_LDCT_R.:E05TOU  cannot be made into a system file and is referenced.
+   KC_CP6.:E05TOU  is referenced.
+   KC$CGBLK.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$HOOKUPM.
+
+   Procedure KCL$HOOKUPM requires 193 words for executable code.
+   Procedure KCL$HOOKUPM requires 20 words of local(AUTO) storage.
+
+    No errors detected in file KCL$CGLCL.:E05TSI    .
+
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:94   
+
+ Object Unit name= KCL$HOOKUPM                                File name= KCL$CGLCL.:E05TOU
+ UTS= JUL 30 '97 00:15:32.56 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0  RoData even  UTS     17     21  KCL$HOOKUPM
+    1   Proc  even  none   193    301  KCL$HOOKUPM
+    2  RoData even  none     6      6  KCL$HOOKUPM
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes    yes     yes      Std        1  KCL$HOOKUPM
+     1    113          yes     yes      Std        0  KCL$HOOKUPMB
+     1    226          yes     yes      Std        0  KCL$HOOKUPH
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       4 KCO$MONCON
+         yes           Std       0 OCI$INIT
+         yes           Std       0 KUB$INIT
+         yes           Std       1 KCF$EXHUME
+ yes     yes           Std       4 KCO$TRMCON
+         yes           Std       0 KUR$INIT
+ yes     yes           Std       1 KCO$TRMGO
+         yes           Std       0 KUR$INIT_HLP
+                       nStd      0 X66_AUTO_1
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:95   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_MONCON                             N$DCT$$                               NK_MONKLDX
+     NK_RESUSLDX                           NK_RESUSLDX_HLP                       NK_BABOONLDX
+     KC_HLPID                              KC_CSID                               KC_HOG$
+     KC_HOG_INFO                           KC_NOCG$                              KC_OCID
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ASLENTSID                             ISSID
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:96   
+
+
+      536        1        /*T***********************************************************/
+      537        2        /*T*                                                         */
+      538        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      539        4        /*T*                                                         */
+      540        5        /*T***********************************************************/
+      541        6        /**/
+      542        7        /**/
+      543        8        /*F* NAME:         KCL$HOOKUP
+      544        9             PURPOSE:      To hook special stations to comgroups
+      545       10             DESCRIPTION:  FEPs and monitor DCB stations all require
+      546       11                           special logic to connect them to their
+      547       12                           respective comgroups.
+      548       13                           These routines perform that connection.   */
+      549       14
+      550       15        /*F* NAME:         KCL$HOOKUPM
+      551       16             PURPOSE:      To connect the monitor DCB stations to the CSCG
+      552       17             DESCRIPTION:  For each monitor DCB station, calls the magic
+      553       18                           interface KCO$MONCON to connect it to the CSCG,
+      554       19                           and then calls its particular init routine.
+      555       20
+      556       21                           Called from KQC$CTL when the CSCG becomes available
+      557       22                           for connects. */
+      558       23        KCL$HOOKUPM: PROC (NK$LDCT) ALTRET; /* !!Doesn't ALTRET!! */
+
+     23  1 000000   000000 700200 xent  KCL$HOOKUPM  TSX0  ! X66_AUTO_1
+         1 000001   000024 000001                    ZERO    20,1
+
+      559       24        /**/
+      560       25
+      561       26
+      562       27
+      563       28        /**/
+      564       29        /* INCLUDES */
+      565       30        /**/
+      566       31        %INCLUDE NK$LDCT;
+      567      133        %INCLUDE KC$CGBLK;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:97   
+      568      181        %INCLUDE KC_CP6;
+      569      741        %INCLUDE NK_LDCT_R;
+      570      750        %INCLUDE NK_SUBS;
+      571      775        %INCLUDE JG_GHOSTS_C;
+      572      865        %INCLUDE B$USER;
+      573     1081
+      574     1082
+      575     1083
+      576     1084        /**/
+      577     1085        /* PARAMETERS */
+      578     1086        /**/
+      579     1087        %NK$LDCT (STCLASS="");
+      580     1133
+      581     1134
+      582     1135
+      583     1136        /**/
+      584     1137        /* BASED STRUCTURES */
+      585     1138        /**/
+      586     1139    1   DCL B$$PTR PTR BASED ALIGNED;
+      587     1140        %NK$LDCT (NAME=VLDCT,STCLASS=BASED);
+      588     1186
+      589     1187
+      590     1188
+      591     1189        /**/
+      592     1190        /* CONSTANT */
+      593     1191        /**/
+      594     1192        %B$CGAUCI (FPTN=CINFO,STCLASS=CONSTANT,INFOSZ=0,NM='*',AC='LOCAL');
+      595     1214    1   DCL SLUG# UBIN(9) CONSTANT INIT(JG_SLUG#);
+      596     1215
+      597     1216
+      598     1217
+      599     1218        /**/
+      600     1219        /* AUTO */
+      601     1220        /**/
+      602     1221    1   DCL FEX UBIN WORD;
+      603     1222    1   DCL ERR UBIN WORD;
+      604     1223    1   DCL LDCT$ PTR;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:98   
+      605     1224    1   DCL LDCT$R REDEF LDCT$ UBIN;
+      606     1225        %B$CGAUCI (FPTN=INFO,STCLASS="");
+      607     1247
+      608     1248
+      609     1249
+      610     1250        /**/
+      611     1251        /* REFS */
+      612     1252        /**/
+      613     1253    1   DCL KCF$EXHUME ENTRY(1);
+      614     1254    1   DCL KCO$MONCON    ENTRY(4) ALTRET;
+      615     1255    1   DCL KCO$TRMCON    ENTRY(4) ALTRET;
+      616     1256    1   DCL KCO$TRMGO ENTRY(1) ALTRET;
+      617     1257    1   DCL KQP$EVNT      ENTRY(2) ALTRET;
+      618     1258    1   DCL KUB$INIT      ENTRY;
+      619     1259    1   DCL KUR$INIT      ENTRY;
+      620     1260    1   DCL KUR$INIT_HLP  ENTRY;
+      621     1261    1   DCL OCI$INIT      ENTRY;
+      622     1262    1   DCL SC_MONCON     ENTRY    CONV(2,0);
+      623     1263    1   DCL SSV$EVENT     ENTRY(7);
+      624     1264
+      625     1265    1   DCL NK_MONKLDX UBIN WORD SYMREF;
+      626     1266    1   DCL NK_RESUSLDX UBIN WORD SYMREF;
+      627     1267    1   DCL NK_RESUSLDX_HLP UBIN WORD SYMREF;
+      628     1268    1   DCL NK_BABOONLDX UBIN WORD SYMREF;
+      629     1269        %KC$CGID (FPTN=KC_HLPID,STCLASS=SYMREF);
+      630     1295        %KC$CGID (FPTN=KC_CSID ,STCLASS=SYMREF);
+      631     1321    1   DCL KC_HOG$ PTR SYMREF;
+      632     1322        %B$CGAUCI (FPTN=KC_HOG_INFO,STCLASS=SYMREF);
+      633     1344    1   DCL KC_NOCG$ PTR SYMREF;
+      634     1345        %KC$CGID (FPTN=KC_OCID ,STCLASS=SYMREF);
+      635     1371        %EJECT;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:99   
+      636     1372        /**/
+      637     1373        /**/
+      638     1374        /**/
+      639     1375    1         IF NK$LDCT$(NK_MONKLDX)->VLDCT.LKFLG.ACTIVE = '0'B THEN
+
+   1375  1 000002   000000 470400 xsym               LDP0    N$DCT$$
+         1 000003   000000 720000 xsym               LXL0    NK_MONKLDX
+         1 000004   000000 471510                    LDP1    0,X0,PR0
+         1 000005   100011 236100                    LDQ     9,,PR1
+         1 000006   000040 316003                    CANQ    32,DU
+         1 000007   000046 601000 1                  TNZ     s:1385
+
+      640     1376    2           DO;
+
+      641     1377    2           INFO=CINFO;
+
+   1377  1 000010   000100 100400                    MLR     fill='000'O
+         1 000011   000000 000044 0                  ADSC9   CINFO                    cn=0,n=36
+         1 000012   200007 000044                    ADSC9   INFO,,AUTO               cn=0,n=36
+
+      642     1378    2           INFO.WHO.ACCT=':SYS';
+
+   1378  1 000013   000012 235000 0                  LDA     CINFO+10
+         1 000014   000035 236000 xsym               LDQ     B_VECTNIL+29
+         1 000015   200012 757100                    STAQ    INFO+3,,AUTO
+
+      643     1379    2           INFO.WHO.NAME='MONKEY';
+
+   1379  1 000016   040100 100400                    MLR     fill='040'O
+         1 000017   000013 000006 0                  ADSC9   CINFO+11                 cn=0,n=6
+         1 000020   200014 000014                    ADSC9   INFO+5,,AUTO             cn=0,n=12
+
+      644     1380    2           INFO.FLG.INPUT='1'B;
+
+   1380  1 000021   400000 236003                    LDQ     -131072,DU
+         1 000022   200017 256100                    ORSQ    INFO+8,,AUTO
+
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:100  
+      645     1381    2           INFO.FLG.OUTPUT='1'B;
+
+   1381  1 000023   200000 236003                    LDQ     65536,DU
+         1 000024   200017 256100                    ORSQ    INFO+8,,AUTO
+
+      646     1382    2           CALL KCO$MONCON (NK$LDCT$(NK_MONKLDX),KC_CSID,INFO,ERR) ALTRET (MERR);
+
+   1382  1 000025   200005 631500                    EPPR1   ERR,,AUTO
+         1 000026   200023 451500                    STP1    INFO+12,,AUTO
+         1 000027   200007 633500                    EPPR3   INFO,,AUTO
+         1 000030   200022 453500                    STP3    INFO+11,,AUTO
+         1 000031   000000 236000 2                  LDQ     0
+         1 000032   200021 756100                    STQ     INFO+10,,AUTO
+         1 000033   000000 236000 xsym               LDQ     NK_MONKLDX
+         1 000034   000022 736000                    QLS     18
+         1 000035   000000 036000 xsym               ADLQ    N$DCT$$
+         1 000036   200020 756100                    STQ     INFO+9,,AUTO
+         1 000037   200020 630500                    EPPR0   INFO+9,,AUTO
+         1 000040   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         1 000041   000000 701000 xent               TSX1    KCO$MONCON
+         1 000042   000276 702000 1                  TSX2    MERR
+
+      647     1383    2           CALL OCI$INIT;
+
+   1383  1 000043   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         1 000044   000000 701000 xent               TSX1    OCI$INIT
+         1 000045   000000 011000                    NOP     0
+
+      648     1384    2           END;
+
+      649     1385    1         IF NK$LDCT$(NK_RESUSLDX)->VLDCT.LKFLG.ACTIVE = '0'B THEN
+
+   1385  1 000046   000000 470400 xsym               LDP0    N$DCT$$
+         1 000047   000000 720000 xsym               LXL0    NK_RESUSLDX
+         1 000050   000000 471510                    LDP1    0,X0,PR0
+         1 000051   100011 236100                    LDQ     9,,PR1
+         1 000052   000040 316003                    CANQ    32,DU
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:101  
+         1 000053   000112 601000 1                  TNZ     s:1395
+
+      650     1386    2           DO;
+
+      651     1387    2           INFO=CINFO;
+
+   1387  1 000054   000100 100400                    MLR     fill='000'O
+         1 000055   000000 000044 0                  ADSC9   CINFO                    cn=0,n=36
+         1 000056   200007 000044                    ADSC9   INFO,,AUTO               cn=0,n=36
+
+      652     1388    2           INFO.WHO.ACCT=':SYS';
+
+   1388  1 000057   000012 235000 0                  LDA     CINFO+10
+         1 000060   000035 236000 xsym               LDQ     B_VECTNIL+29
+         1 000061   200012 757100                    STAQ    INFO+3,,AUTO
+
+      653     1389    2           INFO.WHO.NAME='RESUS';
+
+   1389  1 000062   040100 100400                    MLR     fill='040'O
+         1 000063   000015 000005 0                  ADSC9   CINFO+13                 cn=0,n=5
+         1 000064   200014 000014                    ADSC9   INFO+5,,AUTO             cn=0,n=12
+
+      654     1390    2           INFO.FLG.INPUT='1'B;
+
+   1390  1 000065   400000 236003                    LDQ     -131072,DU
+         1 000066   200017 256100                    ORSQ    INFO+8,,AUTO
+
+      655     1391    2           INFO.FLG.OUTPUT='1'B;
+
+   1391  1 000067   200000 236003                    LDQ     65536,DU
+         1 000070   200017 256100                    ORSQ    INFO+8,,AUTO
+
+      656     1392    2           CALL KCO$MONCON (NK$LDCT$(NK_RESUSLDX),KC_CSID,INFO,ERR) ALTRET(MERR);
+
+   1392  1 000071   200005 631500                    EPPR1   ERR,,AUTO
+         1 000072   200023 451500                    STP1    INFO+12,,AUTO
+         1 000073   200007 633500                    EPPR3   INFO,,AUTO
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:102  
+         1 000074   200022 453500                    STP3    INFO+11,,AUTO
+         1 000075   000000 236000 2                  LDQ     0
+         1 000076   200021 756100                    STQ     INFO+10,,AUTO
+         1 000077   000000 236000 xsym               LDQ     NK_RESUSLDX
+         1 000100   000022 736000                    QLS     18
+         1 000101   000000 036000 xsym               ADLQ    N$DCT$$
+         1 000102   200020 756100                    STQ     INFO+9,,AUTO
+         1 000103   200020 630500                    EPPR0   INFO+9,,AUTO
+         1 000104   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         1 000105   000000 701000 xent               TSX1    KCO$MONCON
+         1 000106   000276 702000 1                  TSX2    MERR
+
+      657     1393    2           CALL KUR$INIT;
+
+   1393  1 000107   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         1 000110   000000 701000 xent               TSX1    KUR$INIT
+         1 000111   000000 011000                    NOP     0
+
+      658     1394    2           END;
+
+      659     1395    1         RETURN;
+
+   1395  1 000112   000000 702200 xent               TSX2  ! X66_ARET
+
+      660     1396        %EJECT;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:103  
+      661     1397        /*F* NAME:        KCL$HOOKUPMB
+      662     1398             PURPOSE:     To connect BABOON and RESUS monitor DCB stations to HLPCG
+      663     1399             DESCRIPTION: Like KCL$HOOKUPM except that BABOON and RESUS are on HLPCG
+      664     1400                          and KCL$HOOKUPMB is called from KQC$CTL when NETCG
+      665     1401                          becomes available. */
+      666     1402    1   KCL$HOOKUPMB: ENTRY ALTRET; /* !!Doesn't ALTRET!! */
+
+   1402  1 000113   000000 700200 xent  KCL$HOOKUPMB TSX0  ! X66_AUTO_1
+         1 000114   000024 000001                    ZERO    20,1
+
+      667     1403    1         IF NK$LDCT$(NK_RESUSLDX_HLP)->VLDCT.LKFLG.ACTIVE = '0'B THEN
+
+   1403  1 000115   000000 470400 xsym               LDP0    N$DCT$$
+         1 000116   000000 720000 xsym               LXL0    NK_RESUSLDX_HLP
+         1 000117   000000 471510                    LDP1    0,X0,PR0
+         1 000120   100011 236100                    LDQ     9,,PR1
+         1 000121   000040 316003                    CANQ    32,DU
+         1 000122   000161 601000 1                  TNZ     s:1413
+
+      668     1404    2           DO;
+
+      669     1405    2           INFO=CINFO;
+
+   1405  1 000123   000100 100400                    MLR     fill='000'O
+         1 000124   000000 000044 0                  ADSC9   CINFO                    cn=0,n=36
+         1 000125   200007 000044                    ADSC9   INFO,,AUTO               cn=0,n=36
+
+      670     1406    2           INFO.WHO.ACCT=':SYS';
+
+   1406  1 000126   000012 235000 0                  LDA     CINFO+10
+         1 000127   000035 236000 xsym               LDQ     B_VECTNIL+29
+         1 000130   200012 757100                    STAQ    INFO+3,,AUTO
+
+      671     1407    2           INFO.WHO.NAME='RESUS';
+
+   1407  1 000131   040100 100400                    MLR     fill='040'O
+         1 000132   000015 000005 0                  ADSC9   CINFO+13                 cn=0,n=5
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:104  
+         1 000133   200014 000014                    ADSC9   INFO+5,,AUTO             cn=0,n=12
+
+      672     1408    2           INFO.FLG.INPUT='1'B;
+
+   1408  1 000134   400000 236003                    LDQ     -131072,DU
+         1 000135   200017 256100                    ORSQ    INFO+8,,AUTO
+
+      673     1409    2           INFO.FLG.OUTPUT='1'B;
+
+   1409  1 000136   200000 236003                    LDQ     65536,DU
+         1 000137   200017 256100                    ORSQ    INFO+8,,AUTO
+
+      674     1410    2           CALL KCO$MONCON (NK$LDCT$(NK_RESUSLDX_HLP),KC_HLPID,INFO,ERR) ALTRET(MERR);
+
+   1410  1 000140   200005 631500                    EPPR1   ERR,,AUTO
+         1 000141   200023 451500                    STP1    INFO+12,,AUTO
+         1 000142   200007 633500                    EPPR3   INFO,,AUTO
+         1 000143   200022 453500                    STP3    INFO+11,,AUTO
+         1 000144   000001 236000 2                  LDQ     1
+         1 000145   200021 756100                    STQ     INFO+10,,AUTO
+         1 000146   000000 236000 xsym               LDQ     NK_RESUSLDX_HLP
+         1 000147   000022 736000                    QLS     18
+         1 000150   000000 036000 xsym               ADLQ    N$DCT$$
+         1 000151   200020 756100                    STQ     INFO+9,,AUTO
+         1 000152   200020 630500                    EPPR0   INFO+9,,AUTO
+         1 000153   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         1 000154   000000 701000 xent               TSX1    KCO$MONCON
+         1 000155   000276 702000 1                  TSX2    MERR
+
+      675     1411    2           CALL KUR$INIT_HLP;
+
+   1411  1 000156   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         1 000157   000000 701000 xent               TSX1    KUR$INIT_HLP
+         1 000160   000000 011000                    NOP     0
+
+      676     1412    2           END;
+
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:105  
+      677     1413    1         IF NK$LDCT$(NK_BABOONLDX)->VLDCT.LKFLG.ACTIVE = '0'B THEN
+
+   1413  1 000161   000000 470400 xsym               LDP0    N$DCT$$
+         1 000162   000000 720000 xsym               LXL0    NK_BABOONLDX
+         1 000163   000000 471510                    LDP1    0,X0,PR0
+         1 000164   100011 236100                    LDQ     9,,PR1
+         1 000165   000040 316003                    CANQ    32,DU
+         1 000166   000225 601000 1                  TNZ     RTN
+
+      678     1414    2           DO;
+
+      679     1415    2           INFO=CINFO;
+
+   1415  1 000167   000100 100400                    MLR     fill='000'O
+         1 000170   000000 000044 0                  ADSC9   CINFO                    cn=0,n=36
+         1 000171   200007 000044                    ADSC9   INFO,,AUTO               cn=0,n=36
+
+      680     1416    2           INFO.WHO.ACCT=':SYS';
+
+   1416  1 000172   000012 235000 0                  LDA     CINFO+10
+         1 000173   000035 236000 xsym               LDQ     B_VECTNIL+29
+         1 000174   200012 757100                    STAQ    INFO+3,,AUTO
+
+      681     1417    2           INFO.WHO.NAME='BABOON';
+
+   1417  1 000175   040100 100400                    MLR     fill='040'O
+         1 000176   000017 000006 0                  ADSC9   CINFO+15                 cn=0,n=6
+         1 000177   200014 000014                    ADSC9   INFO+5,,AUTO             cn=0,n=12
+
+      682     1418    2           INFO.FLG.INPUT='1'B;
+
+   1418  1 000200   400000 236003                    LDQ     -131072,DU
+         1 000201   200017 256100                    ORSQ    INFO+8,,AUTO
+
+      683     1419    2           INFO.FLG.OUTPUT='1'B;
+
+   1419  1 000202   200000 236003                    LDQ     65536,DU
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:106  
+         1 000203   200017 256100                    ORSQ    INFO+8,,AUTO
+
+      684     1420    2           CALL KCO$MONCON (NK$LDCT$(NK_BABOONLDX),KC_HLPID,INFO,ERR) ALTRET(MERR);
+
+   1420  1 000204   200005 631500                    EPPR1   ERR,,AUTO
+         1 000205   200023 451500                    STP1    INFO+12,,AUTO
+         1 000206   200007 633500                    EPPR3   INFO,,AUTO
+         1 000207   200022 453500                    STP3    INFO+11,,AUTO
+         1 000210   000001 236000 2                  LDQ     1
+         1 000211   200021 756100                    STQ     INFO+10,,AUTO
+         1 000212   000000 236000 xsym               LDQ     NK_BABOONLDX
+         1 000213   000022 736000                    QLS     18
+         1 000214   000000 036000 xsym               ADLQ    N$DCT$$
+         1 000215   200020 756100                    STQ     INFO+9,,AUTO
+         1 000216   200020 630500                    EPPR0   INFO+9,,AUTO
+         1 000217   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         1 000220   000000 701000 xent               TSX1    KCO$MONCON
+         1 000221   000276 702000 1                  TSX2    MERR
+
+      685     1421    2           CALL KUB$INIT;
+
+   1421  1 000222   000002 631400 xsym               EPPR1   B_VECTNIL+2
+         1 000223   000000 701000 xent               TSX1    KUB$INIT
+         1 000224   000000 011000                    NOP     0
+
+      686     1422    2           END;
+
+   1420  1 000225                       RTN          null
+      687     1423    1   RTN:  ;
+      688     1424    1         RETURN;
+
+   1424  1 000225   000000 702200 xent               TSX2  ! X66_ARET
+
+      689     1425        %EJECT;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:107  
+      690     1426
+      691     1427             /*F* NAME:   KCL$HOOKUPH
+      692     1428                  PURPOSE: To connect the HOG to OCCG.
+      693     1429                  DESCRIPTION: On the open of OCCG, the hog is connect to
+      694     1430                               the CG.
+      695     1431          */
+      696     1432    1   KCL$HOOKUPH: ENTRY ALTRET;
+
+   1432  1 000226   000000 700200 xent  KCL$HOOKUPH  TSX0  ! X66_AUTO_1
+         1 000227   000024 000001                    ZERO    20,1
+
+      697     1433    1         IF KC_HOG$->VLDCT.LKFLG.ACTIVE
+
+   1433  1 000230   000000 470400 xsym               LDP0    KC_HOG$
+         1 000231   000011 236100                    LDQ     9,,PR0
+         1 000232   000040 316003                    CANQ    32,DU
+         1 000233   000235 600000 1                  TZE     s:1436
+
+      698     1434    1         THEN
+      699     1435    1          RETURN;
+
+   1435  1 000234   000000 702200 xent               TSX2  ! X66_ARET
+
+      700     1436    1         KC_HOG$->VLDCT.RESCOD = NK_CGTRM;
+
+   1436  1 000235   000006 236100                    LDQ     6,,PR0
+         1 000236   000002 376000 2                  ANQ     2
+         1 000237   000002 276007                    ORQ     2,DL
+         1 000240   000006 756100                    STQ     6,,PR0
+
+      701     1437    1         CALL KCF$EXHUME(KC_HOG$->VLDCT);
+
+   1437  1 000241   000000 630400 xsym               EPPR0   KC_HOG$
+         1 000242   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000243   000000 701000 xent               TSX1    KCF$EXHUME
+         1 000244   000000 011000                    NOP     0
+
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:108  
+      702     1438    1         CALL KCO$TRMCON(KC_HOG$,KC_OCID,KC_HOG_INFO,ERR)
+
+   1438  1 000245   200005 630500                    EPPR0   ERR,,AUTO
+         1 000246   200023 450500                    STP0    INFO+12,,AUTO
+         1 000247   000003 236000 2                  LDQ     3
+         1 000250   200022 756100                    STQ     INFO+11,,AUTO
+         1 000251   000004 237000 2                  LDAQ    4
+         1 000252   200020 757100                    STAQ    INFO+9,,AUTO
+         1 000253   200020 630500                    EPPR0   INFO+9,,AUTO
+         1 000254   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         1 000255   000000 701000 xent               TSX1    KCO$TRMCON
+         1 000256   000264 702000 1                  TSX2    s:1443
+
+      703     1439    2         WHENRETURN DO;
+
+      704     1440    2           CALL KCO$TRMGO(KC_HOG$);
+
+   1440  1 000257   000004 630400 2                  EPPR0   4
+         1 000260   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         1 000261   000000 701000 xent               TSX1    KCO$TRMGO
+         1 000262   000000 011000                    NOP     0
+
+      705     1441    2           END;
+
+   1441  1 000263   000275 710000 1                  TRA     s:1448
+
+      706     1442    2         WHENALTRETURN DO;
+
+      707     1443    2           KC_HOG$->VLDCT.RESCOD = NK_NOCG;
+
+   1443  1 000264   000000 470400 xsym               LDP0    KC_HOG$
+         1 000265   000006 236100                    LDQ     6,,PR0
+         1 000266   000002 376000 2                  ANQ     2
+         1 000267   000006 276007                    ORQ     6,DL
+         1 000270   000006 756100                    STQ     6,,PR0
+
+      708     1444    2           KC_HOG$->VLDCT.LNK$ = KC_NOCG$;
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:109  
+
+   1444  1 000271   000000 236000 xsym               LDQ     KC_NOCG$
+         1 000272   000004 756100                    STQ     4,,PR0
+
+      709     1445    2           KC_NOCG$ = KC_HOG$;
+
+   1445  1 000273   000000 236000 xsym               LDQ     KC_HOG$
+         1 000274   000000 756000 xsym               STQ     KC_NOCG$
+
+      710     1446    2           END;
+
+      711     1447
+      712     1448    1         RETURN;
+
+   1448  1 000275   000000 702200 xent               TSX2  ! X66_ARET
+
+      713     1449    1   MERR: CALL SC_MONCON;
+
+   1449  1 000276   000000 713400 xsym  MERR         CLIMB   SC_MONCON
+         1 000277   000000 600000 xsid               climb   nvectors=         0
+
+      714     1450        /*S* SCREECH_CODE: KCL-S$MONCON
+      715     1451             TYPE:         SCREECH
+      716     1452             MESSAGE:      Can't connect MONKEY to the CSCG
+      717     1453             REMARKS:      One of the monitor DCB stations on the CSCG has
+      718     1454                           failed to connect. */
+      719     1455    1         RETURN;
+
+   1455  1 000300   000000 702200 xent               TSX2  ! X66_ARET
+
+CINFO
+ Sect OctLoc
+   0     000   000000 000000   000000 000000   000000 000000   114117 103101    ............LOCA
+   0     004   114040 040040   052040 040040   040040 040040   040040 040040    L   *
+   0     010   000000 000000                                                    ....
+
+(unnamed)
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:110  
+ Sect OctLoc
+   0     011   001*** ******   072123 131123   115117 116113   105131 040040    ....:SYSMONKEY
+   0     015   122105 123125   123040 040040   102101 102117   117116 040040    RESUS   BABOON
+
+(unnamed)
+ Sect OctLoc
+   2     000   000000 006000   000000 006000   777777 777760   000000 006000    ................
+   2     004   000000 006000   000000 006000                                    ........
+      720     1456        /**/
+      721     1457    1   END;
+      722     1458        /**/
+      723     1459        /**/
+
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:111  
+--  Include file information  --
+
+   B$USER.:E05TOU  cannot be made into a system file and is referenced.
+   JG_GHOSTS_C.:E05TOU  is referenced.
+   NK_SUBS.:E05TOU  is referenced.
+   NK_LDCT_R.:E05TOU  cannot be made into a system file and is referenced.
+   KC_CP6.:E05TOU  is referenced.
+   KC$CGBLK.:E05TOU  is referenced.
+   NK$LDCT.:E05TOU  is referenced.
+      No diagnostics issued in procedure KCL$HOOKUPM.
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:112  
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData KCL$HOOKUPM
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(324)   r     1 CINFO
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     3-0-0/w PTR         r     1 @NK$LDCT                   5-0-0/w UBIN        r     1 ERR
+     7-0-0/w STRC(324)   r     1 INFO                      *0-0-0/d STRC(864)   r     1 NK$LDCT
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(432)   r     1 KC_CSID                    0-0-0/w STRC(432)   r     1 KC_HLPID
+     0-0-0/w PTR         r     1 KC_HOG$                    0-0-0/w STRC(324)   r     1 KC_HOG_INFO
+     0-0-0/w PTR         r     1 KC_NOCG$                   0-0-0/w STRC(432)   r     1 KC_OCID
+     0-0-0/w PTR         r     1 N$DCT$$                    0-0-0/w UBIN        r     1 NK_BABOONLDX
+     0-0-0/w UBIN        r     1 NK_MONKLDX                 0-0-0/w UBIN        r     1 NK_RESUSLDX
+     0-0-0/w UBIN        r     1 NK_RESUSLDX_HLP
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 NK$LDCT$(0:0)
+     0-0-0/d STRC(864)   r     1 VLDCT
+
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:113  
+
+   Procedure KCL$HOOKUPM requires 193 words for executable code.
+   Procedure KCL$HOOKUPM requires 20 words of local(AUTO) storage.
+
+    No errors detected in file KCL$CGLCL.:E05TSI    .
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:114  
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:115  
+          MINI XREF LISTING
+
+B$DO.ECCINFO
+      1016**DCL      1017--REDEF
+B$U.MISC
+       995**DCL       996--REDEF
+B$USER.MISC
+      1071**DCL      1072--REDEF
+CINFO
+      1204**DCL      1377>>ASSIGN   1387>>ASSIGN   1405>>ASSIGN   1415>>ASSIGN
+CINFO.ATTR
+      1211**DCL      1211--REDEF
+ERR
+      1222**DCL      1382<>CALL     1392<>CALL     1410<>CALL     1420<>CALL     1438<>CALL
+INFO
+      1237**DCL      1377<<ASSIGN   1382<>CALL     1387<<ASSIGN   1392<>CALL     1405<<ASSIGN   1410<>CALL
+      1415<<ASSIGN   1420<>CALL
+INFO.ATTR
+      1244**DCL      1244--REDEF
+INFO.FLG.INPUT
+      1243**DCL      1380<<ASSIGN   1390<<ASSIGN   1408<<ASSIGN   1418<<ASSIGN
+INFO.FLG.OUTPUT
+      1243**DCL      1381<<ASSIGN   1391<<ASSIGN   1409<<ASSIGN   1419<<ASSIGN
+INFO.WHO.ACCT
+      1242**DCL      1378<<ASSIGN   1388<<ASSIGN   1406<<ASSIGN   1416<<ASSIGN
+INFO.WHO.NAME
+      1242**DCL      1379<<ASSIGN   1389<<ASSIGN   1407<<ASSIGN   1417<<ASSIGN
+KCF$EXHUME
+      1253**DCL-ENT  1437--CALL
+KCO$MONCON
+      1254**DCL-ENT  1382--CALL     1392--CALL     1410--CALL     1420--CALL
+KCO$TRMCON
+      1255**DCL-ENT  1438--CALL
+KCO$TRMGO
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:116  
+      1256**DCL-ENT  1440--CALL
+KC_CSID
+      1310**DCL      1382<>CALL     1392<>CALL
+KC_HLPID
+      1284**DCL      1410<>CALL     1420<>CALL
+KC_HOG$
+      1321**DCL      1433>>IF       1436>>ASSIGN   1437>>CALL     1438<>CALL     1440<>CALL     1443>>ASSIGN
+      1444>>ASSIGN   1445>>ASSIGN
+KC_HOG_INFO
+      1334**DCL      1438<>CALL
+KC_HOG_INFO.ATTR
+      1341**DCL      1341--REDEF
+KC_NOCG$
+      1344**DCL      1444>>ASSIGN   1445<<ASSIGN
+KC_OCID
+      1360**DCL      1438<>CALL
+KUB$INIT
+      1258**DCL-ENT  1421--CALL
+KUR$INIT
+      1259**DCL-ENT  1393--CALL
+KUR$INIT_HLP
+      1260**DCL-ENT  1411--CALL
+LDCT$
+      1223**DCL      1224--REDEF
+MERR
+      1449**LABEL    1382--CALLALT  1392--CALLALT  1410--CALLALT  1420--CALLALT
+N$DCT$$
+       748**DCL       748--IMP-PTR  1375>>IF       1382>>CALL     1385>>IF       1392>>CALL     1403>>IF
+      1410>>CALL     1413>>IF       1420>>CALL
+NK$LDCT
+      1100**DCL        23--PROC
+NK$LDCT.DDT$
+      1102**DCL      1102--REDEF
+NK$LDCT.IOQ$
+      1101**DCL      1102--REDEF
+NK$LDCT.LDCTX
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:117  
+      1103**DCL      1103--REDEF
+NK$LDCT.LKFLG.ABORTED
+      1115**DCL      1116--REDEF
+NK$LDCT.RLCID.LDCTX
+      1125**DCL      1125--REDEF
+NK$LDCT.STA$
+      1121**DCL      1122--REDEF
+NK$LDCT.SYMB$
+      1100**DCL      1100--REDEF    1100--REDEF    1101--REDEF
+NK$LDCT$
+       748**DCL      1375>>IF       1382<>CALL     1385>>IF       1392<>CALL     1403>>IF       1410<>CALL
+      1413>>IF       1420<>CALL
+NK_BABOONLDX
+      1268**DCL      1413>>IF       1420>>CALL
+NK_MONKLDX
+      1265**DCL      1375>>IF       1382>>CALL
+NK_RESUSLDX
+      1266**DCL      1385>>IF       1392>>CALL
+NK_RESUSLDX_HLP
+      1267**DCL      1403>>IF       1410>>CALL
+OCI$INIT
+      1261**DCL-ENT  1383--CALL
+SC_MONCON
+      1262**DCL-ENT  1449--CALL
+VLDCT
+      1153**DCL      1437<>CALL
+VLDCT.DDT$
+      1155**DCL      1155--REDEF
+VLDCT.IOQ$
+      1154**DCL      1155--REDEF
+VLDCT.LDCTX
+      1156**DCL      1156--REDEF
+VLDCT.LKFLG.ABORTED
+      1168**DCL      1169--REDEF
+VLDCT.LKFLG.ACTIVE
+      1172**DCL      1375>>IF       1385>>IF       1403>>IF       1413>>IF       1433>>IF
+PL6.E3A0      #005=KCL$HOOKUPM File=KCL$CGLCL.:E05TSI                            WED 07/30/97 00:15 Page:118  
+VLDCT.LNK$
+      1155**DCL      1444<<ASSIGN
+VLDCT.RESCOD
+      1161**DCL      1436<<ASSIGN   1443<<ASSIGN
+VLDCT.RLCID.LDCTX
+      1178**DCL      1178--REDEF
+VLDCT.STA$
+      1174**DCL      1175--REDEF
+VLDCT.SYMB$
+      1153**DCL      1153--REDEF    1153--REDEF    1154--REDEF

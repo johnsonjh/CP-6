@@ -1,0 +1,666 @@
+/*M* MODEL$MAIN - UTILITY PROCESSOR TO RUN USERS ON SPECIFIC CPUS */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+MODEL$MAIN: PROC MAIN;
+/**/
+/* INCLUDE FILES */
+%INCLUDE CP_6;
+%INCLUDE XU_MACRO_C;
+%INCLUDE B$JIT;
+%INCLUDE B$USER;
+%INCLUDE B_STRINGS_C;
+%INCLUDE SS_SCHED_C;
+%INCLUDE EL$TABLES;
+%INCLUDE EL_SUBS_C;
+%INCLUDE XUR_ENTRY;
+%INCLUDE MODEL_C61;
+%INCLUDE MODEL_C62;
+/**/
+/* AUTO VARIABLES */
+DCL CPU SBIN;
+DCL TX SBIN;
+DCL TOP$ PTR;
+DCL OUT$ PTR;
+DCL SYM$ PTR;
+DCL I SBIN;
+DCL ERROR BIT(36);
+DCL B$UT$ PTR;
+DCL PCU (0:7) UBIN;
+DCL PNO SBIN;
+DCL MSPNO SBIN;
+DCL FIRST_TIME BIT(1) ALIGNED;
+DCL JIT$ PTR;
+DCL TEMP SBIN;
+DCL LINEVEC BIT(72);
+DCL 1 LINE ALIGNED,
+      2 FLAG SBIN,
+      2 FEP# SBIN,
+      2 LINE# SBIN;
+DCL 1 TIME ALIGNED,
+      2 MIN SBIN,
+      2 SEC SBIN;
+DCL PARTITIONED SBIN;
+DCL JSTEP CHAR(1);
+DCL MODELTXT CHAR(256);
+DCL STEPCC UBIN;
+DCL S_PCU$ PTR;
+DCL PCU$ PTR;
+DCL H_RSW2$ PTR;
+DCL RSW2$ PTR;
+DCL CPU_TYPE CHAR(32);
+/**/
+/* STATIC VARIABLES */
+%FPT_TDREQCPU (XEQ=NONTDJASSIGN);
+%FPT_EXIT;
+%P$PCB (NAME=P_PCB,
+        STCLASS=STATIC);
+%VLR_SITEINFO;
+%FPT_CMDVAR (FUN=STORE,NAME=CMDVAR_NAME,VALUE=CMDVAR_VALUE);
+%VLP_NAME (FPTN=CMDVAR_NAME,NAME='CPU_TYPE');
+%VLP_NAME (FPTN=CMDVAR_VALUE,NAME='X');
+%VLR_MONINFO;
+%VLR_MONPTRS;
+%XUR_INIT (NAME=XUR_INIT, COMMANDS=YES, SPELLING=YES, SYNTAX=YES, GOODCMD=YES,
+           PCB=P_PCB);
+DCL INTERACTIVE BIT(1) STATIC ALIGNED INIT('0'B);
+DCL 1 ANLZ_TXT STATIC,
+      2 * CHAR(0) INIT('S_PORTNR+'),
+      2 NTD CHAR(1),
+      2 * CHAR(0) INIT('(CPU '),
+      2 CPU CHAR(1),
+      2 * CHAR(0) INIT(' PARTITIONED)/ .'),
+      2 NEW CHAR(1),
+      2 * CHAR(0) INIT(' (.'),
+      2 OLD CHAR(1),
+      2 * CHAR(0) INIT(')');
+DCL ANLZ_TXT_CHAR REDEF ANLZ_TXT CHAR(38);
+%EL$ANLZ (NAME=EL$ANLZ,
+          STCLASS=STATIC);
+/**/
+/* CONSTANT DATA */
+%FPT_CLOSE (FPTN=CLOSE_LO,
+            DCB=M$LO,
+            DISP=SAVE,
+            STCLASS=CONSTANT);
+%FPT_MONINFO (SITEINFO=VLR_SITEINFO,
+              MONINFO=VLR_MONINFO,
+              MONPTRS=VLR_MONPTRS,
+              STCLASS=CONSTANT);
+%FPT_PRIV (FPTN=SET_PRIV,
+           AUTH=YES,
+           PRIV="%(%PR_TND#|%PR_SPCLMM#|%PR_FMREAD#)",
+           STCLASS=CONSTANT);
+%FPT_WRSYSLOG (ENTRY=EL$ANLZ,
+               SIZE="SIZEW(EL$ANLZ)",
+               TYPE=EL_ANLZ,
+               STCLASS=CONSTANT);
+%TEXTC (NAME=M_MON,
+        TEXT='M:MON.:SYS',
+        STCLASS=CONSTANT);
+%TEXTC (NAME=S_PCU_C,
+        TEXT='S_PCU',
+        STCLASS=CONSTANT);
+%TEXTC (NAME=H_RSW2_C,
+        TEXT='H_RSW2',
+        STCLASS=CONSTANT);
+DCL 1 DI_FMT CONSTANT,
+      2 * CHAR(0) INIT('%A CPU %D is a %>A'),
+      2 * CHAR(0) INIT('%N( running sysid %D (user .%O)%)'),
+      2 * CHAR(0) INIT('%N( *PARTITIONED*%)%15P');
+DCL DI_PART_MSG CHAR(0) CONSTANT INIT(
+   'SLAVE  CPU %D is not running and is partitioned%15P');
+DCL MS (0:7) CHAR(1) CONSTANT INIT('M','S'*0);
+DCL 1 WHERE_FMT CONSTANT,
+      2 * CHAR(0) INIT('You are now running on %>A CPU %D '),
+      2 * CHAR(0) INIT('which is a %>A%15P');
+DCL 1 NO_REQUEST_FMT CONSTANT,
+      2 * CHAR(0) INIT('You have no specific CPU request set%15P');
+DCL MASTER_SLAVE (0:1) CHAR(0) CONSTANT INIT('MASTER','SLAVE');
+DCL SPY_HEADING CHAR(0) CONSTANT INIT(
+  'PORT USR#   IDENTIFICATION      SYSID   LINE    CPU  CCBUF%15P');
+DCL 1 SPY_FMT CONSTANT,
+      2 * CHAR(0) INIT(' %A%D %A%4O%E %>A,%>A%32-%6D %N(%2D-%4ZH%)'),
+      2 * CHAR(0) INIT('%47-%3D:%2ZD %>A%>MA%15P');
+DCL MODECHAR(0:4) CHAR(1) CONSTANT INIT(' ','B','G','O','T');
+DCL NOT_AUTH_RUN_MSG CHAR(0) CONSTANT INIT(
+   'You are not authorized to run on a partitioned CPU%15P');
+DCL NOT_AUTH_PART_MSG CHAR(0) CONSTANT INIT(
+   'You are not authorized to partition or return CPUs%15P');
+DCL MASTER_PART_MSG CHAR(0) CONSTANT INIT(
+   'Master CPU may not be partitioned or returned%15P');
+DCL INVALID_CPU_MSG CHAR(0) CONSTANT INIT(
+   'Invalid CPU number%15P');
+DCL NOT_PART_MSG CHAR(0) CONSTANT INIT(
+   'CPU %D is not partitioned%15P');
+DCL PART_MSG CHAR(0) CONSTANT INIT(
+   '*** CPU %D is now partitioned ***%15P');
+DCL RETURNED_MSG CHAR(0) CONSTANT INIT(
+   '*** CPU %D is returned to general use ***%15P');
+DCL NOT_RUNNING_CPU_MSG CHAR(0) CONSTANT INIT(
+   'The requested CPU is not running%15P');
+DCL NOT_RUNNING_TYPE_MSG CHAR(0) CONSTANT INIT(
+   'There is no running CPU of the requested type%15P');
+DCL NOT_RUNNING_TYPE_PART_MSG CHAR(0) CONSTANT INIT(
+   'There is no running, non-partitioned CPU of the type requested%15P');
+/**/
+/* BASED STRUCTURES */
+%PARSE$OUT (NAME=TOP,
+            STCLASS="BASED(TOP$)");
+%PARSE$OUT (NAME=OUT,
+            STCLASS="BASED(OUT$)");
+%PARSE$SYM (NAME=SYM,
+            STCLASS="BASED(SYM$)");
+%B$TCB (STCLASS="BASED(B$TCB$)");
+%B$ALT;
+DCL 1 S ALIGNED BASED(PCU$),
+      2 PCU (0:7) SBIN,
+      2 PORTNR (0:5) SBIN,
+/*
+          S_PORTNR+7 (S.PART_CPU in MODEL) is a flag set by MODEL and
+          and looked at by the monitor.  When S_PORTNR+7 is zero, no
+          CPU is partitioned.  When non_zero, S_PORTNR+7 indicates
+          the logical processor number of the partitioned CPU.  When a
+          CPU is partitioned, only users who explicitly request this
+          CPU via the CPU field in the user table (B$USER.CPU) will be
+          scheduled on this CPU.  The master CPU can not be
+          partitioned.  S_PORTNR+6 (S.NTD_PART_CPU in MODEL) is a flag
+          set by and looked at only by MODEL.  When S_PORTNR+7
+          indicates that a CPU is partitioned, S_PORTNR+6 is used by
+          MODEL to indicate whether the partitioned CPU is available
+          only to users with TND privilege (S_PORTNR+6 is zero) or is
+          available to any user who explicitly requests that CPU
+          (S_PORTNR+6 is non_zero).
+*/
+      2 NTD_PART_CPU SBIN,
+      2 PART_CPU SBIN,
+      2 MPSTATE (0:7) SBIN,
+      2 STOP (0:7) SBIN,
+      2 STIME (0:7) SBIN,
+      2 PTYPE (0:7) SBIN,
+      2 SSPTYPE (0:7) SBIN,
+      2 NSCPU UBIN,
+      2 NSCPUA UBIN,
+      2 TDCPUF SBIN,
+      2 TDCPU# UBIN,
+      2 TDCPUJ UBIN,
+      2 IDLCPU SBIN;
+DCL JIT$6WRD CHAR(24) DALIGNED BASED(B$JIT$);
+/**/
+/* DCBS */
+DCL M$LO DCB;
+/**/
+/* EXTERNAL REFERENCES */
+DCL MODEL$WRITE ENTRY(16);
+DCL DAM$INIT ENTRY ALTRET;
+DCL DAM$MAP ENTRY(5) ALTRET;
+DCL DAS$SYMINIT ENTRY(2) ALTRET;
+DCL DAS$SYMSRCHPTR ENTRY(2) ALTRET;
+DCL B$JIT$ PTR SYMREF;
+DCL B$TCB$ PTR SYMREF;
+DCL MODEL_CMD SBIN SYMREF;
+%EJECT;
+   CALL M$SPRIV(SET_PRIV) ALTRET(DONT_CARE);
+DONT_CARE:
+   CALL XUR$INIT(XUR_INIT);
+   CALL M$MONINFO(FPT_MONINFO) ALTRET(PMME_ERR);
+   CALL DAS$SYMINIT(M_MON);
+   CALL DAS$SYMSRCHPTR(S_PCU_C,S_PCU$);
+   CALL DAS$SYMSRCHPTR(H_RSW2_C,H_RSW2$);
+   CALL DAM$INIT;
+   CALL DAM$MAP(S_PCU$,PCU$,0);
+   CALL DAM$MAP(H_RSW2$,RSW2$,0);
+   CALL DAM$MAP(VLR_MONPTRS.B$USRT$,B$UT$,0);
+   STEPCC = 0;
+   IF B$JIT.CCARS = B$JIT.CCDISP
+   THEN DO;
+      MODELTXT = B$JIT.CCBUF;
+      I = 0;
+      DO WHILE (SUBSTR(MODELTXT,I,1) = ' ');
+         I = I+1;
+         END;
+      DO WHILE (SUBSTR(MODELTXT,I,1) ~= ' ');
+         SUBSTR(MODELTXT,I,1) = ' ';
+         I = I+1;
+         END;
+      END;
+   ELSE MODELTXT = SUBSTR(B$JIT.CCBUF,
+                          B$JIT.CCDISP+1,
+                          B$JIT.CCARS-B$JIT.CCDISP-2);
+   IF MODELTXT = ' '
+   THEN DO;
+LOOP:
+      INTERACTIVE = '1'B;
+      CALL XUR$GETCMD(MODEL_CMD,TOP$) ALTRET(PARSE_ERR);
+      END;
+   ELSE DO;
+      INTERACTIVE = '0'B;
+      CALL XUR$GETCMD(
+        MODEL_CMD,TOP$,,MODELTXT,SIZEC(MODELTXT)) ALTRET(PARSE_ERR);
+      END;
+   DO TX = 0 TO TOP.NSUBLKS-1;
+      FPT_TDREQCPU.V.MODE# = 1;
+      FPT_TDREQCPU.V.TYPE# = 0;
+      FPT_TDREQCPU.V.CPU# = 0;
+      OUT$ = TOP.SUBLK$(TX);
+      DO CASE(OUT.CODE);
+        CASE(%DI_CMD);                                    /* DISPLAY COMMMAND */
+           PCU = S.PCU;
+           DO I = 0 TO S.NSCPU;
+              IF S.MPSTATE(I) > 0 AND S.MPSTATE(I) ~= 3
+              THEN DO;
+                 IF I = 0
+                 THEN MSPNO = 0;
+                 ELSE MSPNO = 1;
+                 IF PCU(I) = 0
+                 THEN DO;
+                    LINE.FLAG = 0;
+                    LINEVEC = VECTOR(LINE.FLAG);
+                    END;
+                 ELSE DO;
+                    LINE.FLAG = 1;
+                    LINE.FEP# = B$UT$->B$USER.SYSID(PCU(I));
+                    LINE.LINE# = PCU(I);
+                    LINEVEC = VECTOR(LINE);
+                    END;
+                 IF I>0 AND I=S.PART_CPU
+                 THEN PARTITIONED = 1;
+                 ELSE PARTITIONED = 0;
+                 CALL FIND_MODEL(I);
+                 CALL MODEL$WRITE(VECTOR(DI_FMT),
+                                  VECTOR(MASTER_SLAVE(MSPNO)),
+                                  VECTOR(S.PORTNR(I)),
+                                  VECTOR(CPU_TYPE),
+                                  LINEVEC,
+                                  VECTOR(PARTITIONED));
+                 END;
+              END;
+           IF S.PART_CPU>0 AND S.MPSTATE(S.PART_CPU)=0
+           THEN CALL MODEL$WRITE(VECTOR(DI_PART_MSG),
+                                 VECTOR(S.PORTNR(S.PART_CPU)));
+           GOTO LOOPEND;
+        CASE(%CPU_CMD,%PORT_CMD);                   /* CPU  AND PORT  COMMAND */
+           STEPCC = 0;
+           SYM$ = OUT.SUBLK$(0);
+           CALL CHARBIN(CPU,SYM.TEXT);
+           CALL FIND_CPU ALTRET(INV_CPU);
+           IF S.MPSTATE(PNO) = 0 OR S.MPSTATE(PNO) = 3
+           THEN DO;
+              CALL MODEL$WRITE(VECTOR(NOT_RUNNING_CPU_MSG));
+              GOTO BADCC;
+              END;
+           IF S.PART_CPU>0 AND S.PART_CPU=PNO AND S.NTD_PART_CPU=0
+             AND NOT (B$JIT.PRIV.AUTH & %PR_TND#)
+             AND NOT (B$JIT.PRIV.JOB & %PR_TND#)
+           THEN DO;
+              CALL MODEL$WRITE(VECTOR(NOT_AUTH_RUN_MSG));
+              GOTO BADCC;
+              END;
+           FPT_TDREQCPU.V.CPU# = CPU;
+        CASE(%L66_CMD,%DPSE_CMD,%ELS_CMD,%DPS90_CMD,%DPS90XA_CMD,%DPS8000_CMD); /* L66, DPSE, ELS, DPS90,DPS90XA & DPS8000 commands */
+           STEPCC = 0;
+           PARTITIONED = 0;
+           DO PNO = S.NSCPU DOWNTO 0;
+              IF S.MPSTATE(PNO)>0 AND (S.PTYPE(PNO)=OUT.CODE-%L66_CMD)
+              THEN DO;
+                 IF S.PART_CPU>0 AND S.PART_CPU=PNO
+                 THEN PARTITIONED = 1;
+                 ELSE GOTO FOUND_TYPE;
+                 END;
+              END;
+           IF PARTITIONED = 0
+           THEN CALL MODEL$WRITE(VECTOR(NOT_RUNNING_TYPE_MSG));
+           ELSE CALL MODEL$WRITE(VECTOR(NOT_RUNNING_TYPE_PART_MSG));
+           GOTO BADCC;
+FOUND_TYPE:
+           FPT_TDREQCPU.V.CPU# = S.PORTNR(PNO);
+        CASE(%WHERE_CMD);                                    /* WHERE COMMAND */
+WHERE_:
+           PNO = B$UT$->B$USER.CPU(B$JIT.USER)-1;
+           IF PNO >= 0
+           THEN DO;
+              IF PNO = 0
+              THEN MSPNO = 0;
+              ELSE MSPNO = 1;
+              CALL FIND_MODEL(PNO);
+              CALL MODEL$WRITE (VECTOR(WHERE_FMT),
+                                VECTOR(MASTER_SLAVE(MSPNO)),
+                                VECTOR(S.PORTNR(PNO)),
+                                VECTOR(CPU_TYPE));
+              STEPCC = 0;
+              END;
+           ELSE DO;
+              CALL MODEL$WRITE(VECTOR(NO_REQUEST_FMT));
+              GOTO BADCC;
+              END;
+           GOTO LOOPEND;
+        CASE(%RESET_CMD);                                    /* RESET COMMAND */
+           STEPCC = 0;
+           FPT_TDREQCPU.V.MODE# = 2;
+        CASE(%SPY_CMD,%SPYALL_CMD);                            /* SPY COMMAND */
+           FIRST_TIME = '1'B;
+           DO I = 1 TO VLR_MONINFO.MUAIS#;
+              IF B$UT$->B$USER.US(I) < %SS_SNULL
+                AND B$UT$->B$USER.CPU(I) ~= 0
+                AND (B$UT$->B$USER.MODE(I)~=%M_GHOST# OR OUT.CODE=%SPYALL_CMD)
+              THEN DO;
+                 PNO = B$UT$->B$USER.CPU(I)-1;
+                 IF FIRST_TIME
+                 THEN DO;
+                    CALL MODEL$WRITE(VECTOR(SPY_HEADING));
+                    FIRST_TIME = '0'B;
+                    END;
+                 CALL DAM$MAP(B$JIT$,JIT$,-I,0) ALTRET(NXT_USR);
+                 IF JIT$->B$JIT.TSLINE.FEX~=0
+                 THEN DO;
+                    LINE.FLAG=1;
+                    LINE.FEP#=JIT$->B$JIT.TSLINE.FEX;
+                    LINE.LINE#=JIT$->B$JIT.TSLINE.PORT;
+                    LINEVEC=VECTOR(LINE);
+                    END;
+                 ELSE DO;
+                    LINE.FLAG=0;
+                    LINEVEC=VECTOR(LINE.FLAG);
+                    END;
+                 TEMP=JIT$->B$JIT.TPEXT+
+                   JIT$->B$JIT.TPSVT+
+                   JIT$->B$JIT.TUEXT+
+                   JIT$->B$JIT.TUSVT;
+                 TIME.MIN=TEMP/6000;
+                 TIME.SEC=MOD(TEMP,6000)/100;
+                 IF JIT$->B$JIT.CPFLAGS1 & %CP_JSTEP#
+                 THEN JSTEP='!';
+                 ELSE JSTEP=' ';
+                 CALL MODEL$WRITE(VECTOR(SPY_FMT),
+                   VECTOR(MS(PNO)),
+                   VECTOR(S.PORTNR(PNO)),
+                   VECTOR(MODECHAR(JIT$->B$JIT.MODE)),
+                   VECTOR(JIT$->B$JIT.USER),
+                   VECTOR(JIT$->B$JIT.ACCN),
+                   VECTOR(JIT$->B$JIT.UNAME),
+                   VECTOR(JIT$->B$JIT.SYSID),
+                   LINEVEC,
+                   VECTOR(TIME),
+                   VECTOR(JSTEP),
+                   VECTOR(JIT$->B$JIT.CCBUF));
+                 END;
+NXT_USR:
+              END;
+           GOTO LOOPEND;
+        CASE(%END_CMD);                                        /* END COMMAND */
+           GOTO LOOPEXIT;
+        CASE(%PART_CMD,%NTD_PART_CMD,%RETURN_CMD);      /* PARTITION COMMANDS */
+           STEPCC = 0;
+           IF NOT B$JIT.PRIV.JOB & %PR_EXMM#
+           THEN DO;
+              CALL MODEL$WRITE(VECTOR(NOT_AUTH_PART_MSG));
+              GOTO BADCC;
+              END;
+           SYM$ = OUT.SUBLK$(0);
+           CALL CHARBIN(CPU,SYM.TEXT);
+           LINEVEC = VECTOR(CPU);
+           CALL FIND_CPU ALTRET(INV_CPU);
+           IF PNO = 0
+           THEN DO;
+              CALL MODEL$WRITE(VECTOR(MASTER_PART_MSG));
+              GOTO BADCC;
+              END;
+           IF OUT.CODE = %RETURN_CMD
+           THEN DO;
+              IF S.PART_CPU ~= PNO
+              THEN DO;
+                 CALL MODEL$WRITE(VECTOR(NOT_PART_MSG),LINEVEC);
+                 GOTO BADCC;
+                 END;
+              PNO = 0;
+              IF S.NTD_PART_CPU = 0
+              THEN ANLZ_TXT.NTD = '7';
+              ELSE ANLZ_TXT.NTD = '6';
+              END;
+           ELSE DO;
+              IF OUT.CODE = %PART_CMD
+              THEN ANLZ_TXT.NTD = '7';    /* ERROR LOG S_PORTN+7 FOR PART CMD */
+              ELSE ANLZ_TXT.NTD = '6';   /* ERROR LOG S_PORTNR+6 FOR NTD PART */
+              END;
+           EL$ANLZ.JIT = JIT$6WRD;
+           CALL BINCHAR(ANLZ_TXT.CPU,CPU);
+           CALL BINCHAR(ANLZ_TXT.OLD,S.PART_CPU);
+           CALL BINCHAR(ANLZ_TXT.NEW,PNO);
+           EL$ANLZ.TXT = ANLZ_TXT_CHAR;
+/**/
+           S.PART_CPU = PNO;
+           IF OUT.CODE = %NTD_PART_CMD
+           THEN S.NTD_PART_CPU = PNO;
+           ELSE S.NTD_PART_CPU = 0;
+/**/
+           CALL M$WRSYSLOG(FPT_WRSYSLOG) ALTRET(PMME_ERR);
+           IF OUT.CODE = %RETURN_CMD
+           THEN CALL MODEL$WRITE(VECTOR(RETURNED_MSG),LINEVEC);
+           ELSE CALL MODEL$WRITE(VECTOR(PART_MSG),LINEVEC);
+           GOTO LOOPEND;
+        CASE(%VAR_CMD);                                    /* VAR COMMAND */
+           CALL BINCHAR(CMDVAR_VALUE.NAME#, VLR_SITEINFO.CPU_TYPE#);
+           CALL M$CMDVAR (FPT_CMDVAR);
+           GOTO LOOPEND;
+        CASE(ELSE);
+           STEPCC = 4;
+           GOTO LOOPEXIT;
+        END;   /* CASE */
+      CALL M$TDREQCPU(FPT_TDREQCPU) ALTRET(PMME_ERR);
+      IF OUT.CODE ~= %RESET_CMD
+      THEN GOTO WHERE_;
+LOOPEND:
+      END;  /* DO TX */
+   IF INTERACTIVE
+   THEN GOTO LOOP;
+LOOPEXIT:
+   CALL M$CLOSE(CLOSE_LO);
+   FPT_EXIT.V.STEPCC# = STEPCC;
+   CALL M$EXIT(FPT_EXIT);
+PMME_ERR:
+   ERROR = B$TCB.ALT$->B$ALT.ERR;
+   CALL XUR$ERRMSG(ERROR);
+ERR_:
+   STEPCC = 4;
+   IF INTERACTIVE
+   THEN GOTO LOOP;
+   ELSE GOTO LOOPEXIT;
+PARSE_ERR:
+   ERROR = P_PCB.ERROR;
+   GOTO ERR_;
+INV_CPU:
+   CALL MODEL$WRITE(VECTOR(INVALID_CPU_MSG));
+BADCC:
+   STEPCC = 4;
+   GOTO LOOPEND;
+%EJECT;
+/*X* DDA */
+FIND_CPU: PROC ALTRET;
+   DO PNO = 0 TO S.NSCPU;
+      IF S.PORTNR(PNO) = CPU
+      THEN RETURN;
+      END;
+   ALTRETURN;
+END FIND_CPU;
+%EJECT;
+/*X* DDA */
+FIND_MODEL: PROC(J);
+DCL J UBIN;
+/**/
+/* CONSTANT DATA */
+DCL L66_MODELS (0:3) CHAR(0) CONSTANT INIT(
+  'DPS/C (L66)',         /* BIT 32-33 IS '00'B */
+  'DPS/? (L66)',         /*              '01'B */
+  'DPS/B (L66)',         /*              '10'B */
+  'DPS/? (L66)');        /*              '11'B */
+DCL DPSE_MODELS (0:3) CHAR(0) CONSTANT INIT(
+  'DPS 8/70 (DPSE)',     /* BIT 29-30 IS '00'B */
+  'DPS 8/52 (DPSE)',     /*              '01'B */
+  'DPS 8/62 (DPSE)',     /*              '10'B */
+  'DPS 8/50 (DPSE)');    /*              '11'B */
+DCL ELS_MODELS (0:3) CHAR(0) CONSTANT INIT(
+  'DPS 8/20 (ELS)',      /* BIT 32 IS '0'B */
+  'DPS 8/47 (ELS)',      /* BIT 32 IS '0'B */
+  'DPS 8/44 (ELS)',     /*           '1'B */
+  'DPS 8/49 (ELS)');     /*           '1'B */
+/**/
+/* BASED STRUCTURES */
+DCL 1 L66_RSW2 (0:7) BASED(RSW2$),
+      2 * BIT(32),
+      2 SPEED UBIN(2) UNAL,
+      2 * BIT(2);
+DCL 1 DPSE_RSW2 (0:7) BASED(RSW2$),
+      2 * BIT(29),
+      2 SPEED UBIN(2) UNAL,
+      2 * BIT(5);
+DCL 1 ELS_RSW2 (0:7) BASED(RSW2$),
+      2 * BIT(20) UNAL,
+      2 CACHE UBIN(1) UNAL,    /* 8k cache installed */
+      2 * BIT(11) UNAL,
+      2 SPEED UBIN(1) UNAL,
+      2 * BIT(3);
+/**/
+/* PROCEDURE */
+   DO CASE (S.PTYPE(J));
+     CASE (%L66);
+        CPU_TYPE = L66_MODELS(L66_RSW2.SPEED(J));
+     CASE (%DPSE);
+        CPU_TYPE = DPSE_MODELS(DPSE_RSW2.SPEED(J));
+     CASE (%ELS1);
+        CPU_TYPE = ELS_MODELS(ELS_RSW2.SPEED(J)*2 + ELS_RSW2.CACHE(J));
+     CASE (%DPS90);
+        CPU_TYPE = 'DPS 90 ';
+     CASE (%DPS90XA);
+        CPU_TYPE = 'DPS 90XA ';
+     CASE (%DPS8000);
+        CPU_TYPE = 'DPS 8000';
+     END;   /* DO CASE */
+   RETURN;
+END FIND_MODEL;
+END MODEL$MAIN;
+%EOD;
+/*M* MODEL$WRITE - WRITE ROUTINE FOR MODEL PROCESSOR */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+MODEL$WRITE: PROC(FORMAT_VEC,DV1,DV2,DV3,DV4,DV5,DV6,DV7,DV8,DV9,DV10,
+               DV11,DV12,DV13,DV14,DV15);
+/**/
+/* PARAMS */
+DCL FORMAT_VEC BIT(72);
+DCL DV1 BIT(72);
+DCL DV2 BIT(72);
+DCL DV3 BIT(72);
+DCL DV4 BIT(72);
+DCL DV5 BIT(72);
+DCL DV6 BIT(72);
+DCL DV7 BIT(72);
+DCL DV8 BIT(72);
+DCL DV9 BIT(72);
+DCL DV10 BIT(72);
+DCL DV11 BIT(72);
+DCL DV12 BIT(72);
+DCL DV13 BIT(72);
+DCL DV14 BIT(72);
+DCL DV15 BIT(72);
+/**/
+/* INCLUDE FILES */
+%INCLUDE CP_6;
+%INCLUDE XU_FORMAT_C;
+/**/
+/* DCBS */
+DCL M$LO DCB;
+/**/
+/* VARIABLES */
+DCL OUTBUF CHAR(132) STATIC;
+DCL I UBIN;
+DCL M$LO$ PTR;
+DCL DATA_VEC(0:14) BIT(72) STATIC INIT(VECTOR(NIL)*0);
+/**/
+/* FPTS */
+%FPT_OPEN (FPTN=OPEN_LO,
+           DCB=M$LO,
+           STCLASS=CONSTANT);
+/**/
+/* ENTRY DEFS */
+DCL X$FORMAT ENTRY(1);
+DCL MODEL$SPYDOT ENTRY(2);
+/**/
+/* MACROS */
+%F_FDS (NAME=FDS,
+        DCB=M$LO,
+        TRUNC=YES,
+        BUF=OUTBUF,
+        EDIT=MODEL$SPYDOT,
+        VECTR=DATA_VEC);
+%F$DCB;
+%EJECT;
+     M$LO$ = DCBADDR(DCBNUM(M$LO));
+     IF NOT M$LO$->F$DCB.FCD#
+     THEN CALL M$OPEN(OPEN_LO);
+     FDS.FMT_ = FORMAT_VEC;
+     IF ADDR(DV1) ~= ADDR(NIL)
+        THEN DATA_VEC(0) = DV1;
+     IF ADDR(DV2) ~= ADDR(NIL)
+        THEN DATA_VEC(1) = DV2;
+     IF ADDR(DV3) ~= ADDR(NIL)
+        THEN DATA_VEC(2) = DV3;
+     IF ADDR(DV4) ~= ADDR(NIL)
+        THEN DATA_VEC(3) = DV4;
+     IF ADDR(DV5) ~= ADDR(NIL)
+        THEN DATA_VEC(4) = DV5;
+     IF ADDR(DV6) ~= ADDR(NIL)
+        THEN DATA_VEC(5) = DV6;
+     IF ADDR(DV7) ~= ADDR(NIL)
+        THEN DATA_VEC(6) = DV7;
+     IF ADDR(DV8) ~= ADDR(NIL)
+        THEN DATA_VEC(7) = DV8;
+     IF ADDR(DV9) ~= ADDR(NIL)
+        THEN DATA_VEC(8) = DV9;
+     IF ADDR(DV10) ~= ADDR(NIL)
+        THEN DATA_VEC(9) = DV10;
+     IF ADDR(DV11) ~= ADDR(NIL)
+        THEN DATA_VEC(10) = DV11;
+     IF ADDR(DV12) ~= ADDR(NIL)
+        THEN DATA_VEC(11) = DV12;
+     IF ADDR(DV13) ~= ADDR(NIL)
+        THEN DATA_VEC(12) = DV13;
+     IF ADDR(DV14) ~= ADDR(NIL)
+        THEN DATA_VEC(13) = DV14;
+     IF ADDR(DV15) ~= ADDR(NIL)
+        THEN DATA_VEC(14) = DV15;
+     I = 0;
+     DO WHILE(DATA_VEC(I) ~= VECTOR(NIL));
+        I = I + 1;
+        END;
+     FDS.NVECS# = I;
+     FDS.BUF_.BOUND = M$LO$->F$DCB.WIDTH#;
+     IF (FDS.BUF_.BOUND = 0 OR FDS.BUF_.BOUND > 132)
+     THEN FDS.BUF_.BOUND = 132;
+     CALL X$FORMAT(FDS);
+END MODEL$WRITE;
+%EOD;
+/*M* MODEL$SPYDOT - EDIT ROUTINE FOR MODEL PROCESSOR */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+MODEL$SPYDOT: PROC(FDS,CNT);
+%INCLUDE XU_FORMAT_C;
+%F_FDS (NAME=FDS,STCLASS="");
+DCL CNT(0:3) SBIN;
+DCL BUFFER CHAR(FDS.BUFSIZE) BASED(FDS.BUF_.BUF$);
+DCL I SBIN;
+/**/
+        CALL INDEX1R(I,' ',SUBSTR(BUFFER,FDS.FIELDX,FDS.FWID)) ALTRET(NODOT);
+        CALL INSERT(BUFFER,I+FDS.FIELDX,1,'.');
+NODOT:  RETURN;
+END MODEL$SPYDOT;

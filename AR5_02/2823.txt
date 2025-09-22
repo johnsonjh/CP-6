@@ -1,0 +1,708 @@
+
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:1    
+        1        1        /*T***********************************************************/
+        2        2        /*T*                                                         */
+        3        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+        4        4        /*T*                                                         */
+        5        5        /*T***********************************************************/
+        6        6        /*
+        7        7         * CP-6 C heap routines.
+        8        8         *
+        9        9         * Based on the boundary tag method as described by Donald E Knuth and
+       10       10         * Ellis Horowitz and Sahni.
+       11       11         *
+       12       12         * This system allocates all memory from the dynamic segment creating
+       13       13         * structures of the following form:
+       14       14         *
+       15       15         *                structure
+       16       16         *                   PTR*     Left_Link;
+       17       17         *                   PTR*     Right_Link;
+       18       18         *                   INTEGER  Size;          -- stored as a 2^n value
+       19       19         *                   BIT      Flags [36];    -- includes a TAG field and
+       20       20         *                                           -- a PROTECTED field.  The
+       21       21         *                                           -- other fields are for padding
+       22       22         *                   CHAR     Data [Size];   -- A block of data
+       23       23         *                   PTR*     Up_Link;       -- Required for the boundary tag method
+       24       24         *                   BIT      Flags [36];    -- The same flags (only really need
+       25       25         *                                           -- ONE bit, but this is simpler!)
+       26       26         *                endstructure
+       27       27         *
+       28       28         * OK, a quicky explanation:  What we allocate is a left and right pointer
+       29       29         * to other unallocated data.  The Size is the size of the unallocated
+       30       30         * block and the Up_Link is the pointer which points back UP to the top
+       31       31         * of the structure.  As well, there are a set of flags (36 reserved bits)
+       32       32         * which can be used for whatever the SYSTEMS programmer wishes.  These
+       33       33         * are NOT visible to the user.
+       34       34         *
+       35       35         * This, of course, leads us to reserving 4 words before the block of data
+       36       36         * and 2 words after.  However, in most cases this will not impact heavily
+       37       37         * upon memory usage since in most cases allocated memory is greater than
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:2    
+       38       38         * 6 words.  Also, it is hoped, by examining the method in which CP-6
+       39       39         * allocates data, to shrink the above information down to 3 words, whereby
+       40       40         * the information would be stored as follows:
+       41       41         *
+       42       42         *            35   (16 bits)   19    (20 bits)    0
+       43       43         *             +---------------+------------------+
+       44       44         *             |     Size      |   Left Pointer   |      Word 1
+       45       45         *             +---------------+------------------+
+       46       46         *
+       47       47         *            35   (16 bits)   19    (20 bits)    0
+       48       48         *             +---------------+------------------+
+       49       49         *             |     Flags     |  Right Pointer   |      Word 2
+       50       50         *             +---------------+------------------+
+       51       51         *
+       52       52         *                             :
+       53       53         *
+       54       54         *                        D  A  T  A                     Words 3 .. n-1
+       55       55         *
+       56       56         *                             :
+       57       57         *
+       58       58         *            35   (16 bits)   19    (20 bits)    0
+       59       59         *             +---------------+------------------+
+       60       60         *             |     Flags     |    Up Pointer    |      Word n
+       61       61         *             +---------------+------------------+
+       62       62         *
+       63       63         *
+       64       64         * Of course we then have to limit the size of an allocated block to
+       65       65         * 64k (eeek!  Shades of MS-DOS (CP/M???)).  However, this method is
+       66       66         * there just as an example of what MAY be possible to shrink the size
+       67       67         * of the reserved word space required.  It may NOT be feasible...
+       68       68         *
+       69       69         */
+       70       70
+       71       71
+       72       72        xbi$vmalloc: PROC (Size_In_Bytes, Result);
+       73       73           /*I*  NAME: XBI$VMALLOC
+       74       74                 CALL: CALL XBI$VMALLOC (size_in_bytes, result);
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:3    
+       75       75                 INPUT:   size_in_bytes  UBIN;
+       76       76                 OUTPUT:  result         PTR;
+       77       77                 DESCRIPTION: finds a block of memory size_in_bytes large in the
+       78       78                    heap and returns a pointer to it in result.  If size_in_bytes
+       79       79                    is zero, or memory is unavailable, a nil pointer is returned.
+       80       80           */
+       81       81
+       82       82           %INCLUDE CP_6;
+       83     5642           %INCLUDE xb_vheap_i6;
+       84     5715           %INCLUDE xb_heap_i6;
+       85     5790           %INCLUDE xb_error_numbers_i6;
+       86     5837
+       87     5838    1      DCL Size_In_Bytes          UBIN;
+       88     5839    1      DCL Result                 PTR;
+       89     5840
+       90     5841    1      DCL Size_In_Words          UBIN;
+       91     5842    1      DCL p                      PTR;
+       92     5843    1      DCL Tail_P                 PTR;
+       93     5844    1      DCL Old_Size               SBIN;
+       94     5845    1      DCL difference             SBIN;
+       95     5846    1      DCL epsilon         CONSTANT SBIN INIT (4);
+              5846               /* so we can easily modify it from DELTA */
+       96     5847    1      DCL space_needed           SBIN;
+       97     5848    1      DCL string                 char(80)    based;
+       98     5849
+       99     5850    1      DCL XBI$VFRAME             ENTRY(3);
+      100     5851    1      DCL XBI_SET_ERRNO          ENTRY (1);
+      101     5852    1      DCL XBI$VFREE              ENTRY (1);
+      102     5853
+      103     5854           %VLP_ERRCODE (FPTN=XB$ERR$NO_MEMORY_FOR_VMALLOC, STCLASS="CONSTANT SYMDEF",
+      104     5855                         FCG='XB', MID='I', ERR#="E$NO_MEMORY_FOR_VMALLOC", SEV=7);
+      105     5900           %VLP_ERRCODE (FPTN=XB$ERR$MEMORY_REQ_TOO_BIG, STCLASS="CONSTANT SYMDEF",
+      106     5901                         FCG='XB', MID='I', ERR#="E$MEMORY_REQ_TOO_BIG", SEV=7);
+      107     5946
+      108     5947           %HEAP_VIRT_SYMREF;
+      109     5967
+      110     5968
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:4    
+      111     5969           /*
+      112     5970            * Allocate (n: Integer; p: PTR)
+      113     5971            *
+      114     5972            * Use next fit to allocate a block of memory of size at least n, n > 0.
+      115     5973            * The available space list is maintained as described above and it is
+      116     5974            * assumed that no blocks of size < epsilon are to be retained.  p is
+      117     5975            * set to be the address of the first word in the block allocated.  AV
+      118     5976            * points to a node on the available list.
+      119     5977            */
+      120     5978
+      121     5979           /*
+      122     5980            * p is based onto Free_Block (looks like Heap)
+      123     5981            * We start the search for an appropriate free block at p which
+      124     5982            * is actually the Heap's right link
+      125     5983            */
+      126     5984
+      127     5985    1      Size_In_Words = (Size_In_Bytes + 3) / 4 + sizew (head) + sizew (tail);
+      128     5986
+      129     5987           /* we'll be conservative and make sure all blocks are double word
+      130     5988              aligned. */
+      131     5989
+      132     5990    1      Size_In_Words = Size_In_Words + mod(Size_In_Words, 2);
+      133     5991
+      134     5992    1      if (~XBI$VIRT_Allocation_Heap.Initialized)
+      135     5993    2      then do;
+      136     5994    2         result = ADDR(NIL);
+      137     5995    2         return;
+      138     5996    2      END;
+      139     5997
+      140     5998    1      if (Size_in_Words > (256 * 1024 - sizew(HEAD) - sizew (tail)))
+      141     5999    2      then do;
+      142     6000           /*E* ERROR: XBI-E$MEMORY_REQ_TOO_BIG-C
+      143     6001                MESSAGE: A call to vmalloc, vcalloc or vrealloc failed because you have
+      144     6002         requested a memory size larger than the machines addressing capabilities.
+      145     6003           */
+      146     6004    2            call XBI_SET_ERRNO (XB$ERR$MEMORY_REQ_TOO_BIG);
+      147     6005    2         result = ADDR(NIL);
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:5    
+      148     6006    2         return;
+      149     6007    2      END;
+      150     6008
+      151     6009    1   try_again:
+      152     6010    1      if XBI$VIRT_AV = ADDR(NIL) then
+      153     6011    1         p = ADDR(NIL);
+      154     6012    2      else do;
+      155     6013    2         p = XBI$VIRT_AV;                           /* begin search at p */
+      156     6014
+      157     6015    3         do until (p = XBI$VIRT_AV);
+      158     6016    3            if (p->Head.Size >= Size_In_Words)
+      159     6017    3            then                                            /* block is big enough */
+      160     6018    4               do;
+      161     6019    5                  do inhibit;
+      162     6020    5                     difference = p->Head.Size - Size_In_Words;
+      163     6021
+      164     6022    5                     if difference < (epsilon + SIZEW(Head) + SIZEW(Tail))
+      165     6023    5                     then                                    /* allocate whole block */
+      166     6024    6                        do;
+      167     6025                                /*
+      168     6026                                 * Delete node from available list
+      169     6027                                 */
+      170     6028
+      171     6029    6                           p->Head.Left_Link->Head.Right_Link = p->Head.Right_Link;
+      172     6030    6                           p->Head.Right_Link->Head.Left_Link = p->Head.Left_Link;
+      173     6031
+      174     6032    6                           p->Head.Flags.Tag = '1'B;                 /* set tags */
+      175     6033    6                           p->Head.Flags.Stamp = 88;
+      176     6034
+      177     6035                                /*
+      178     6036                                 * set starting point of next search
+      179     6037                                 */
+      180     6038
+      181     6039    6                           XBI$VIRT_AV = p->Head.Left_Link;
+      182     6040                                /* free list may be exhausted */
+      183     6041    6                           IF XBI$VIRT_AV = p THEN XBI$VIRT_AV = ADDR(NIL);
+      184     6042    6                           Result = PINCRW (p, SIZEW (Head));
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:6    
+              6042                                    /* point past data block */
+      185     6043    6                           return;
+      186     6044    6                        end;
+      187     6045    5                     else
+      188     6046    6                        do;
+      189     6047    6                           XBI$VIRT_AV = p;                  /* posn for next search */
+      190     6048
+      191     6049                                /*
+      192     6050                                 * Allocate *LOWER* n words
+      193     6051                                 */
+      194     6052
+      195     6053    6                           p->Head.Size       = difference;
+      196     6054    6                           Tail_p             = PINCRW (p, difference - SIZEW (Tail));
+      197     6055    6                           Tail_p->Tail.Up_Link = p;
+      198     6056
+      199     6057
+      200     6058    6                           p = PINCRW (p, difference);      /* set to point one past */
+      201     6059
+      202     6060    6                           p->Head.Size = Size_In_Words;
+      203     6061    6                           p->Head.Flags       = '0'B;
+      204     6062    6                           p->Head.Flags.Tag   = '1'B;
+      205     6063    6                           p->Head.Flags.Stamp = 88;
+      206     6064    6                           p->Head.Left_Link = ADDR(NIL);
+      207     6065    6                           p->Head.Right_Link = ADDR(NIL);
+      208     6066
+      209     6067    6                           Tail_p = PINCRW (p, Size_In_Words - SIZEW(Tail));
+      210     6068    6                           Tail_p -> Tail.Up_Link = p;
+      211     6069
+      212     6070    6                           Result = PINCRW (p, SIZEW (Head));
+              6070                                    /* point past data block */
+      213     6071    6                           return;
+      214     6072    6                        end;
+      215     6073    5                  end /* inhibit */;
+      216     6074    4               end;
+      217     6075
+      218     6076    3            p = p->Head.Right_Link;
+      219     6077    3         end;
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:7    
+      220     6078    2      end;
+      221     6079
+      222     6080           /*
+      223     6081            * no block large enough
+      224     6082            *
+      225     6083            * If there is nothing left to allocate (i.e. p is NIL)
+      226     6084            * then try to get the next virtual segment of memory from CP-6.
+      227     6085            */
+      228     6086    1      if (XBI$VIRT_ASCUR >= XBI$VIRT_Allocation_Heap.Heap_.Size#)
+      229     6087    1      then
+      230     6088    2         do;
+      231     6089           /*E* ERROR: XBI-E$NO_MEMORY_FOR_VMALLOC-C
+      232     6090                MESSAGE: A call to vmalloc, vcalloc or vrealloc failed because you have
+      233     6091         reached the limit of the virtual heap you allocated.  Try allocating
+      234     6092         a larger virtual segment.
+      235     6093           */
+      236     6094    2            call XBI_SET_ERRNO (XB$ERR$NO_MEMORY_FOR_VMALLOC);
+      237     6095    2            result = ADDR(NIL);
+      238     6096    2            return;
+      239     6097    2         end;
+      240     6098    1      CALL XBI$VFRAME (XBI$VIRT_Allocation_Heap.Heap_.Base$->string,
+      241     6099    1                       XBI$VIRT_ASCUR, XBI$VIRT_LAST_ASPTR$);
+      242     6100
+      243     6101    1      p = XBI$VIRT_LAST_ASPTR$;
+      244     6102    1      XBI$VIRT_ASCUR = XBI$VIRT_ASCUR + 1;
+      245     6103    1      XBI$VIRT_ASINFO$->ASINFO.CURSEGS = XBI$VIRT_ASCUR;
+      246     6104    1      XBI$VIRT_ASINFO$->ASINFO.ASPTR$(XBI$VIRT_ASCUR-1) = XBI$VIRT_LAST_ASPTR$;
+      247     6105
+      248     6106
+      249     6107           /*
+      250     6108            * Now link this into the existing memory map so that the
+      251     6109            * tags and other structures exist.
+      252     6110            */
+      253     6111
+      254     6112
+      255     6113           /*
+      256     6114            * set the appropriate variables so that this block can be
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:8    
+      257     6115            * quickly reclaimed when free'd
+      258     6116            */
+      259     6117
+      260     6118    2      do inhibit;
+      261     6119    2         p->Head.Right_Link      = ADDR (NIL);
+      262     6120    2         p->Head.Left_Link       = ADDR (NIL);
+      263     6121    2         p->Head.Size            = 256 * 1024;
+      264     6122    2         p->Head.Flags           = '0'B;       /* not in use */
+      265     6123    2         p->Head.Flags.Stamp     = 88;          /* in use (else it won't be freed!) */
+      266     6124
+      267     6125    2         Tail_p = PINCRW (p, p->Head.Size - SIZEW(Tail));
+      268     6126
+      269     6127    2         Tail_p->Tail.Up_Link         = p;    /* for quick reclaim */
+      270     6128
+      271     6129    2         XBI$VIRT_Last_AV = PINCRW (Tail_p, SIZEW (Tail));
+              6129                  /* remember the *last* alloc!! */
+      272     6130    2      end /* inhibit */;
+      273     6131
+      274     6132    1      call xbi$vfree (PINCRW (p, SIZEW(Head)));  /* link new block into free list */
+      275     6133    1      goto try_again;     /* Ugh... backwards goto!  Minus 20 points for style! */
+      276     6134    1   END xbi$vmalloc;
+      277     6135        %EOD;
+
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:9    
+--  Include file information  --
+
+   xb_error_numbers_i6.:XBC3TOU  is referenced.
+   xb_heap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   xb_vheap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI$VMALLOC.
+
+   Procedure XBI$VMALLOC requires 171 words for executable code.
+   Procedure XBI$VMALLOC requires 16 words of local(AUTO) storage.
+
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:10   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:11   
+          MINI XREF LISTING
+
+ASINFO.ASPTR$
+      5710**DCL      6104<<ASSIGN
+ASINFO.CURSEGS
+      5709**DCL      6103<<ASSIGN
+DIFFERENCE
+      5845**DCL      6020<<ASSIGN   6022>>IF       6053>>ASSIGN   6054>>ASSIGN   6058>>ASSIGN
+EPSILON
+      5846**DCL      6022>>IF
+HEAD
+      5768**DCL      5985--ASSIGN   5998--IF       6022--IF       6042--ASSIGN   6070--ASSIGN   6132--CALL
+HEAD.FLAGS
+      5772**DCL      6061<<ASSIGN   6122<<ASSIGN
+HEAD.FLAGS.STAMP
+      5779**DCL      6033<<ASSIGN   6063<<ASSIGN   6123<<ASSIGN
+HEAD.FLAGS.TAG
+      5773**DCL      6032<<ASSIGN   6062<<ASSIGN
+HEAD.LEFT_LINK
+      5769**DCL      6029>>ASSIGN   6030<<ASSIGN   6030>>ASSIGN   6039>>ASSIGN   6064<<ASSIGN   6120<<ASSIGN
+HEAD.RIGHT_LINK
+      5770**DCL      6029<<ASSIGN   6029>>ASSIGN   6030>>ASSIGN   6065<<ASSIGN   6076>>ASSIGN   6119<<ASSIGN
+HEAD.SIZE
+      5771**DCL      6016>>IF       6020>>ASSIGN   6053<<ASSIGN   6060<<ASSIGN   6121<<ASSIGN   6125>>ASSIGN
+P
+      5842**DCL      6011<<ASSIGN   6013<<ASSIGN   6015>>DOUNTIL  6016>>IF       6020>>ASSIGN   6029>>ASSIGN
+      6029>>ASSIGN   6030>>ASSIGN   6030>>ASSIGN   6032>>ASSIGN   6033>>ASSIGN   6039>>ASSIGN   6041>>IF
+      6042>>ASSIGN   6047>>ASSIGN   6053>>ASSIGN   6054>>ASSIGN   6055>>ASSIGN   6058<<ASSIGN   6058>>ASSIGN
+      6060>>ASSIGN   6061>>ASSIGN   6062>>ASSIGN   6063>>ASSIGN   6064>>ASSIGN   6065>>ASSIGN   6067>>ASSIGN
+      6068>>ASSIGN   6070>>ASSIGN   6076<<ASSIGN   6076>>ASSIGN   6101<<ASSIGN   6119>>ASSIGN   6120>>ASSIGN
+      6121>>ASSIGN   6122>>ASSIGN   6123>>ASSIGN   6125>>ASSIGN   6125>>ASSIGN   6127>>ASSIGN   6132>>CALL
+RESULT
+      5839**DCL        72--PROC     5994<<ASSIGN   6005<<ASSIGN   6042<<ASSIGN   6070<<ASSIGN   6095<<ASSIGN
+SIZE_IN_BYTES
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:12   
+      5838**DCL        72--PROC     5985>>ASSIGN
+SIZE_IN_WORDS
+      5841**DCL      5985<<ASSIGN   5990<<ASSIGN   5990>>ASSIGN   5990>>ASSIGN   5998>>IF       6016>>IF
+      6020>>ASSIGN   6060>>ASSIGN   6067>>ASSIGN
+STRING
+      5848**DCL      6098<>CALL
+TAIL
+      5781**DCL      5985--ASSIGN   5998--IF       6022--IF       6054--ASSIGN   6067--ASSIGN   6125--ASSIGN
+      6129--ASSIGN
+TAIL.UP_LINK
+      5782**DCL      6055<<ASSIGN   6068<<ASSIGN   6127<<ASSIGN
+TAIL_P
+      5843**DCL      6054<<ASSIGN   6055>>ASSIGN   6067<<ASSIGN   6068>>ASSIGN   6125<<ASSIGN   6127>>ASSIGN
+      6129>>ASSIGN
+TRY_AGAIN
+      6010**LABEL    6133--GOTO
+XB$ERR$MEMORY_REQ_TOO_BIG
+      5913**DCL      6004<>CALL
+XB$ERR$NO_MEMORY_FOR_VMALLOC
+      5867**DCL      6094<>CALL
+XBI$VFRAME
+      5850**DCL-ENT  6098--CALL
+XBI$VFREE
+      5852**DCL-ENT  6132--CALL
+XBI$VIRT_ALLOCATION_HEAP.HEAP_.BASE$
+      5961**DCL      5962--REDEF    6098>>CALL
+XBI$VIRT_ALLOCATION_HEAP.HEAP_.SIZE#
+      5959**DCL      6086>>IF
+XBI$VIRT_ALLOCATION_HEAP.INITIALIZED
+      5965**DCL      5992>>IF
+XBI$VIRT_ASCUR
+      5948**DCL      6086>>IF       6098<>CALL     6102<<ASSIGN   6102>>ASSIGN   6103>>ASSIGN   6104>>ASSIGN
+XBI$VIRT_ASINFO$
+      5953**DCL      6103>>ASSIGN   6104>>ASSIGN
+XBI$VIRT_AV
+      5954**DCL      6010>>IF       6013>>ASSIGN   6015>>DOUNTIL  6039<<ASSIGN   6041>>IF       6041<<ASSIGN
+PL6.E3A0      #001=XBI$VMALLOC File=xbi_valloc:6.:XBC3TSI                        FRI 01/06/95 11:18 Page:13   
+      6047<<ASSIGN
+XBI$VIRT_LAST_ASPTR$
+      5949**DCL      5950--REDEF    6098<>CALL     6101>>ASSIGN   6104>>ASSIGN
+XBI$VIRT_LAST_AV
+      5956**DCL      6129<<ASSIGN
+XBI_SET_ERRNO
+      5851**DCL-ENT  6004--CALL     6094--CALL
+
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:14   
+      278        1        /*T***********************************************************/
+      279        2        /*T*                                                         */
+      280        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+      281        4        /*T*                                                         */
+      282        5        /*T***********************************************************/
+      283        6
+      284        7        xbi$vfree: PROC (A$);
+      285        8           /*I*  NAME: XBI$VFREE
+      286        9                 CALL: CALL XBI$VFREE (A$);
+      287       10                 INPUT: A$ PTR;
+      288       11                 DESCRIPTION: If A$ is a pointer into the heap and the Protected flag
+      289       12                    is not set, the block of storage
+      290       13                    it points to is deallocated and added to the free list.  If A$ is
+      291       14                    null or doesn't point into the heap nothing is done.
+      292       15           */
+      293       16
+      294       17           %INCLUDE CP_6;
+      295     5577           %INCLUDE xb_vheap_i6;
+      296     5650           %INCLUDE xb_heap_i6;
+      297     5725           %INCLUDE xb_error_numbers_i6;
+      298     5772
+      299     5773    1      DCL A$                     PTR;
+      300     5774    1      DCL 1 A$_exposed REDEF A$,
+      301     5775    1         2  Word_Offset          UBIN (24) UNAL,
+      302     5776    1         2  Segid                UBIN (12) UNAL;
+      303     5777
+      304     5778    1      DCL p                      PTR;
+      305     5779    1      DCL 1 p_exposed REDEF p,
+      306     5780    1         2  Word_Offset          UBIN (24) UNAL,
+      307     5781    1         2  Segid                UBIN (12) UNAL;
+      308     5782    1      DCL Tail_p                 PTR;
+      309     5783    1      DCL n                      SBIN;
+      310     5784    1      DCL Next_p                 PTR;
+      311     5785    1      DCL 1 Next_p_exposed REDEF Next_p,
+      312     5786    1         2  word_offset          UBIN (24) UNAL,
+      313     5787    1         2  segid                UBIN (12) UNAL;
+      314     5788    1      DCL Prev_p                 PTR;
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:15   
+      315     5789    1      DCL 1 Prev_p_exposed REDEF Prev_p,
+      316     5790    1         2  word_offset          UBIN (24) UNAL,
+      317     5791    1         2  segid                UBIN (12) UNAL;
+      318     5792    1      DCL Next_Tail              PTR;
+      319     5793    1      DCL Prev_Tail              PTR;
+      320     5794    1      DCL Next_Tag               BIT (1);
+      321     5795    1      DCL Prev_Tag               BIT (1);
+      322     5796    1      DCL XBI_SET_ERRNO          ENTRY (1);
+      323     5797    1      DCL XB_IO_ERROR            ENTRY;
+      324     5798           %VLP_ERRCODE (FPTN=XB$ERR$BAD_VMEMORY_STACK, STCLASS="CONSTANT SYMDEF",
+      325     5799                         FCG='XB', MID='I', ERR#="E$BAD_VMEMORY_STACK", SEV=7);
+      326     5844
+      327     5845           %HEAP_VIRT_SYMREF;
+      328     5865
+      329     5866    1      if A$ = ADDR(NIL) then return;
+      330     5867
+      331     5868           /* Ignore requests to free things that are not in the heap.  This also
+      332     5869              serves as a test for the null pointer.
+      333     5870           */
+      334     5871    1      IF (A$_exposed.segid < %XBI$VIRT_MIN_AS) OR
+      335     5872    2         (A$_exposed.segid > XBI$LAST_ASPTR$_exposed.segid) THEN DO;
+      336     5873    2         RETURN;
+      337     5874    2      END;
+      338     5875
+      339     5876    1      p = PINCRW (A$, -SIZEW (Head));    /* set to point to allocation data */
+      340     5877
+      341     5878    1      if p -> Head.Flags.Protected then return; /* don't free if block is protected */
+      342     5879
+      343     5880           /* something's funny if the Stamp field doesn't contain the magic value */
+      344     5881    1      if p -> Head.Flags.Stamp ~= 88 then return;
+      345     5882
+      346     5883           /* clear the Stamp field */
+      347     5884
+      348     5885    1      p -> Head.Flags.Stamp = 0;
+      349     5886
+      350     5887           /*
+      351     5888            * p (passed as an argument to free) points to the block to be
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:16   
+      352     5889            * freed.  We use a based structure to look at it more elegantly
+      353     5890            */
+      354     5891
+      355     5892    1      n = p->Head.Size;
+      356     5893
+      357     5894    2      DO INHIBIT;
+      358     5895        /*    If p's word offset is 0 it means that the pointer is at the
+      359     5896              beginning of a virtual segment therefore it can't have a prev
+      360     5897              block.  To determine if the guy has a next block is a little
+      361     5898              trickier.  After incrementing next by the number of words,
+      362     5899              if p was at an end of a segment next will contain a word
+      363     5900              offset of 0.  This is do to wraparound.                       */
+      364     5901
+      365     5902    2         if (p_exposed.Word_Offset = %XBI$VIRT_SEG_BOUND)
+      366     5903    2         then
+      367     5904    3            do;
+      368     5905    3               Prev_Tail     = ADDR(NIL);
+      369     5906    3               Prev_p        = ADDR(NIL);
+      370     5907    3               Prev_Tag      = '1'B;
+      371     5908    3            end;
+      372     5909    2         else
+      373     5910    3            do;
+      374     5911    3               Prev_Tail     = PINCRW (p, -SIZEW (Tail));
+      375     5912    3               Prev_p        = Prev_Tail -> Tail.Up_Link;
+      376     5913    3               if Prev_p_exposed.segid ~= A$_exposed.segid then
+      377     5914    3                  Prev_Tag = '1'B;
+      378     5915    3               else
+      379     5916    3                  Prev_Tag      = Prev_p -> Head.Flags.Tag;
+      380     5917    3            end;
+      381     5918    2         Next_p = PINCRW (p, n);
+      382     5919    2         if (Next_p_exposed.Word_Offset =%XBI$VIRT_SEG_BOUND)
+      383     5920    2         then
+      384     5921    2            Next_Tag = '1'B;
+      385     5922    2         else if Next_p_exposed.segid ~= A$_exposed.segid then
+      386     5923    2            Next_Tag = '1'B;
+      387     5924    2         else
+      388     5925    2            Next_Tag = Next_p -> Head.Flags.Tag;
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:17   
+      389     5926
+      390     5927    2         if Prev_Tag and Next_Tag
+      391     5928    2         then
+      392     5929    3            do;
+      393     5930                    /*
+      394     5931                     * Both adjacent blocks are in use
+      395     5932                     */
+      396     5933
+      397     5934    3               p->Head.Flags.Tag          = '0'B;
+      398     5935
+      399     5936                    /* The free list may be empty... */
+      400     5937    3               if XBI$VIRT_AV = ADDR(NIL)
+      401     5938    3               then
+      402     5939    4                  do;
+      403     5940    4                     XBI$VIRT_AV = p;
+      404     5941    4                     p -> Head.Right_Link = p;
+      405     5942    4                     p -> Head.Left_Link = p;
+      406     5943    4                  end;
+      407     5944    3               else
+      408     5945    4                  do;
+      409     5946                          /*
+      410     5947                           * Insert at right of AV
+      411     5948                           */
+      412     5949
+      413     5950    4                     p->Head.Left_Link  = XBI$VIRT_AV;
+      414     5951    4                     p->Head.Right_Link = XBI$VIRT_AV->Head.Right_Link;
+      415     5952
+      416     5953    4                     p->Head.Right_Link->Head.Left_Link = p;
+      417     5954    4                     XBI$VIRT_AV->Head.Right_Link                = p;
+      418     5955    4                  end;
+      419     5956    3            end;
+      420     5957    2         else if ~Prev_Tag and Next_Tag
+      421     5958    2         then
+      422     5959    3            do;
+      423     5960                    /*
+      424     5961                     * Only the left block is free
+      425     5962                     */
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:18   
+      426     5963
+      427     5964    3               Prev_p -> Head.Size = Prev_p->Head.Size + n;
+      428     5965    4               if (XBI$VIRT_AV = addr (NIL)) then do;
+      429     5966    4                  call XBI_SET_ERRNO (XB$ERR$BAD_VMEMORY_STACK);
+      430     5967    4                  call XB_IO_ERROR;
+      431     5968    4               end;
+      432     5969    3               Tail_p = PINCRW (p, n - SIZEW (Tail));
+      433     5970    3               Tail_p -> Tail.Up_Link = Prev_P;
+      434     5971    3             end;
+      435     5972    2         else if Prev_Tag and ~Next_Tag
+      436     5973    2         then
+      437     5974    3            do;
+      438     5975                    /*
+      439     5976                     * Only right adjacent block is free
+      440     5977                     */
+      441     5978
+      442     5979    4               if (XBI$VIRT_AV = addr (NIL)) then do;
+      443     5980           /*E* ERROR: XBI-E$BAD_VMEMORY_STACK-C
+      444     5981                MESSAGE: The memory heap is malformed, possibly due to assigning values
+      445     5982           past the requested allocated area.
+      446     5983           */
+      447     5984    4                  call XBI_SET_ERRNO (XB$ERR$BAD_VMEMORY_STACK);
+      448     5985    4                  call XB_IO_ERROR;
+      449     5986    4               end;
+      450     5987    3               Prev_p = Next_p->Head.Right_Link;
+      451     5988    3               Next_p->Head.Left_Link->Head.Right_Link = p;
+              5988                        /* Replace block beginning */
+      452     5989    3               Prev_p->Head.Left_Link = p;  /* at p + n by one */
+      453     5990    3               if (XBI$VIRT_AV = Next_p)
+      454     5991    3               then
+      455     5992    3                  XBI$VIRT_AV = p;
+      456     5993
+      457     5994    3               p->Head.Left_Link  = Next_p->Head.Left_Link;  /* beginning at p */
+      458     5995    3               p->Head.Right_Link = Next_p->Head.Right_Link;
+      459     5996    3               p->Head.Size       = Next_p->Head.Size + n;
+      460     5997    3               p->Head.Flags.Tag        = '0'B;
+      461     5998
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:19   
+      462     5999    3               Tail_p = PINCRW (p, p->Head.size - SIZEW (Tail));
+      463     6000    3               Tail_p->Tail.Up_Link = p;
+      464     6001    3            end;
+      465     6002    2         else
+      466     6003    3            do;
+      467     6004                    /*
+      468     6005                     * both adjacent blocks are free
+      469     6006                     * delete right free block from AV list
+      470     6007                     */
+      471     6008
+      472     6009    3               Next_p->Head.Left_Link->Head.Right_Link = Next_p->Head.Right_Link;
+      473     6010    4               if (XBI$VIRT_AV = addr (NIL)) then do;
+      474     6011    4                  call XBI_SET_ERRNO (XB$ERR$BAD_VMEMORY_STACK);
+      475     6012    4                  call XB_IO_ERROR;
+      476     6013    4               end;
+      477     6014    3               Next_p->Head.Right_Link->Head.Left_Link = Next_p->Head.Left_Link;
+      478     6015    3               if (XBI$VIRT_AV = Next_p)
+      479     6016    3               then
+      480     6017    3                  XBI$VIRT_AV = Prev_p;
+      481     6018    3               Prev_p -> Head.Size = Prev_p->Head.Size + n + Next_p -> Head.Size;
+      482     6019    3               Prev_Tail = PINCRW (Prev_p, Prev_p -> Head.Size - SIZEW (Tail));
+      483     6020    3               Prev_Tail -> Tail.Up_link = Prev_p;
+      484     6021    3            end;
+      485     6022    2      END /* INHIBIT */;
+      486     6023    1   END xbi$vfree;
+
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:20   
+--  Include file information  --
+
+   xb_error_numbers_i6.:XBC3TOU  is referenced.
+   xb_heap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   xb_vheap_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   CP_6_C.:LIB_E04  is referenced.
+   CP_6.:LIB_E04  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI$VFREE.
+
+   Procedure XBI$VFREE requires 216 words for executable code.
+   Procedure XBI$VFREE requires 16 words of local(AUTO) storage.
+
+    No errors detected in file xbi_valloc:6.:XBC3TSI    .
+
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:21   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:22   
+          MINI XREF LISTING
+
+A$
+      5773**DCL         7--PROC     5774--REDEF    5866>>IF       5876>>ASSIGN
+A$_EXPOSED.SEGID
+      5776**DCL      5871>>IF       5871>>IF       5913>>IF       5922>>IF
+HEAD
+      5703**DCL      5876--ASSIGN
+HEAD.FLAGS.PROTECTED
+      5709**DCL      5878>>IF
+HEAD.FLAGS.STAMP
+      5714**DCL      5881>>IF       5885<<ASSIGN
+HEAD.FLAGS.TAG
+      5708**DCL      5916>>ASSIGN   5925>>ASSIGN   5934<<ASSIGN   5997<<ASSIGN
+HEAD.LEFT_LINK
+      5704**DCL      5942<<ASSIGN   5950<<ASSIGN   5953<<ASSIGN   5988>>ASSIGN   5989<<ASSIGN   5994<<ASSIGN
+      5994>>ASSIGN   6009>>ASSIGN   6014<<ASSIGN   6014>>ASSIGN
+HEAD.RIGHT_LINK
+      5705**DCL      5941<<ASSIGN   5951<<ASSIGN   5951>>ASSIGN   5953>>ASSIGN   5954<<ASSIGN   5987>>ASSIGN
+      5988<<ASSIGN   5995<<ASSIGN   5995>>ASSIGN   6009<<ASSIGN   6009>>ASSIGN   6014>>ASSIGN
+HEAD.SIZE
+      5706**DCL      5892>>ASSIGN   5964<<ASSIGN   5964>>ASSIGN   5996<<ASSIGN   5996>>ASSIGN   5999>>ASSIGN
+      6018<<ASSIGN   6018>>ASSIGN   6018>>ASSIGN   6019>>ASSIGN
+N
+      5783**DCL      5892<<ASSIGN   5918>>ASSIGN   5964>>ASSIGN   5969>>ASSIGN   5996>>ASSIGN   6018>>ASSIGN
+NEXT_P
+      5784**DCL      5785--REDEF    5918<<ASSIGN   5925>>ASSIGN   5987>>ASSIGN   5988>>ASSIGN   5990>>IF
+      5994>>ASSIGN   5995>>ASSIGN   5996>>ASSIGN   6009>>ASSIGN   6009>>ASSIGN   6014>>ASSIGN   6014>>ASSIGN
+      6015>>IF       6018>>ASSIGN
+NEXT_P_EXPOSED.SEGID
+      5787**DCL      5922>>IF
+NEXT_P_EXPOSED.WORD_OFFSET
+      5786**DCL      5919>>IF
+NEXT_TAG
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:23   
+      5794**DCL      5921<<ASSIGN   5923<<ASSIGN   5925<<ASSIGN   5927>>IF       5957>>IF       5972>>IF
+P
+      5778**DCL      5779--REDEF    5876<<ASSIGN   5878>>IF       5881>>IF       5885>>ASSIGN   5892>>ASSIGN
+      5911>>ASSIGN   5918>>ASSIGN   5934>>ASSIGN   5940>>ASSIGN   5941>>ASSIGN   5941>>ASSIGN   5942>>ASSIGN
+      5942>>ASSIGN   5950>>ASSIGN   5951>>ASSIGN   5953>>ASSIGN   5953>>ASSIGN   5954>>ASSIGN   5969>>ASSIGN
+      5988>>ASSIGN   5989>>ASSIGN   5992>>ASSIGN   5994>>ASSIGN   5995>>ASSIGN   5996>>ASSIGN   5997>>ASSIGN
+      5999>>ASSIGN   5999>>ASSIGN   6000>>ASSIGN
+PREV_P
+      5788**DCL      5789--REDEF    5906<<ASSIGN   5912<<ASSIGN   5916>>ASSIGN   5964>>ASSIGN   5964>>ASSIGN
+      5970>>ASSIGN   5987<<ASSIGN   5989>>ASSIGN   6017>>ASSIGN   6018>>ASSIGN   6018>>ASSIGN   6019>>ASSIGN
+      6019>>ASSIGN   6020>>ASSIGN
+PREV_P_EXPOSED.SEGID
+      5791**DCL      5913>>IF
+PREV_TAG
+      5795**DCL      5907<<ASSIGN   5914<<ASSIGN   5916<<ASSIGN   5927>>IF       5957>>IF       5972>>IF
+PREV_TAIL
+      5793**DCL      5905<<ASSIGN   5911<<ASSIGN   5912>>ASSIGN   6019<<ASSIGN   6020>>ASSIGN
+P_EXPOSED.WORD_OFFSET
+      5780**DCL      5902>>IF
+TAIL
+      5716**DCL      5911--ASSIGN   5969--ASSIGN   5999--ASSIGN   6019--ASSIGN
+TAIL.UP_LINK
+      5717**DCL      5912>>ASSIGN   5970<<ASSIGN   6000<<ASSIGN   6020<<ASSIGN
+TAIL_P
+      5782**DCL      5969<<ASSIGN   5970>>ASSIGN   5999<<ASSIGN   6000>>ASSIGN
+XB$ERR$BAD_VMEMORY_STACK
+      5811**DCL      5966<>CALL     5984<>CALL     6011<>CALL
+XBI$LAST_ASPTR$_EXPOSED.SEGID
+      5850**DCL      5871>>IF
+XBI$VIRT_ALLOCATION_HEAP.HEAP_.BASE$
+      5859**DCL      5860--REDEF
+XBI$VIRT_AV
+      5852**DCL      5937>>IF       5940<<ASSIGN   5950>>ASSIGN   5951>>ASSIGN   5954>>ASSIGN   5965>>IF
+      5979>>IF       5990>>IF       5992<<ASSIGN   6010>>IF       6015>>IF       6017<<ASSIGN
+XBI$VIRT_LAST_ASPTR$
+      5847**DCL      5848--REDEF
+PL6.E3A0      #002=XBI$VFREE File=xbi_valloc:6.:XBC3TSI                          FRI 01/06/95 11:18 Page:24   
+XBI_SET_ERRNO
+      5796**DCL-ENT  5966--CALL     5984--CALL     6011--CALL
+XB_IO_ERROR
+      5797**DCL-ENT  5967--CALL     5985--CALL     6012--CALL

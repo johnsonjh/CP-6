@@ -1,0 +1,219 @@
+
+
+CC.C03    File=zbe$il1_anal:c.:ZBC3TSI                                              Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: il1_anal.c,v 1.3 87/03/10 11:11:27 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /*  I N L I N E   S U B S T I T U T I O N
+        7         7              *
+        8         8              *  I L 1 _ A N A L . C
+        9         9              */
+       10        10
+       11        11             #include <stdio:h>
+       12        12             #include "types:h"
+       13        13             #include "il:h"
+       14        14             #include "debug:h"
+       15        15             #include "alloc:h"
+       16        16             #include "global:h"
+       17        17             #include "lset:h"
+       18        18             #include "aux:h"
+       19        19             #include "em_mnem:h"
+       20        20             #include "em_pseu:h"
+       21        21             #include "il1_aux:h"
+       22        22             #include "il1_formal:h"
+       23        23             #include "il1_cal:h"
+       24        24             #include "il1_anal:h"
+       25        25             #include "il_aux:h"
+       26        26             #include "put:h"
+       27        27
+       28        28             #define BODY_KNOWN(p)    (p->p_flags1 & (byte) PF_BODYSEEN)
+       29        29             #define ENVIRON(p)    (p->p_flags1 & (byte) PF_ENVIRON)
+       30        30             #define RETURN_BLOCK(b)     (Lnrelems(b->b_succ) == 0)
+       31        31             #define LAST_BLOCK(b)    (b->b_next == (bblock_p) 0)
+       32        32
+       33        33             /* Daisy chain recursion not yet accounted for: */
+       34        34             #define RECURSIVE(p)     (Cis_elem(p->p_id,p->p_calling))
+       35        35             /*
+       36        36             #define CALLS_UNKNOWN(p) (p->p_flags1 & (byte) PF_CALUNKNOWN)
+CC.C03    File=zbe$il1_anal:c.:ZBC3TSI                                              Fri Aug 22 1997  Page=2  
+       37        37             */
+       38        38             #define CALLS_UNKNOWN(p) (FALSE)
+       39        39
+       40        40
+       41        41
+       42        42             apriori(proctab)
+       43        43              proc_p proctab;
+       44        44             {
+       45        45    1         /* For every procedure, see if we can determine
+       46        46    1          * from the information provided by the previous
+       47        47    1          * phases of the optimizer that it cannot or should not
+       48        48    1          * be expanded in line. This will reduce the length
+       49        49    1          * of the call list.
+       50        50    1          */
+       51        51    1
+       52        52    1         register proc_p p;
+       53        53    1
+       54        54    1         for (p = proctab; p != (proc_p) 0; p = p->p_next) {
+       55        55    2          p->p_flags2 = 0;  /* this flag was set in ic_loopup, needs reset */
+       56        56    2            if (!BODY_KNOWN(p)  ||
+       57        57    2                 ENVIRON(p) || RECURSIVE(p) ||
+       58        58    2                 PARAMS_UNKNOWN(p) || MANY_LOCALS(p)) {
+       59        59    3                UNSUITABLE(p);
+       60        60    3        #ifdef VERBOSE
+       61        61   *S*              if (BODY_KNOWN(p)) {
+       62        62   *S*                 if (ENVIRON(p)) Senv++;
+       63        63   *S*                 if (RECURSIVE(p)) Srecursive++;
+       64        64   *S*                 if (MANY_LOCALS(p)) Slocals++;
+       65        65   *S*              }
+       66        66   *S*       #endif
+       67        67    3            }
+       68        68    2         }
+       69        69    1        }
+       70        70
+       71        71
+       72        72             STATIC check_labels(p,arglist)
+       73        73              proc_p p;
+CC.C03    File=zbe$il1_anal:c.:ZBC3TSI                                              Fri Aug 22 1997  Page=3  
+       74        74              arg_p arglist;
+       75        75             {
+       76        76    1         /* Check if any of the arguments contains an instruction
+       77        77    1          * label; if so, make p unsuitable.
+       78        78    1          */
+       79        79    1
+       80        80    1         arg_p arg;
+       81        81    1
+       82        82    1         for (arg = arglist; arg != (arg_p) 0; arg = arg->a_next) {
+       83        83    2            if (arg->a_type == ARGINSTRLAB) {
+       84        84    3               UNSUITABLE(p);
+       85        85    3        #ifdef VERBOSE
+       86        86   *S*              Sinstrlab++;
+       87        87   *S*       #endif
+       88        88    3               break;
+       89        89    3            }
+       90        90    2         }
+       91        91    1        }
+       92        92
+       93        93
+       94        94
+       95        95             STATIC anal_instr(p,b,cf)
+       96        96              proc_p   p;
+       97        97              bblock_p b;
+       98        98              FILE     *cf;
+       99        99             {
+      100       100    1         /* Analyze the instructions of block b
+      101       101    1          * within procedure p.
+      102       102    1          * See which parameters are used, changed
+      103       103    1          * or have their address taken. Recognize
+      104       104    1          * the actual parameter expressions of
+      105       105    1          * the CAL instructions.
+      106       106    1          */
+      107       107    1        proc_p  callee;
+      108       108    1
+      109       109    1         register line_p l;
+      110       110    1
+CC.C03    File=zbe$il1_anal:c.:ZBC3TSI                                              Fri Aug 22 1997  Page=4  
+      111       111    1         for (l = b->b_start; l != (line_p) 0; l = l->l_next) {
+      112       112    2            switch(INSTR(l)) {
+      113       113    3            case op_cal:
+      114       114    3               if (l->l_next != (line_p) 0) {
+      115       115    4                  if (INSTR(l->l_next) == op_lal || INSTR(l->l_next) == op_lol) {
+      116       116    5                     callee = PROC(l);
+      117       117    5                     UNSUITABLE (callee); }
+      118       118    4               }
+      119       119    3               anal_cal(p,l,b,cf);
+      120       120    3               break;
+      121       121    3            case op_stl:
+      122       122    3            case op_inl:
+      123       123    3            case op_del:
+      124       124    3            case op_zrl:
+      125       125    3               formal(p,b,off_set(l),SINGLE,CHANGE);
+      126       126    3               /* see if the local is a parameter.
+      127       127    3                * If so, it is a one-word parameter
+      128       128    3                * that is stored into.
+      129       129    3                */
+      130       130    3               break;
+      131       131    3            case op_sdl:
+      132       132    3               formal(p,b,off_set(l),DOUBLE,CHANGE);
+      133       133    3               break;
+      134       134    3            case op_lol:
+      135       135    3               formal(p,b,off_set(l),SINGLE,USE);
+      136       136    3               break;
+      137       137    3            case op_ldl:
+      138       138    3               formal(p,b,off_set(l),DOUBLE,USE);
+      139       139    3               break;
+      140       140    3            case op_sil:
+      141       141    3            case op_lil:
+      142       142    3               formal(p,b,off_set(l),POINTER,USE);
+      143       143    3               break;
+      144       144    3            case op_lal:
+      145       145    3               formal(p,b,off_set(l),UNKNOWN,ADDRESS);
+      146       146    3               break;
+      147       147    3            case ps_rom:
+CC.C03    File=zbe$il1_anal:c.:ZBC3TSI                                              Fri Aug 22 1997  Page=5  
+      148       148    3            case ps_con:
+      149       149    3            case ps_bss:
+      150       150    3            case ps_hol:
+      151       151    3               check_labels(p,ARG(l));
+      152       152    3               break;
+      153       153    3            }
+      154       154    2         }
+      155       155    1        }
+      156       156
+      157       157
+      158       158
+      159       159             anal_proc(p,cf,ccf)
+      160       160              proc_p p;
+      161       161              FILE   *cf,*ccf;
+      162       162             {
+      163       163    1         /* Analyze a procedure; use information
+      164       164    1          * stored in its basic blocks or in
+      165       165    1          * its instructions.
+      166       166    1          */
+      167       167    1
+      168       168    1         register bblock_p b;
+      169       169    1         bool     fallthrough = TRUE;
+      170       170    1
+      171       171    1         cchead = (calcnt_p) 0;
+      172       172    1         for (b = p->p_start; b != (bblock_p) 0; b = b->b_next) {
+      173       173    2            if (RETURN_BLOCK(b) && !LAST_BLOCK(b)) {
+      174       174    3               fallthrough = FALSE;
+      175       175    3               /* p contains a RET instruction somewhere
+      176       176    3                * in the middle of its code.
+      177       177    3                */
+      178       178    3            }
+      179       179    2            anal_instr(p,b,cf); /* analyze instructions */
+      180       180    2         }
+      181       181    1         if (fallthrough) {
+      182       182    2            p->p_flags2 |= PF_FALLTHROUGH;
+      183       183    2         }
+      184       184    1         rem_indir_acc(p);
+CC.C03    File=zbe$il1_anal:c.:ZBC3TSI                                              Fri Aug 22 1997  Page=6  
+      185       185    1         /* don't expand formal that may be accessed indirectly */
+      186       186    1         p->P_CCADDR = putcc(cchead,ccf);
+      187       187    1         /* write calcnt info and remember disk address */
+      188       188    1         remcc(cchead);
+      189       189    1        }
+      190       190
+---  Include file information  ---
+
+   stdio:h.:LIBRARY. is referenced
+   zbe$types:h.:ZBC3TOU. is referenced
+   zbe$il:h.:ZBC3TOU. is referenced
+   zbe$debug:h.:ZBC3TOU. is referenced
+   zbe$alloc:h.:ZBC3TOU. is referenced
+   zbe$global:h.:ZBC3TOU. is referenced
+   zbe$lset:h.:ZBC3TOU. is referenced
+   zbe$aux:h.:ZBC3TOU. is referenced
+   em_mnem:h.:ZBC3TOU. is referenced
+   em_pseu:h.:ZBC3TOU. is referenced
+   zbe$il1_aux:h.:ZBC3TOU. is referenced
+   zbe$il1_formal:h.:ZBC3TOU. is referenced
+   zbe$il1_cal:h.:ZBC3TOU. is referenced
+   zbe$il1_anal:h.:ZBC3TOU. is referenced
+   zbe$il_aux:h.:ZBC3TOU. is referenced
+   zbe$put:h.:ZBC3TOU. is referenced
+
+No diagnostics were issued in the file zbe$il1_anal:c.:ZBC3TSI

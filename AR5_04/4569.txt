@@ -1,0 +1,435 @@
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DDA */
+EVERY: PROC MAIN;
+ 
+%PLIST;
+%INCLUDE B$JIT;
+%INCLUDE B_ERRORS_C;
+%INCLUDE CP_6;
+  %B$ALT;
+  %B$TCB;
+%INCLUDE CP_6_SUBS;
+%INCLUDE XUD_UTS_M;
+  %XUD$UTS_ENTRIES;
+  %XUD_UTS_EQU;
+%FPT_OPEN    (FPTN=OPEN_DO,
+              DCB=M$DO,
+              ORG=TERMINAL );
+%FPT_WRITE   (FPTN=WRITE_LO,
+              DCB=M$LO,
+              BUF=LO_BUF);
+%FPT_WRITE   (FPTN=WRITE_DO,
+              DCB=M$DO,
+              BUF=DO_BUF);
+%FPT_YC      (FPTN=YC_FPT,
+              CMD=LINK_CMD,
+              LINK=YES );
+%FPT_INT     (FPTN=INT_FPT,
+              UENTRY=BREAK );
+%FPT_WAIT    (FPTN=SLEEP,
+              UNITS=10);
+%FPT_TIME    (FPTN=GET_TIME,
+              DATE=LO.DATE,
+              DEST=LOCAL,
+              TSTAMP=UTS,
+              TIME=LO.TIME);
+%FPT_DISPLAY (FPTN=DI_INFO,
+              RESULTS=DI);
+%VLR_DISPLAY (FPTN=DI);
+%FPT_ERRMSG  (FPTN=ERRMSG,
+              DCB=NIL,
+              BUF=ERR_MESG,
+              CODE=ERR_CODE,
+              OUTDCB1=M$DO);
+ 
+%EQU MESG0                   = 0;
+%EQU MESG1                   = 1;
+%EQU MESG2                   = 2;
+%EQU MESG3                   = 3;
+%EQU MESG4                   = 4;
+%EQU MESG5                   = 5;
+%EQU MESG6                   = 6;
+%EQU MESG7                   = 7;
+%EQU MESG8                   = 8;
+%EQU MESG9                   = 9;
+%EJECT;
+DCL ERR_CODE                 BIT(36)   STATIC;
+DCL I                        SBIN;
+DCL J                        SBIN;
+DCL INDX                     SBIN;
+DCL CMD_BEG                  SBIN;
+DCL NAME_BEG                 SBIN;
+DCL TIMES                    SBIN      STATIC;
+DCL NUM_TIMES                SBIN      STATIC   INIT(360);
+DCL BIN_NUM                  SBIN      STATIC;
+DCL INTERVAL                 UBIN      STATIC   INIT(10);
+DCL NEXT_TIME                UBIN      STATIC;
+DCL UTS                      UBIN      STATIC INIT(0);
+ 
+DCL NUM_ACTIVE_CALLS         UBIN(9)   STATIC   INIT(0);
+DCL NUM_CALLS                UBIN(9)   STATIC   INIT(0);
+ 
+DCL TMP_INDX                 SBIN;
+DCL STR_INDX                 SBIN;
+DCL LO_INDX                  SBIN;
+DCL LEN                      SBIN;
+ 
+DCL ERR_MESG                 CHAR(360) STATIC;
+DCL STRING                   CHAR(31)  STATIC;
+DCL STR_BYTE(0:30) REDEF STRING CHAR(1);
+DCL TMP_NUM                  CHAR(5)   STATIC;
+DCL BYT                      CHAR(1)   STATIC;
+DCL DO_BUF                   CHAR(80)  STATIC   INIT(' ');
+DCL DO_BYTE(0:79) REDEF DO_BUF  CHAR(1);
+DCL 1 LO  STATIC,
+      2 TIME                 CHAR(11),
+      2 *                    CHAR(2)            INIT('  '),
+      2 DATE                 CHAR(8),
+      2 *                    CHAR(2)          INIT('  '),
+      2 DISPLAY_INFO         CHAR(13);
+DCL LO_BUF REDEF LO          CHAR(36);
+DCL CALL_CMD_BUF(0:125)      CHAR(256);
+DCL CALL_CMD_SIZE(0:125)     UBIN(9);
+ 
+DCL LINK_CMD                 CHAR(256) STATIC;
+ 
+ 
+DCL DONE_PARSING             BIT(1)    STATIC   INIT(%NO#);
+DCL IN_A_COMMENT             BIT(1);
+DCL NUMERIC                  BIT(1);
+DCL REPORTING_ALTRETS        BIT(1)    STATIC INIT(%YES#);
+DCL REPORTING_THE_TIME       BIT(1)    STATIC INIT(%YES#);
+ 
+DCL B$JIT$            SYMREF PTR;
+DCL B$TCB$            SYMREF PTR;
+ 
+DCL M$DO                     DCB;
+DCL M$LO                     DCB;
+ 
+DCL BREAK                    ENTRY     ASYNC;
+%EJECT;
+DCL ERRORS(0:5)              CHAR(45)  STATIC   INIT(
+  /* 0 */ 'Something''s missing here',
+  /* 1 */ 'Expected a ! here',
+  /* 2 */ 'Expected IA ST or a * ! or numeric digit here',
+  /* 3 */ 'Too many digits; Maximum of 5',
+  /* 4 */ 'Don''t be ridiculous!  Wait time must be > 0',
+  /* 5 */ 'Sorry, continuation NOT allowed');
+%EJECT;
+    /*  Command looks like:                                                   */
+    /*    !EVERY [[(] [t*] [s] [!xxx...]]                                     */
+    /*                                                                        */
+ 
+    CALL M$OPEN( OPEN_DO );
+ 
+    /*                                                                        */
+    /* Check to see if my invocation line was continued.  If so, print an     */
+    /* error message and quit.                                                */
+    /*                                                                        */
+    J= MINIMUM(B$JIT.CCARS-1,LENGTHC(B$JIT.CCBUF));
+    DO WHILE( J>= 0  AND  SUBSTR(B$JIT.CCBUF,J,1)=' ' );
+       J= J - LENGTHC(' ');
+       END;
+    IF J >= 0  AND  SUBSTR(B$JIT.CCBUF,J,1)=';'  THEN
+       CALL PUT_ERR(%MESG5,J);             /* Sorry, continuation NOT allowed */
+ 
+    /*                                                                        */
+    /* Skip any blanks before my (M$LM) name in CCBUF                         */
+    /*                                                                        */
+    J= 0;
+    DO WHILE( J< B$JIT.CCARS  AND SUBSTR(B$JIT.CCBUF,J,1)=' ' );
+       J= J + LENGTHC(' ');
+       END;
+ 
+    /*  Look for ' ' or '(' following                                         */
+    /*    !EVERY ...                                                          */
+    /*                                                                        */
+    DO I=J TO B$JIT.CCARS-1;
+       IF SUBSTR(B$JIT.CCBUF,I,1) = ' '  OR
+         SUBSTR(B$JIT.CCBUF,I,1) = '('  THEN GOTO SKIP_BLNKS;
+       END;
+    INDX= B$JIT.CCARS;
+    CALL PUT_ERR(%MESG0,INDX);                /* Something's missing here     */
+ 
+SKIP_BLNKS:
+    /*                                                                        */
+    /* Skip any blanks and '(' following our Run Unit name on the command line*/
+    /*                                                                        */
+    DO INDX=I TO B$JIT.CCARS-1;
+       IF SUBSTR(B$JIT.CCBUF,INDX,1) ~= ' ' AND
+          SUBSTR(B$JIT.CCBUF,INDX,1) ~= '('  THEN GOTO IS_IT_AN_OPTION;
+       END;
+    INDX= B$JIT.CCARS;
+    CALL PUT_ERR(%MESG0,INDX);                /* Something's missing here     */
+IS_IT_AN_OPTION:
+    CALL CHECK_FOR_OPTION  ALTRET( SKIP_BLNKS );
+GET_NUM_TIMES:
+    CALL GET_A_NUM;
+    IF NUMERIC  THEN
+       IF BYT = '*' THEN
+          NUM_TIMES= BIN_NUM;
+       ELSE
+          INTERVAL = BIN_NUM;
+    ELSE
+       IF BYT = '*' THEN
+          NUM_TIMES= 1;
+    IF BYT = '*' THEN DO;
+       INDX= INDX+1;
+       CALL GET_A_NUM;
+       IF NUMERIC THEN
+          INTERVAL= BIN_NUM;
+       END;
+    IF BYT ~= '!' THEN
+       CALL PUT_ERR(%MESG1,INDX);             /* Expected a ! here            */
+    CMD_BEG= INDX+LENGTHC('!');
+    DO WHILE(NOT DONE_PARSING);
+       CALL PARSE_CMNDS;
+       END;
+%EJECT;
+    /*                                                                        */
+    /*  If first and last byte of command line are not blank then put:        */
+    /*  'HH:MM:SS.SS  MM/DD/YY' each time through.                            */
+    /*                                                                        */
+    CALL M$INT(INT_FPT);
+    NUM_ACTIVE_CALLS= NUM_CALLS;
+    BYT= SUBSTR(B$JIT.CCBUF,B$JIT.CCARS-1,1);
+    IF REPORTING_THE_TIME THEN
+       IF BYT = ' ' THEN
+          REPORTING_THE_TIME= %NO#;
+    DO TIMES=1 TO NUM_TIMES;
+       IF REPORTING_THE_TIME THEN DO;
+          LO_BUF= ' ';
+          CALL M$WRITE(WRITE_LO);
+          CALL M$TIME(GET_TIME);
+          CALL M$DISPLAY(DI_INFO);
+          LO_INDX= 23;
+          CALL MOVE_DI(DI.USERS);
+          CALL INSERT(LO_BUF,LO_INDX,1,'*');
+          LO_INDX= LO_INDX+LENGTHC('*');
+          CALL MOVE_DI(DI.ETMF);
+          CALL INSERT(LO_BUF,LO_INDX,1,'<');
+          LO_INDX= LO_INDX+LENGTHC('<');
+          CALL MOVE_DI(DI.RESP);
+          CALL M$WRITE(WRITE_LO);
+          END;
+       ELSE
+          CALL M$TIME( GET_TIME );
+       CALL XUD$UTS_ADJUST (NEXT_TIME,UTS,INTERVAL*%UTS_CSEC_SEC#);
+       DO I= 1 TO NUM_CALLS;
+TRY_YC:   LINK_CMD= CALL_CMD_BUF(I);
+          CALL M$YC(YC_FPT)  WHENALTRETURN DO;
+YC_ERR:
+             IF REPORTING_ALTRETS THEN DO;
+                NUM_ACTIVE_CALLS= NUM_ACTIVE_CALLS-1;
+                DO_BUF= '* Error in M$YC; ERROR follows below *';
+                CALL M$WRITE(WRITE_DO);
+                ERR_CODE= B$TCB$->B$TCB.ALT$->B$ALT.ERR;
+                CALL M$ERRMSG(ERRMSG);
+                END;
+             END;
+CONTINUE:
+          END;                                /* End DO I                     */
+       IF NUM_ACTIVE_CALLS < 1  THEN          /* Time to quit?                */
+          CALL M$EXIT;
+       CALL M$TIME( GET_TIME );
+       IF TIMES < NUM_TIMES  AND
+          UTS < NEXT_TIME THEN DO;
+          CALL XUD$UTS_ADJUST (NEXT_TIME,NEXT_TIME,%UTS_CSEC_SEC#/2);
+          CALL XUD$UTS_DIFF_SEC (SLEEP.V.UNITS#,NEXT_TIME,UTS);
+          IF SLEEP.V.UNITS# > 0 THEN
+             CALL M$WAIT( SLEEP );
+          END;
+       END;                              /* End DO TIMES                      */
+    CALL M$EXIT;
+%EJECT;
+GET_A_NUM: PROC;
+    NUMERIC= %NO#;
+    TMP_NUM= '00000';
+    TMP_INDX= -1;
+    DO I=INDX TO B$JIT.CCARS-1;
+       BYT= SUBSTR(B$JIT.CCBUF,I,1);
+       IF BYT < '0' OR
+          BYT > '9' THEN
+          IF BYT = '*' OR
+             BYT = '!' THEN
+             GOTO CNVT_NUM;
+          ELSE
+             IF BYT = ' ' THEN
+                GOTO NEXT_I;                  /* Ignore any blanks            */
+             ELSE
+                CALL PUT_ERR(%MESG2,I);/* Expected IA ST or a * ! or num digit*/
+       IF TMP_INDX < 4  THEN DO;
+          TMP_INDX= TMP_INDX+1;
+          CALL INSERT(TMP_NUM,TMP_INDX,1,BYT);
+          END;
+       ELSE
+          CALL PUT_ERR(%MESG3,INDX);          /* Too many digits; Maximum of 5*/
+NEXT_I:
+       END;
+    I= B$JIT.CCARS;
+                                        /* Something's missing here           */
+    CALL PUT_ERR(%MESG0,I);                   /* Something's missing here     */
+CNVT_NUM:
+    IF TMP_INDX > -1 THEN DO;
+         CALL CHARBIN(BIN_NUM,SUBSTR(TMP_NUM,0,TMP_INDX+1));
+         NUMERIC= %YES#;
+         IF BYT = '!'  AND
+            TMP_NUM = '00000'  THEN
+              /* Don't be ridiculous!  Wait time must be > 0                  */
+              CALL PUT_ERR(%MESG4,INDX);
+         ELSE IF TMP_NUM = '00000'  THEN
+                  BIN_NUM= 604800;      /* Set # times to 7 days!!            */
+         END;
+    INDX= I;
+    RETURN;
+END GET_A_NUM;
+ 
+ 
+CHECK_FOR_OPTION: PROC  ALTRET;
+ 
+    IF SUBSTR(B$JIT.CCBUF,INDX,1) < '0'  OR
+       SUBSTR(B$JIT.CCBUF,INDX,1) > '9' THEN DO;
+       IF SUBSTR(B$JIT.CCBUF,INDX,2) = 'ia' OR
+          SUBSTR(B$JIT.CCBUF,INDX,2) = 'IA' THEN
+          REPORTING_ALTRETS= %NO#;
+       ELSE
+          IF SUBSTR(B$JIT.CCBUF,INDX,2) = 'st'  OR
+             SUBSTR(B$JIT.CCBUF,INDX,2) = 'ST' THEN
+             REPORTING_THE_TIME= %NO#;
+          ELSE
+             GOTO RE_TURN;
+       I= INDX + 2;
+       END;
+    ELSE
+       GOTO RE_TURN;
+ 
+ALT_RETURN:
+    ALTRETURN;
+ 
+RE_TURN:
+    RETURN;
+ 
+END CHECK_FOR_OPTION;
+ 
+ 
+BUILD_STRING: PROC;
+ 
+    STRING= ' ';
+    STR_INDX= -1;
+    I= INDX;
+    DO INDX=I TO B$JIT.CCARS-1;
+       BYT= SUBSTR(B$JIT.CCBUF,INDX,1);
+       IF IN_A_COMMENT THEN
+          IF BYT = '"' THEN
+             IN_A_COMMENT= %NO#;
+          ELSE;
+       ELSE
+          IF BYT = '"' THEN
+             IN_A_COMMENT= %YES#;
+          ELSE
+             IF BYT = '.'  OR
+                BYT = ' ' OR
+                BYT = '!' OR
+                BYT = '(' THEN
+                RETURN;
+             ELSE DO;
+                STR_INDX= STR_INDX+1;
+                IF STR_INDX > 30  THEN
+                   RETURN;
+                ELSE
+                   STR_BYTE(STR_INDX)= BYT;
+                END;
+       END;
+    RETURN;
+ 
+END BUILD_STRING;
+%EJECT;
+PARSE_CMNDS: PROC;
+ 
+/*                                                                            */
+/*  Skip any blanks following the '!'                                         */
+/*                                                                            */
+    DO INDX=CMD_BEG TO B$JIT.CCARS-1;
+       IF SUBSTR(B$JIT.CCBUF,INDX,1) ~= ' '  THEN GOTO GET_NAME;
+       END;
+    INDX= B$JIT.CCARS;
+    CALL PUT_ERR(%MESG0,INDX);                /* Something's missing here     */
+GET_NAME:
+    NAME_BEG= INDX;
+    NUM_CALLS= NUM_CALLS + 1;
+    CALL INDEX(INDX,'!',SUBSTR(B$JIT.CCBUF,0,B$JIT.CCARS),NAME_BEG );
+FIND_CMND_END:
+    IF INDX < B$JIT.CCARS  THEN
+       I= INDX;
+    ELSE
+       I= B$JIT.CCARS;
+    DO INDX= I TO B$JIT.CCARS-1;
+       IF SUBSTR(B$JIT.CCBUF,INDX,1) = '!'  THEN GOTO MOVE_CCBUF;
+       END;
+    INDX= B$JIT.CCARS;
+MOVE_CCBUF:
+    CALL_CMD_BUF(NUM_CALLS)= SUBSTR(B$JIT.CCBUF,CMD_BEG,INDX-CMD_BEG);
+    CALL_CMD_SIZE(NUM_CALLS)= INDX-CMD_BEG;
+    IF INDX >= B$JIT.CCARS  THEN
+       DONE_PARSING= %YES#;
+    ELSE
+       INDX= INDX + 1;
+    CMD_BEG= INDX;
+    END PARSE_CMNDS;
+%EJECT;
+PUT_ERR: PROC(ERR_NUM,POS);
+DCL ERR_NUM                  UBIN;
+DCL POS                      UBIN;
+ 
+    DO_BYTE(POS+1)= '^';
+    CALL M$WRITE(WRITE_DO);
+    CALL CONCAT( DO_BUF,'',ERRORS(ERR_NUM) );
+    CALL M$WRITE(WRITE_DO);
+    CALL M$EXIT;
+ 
+END PUT_ERR;
+ 
+MOVE_DI: PROC(NUM);
+DCL NUM                      UBIN(36);
+ 
+    CALL BINCHAR(TMP_NUM,NUM);
+    TMP_INDX= 0;
+    DO WHILE(TMP_INDX < 4  AND
+             SUBSTR(TMP_NUM,TMP_INDX,1) = '0');
+       TMP_INDX= TMP_INDX+1;
+       END;
+    LEN= 5 - TMP_INDX;
+    CALL INSERT(LO_BUF,LO_INDX,LEN,SUBSTR(TMP_NUM,TMP_INDX,LEN));
+    LO_INDX= LO_INDX+LEN;
+END MOVE_DI;
+ 
+END EVERY;
+%EOD;
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+BREAK: PROC ASYNC;
+ 
+%INCLUDE CP_6;
+%FPT_PROMPT  (PROMPT=MSG,
+              VFC=YES);
+%FPT_READ    (DCB=M$UC,
+              BUF=BUF);
+DCL 1 MSG                    CONSTANT,
+    2 VFC                    CHAR(1)    INIT(BINASC(30)),
+    2 MSG                    CHAR(0)    INIT('C to continue: ');
+DCL BUF                      CHAR(1)    STATIC;
+ 
+    CALL M$PROMPT(FPT_PROMPT);
+    BUF = 'N';
+    CALL M$READ(FPT_READ);
+    IF BUF ~= 'C' AND BUF ~= 'c' THEN CALL M$EXIT;
+ 
+END BREAK;

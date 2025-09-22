@@ -1,0 +1,1128 @@
+VERSION E05
+
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:1    
+        1        1        /*M* Segment-relative memory management routines.                  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* PLM=8,IND=2,THI=2,ENU=2,CSU=2,DTI=4,DCI=4,ECU=4,AND */
+        8        8        MMG$SGVP: PROC(EWSQ,SEGID,VPNO,N,ERR) ALTRET;
+        9        9        /**/
+       10       10    1   DCL EWSQ UBIN;                /* Effective wsq - the one making the request   */
+       11       11    1   DCL SEGID UBIN;                         /* Segid of segment to be handled     */
+       12       12    1   DCL VPNO UBIN;                          /* Segment-relative virtual page no.  */
+       13       13    1   DCL N UBIN;                             /* No. Of pages to get or free        */
+       14       14    1   DCL ERR UBIN;                           /* Error code returned if altreturn   */
+       15       15        /**/
+       16       16    1   DCL MME$WGVP ENTRY(4) ALTRET;           /* Routine to get virtual page        */
+       17       17    1   DCL MME$WFVP ENTRY(4) ALTRET;           /* Routine to free virtual page       */
+       18       18    1   DCL MME$WFVP_NOW ENTRY(4) ALTRET; /* Routine to free virtual page unconditionally */
+       19       19    1   DCL MME$CVM ENTRY(4) ALTRET;
+       20       20    1   DCL SSR$REG ENTRY(3) ALTRET;
+       21       21    1   DCL SC_MM25 ENTRY CONV(2,0);
+       22       22        /**/
+       23       23    1   DCL I SBIN;
+       24       24    1   DCL WVPNO SBIN;
+       25       25    1   DCL SEGX SBIN;
+       26       26    1   DCL SEGBASE SBIN;
+       27       27    1   DCL SEGTOP SBIN;
+       28       28    1   DCL ELS$ PTR;
+       29       29    1   DCL FVP_NOW BIT(1);
+       30       30        /**/
+       31       31    1   DCL B$JIT$ PTR SYMREF;
+       32       32    1   DCL MM_CGQD$ PTR SYMREF;
+       33       33        /**/
+       34       34        %INCLUDE M_ERRORS_C;
+       35       98        %INCLUDE B_SEGIDS_C;                    /* Segid string substitutions         */
+       36      637        %INCLUDE M$JIT_C;                       /* Mm jit definitions                 */
+       37     1157        %INCLUDE MM_DATA_R;                     /* References to mm's data            */
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:2    
+       38     1677        %INCLUDE SS_SCHED_C;
+       39     1910        %INCLUDE FM_CACHE_R;
+       40     1922        %MM$CGQD (STCLASS="BASED(MM_CGQD$)");
+       41     1981        %SUB   IN_PROCEDURE ="((WVPNO>=B$JIT$->B$JIT.PLL) AND (WVPNO<=B$JIT$->B$JIT.PUL))";
+       42     1982        /**/
+       43     1983        %EJECT;
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:3    
+       44     1984        /*F*   NAME:   MMG$SGVP                                            */
+       45     1985        /*F*   PURPOSE: To get a number of contiguous, segment-relative    */
+       46     1986        /*,*           virtual pages.                                      */
+       47     1987                %FINDLS(WSQ = EWSQ , P$ = ELS$); /* Get ptr to this guy's lseg        */
+       48     1990    1           SEGX = MOD (SEGID , 1024);
+       49     1991        /**/
+       50     1992        /*S*    SCREECH_CODE: MMG-S$MM25                                   */
+       51     1993        /*S*   TYPE:   SCREECH                                             */
+       52     1994        /*S*   MESSAGE: SEGID invalid for memory allocation.               */
+       53     1995    2           IF SEGX > %MAXDATASID THEN DO;
+       54     1996    2                 CALL SC_MM25;
+       55     1997    2                 ALTRETURN;
+       56     1998    2               END;
+       57     1999        /**/
+       58     2000    1           IF SEGX <= %HIFIXEDSID          /* If its one of the fixed SEG'S...   */
+       59     2001    2             THEN DO;
+       60     2002    2                 SEGBASE = MM_SEGLO(SEGX); /* Then this is easy                  */
+       61     2003    2                 SEGTOP = MM_SEGHI(SEGX);
+       62     2004    2               END;
+       63     2005    2             ELSE DO;                 /* Else we've gotta compute the bounds     */
+       64     2006    2                 SEGBASE = ELS$ -> MM$DESC.BASE (SEGX);
+       65     2007    2                 SEGBASE = SEGBASE/4096;   /* Convert to page #                  */
+       66     2008    2                 IF SEGX = %MAXDATASID     /* If its the last seg descriptor     */
+       67     2009    3                   THEN DO CASE(EWSQ);     /* Then we know upper bound           */
+       68     2010    3                       CASE(%CPWSQ);
+       69     2011    3                         SEGTOP = %CPDSEGHI;
+       70     2012    3                       CASE(%DBWSQ);
+       71     2013    3                         SEGTOP = %DBDSEGHI;
+       72     2014    3                       CASE(%ASLWSQ);
+       73     2015    3                         SEGTOP = %ASLSEGHI;
+       74     2016    3                       CASE(ELSE);         /* Ewsq is valid - findls checked     */
+       75     2017    3                         SEGTOP = B$JIT.PTSIZ;
+       76     2018    3                     END;
+       77     2019    3                   ELSE DO;           /* Else use base of nxt higher seg. - 1    */
+       78     2020    3                       SEGTOP = ELS$ -> MM$DESC.BASE (SEGX+1);
+       79     2021    3                       SEGTOP = (SEGTOP/4096) -1;
+       80     2022    3                     END;
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:4    
+       81     2023    2               END;
+       82     2024    1           WVPNO = VPNO + SEGBASE;         /* Get wsq-relative  page number      */
+       83     2025
+       84     2026        /* Check if there are enough free pages for this request */
+       85     2027
+       86     2028    1           I = 1;                          /* Init this for BRKCTY altret        */
+       87     2029    1           IF N > 4
+       88     2030    1             THEN
+       89     2031    2               DO WHILE (MINIMUM (N,SEGTOP-WVPNO+1) >
+       90     2032    2             (MM$BYP.AUTOP + MM$BYP.FPPC + MM$CGQD.FPPC + FMC$CACHEPGCNT - MM_HELD));
+       91     2033    2                 CALL SSR$REG (%SS_NC) ALTRET (USER_BREAK);
+       92     2034    2               END;
+       93     2035
+       94     2036        /* Now, get n contiguous virtual pages beginning at wvpno          */
+       95     2037
+       96     2038    2           DO I = 1 TO N;                  /* 'I' is a dummy - never used        */
+       97     2039    2             IF WVPNO > SEGTOP             /* Check for hitting end of segment   */
+       98     2040    3               THEN DO;
+       99     2041    3                   N = I - 1;              /* Return # pgs we actually got       */
+      100     2042        /*E*   ERROR:     -E$ALLGONE-0
+      101     2043                MESSAGE: All segment space has been allocated.             */
+      102     2044        /*E*   ERROR:  MMG-E$ALLGONE-0
+      103     2045                MESSAGE: All segment space has been allocated.             */
+      104     2046    3                   ERR = %E$ALLGONE;       /* Data seg space all allocated       */
+      105     2047    3                   ALTRETURN;
+      106     2048    3                 END;
+      107     2049        /* Now, get the page with the determined protection                */
+      108     2050    2             CALL MME$WGVP(EWSQ,WVPNO,BITBIN(%PGINMEM|%PGWRITE|%PGIOM),ERR) ALTRET(NOVP
+              2050                      );
+      109     2051    2             WVPNO = WVPNO + 1;            /* Go for next vp                     */
+      110     2052    2           END;                            /* End of get vp loop                 */
+      111     2053    1           RETURN;
+      112     2054        /**/
+      113     2055        /**/
+      114     2056        /* Altreturn from MME$WGVP HANDLER: */
+      115     2057    1   NOVP:   N = I - 1;                      /* Return # of pages we actually got  */
+      116     2058                                                /* Err will have been set to either   */
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:5    
+      117     2059                                           /* E$MEMLIMIT  - page limit reached , or...*/
+      118     2060                                 /* E$MONPP - can't get phy. Pg for monitor, or...*/
+      119     2061                                           /* E$NOTFREE  - page already allocated     */
+      120     2062    1           ALTRETURN;                      /* Exit with error code set           */
+      121     2063
+      122     2064        /*    USER WAS X'ed, HIT BREAK OR CONTROL Y */
+      123     2065
+      124     2066    1   USER_BREAK: ;
+      125     2067    1           ERR = %E$BRKCTY;
+      126     2068    1           N = I - 1;
+      127     2069    1           ALTRETURN;
+      128     2070        %EJECT;
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:6    
+      129     2071        /*F*   NAME:   MMG$SFVP_NOW                                        */
+      130     2072        /*F*   PURPOSE: To free a number of contiguous, segment-relative   */
+      131     2073        /*,*           virtual pages unconditionally.                      */
+      132     2074    1   MMG$SFVP_NOW: ENTRY(EWSQ,SEGID,VPNO,N,ERR)  ALTRET;
+      133     2075    1           FVP_NOW = %TRUE;
+      134     2076    1           GOTO COMMON;
+      135     2077        /*F*   NAME:   MMG$SFVP                                            */
+      136     2078        /*F*   PURPOSE: To free a number of contiguous, segment-relative   */
+      137     2079        /*,*           virtual pages.                                      */
+      138     2080    1   MMG$SFVP: ENTRY(EWSQ,SEGID,VPNO,N,ERR)  ALTRET;
+      139     2081    1           FVP_NOW = %FALSE;
+      140     2082    1   COMMON:
+      141     2083                %FINDLS(WSQ = EWSQ , P$ = ELS$); /* Get ptr to this guy's lseg        */
+      142     2086    1           SEGX = MOD (SEGID , 1024);
+      143     2087        /**/
+      144     2088    2           IF SEGX > %MAXDATASID THEN DO;
+      145     2089    2                 CALL SC_MM25;
+      146     2090    2                 ALTRETURN;
+      147     2091    2               END;
+      148     2092        /**/
+      149     2093    1           IF SEGX <= %HIFIXEDSID          /* If its one of the fixed SEG'S...   */
+      150     2094    2             THEN DO;
+      151     2095    2                 SEGBASE = MM_SEGLO(SEGX); /* Then this is easy                  */
+      152     2096    2                 SEGTOP = MM_SEGHI(SEGX);
+      153     2097    2               END;
+      154     2098    2             ELSE DO;                 /* Else we've gotta compute the bounds     */
+      155     2099    2                 SEGBASE = ELS$ -> MM$DESC.BASE (SEGX);
+      156     2100    2                 SEGTOP = ELS$ -> MM$DESC.BOUND (SEGX);
+      157     2101    2                 SEGTOP = (SEGTOP + SEGBASE)/4096; /* Pg # of top of seg         */
+      158     2102    2                 SEGBASE = SEGBASE/4096;   /* Convert base to a page #           */
+      159     2103    2               END;
+      160     2104        /* Get the workspace-relative virtual page at which to start freeing */
+      161     2105    1           WVPNO = VPNO + SEGBASE;
+      162     2106    1           IF WVPNO > SEGTOP THEN
+      163     2107    2               DO;
+      164     2108        /*E*   ERROR:  MMG-E$BADVP-0
+      165     2109               MESSAGE: Bad virtual page no. - not in free segment area.     */
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:7    
+      166     2110    2                 ERR = %E$BADVP;
+      167     2111    2                 ALTRETURN;
+      168     2112    2               END;
+      169     2113    2           DO I = 1 TO N;                  /* 'I' is a dummy - never referenced  */
+      170     2114    2             IF WVPNO < SEGBASE            /* Tried to free too much             */
+      171     2115    3               THEN DO;
+      172     2116        /*E*   ERROR:  MMG-E$BIGFREE-0
+      173     2117               MESSAGE: Attempt to free more space than is in data segment.  */
+      174     2118    3                   ERR = %E$BIGFREE;       /* Freed more than was there          */
+      175     2119    3                   ALTRETURN;
+      176     2120    3                 END;
+      177     2121    2             IF FVP_NOW THEN
+      178     2122    2               CALL MME$WFVP_NOW(EWSQ,WVPNO,ERR,ERR) ALTRET(NOPP); /* Free the vp */
+      179     2123    2               ELSE
+      180     2124    2               CALL MME$WFVP(EWSQ,WVPNO,ERR,ERR) ALTRET(NOPP); /* Free the vp    */
+      181     2125    2   NXT:      WVPNO = WVPNO - 1;            /* Go to next vp                      */
+      182     2126    2           END;
+      183     2127    1           RETURN;
+      184     2128        /**/
+      185     2129        /* If we were only doing one page, then give an error back (a      */
+      186     2130        /* range of pages may, by definition of this service, contain      */
+      187     2131        /* some unallocated ones. Also, if we can't free a page because    */
+      188     2132        /* of master function count > 0, then altreturn.                   */
+      189     2133    1   NOPP:   IF ERR = %E$HANDSOFF AND (( ELS$ -> MM$DESC.FLGS(SEGX) & %DSEXEC)
+      190     2134    2             OR SEGID = BITBIN(%BUFSID)) THEN DO;
+      191     2135    2                 CALL MME$CVM (EWSQ,WVPNO,-1,ERR);
+      192     2136    2                 GOTO NXT;
+      193     2137    2               END;
+      194     2138    1           IF (N = 1) OR (ERR = %E$IOACTIVE)
+      195     2139    1             THEN ALTRETURN;
+      196     2140    1             ELSE GOTO NXT;
+      197     2141        /**/
+      198     2142    1   END MMG$SGVP;
+
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:8    
+--  Include file information  --
+
+   FM_CACHE_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+   M$JIT_C.:E05TOU  cannot be made into a system file and is referenced.
+   B_SEGIDS_C.:E05TOU  is referenced.
+   M_ERRORS_C.:E05TOU  is referenced.
+      No diagnostics issued in procedure MMG$SGVP.
+
+   Procedure MMG$SGVP requires 279 words for executable code.
+   Procedure MMG$SGVP requires 20 words of local(AUTO) storage.
+
+    No errors detected in file MMG$SMEM.:E05TSI    .
+
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:9    
+
+ Object Unit name= MMG$SGVP                                   File name= MMG$SMEM.:E05TOU
+ UTS= JUL 30 '97 03:20:54.72 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_SYSTEM                                    Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size OctSiz  Section name(segment info)
+    0   Proc  even  none   279    427  MMG$SGVP
+    1  RoData even  none     5      5  MMG$SGVP
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect OctLoc Primary Altret sequence   type   Parms  Name
+     0      0   yes    yes     yes      Std        5  MMG$SGVP
+     0    220          yes     yes      Std        5  MMG$SFVP_NOW
+     0    225          yes     yes      Std        5  MMG$SFVP
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes           Std       3 SSR$REG
+ yes     yes           Std       4 MME$WFVP
+ yes     yes           Std       4 MME$WFVP_NOW
+ yes     yes           Std       4 MME$CVM
+ yes     yes           Std       4 MME$WGVP
+                       nStd      0 X66_AUTO_5
+                       nStd      0 X66_AALT
+                       Std       0 B_CONSPOOL_D
+                       nStd      0 X66_ARET
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:10   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     SC_MM25                               B$JIT$                                MM_CGQD$
+r    MM_BYP$                               MM_HELD                               MM_SEGLO
+     MM_SEGHI                         r    MM_LSPTRS$                            FMC_CACHEPGCNT$
+     B_VECTNIL
+
+  ****  Segment refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     ASLENTSID                             ISSID
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:11   
+
+
+        1        1        /*M* Segment-relative memory management routines.                  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* PLM=8,IND=2,THI=2,ENU=2,CSU=2,DTI=4,DCI=4,ECU=4,AND */
+        8        8        MMG$SGVP: PROC(EWSQ,SEGID,VPNO,N,ERR) ALTRET;
+
+      8  0 000000   000000 700200 xent  MMG$SGVP     TSX0  ! X66_AUTO_5
+         0 000001   000024 000005                    ZERO    20,5
+
+        9        9        /**/
+       10       10    1   DCL EWSQ UBIN;                /* Effective wsq - the one making the request   */
+       11       11    1   DCL SEGID UBIN;                         /* Segid of segment to be handled     */
+       12       12    1   DCL VPNO UBIN;                          /* Segment-relative virtual page no.  */
+       13       13    1   DCL N UBIN;                             /* No. Of pages to get or free        */
+       14       14    1   DCL ERR UBIN;                           /* Error code returned if altreturn   */
+       15       15        /**/
+       16       16    1   DCL MME$WGVP ENTRY(4) ALTRET;           /* Routine to get virtual page        */
+       17       17    1   DCL MME$WFVP ENTRY(4) ALTRET;           /* Routine to free virtual page       */
+       18       18    1  DCL MME$WFVP_NOW ENTRY(4) ALTRET; /* Routine to free virtual page unconditionally */
+       19       19    1   DCL MME$CVM ENTRY(4) ALTRET;
+       20       20    1   DCL SSR$REG ENTRY(3) ALTRET;
+       21       21    1   DCL SC_MM25 ENTRY CONV(2,0);
+       22       22        /**/
+       23       23    1   DCL I SBIN;
+       24       24    1   DCL WVPNO SBIN;
+       25       25    1   DCL SEGX SBIN;
+       26       26    1   DCL SEGBASE SBIN;
+       27       27    1   DCL SEGTOP SBIN;
+       28       28    1   DCL ELS$ PTR;
+       29       29    1   DCL FVP_NOW BIT(1);
+       30       30        /**/
+       31       31    1   DCL B$JIT$ PTR SYMREF;
+       32       32    1   DCL MM_CGQD$ PTR SYMREF;
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:12   
+       33       33        /**/
+       34       34        %INCLUDE M_ERRORS_C;
+       35       98        %INCLUDE B_SEGIDS_C;                    /* Segid string substitutions         */
+       36      637        %INCLUDE M$JIT_C;                       /* Mm jit definitions                 */
+       37     1157        %INCLUDE MM_DATA_R;                     /* References to mm's data            */
+       38     1677        %INCLUDE SS_SCHED_C;
+       39     1910        %INCLUDE FM_CACHE_R;
+       40     1922        %MM$CGQD (STCLASS="BASED(MM_CGQD$)");
+       41     1981        %SUB   IN_PROCEDURE ="((WVPNO>=B$JIT$->B$JIT.PLL) AND (WVPNO<=B$JIT$->B$JIT.PUL))";
+       42     1982        /**/
+       43     1983        %EJECT;
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:13   
+       44     1984        /*F*   NAME:   MMG$SGVP                                            */
+       45     1985        /*F*   PURPOSE: To get a number of contiguous, segment-relative    */
+       46     1986        /*,*           virtual pages.                                      */
+       47     1987                %FINDLS(WSQ = EWSQ , P$ = ELS$); /* Get ptr to this guy's lseg        */
+
+   1988  0 000002   200003 470500                    LDP0    @EWSQ,,AUTO
+         0 000003   000000 720100                    LXL0    0,,PR0
+         0 000004   000000 236010 xsym               LDQ     MM_LSPTRS$,X0
+         0 000005   200015 756100                    STQ     ELS$,,AUTO
+
+       48     1990    1           SEGX = MOD (SEGID , 1024);
+
+   1990  0 000006   200004 471500                    LDP1    @SEGID,,AUTO
+         0 000007   100000 236100                    LDQ     0,,PR1
+         0 000010   001777 376007                    ANQ     1023,DL
+         0 000011   200012 756100                    STQ     SEGX,,AUTO
+
+       49     1991        /**/
+       50     1992        /*S*    SCREECH_CODE: MMG-S$MM25                                   */
+       51     1993        /*S*   TYPE:   SCREECH                                             */
+       52     1994        /*S*   MESSAGE: SEGID invalid for memory allocation.               */
+       53     1995    2           IF SEGX > %MAXDATASID THEN DO;
+
+   1995  0 000012   000013 116007                    CMPQ    11,DL
+         0 000013   000017 604400 0                  TMOZ    s:2000
+
+       54     1996    2                 CALL SC_MM25;
+
+   1996  0 000014   000000 713400 xsym               CLIMB   SC_MM25
+         0 000015   000000 600000 xsid               climb   nvectors=         0
+
+       55     1997    2                 ALTRETURN;
+
+   1997  0 000016   000000 702200 xent               TSX2  ! X66_AALT
+
+       56     1998    2               END;
+       57     1999        /**/
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:14   
+       58     2000    1           IF SEGX <= %HIFIXEDSID          /* If its one of the fixed SEG'S...   */
+
+   2000  0 000017   000003 116007                    CMPQ    3,DL
+         0 000020   000027 605400 0                  TPNZ    s:2006
+
+       59     2001    2             THEN DO;
+
+       60     2002    2                 SEGBASE = MM_SEGLO(SEGX); /* Then this is easy                  */
+
+   2002  0 000021   000000 235006 xsym               LDA     MM_SEGLO,QL
+         0 000022   200013 755100                    STA     SEGBASE,,AUTO
+
+       61     2003    2                 SEGTOP = MM_SEGHI(SEGX);
+
+   2003  0 000023   200012 721100                    LXL1    SEGX,,AUTO
+         0 000024   000000 235011 xsym               LDA     MM_SEGHI,X1
+         0 000025   200014 755100                    STA     SEGTOP,,AUTO
+
+       62     2004    2               END;
+
+   2004  0 000026   000077 710000 0                  TRA     s:2024
+
+       63     2005    2             ELSE DO;                 /* Else we've gotta compute the bounds     */
+
+       64     2006    2                 SEGBASE = ELS$ -> MM$DESC.BASE (SEGX);
+
+   2006  0 000027   200012 235100                    LDA     SEGX,,AUTO
+         0 000030   000001 735000                    ALS     1
+         0 000031   200015 473500                    LDP3    ELS$,,AUTO
+         0 000032   300001 235105                    LDA     1,AL,PR3
+         0 000033   200013 755100                    STA     SEGBASE,,AUTO
+
+       65     2007    2                 SEGBASE = SEGBASE/4096;   /* Convert to page #                  */
+
+   2007  0 000034   200013 236100                    LDQ     SEGBASE,,AUTO
+         0 000035   010000 506007                    DIV     4096,DL
+         0 000036   200013 756100                    STQ     SEGBASE,,AUTO
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:15   
+
+       66     2008    2                 IF SEGX = %MAXDATASID     /* If its the last seg descriptor     */
+
+   2008  0 000037   200012 235100                    LDA     SEGX,,AUTO
+         0 000040   000013 115007                    CMPA    11,DL
+         0 000041   000070 601000 0                  TNZ     s:2020
+
+       67     2009    3                   THEN DO CASE(EWSQ);     /* Then we know upper bound           */
+
+   2009  0 000042   000000 235100                    LDA     0,,PR0
+         0 000043   000004 135007                    SBLA    4,DL
+         0 000044   000003 115007                    CMPA    3,DL
+         0 000045   000047 602005 0                  TNC     s:2009+5,AL
+         0 000046   000063 710000 0                  TRA     s:2017
+         0 000047   000052 710000 0                  TRA     s:2011
+         0 000050   000055 710000 0                  TRA     s:2013
+         0 000051   000060 710000 0                  TRA     s:2015
+
+       68     2010    3                       CASE(%CPWSQ);
+
+       69     2011    3                         SEGTOP = %CPDSEGHI;
+
+   2011  0 000052   001047 235007                    LDA     551,DL
+         0 000053   200014 755100                    STA     SEGTOP,,AUTO
+         0 000054   000077 710000 0                  TRA     s:2024
+
+       70     2012    3                       CASE(%DBWSQ);
+
+       71     2013    3                         SEGTOP = %DBDSEGHI;
+
+   2013  0 000055   000607 235007                    LDA     391,DL
+         0 000056   200014 755100                    STA     SEGTOP,,AUTO
+         0 000057   000077 710000 0                  TRA     s:2024
+
+       72     2014    3                       CASE(%ASLWSQ);
+
+       73     2015    3                         SEGTOP = %ASLSEGHI;
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:16   
+
+   2015  0 000060   001007 235007                    LDA     519,DL
+         0 000061   200014 755100                    STA     SEGTOP,,AUTO
+         0 000062   000077 710000 0                  TRA     s:2024
+
+       74     2016    3                       CASE(ELSE);         /* Ewsq is valid - findls checked     */
+
+       75     2017    3                         SEGTOP = B$JIT.PTSIZ;
+
+   2017  0 000063   000000 474400 xsym               LDP4    B$JIT$
+         0 000064   400216 236100                    LDQ     142,,PR4
+         0 000065   777777 376007                    ANQ     -1,DL
+         0 000066   200014 756100                    STQ     SEGTOP,,AUTO
+
+       76     2018    3                     END;
+
+   2018  0 000067   000077 710000 0                  TRA     s:2024
+
+       77     2019    3                   ELSE DO;           /* Else use base of nxt higher seg. - 1    */
+
+       78     2020    3                       SEGTOP = ELS$ -> MM$DESC.BASE (SEGX+1);
+
+   2020  0 000070   000001 735000                    ALS     1
+         0 000071   300003 235105                    LDA     3,AL,PR3
+         0 000072   200014 755100                    STA     SEGTOP,,AUTO
+
+       79     2021    3                       SEGTOP = (SEGTOP/4096) -1;
+
+   2021  0 000073   200014 236100                    LDQ     SEGTOP,,AUTO
+         0 000074   010000 506007                    DIV     4096,DL
+         0 000075   000001 136007                    SBLQ    1,DL
+         0 000076   200014 756100                    STQ     SEGTOP,,AUTO
+
+       80     2022    3                     END;
+
+       81     2023    2               END;
+
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:17   
+       82     2024    1           WVPNO = VPNO + SEGBASE;         /* Get wsq-relative  page number      */
+
+   2024  0 000077   200005 473500                    LDP3    @VPNO,,AUTO
+         0 000100   300000 236100                    LDQ     0,,PR3
+         0 000101   200013 036100                    ADLQ    SEGBASE,,AUTO
+         0 000102   200011 756100                    STQ     WVPNO,,AUTO
+
+       83     2025
+       84     2026        /* Check if there are enough free pages for this request */
+       85     2027
+       86     2028    1           I = 1;                          /* Init this for BRKCTY altret        */
+
+   2028  0 000103   000001 235007                    LDA     1,DL
+         0 000104   200010 755100                    STA     I,,AUTO
+
+       87     2029    1           IF N > 4
+
+   2029  0 000105   200006 474500                    LDP4    @N,,AUTO
+         0 000106   400000 235100                    LDA     0,,PR4
+         0 000107   000005 115007                    CMPA    5,DL
+         0 000110   000142 602000 0                  TNC     s:2038
+
+       88     2030    1             THEN
+       89     2031    2               DO WHILE (MINIMUM (N,SEGTOP-WVPNO+1) >
+
+   2031  0 000111   000116 710000 0                  TRA     s:2034
+
+       90     2032    2             (MM$BYP.AUTOP + MM$BYP.FPPC + MM$CGQD.FPPC + FMC$CACHEPGCNT - MM_HELD));
+       91     2033    2                 CALL SSR$REG (%SS_NC) ALTRET (USER_BREAK);
+
+   2033  0 000112   000001 630400 1                  EPPR0   1
+         0 000113   000017 631400 xsym               EPPR1   B_VECTNIL+15
+         0 000114   000000 701000 xent               TSX1    SSR$REG
+         0 000115   000210 702000 0                  TSX2    USER_BREAK
+
+       92     2034    2               END;
+
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:18   
+   2034  0 000116   200014 236100                    LDQ     SEGTOP,,AUTO
+         0 000117   200011 136100                    SBLQ    WVPNO,,AUTO
+         0 000120   000001 036007                    ADLQ    1,DL
+         0 000121   200006 470500                    LDP0    @N,,AUTO
+         0 000122   000127 604000 0                  TMI     s:2034+9
+         0 000123   000000 116100                    CMPQ    0,,PR0
+         0 000124   000127 602000 0                  TNC     s:2034+9
+         0 000125   000127 600000 0                  TZE     s:2034+9
+         0 000126   000000 236100                    LDQ     0,,PR0
+         0 000127   000000 471400 xsym               LDP1    MM_BYP$
+         0 000130   200020 756100                    STQ     FVP_NOW+2,,AUTO
+         0 000131   100014 236100                    LDQ     12,,PR1
+         0 000132   100002 036100                    ADLQ    2,,PR1
+         0 000133   000000 473400 xsym               LDP3    MM_CGQD$
+         0 000134   300000 036100                    ADLQ    0,,PR3
+         0 000135   000000 474400 xsym               LDP4    FMC_CACHEPGCNT$
+         0 000136   400000 036100                    ADLQ    0,,PR4
+         0 000137   000000 136000 xsym               SBLQ    MM_HELD
+         0 000140   200020 116100                    CMPQ    FVP_NOW+2,,AUTO
+         0 000141   000112 604000 0                  TMI     s:2033
+
+       93     2035
+       94     2036        /* Now, get n contiguous virtual pages beginning at wvpno          */
+       95     2037
+       96     2038    2           DO I = 1 TO N;                  /* 'I' is a dummy - never used        */
+
+   2038  0 000142   000001 235007                    LDA     1,DL
+         0 000143   200010 755100                    STA     I,,AUTO
+         0 000144   000175 710000 0                  TRA     s:2052+1
+
+       97     2039    2             IF WVPNO > SEGTOP             /* Check for hitting end of segment   */
+
+   2039  0 000145   200011 236100                    LDQ     WVPNO,,AUTO
+         0 000146   200014 116100                    CMPQ    SEGTOP,,AUTO
+         0 000147   000160 604400 0                  TMOZ    s:2050
+
+       98     2040    3               THEN DO;
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:19   
+
+       99     2041    3                   N = I - 1;              /* Return # pgs we actually got       */
+
+   2041  0 000150   200010 235100                    LDA     I,,AUTO
+         0 000151   000001 135007                    SBLA    1,DL
+         0 000152   200006 470500                    LDP0    @N,,AUTO
+         0 000153   000000 755100                    STA     0,,PR0
+
+      100     2042        /*E*   ERROR:     -E$ALLGONE-0
+      101     2043                MESSAGE: All segment space has been allocated.             */
+      102     2044        /*E*   ERROR:  MMG-E$ALLGONE-0
+      103     2045                MESSAGE: All segment space has been allocated.             */
+      104     2046    3                   ERR = %E$ALLGONE;       /* Data seg space all allocated       */
+
+   2046  0 000154   001134 236007                    LDQ     604,DL
+         0 000155   200007 471500                    LDP1    @ERR,,AUTO
+         0 000156   100000 756100                    STQ     0,,PR1
+
+      105     2047    3                   ALTRETURN;
+
+   2047  0 000157   000000 702200 xent               TSX2  ! X66_AALT
+
+      106     2048    3                 END;
+      107     2049        /* Now, get the page with the determined protection                */
+      108     2050    2            CALL MME$WGVP(EWSQ,WVPNO,BITBIN(%PGINMEM|%PGWRITE|%PGIOM),ERR) ALTRET(NOVP
+              2050                      );
+
+   2050  0 000160   200007 236100                    LDQ     @ERR,,AUTO
+         0 000161   000003 235000 1                  LDA     3
+         0 000162   200022 757100                    STAQ    FVP_NOW+4,,AUTO
+         0 000163   200011 630500                    EPPR0   WVPNO,,AUTO
+         0 000164   200021 450500                    STP0    FVP_NOW+3,,AUTO
+         0 000165   200003 236100                    LDQ     @EWSQ,,AUTO
+         0 000166   200020 756100                    STQ     FVP_NOW+2,,AUTO
+         0 000167   200020 630500                    EPPR0   FVP_NOW+2,,AUTO
+         0 000170   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         0 000171   000000 701000 xent               TSX1    MME$WGVP
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:20   
+         0 000172   000203 702000 0                  TSX2    NOVP
+
+      109     2051    2             WVPNO = WVPNO + 1;            /* Go for next vp                     */
+
+   2051  0 000173   200011 054100                    AOS     WVPNO,,AUTO
+
+      110     2052    2           END;                            /* End of get vp loop                 */
+
+   2052  0 000174   200010 054100                    AOS     I,,AUTO
+         0 000175   200006 470500                    LDP0    @N,,AUTO
+         0 000176   000000 236100                    LDQ     0,,PR0
+         0 000177   000145 604000 0                  TMI     s:2039
+         0 000200   200010 116100                    CMPQ    I,,AUTO
+         0 000201   000145 605000 0                  TPL     s:2039
+
+      111     2053    1           RETURN;
+
+   2053  0 000202   000000 702200 xent               TSX2  ! X66_ARET
+
+      112     2054        /**/
+      113     2055        /**/
+      114     2056        /* Altreturn from MME$WGVP HANDLER: */
+      115     2057    1   NOVP:   N = I - 1;                      /* Return # of pages we actually got  */
+
+   2057  0 000203   200010 235100       NOVP         LDA     I,,AUTO
+         0 000204   000001 135007                    SBLA    1,DL
+         0 000205   200006 470500                    LDP0    @N,,AUTO
+         0 000206   000000 755100                    STA     0,,PR0
+
+      116     2058                                                /* Err will have been set to either   */
+      117     2059                                           /* E$MEMLIMIT  - page limit reached , or...*/
+      118     2060                                 /* E$MONPP - can't get phy. Pg for monitor, or...*/
+      119     2061                                           /* E$NOTFREE  - page already allocated     */
+      120     2062    1           ALTRETURN;                      /* Exit with error code set           */
+
+   2062  0 000207   000000 702200 xent               TSX2  ! X66_AALT
+
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:21   
+   2051  0 000210                       USER_BREAK   null
+      121     2063
+      122     2064        /*    USER WAS X'ed, HIT BREAK OR CONTROL Y */
+      123     2065
+      124     2066    1   USER_BREAK: ;
+      125     2067    1           ERR = %E$BRKCTY;
+
+   2067  0 000210   001207 235007                    LDA     647,DL
+         0 000211   200007 470500                    LDP0    @ERR,,AUTO
+         0 000212   000000 755100                    STA     0,,PR0
+
+      126     2068    1           N = I - 1;
+
+   2068  0 000213   200010 236100                    LDQ     I,,AUTO
+         0 000214   000001 136007                    SBLQ    1,DL
+         0 000215   200006 471500                    LDP1    @N,,AUTO
+         0 000216   100000 756100                    STQ     0,,PR1
+
+      127     2069    1           ALTRETURN;
+
+   2069  0 000217   000000 702200 xent               TSX2  ! X66_AALT
+
+      128     2070        %EJECT;
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:22   
+      129     2071        /*F*   NAME:   MMG$SFVP_NOW                                        */
+      130     2072        /*F*   PURPOSE: To free a number of contiguous, segment-relative   */
+      131     2073        /*,*           virtual pages unconditionally.                      */
+      132     2074    1   MMG$SFVP_NOW: ENTRY(EWSQ,SEGID,VPNO,N,ERR)  ALTRET;
+
+   2074  0 000220   000000 700200 xent  MMG$SFVP_NOW TSX0  ! X66_AUTO_5
+         0 000221   000024 000005                    ZERO    20,5
+
+      133     2075    1           FVP_NOW = %TRUE;
+
+   2075  0 000222   400000 236003                    LDQ     -131072,DU
+         0 000223   200016 756100                    STQ     FVP_NOW,,AUTO
+
+      134     2076    1           GOTO COMMON;
+
+   2076  0 000224   000230 710000 0                  TRA     COMMON
+
+      135     2077        /*F*   NAME:   MMG$SFVP                                            */
+      136     2078        /*F*   PURPOSE: To free a number of contiguous, segment-relative   */
+      137     2079        /*,*           virtual pages.                                      */
+      138     2080    1   MMG$SFVP: ENTRY(EWSQ,SEGID,VPNO,N,ERR)  ALTRET;
+
+   2080  0 000225   000000 700200 xent  MMG$SFVP     TSX0  ! X66_AUTO_5
+         0 000226   000024 000005                    ZERO    20,5
+
+      139     2081    1           FVP_NOW = %FALSE;
+
+   2081  0 000227   200016 450100                    STZ     FVP_NOW,,AUTO
+
+      140     2082    1   COMMON:
+      141     2083                %FINDLS(WSQ = EWSQ , P$ = ELS$); /* Get ptr to this guy's lseg        */
+
+   2084  0 000230   200003 470500       COMMON       LDP0    @EWSQ,,AUTO
+         0 000231   000000 720100                    LXL0    0,,PR0
+         0 000232   000000 236010 xsym               LDQ     MM_LSPTRS$,X0
+         0 000233   200015 756100                    STQ     ELS$,,AUTO
+
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:23   
+      142     2086    1           SEGX = MOD (SEGID , 1024);
+
+   2086  0 000234   200004 471500                    LDP1    @SEGID,,AUTO
+         0 000235   100000 236100                    LDQ     0,,PR1
+         0 000236   001777 376007                    ANQ     1023,DL
+         0 000237   200012 756100                    STQ     SEGX,,AUTO
+
+      143     2087        /**/
+      144     2088    2           IF SEGX > %MAXDATASID THEN DO;
+
+   2088  0 000240   000013 116007                    CMPQ    11,DL
+         0 000241   000245 604400 0                  TMOZ    s:2093
+
+      145     2089    2                 CALL SC_MM25;
+
+   2089  0 000242   000000 713400 xsym               CLIMB   SC_MM25
+         0 000243   000000 600000 xsid               climb   nvectors=         0
+
+      146     2090    2                 ALTRETURN;
+
+   2090  0 000244   000000 702200 xent               TSX2  ! X66_AALT
+
+      147     2091    2               END;
+      148     2092        /**/
+      149     2093    1           IF SEGX <= %HIFIXEDSID          /* If its one of the fixed SEG'S...   */
+
+   2093  0 000245   000003 116007                    CMPQ    3,DL
+         0 000246   000255 605400 0                  TPNZ    s:2099
+
+      150     2094    2             THEN DO;
+
+      151     2095    2                 SEGBASE = MM_SEGLO(SEGX); /* Then this is easy                  */
+
+   2095  0 000247   000000 235006 xsym               LDA     MM_SEGLO,QL
+         0 000250   200013 755100                    STA     SEGBASE,,AUTO
+
+      152     2096    2                 SEGTOP = MM_SEGHI(SEGX);
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:24   
+
+   2096  0 000251   200012 721100                    LXL1    SEGX,,AUTO
+         0 000252   000000 235011 xsym               LDA     MM_SEGHI,X1
+         0 000253   200014 755100                    STA     SEGTOP,,AUTO
+
+      153     2097    2               END;
+
+   2097  0 000254   000275 710000 0                  TRA     s:2105
+
+      154     2098    2             ELSE DO;                 /* Else we've gotta compute the bounds     */
+
+      155     2099    2                 SEGBASE = ELS$ -> MM$DESC.BASE (SEGX);
+
+   2099  0 000255   200012 235100                    LDA     SEGX,,AUTO
+         0 000256   000001 735000                    ALS     1
+         0 000257   200015 473500                    LDP3    ELS$,,AUTO
+         0 000260   300001 235105                    LDA     1,AL,PR3
+         0 000261   200013 755100                    STA     SEGBASE,,AUTO
+
+      156     2100    2                 SEGTOP = ELS$ -> MM$DESC.BOUND (SEGX);
+
+   2100  0 000262   200012 235100                    LDA     SEGX,,AUTO
+         0 000263   000001 735000                    ALS     1
+         0 000264   300000 236105                    LDQ     0,AL,PR3
+         0 000265   000020 772000                    QRL     16
+         0 000266   200014 756100                    STQ     SEGTOP,,AUTO
+
+      157     2101    2                 SEGTOP = (SEGTOP + SEGBASE)/4096; /* Pg # of top of seg         */
+
+   2101  0 000267   200013 036100                    ADLQ    SEGBASE,,AUTO
+         0 000270   010000 506007                    DIV     4096,DL
+         0 000271   200014 756100                    STQ     SEGTOP,,AUTO
+
+      158     2102    2                 SEGBASE = SEGBASE/4096;   /* Convert base to a page #           */
+
+   2102  0 000272   200013 236100                    LDQ     SEGBASE,,AUTO
+         0 000273   010000 506007                    DIV     4096,DL
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:25   
+         0 000274   200013 756100                    STQ     SEGBASE,,AUTO
+
+      159     2103    2               END;
+
+      160     2104        /* Get the workspace-relative virtual page at which to start freeing */
+      161     2105    1           WVPNO = VPNO + SEGBASE;
+
+   2105  0 000275   200005 473500                    LDP3    @VPNO,,AUTO
+         0 000276   300000 236100                    LDQ     0,,PR3
+         0 000277   200013 036100                    ADLQ    SEGBASE,,AUTO
+         0 000300   200011 756100                    STQ     WVPNO,,AUTO
+
+      162     2106    1           IF WVPNO > SEGTOP THEN
+
+   2106  0 000301   200014 116100                    CMPQ    SEGTOP,,AUTO
+         0 000302   000307 604400 0                  TMOZ    s:2113
+
+      163     2107    2               DO;
+
+      164     2108        /*E*   ERROR:  MMG-E$BADVP-0
+      165     2109               MESSAGE: Bad virtual page no. - not in free segment area.     */
+      166     2110    2                 ERR = %E$BADVP;
+
+   2110  0 000303   001142 235007                    LDA     610,DL
+         0 000304   200007 474500                    LDP4    @ERR,,AUTO
+         0 000305   400000 755100                    STA     0,,PR4
+
+      167     2111    2                 ALTRETURN;
+
+   2111  0 000306   000000 702200 xent               TSX2  ! X66_AALT
+
+      168     2112    2               END;
+      169     2113    2           DO I = 1 TO N;                  /* 'I' is a dummy - never referenced  */
+
+   2113  0 000307   000001 235007                    LDA     1,DL
+         0 000310   200010 755100                    STA     I,,AUTO
+         0 000311   000355 710000 0                  TRA     s:2126+1
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:26   
+
+      170     2114    2             IF WVPNO < SEGBASE            /* Tried to free too much             */
+
+   2114  0 000312   200011 236100                    LDQ     WVPNO,,AUTO
+         0 000313   200013 116100                    CMPQ    SEGBASE,,AUTO
+         0 000314   000321 605000 0                  TPL     s:2121
+
+      171     2115    3               THEN DO;
+
+      172     2116        /*E*   ERROR:  MMG-E$BIGFREE-0
+      173     2117               MESSAGE: Attempt to free more space than is in data segment.  */
+      174     2118    3                   ERR = %E$BIGFREE;       /* Freed more than was there          */
+
+   2118  0 000315   001136 235007                    LDA     606,DL
+         0 000316   200007 470500                    LDP0    @ERR,,AUTO
+         0 000317   000000 755100                    STA     0,,PR0
+
+      175     2119    3                   ALTRETURN;
+
+   2119  0 000320   000000 702200 xent               TSX2  ! X66_AALT
+
+      176     2120    3                 END;
+      177     2121    2             IF FVP_NOW THEN
+
+   2121  0 000321   200016 234100                    SZN     FVP_NOW,,AUTO
+         0 000322   000337 605000 0                  TPL     s:2124
+
+      178     2122    2               CALL MME$WFVP_NOW(EWSQ,WVPNO,ERR,ERR) ALTRET(NOPP); /* Free the vp */
+
+   2122  0 000323   200007 236100                    LDQ     @ERR,,AUTO
+         0 000324   200007 235100                    LDA     @ERR,,AUTO
+         0 000325   200022 757100                    STAQ    FVP_NOW+4,,AUTO
+         0 000326   200011 630500                    EPPR0   WVPNO,,AUTO
+         0 000327   200021 450500                    STP0    FVP_NOW+3,,AUTO
+         0 000330   200003 236100                    LDQ     @EWSQ,,AUTO
+         0 000331   200020 756100                    STQ     FVP_NOW+2,,AUTO
+         0 000332   200020 630500                    EPPR0   FVP_NOW+2,,AUTO
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:27   
+         0 000333   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         0 000334   000000 701000 xent               TSX1    MME$WFVP_NOW
+         0 000335   000363 702000 0                  TSX2    NOPP
+         0 000336   000352 710000 0                  TRA     NXT
+
+      179     2123    2               ELSE
+      180     2124    2               CALL MME$WFVP(EWSQ,WVPNO,ERR,ERR) ALTRET(NOPP); /* Free the vp    */
+
+   2124  0 000337   200007 236100                    LDQ     @ERR,,AUTO
+         0 000340   200007 235100                    LDA     @ERR,,AUTO
+         0 000341   200022 757100                    STAQ    FVP_NOW+4,,AUTO
+         0 000342   200011 630500                    EPPR0   WVPNO,,AUTO
+         0 000343   200021 450500                    STP0    FVP_NOW+3,,AUTO
+         0 000344   200003 236100                    LDQ     @EWSQ,,AUTO
+         0 000345   200020 756100                    STQ     FVP_NOW+2,,AUTO
+         0 000346   200020 630500                    EPPR0   FVP_NOW+2,,AUTO
+         0 000347   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         0 000350   000000 701000 xent               TSX1    MME$WFVP
+         0 000351   000363 702000 0                  TSX2    NOPP
+
+      181     2125    2   NXT:      WVPNO = WVPNO - 1;            /* Go to next vp                      */
+
+   2125  0 000352   000001 336007       NXT          LCQ     1,DL
+         0 000353   200011 056100                    ASQ     WVPNO,,AUTO
+
+      182     2126    2           END;
+
+   2126  0 000354   200010 054100                    AOS     I,,AUTO
+         0 000355   200006 470500                    LDP0    @N,,AUTO
+         0 000356   000000 236100                    LDQ     0,,PR0
+         0 000357   000312 604000 0                  TMI     s:2114
+         0 000360   200010 116100                    CMPQ    I,,AUTO
+         0 000361   000312 605000 0                  TPL     s:2114
+
+      183     2127    1           RETURN;
+
+   2127  0 000362   000000 702200 xent               TSX2  ! X66_ARET
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:28   
+
+      184     2128        /**/
+      185     2129        /* If we were only doing one page, then give an error back (a      */
+      186     2130        /* range of pages may, by definition of this service, contain      */
+      187     2131        /* some unallocated ones. Also, if we can't free a page because    */
+      188     2132        /* of master function count > 0, then altreturn.                   */
+      189     2133    1   NOPP:   IF ERR = %E$HANDSOFF AND (( ELS$ -> MM$DESC.FLGS(SEGX) & %DSEXEC)
+
+   2133  0 000363   200007 470500       NOPP         LDP0    @ERR,,AUTO
+         0 000364   000000 235100                    LDA     0,,PR0
+         0 000365   001143 115007                    CMPA    611,DL
+         0 000366   000417 601000 0                  TNZ     s:2138
+         0 000367   200012 236100                    LDQ     SEGX,,AUTO
+         0 000370   000001 736000                    QLS     1
+         0 000371   200015 471500                    LDP1    ELS$,,AUTO
+         0 000372   100000 236106                    LDQ     0,QL,PR1
+         0 000373   000024 736000                    QLS     20
+         0 000374   777000 376003                    ANQ     -512,DU
+         0 000375   010000 376003                    ANQ     4096,DU
+         0 000376   000403 601000 0                  TNZ     s:2135
+         0 000377   200004 473500                    LDP3    @SEGID,,AUTO
+         0 000400   300000 235100                    LDA     0,,PR3
+         0 000401   006002 115007                    CMPA    3074,DL
+         0 000402   000417 601000 0                  TNZ     s:2138
+
+      190     2134    2             OR SEGID = BITBIN(%BUFSID)) THEN DO;
+
+      191     2135    2                 CALL MME$CVM (EWSQ,WVPNO,-1,ERR);
+
+   2135  0 000403   200007 236100                    LDQ     @ERR,,AUTO
+         0 000404   000004 235000 1                  LDA     4
+         0 000405   200022 757100                    STAQ    FVP_NOW+4,,AUTO
+         0 000406   200011 633500                    EPPR3   WVPNO,,AUTO
+         0 000407   200021 453500                    STP3    FVP_NOW+3,,AUTO
+         0 000410   200003 236100                    LDQ     @EWSQ,,AUTO
+         0 000411   200020 756100                    STQ     FVP_NOW+2,,AUTO
+         0 000412   200020 630500                    EPPR0   FVP_NOW+2,,AUTO
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:29   
+         0 000413   000022 631400 xsym               EPPR1   B_VECTNIL+18
+         0 000414   000000 701000 xent               TSX1    MME$CVM
+         0 000415   000000 011000                    NOP     0
+
+      192     2136    2                 GOTO NXT;
+
+   2136  0 000416   000352 710000 0                  TRA     NXT
+
+      193     2137    2               END;
+      194     2138    1           IF (N = 1) OR (ERR = %E$IOACTIVE)
+
+   2138  0 000417   200006 471500                    LDP1    @N,,AUTO
+         0 000420   100000 235100                    LDA     0,,PR1
+         0 000421   000001 115007                    CMPA    1,DL
+         0 000422   000426 600000 0                  TZE     s:2139
+         0 000423   000000 235100                    LDA     0,,PR0
+         0 000424   001160 115007                    CMPA    624,DL
+         0 000425   000352 601000 0                  TNZ     NXT
+
+      195     2139    1             THEN ALTRETURN;
+
+   2139  0 000426   000000 702200 xent               TSX2  ! X66_AALT
+
+(unnamed)
+ Sect OctLoc
+   1     000   000000 000100   000000 006000   000000 000064   000002 006000    ...@.......4....
+   1     004   000027 006000                                                    ....
+      196     2140    1             ELSE GOTO NXT;
+      197     2141        /**/
+      198     2142    1   END MMG$SGVP;
+
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:30   
+--  Include file information  --
+
+   FM_CACHE_R.:E05TOU  cannot be made into a system file and is referenced.
+   SS_SCHED_C.:E05TOU  is referenced.
+   MM_MACRO_M.:E05TOU  is referenced.
+   B_STRINGS_C.:E05TOU  is referenced.
+   MM$SYSGEN.:E05TOU  is referenced.
+   M_INFO_C.:E05TOU  is referenced.
+   MM_DATA_R.:E05TOU  cannot be made into a system file and is referenced.
+   B$JIT_C.:E05TOU  is referenced.
+   M$JIT_C.:E05TOU  cannot be made into a system file and is referenced.
+   B_SEGIDS_C.:E05TOU  is referenced.
+   M_ERRORS_C.:E05TOU  is referenced.
+      No diagnostics issued in procedure MMG$SGVP.
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:31   
+
+ **** Variables and constants ****
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     7-0-0/w PTR         r     1 @ERR                       3-0-0/w PTR         r     1 @EWSQ
+     6-0-0/w PTR         r     1 @N                         4-0-0/w PTR         r     1 @SEGID
+     5-0-0/w PTR         r     1 @VPNO                     15-0-0/w PTR         r     1 ELS$
+    *0-0-0/w UBIN        r     1 ERR                       *0-0-0/w UBIN        r     1 EWSQ
+    16-0-0/b BIT         r     1 FVP_NOW                   10-0-0/w SBIN        r     1 I
+    *0-0-0/w UBIN        r     1 N                         13-0-0/w SBIN        r     1 SEGBASE
+    *0-0-0/w UBIN        r     1 SEGID                     14-0-0/w SBIN        r     1 SEGTOP
+    12-0-0/w SBIN        r     1 SEGX                      *0-0-0/w UBIN        r     1 VPNO
+    11-0-0/w SBIN        r     1 WVPNO
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 B$JIT$                     0-0-0/w PTR         r     1 FMC_CACHEPGCNT$
+     0-0-0/w PTR         r     1 MM_BYP$                    0-0-0/w PTR         r     1 MM_CGQD$
+     0-0-0/w UBIN        r     1 MM_HELD
+     0-0-0/w PTR         r     1 MM_LSPTRS$(0:8)
+     0-0-0/w SBIN        r     1 MM_SEGHI(0:3)
+     0-0-0/w SBIN        r     1 MM_SEGLO(0:3)
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+OctLoc.c.b A Datatyp(siz) R M Lvl/name                 OctLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(8856)  r     1 B$JIT                      0-0-0/w SBIN        r     1 FMC$CACHEPGCNT
+     0-0-0/w STRC(576)   r     1 MM$BYP                     0-0-0/w STRC(288)   r     1 MM$CGQD
+     0-0-0/d STRC(72)    r     1 MM$DESC(0:0)
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:32   
+
+
+   Procedure MMG$SGVP requires 279 words for executable code.
+   Procedure MMG$SGVP requires 20 words of local(AUTO) storage.
+
+    No errors detected in file MMG$SMEM.:E05TSI    .
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:33   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:34   
+          MINI XREF LISTING
+
+B$JIT.ERR.MID
+       965**DCL       965--REDEF
+B$JIT.JRESPEAK
+      1055**DCL      1056--REDEF
+B$JIT.PTSIZ
+      1057**DCL      2017>>ASSIGN
+B$JIT$
+        31**DCL       959--IMP-PTR  2017>>ASSIGN
+COMMON
+      2084**LABEL    2076--GOTO
+ELS$
+        28**DCL      1988<<ASSIGN   2006>>ASSIGN   2020>>ASSIGN   2084<<ASSIGN   2099>>ASSIGN   2100>>ASSIGN
+      2133>>IF
+ERR
+        14**DCL         8--PROC     2046<<ASSIGN   2050<>CALL     2067<<ASSIGN   2074--ENTRY    2080--ENTRY
+      2110<<ASSIGN   2118<<ASSIGN   2122<>CALL     2122<>CALL     2124<>CALL     2124<>CALL     2133>>IF
+      2135<>CALL     2138>>IF
+EWSQ
+        10**DCL         8--PROC     1988>>ASSIGN   2009>>DOCASE   2050<>CALL     2074--ENTRY    2080--ENTRY
+      2084>>ASSIGN   2122<>CALL     2124<>CALL     2135<>CALL
+FMC$CACHEPGCNT
+      1919**DCL      2031>>DOWHILE
+FMC_CACHEPGCNT$
+      1919**DCL      1919--IMP-PTR  1919--REDEF    2031>>DOWHILE
+FVP_NOW
+        29**DCL      2075<<ASSIGN   2081<<ASSIGN   2121>>IF
+I
+        23**DCL      2028<<ASSIGN   2038<<DOINDEX  2041>>ASSIGN   2057>>ASSIGN   2068>>ASSIGN   2113<<DOINDEX
+MM$BYP.AUTOP
+      1550**DCL      2031>>DOWHILE
+MM$BYP.FPPC
+      1549**DCL      2031>>DOWHILE
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:35   
+MM$CGQD.FPPC
+      1936**DCL      2031>>DOWHILE
+MM$DESC.BASE
+      1630**DCL      2006>>ASSIGN   2020>>ASSIGN   2099>>ASSIGN
+MM$DESC.BOUND
+      1628**DCL      1629--REDEF    2100>>ASSIGN
+MM$DESC.FLGS
+      1629**DCL      1629--REDEF    2133>>IF
+MM$PPUT.USER#
+      1617**DCL      1617--REDEF
+MME$CVM
+        19**DCL-ENT  2135--CALL
+MME$WFVP
+        17**DCL-ENT  2124--CALL
+MME$WFVP_NOW
+        18**DCL-ENT  2122--CALL
+MME$WGVP
+        16**DCL-ENT  2050--CALL
+MM_BYP$
+      1548**DCL      1548--IMP-PTR  2031>>DOWHILE  2031>>DOWHILE
+MM_CGQD$
+        32**DCL      1935--IMP-PTR  2031>>DOWHILE
+MM_HELD
+      1551**DCL      2031>>DOWHILE
+MM_LSPTRS$
+      1628**DCL      1988>>ASSIGN   2084>>ASSIGN
+MM_SEGHI
+      1553**DCL      2003>>ASSIGN   2096>>ASSIGN
+MM_SEGLO
+      1552**DCL      2002>>ASSIGN   2095>>ASSIGN
+N
+        13**DCL         8--PROC     2029>>IF       2031>>DOWHILE  2038>>DOINDEX  2041<<ASSIGN   2057<<ASSIGN
+      2068<<ASSIGN   2074--ENTRY    2080--ENTRY    2113>>DOINDEX  2138>>IF
+NOPP
+      2133**LABEL    2122--CALLALT  2124--CALLALT
+NOVP
+PL6.E3A0      #001=MMG$SGVP File=MMG$SMEM.:E05TSI                                WED 07/30/97 03:20 Page:36   
+      2057**LABEL    2050--CALLALT
+NXT
+      2125**LABEL    2136--GOTO     2140--GOTO
+SC_MM25
+        21**DCL-ENT  1996--CALL     2089--CALL
+SEGBASE
+        26**DCL      2002<<ASSIGN   2006<<ASSIGN   2007<<ASSIGN   2007>>ASSIGN   2024>>ASSIGN   2095<<ASSIGN
+      2099<<ASSIGN   2101>>ASSIGN   2102<<ASSIGN   2102>>ASSIGN   2105>>ASSIGN   2114>>IF
+SEGID
+        11**DCL         8--PROC     1990>>ASSIGN   2074--ENTRY    2080--ENTRY    2086>>ASSIGN   2133>>IF
+SEGTOP
+        27**DCL      2003<<ASSIGN   2011<<ASSIGN   2013<<ASSIGN   2015<<ASSIGN   2017<<ASSIGN   2020<<ASSIGN
+      2021<<ASSIGN   2021>>ASSIGN   2031>>DOWHILE  2039>>IF       2096<<ASSIGN   2100<<ASSIGN   2101<<ASSIGN
+      2101>>ASSIGN   2106>>IF
+SEGX
+        25**DCL      1990<<ASSIGN   1995>>IF       2000>>IF       2002>>ASSIGN   2003>>ASSIGN   2006>>ASSIGN
+      2008>>IF       2020>>ASSIGN   2086<<ASSIGN   2088>>IF       2093>>IF       2095>>ASSIGN   2096>>ASSIGN
+      2099>>ASSIGN   2100>>ASSIGN   2133>>IF
+SSR$REG
+        20**DCL-ENT  2033--CALL
+USER_BREAK
+      2051**LABEL    2033--CALLALT
+VPNO
+        12**DCL         8--PROC     2024>>ASSIGN   2074--ENTRY    2080--ENTRY    2105>>ASSIGN
+WVPNO
+        24**DCL      2024<<ASSIGN   2031>>DOWHILE  2039>>IF       2050<>CALL     2051<<ASSIGN   2051>>ASSIGN
+      2105<<ASSIGN   2106>>IF       2114>>IF       2122<>CALL     2124<>CALL     2125<<ASSIGN   2125>>ASSIGN
+      2135<>CALL

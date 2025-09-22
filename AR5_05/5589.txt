@@ -1,0 +1,1054 @@
+/*M*    make_derive:c  --    determine derivation of major target   */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+#include   "MAKE_Cc14"
+#include   <stdlib.h>
+#include   <b$jit_c.h>
+#include   <string.h>
+ 
+/*F*    NAME:          make_derive
+        PURPOSE:       To determine the steps involved to produce
+                    the specified target.
+        DESCRIPTION:
+           This function produces two lists and temporarily creates
+           and uses a third.  The temporary list is used so save
+           memory, we could use recursive calls to make_derive but
+           that would waste auto-space.
+ 
+           The result of this function is a list of targets which were
+           more recent than the target we are building and this
+           function adds pointers to the "struct target_action"'s
+           required to build the main target.
+ 
+           The major data structures used are:
+ 
+           1. "struct derive_list *(dl[])" which points to a temporary
+              table allocated to hold information instead of using
+              recursion.  This table is indexed by the recursion level
+              and contains the current dependancy list, the position
+              in that list and the index in the early target list that
+              corresponds to the first entry associated with this
+              target.
+ 
+           2. "struct sym_target **ChangedTargets" which points to an
+              array of pointers to the targets which were more recent
+              than the target.  This information is used to provide
+              the "$?" macro value.
+ 
+           3. "struct target_action *a" which holds the information
+              necessary to build the target.  This structure holds
+              the jcl, input and output files and information on
+              the entries in ChangedTargets that would be necessary
+              to expand if the jcl references the "$?" function.
+ 
+*/
+ 
+struct derive_list  {
+  struct   dependancy  *dl_depend;
+  int                   dl_index;
+  int                   dl_early;
+  timetype              dl_modtime;
+  };
+ 
+extern char *fid_acct();
+ 
+struct  derive_list *dl = 0;
+unsigned            dl_size  = 0;
+unsigned            dl_i     = 0;
+ 
+#define             DL_ALLOC 10
+ 
+struct  sym_target  **ChangedTargets = 0;
+unsigned            ChangeTableSize  = 0;
+ 
+#define ALLOC_NUM      64
+struct target_action   *target_action_head = 0;
+ 
+unsigned            ChangeTableI     = 0;
+ 
+struct  sym_target  fake_targets[8];  /** Temp pseudo-targets **/
+struct  file_info   file_names  [8];  /** Temp file information **/
+static  int         last_file        = 0;
+ 
+ 
+int
+derive(tg, LS_width, debug, verbose)
+  struct sym_target *tg;
+  int               LS_width;
+  int               debug;
+  int               verbose;
+{
+  timetype          early_start;
+  timetype          late_modtime;
+  int               i;
+  int               k;
+  int               w_p;
+  struct dependancy *d;
+  struct sym_target *new_file();
+  struct target_action *a;
+  int                flg;
+timetype            derive_target();
+timetype            derive_targets();
+ 
+  if (tg->tg_status > STATUS_UNUSED) return 0;
+start:
+  early_start = ChangeTableI;
+  late_modtime = BEGINNING_OF_TIME;
+  i = 0;
+  d = tg->tg_depend;
+ 
+  tg->tg_status = STATUS_BUSY;
+ 
+resume:
+  while (d)   {
+     if (B$JIT$->active.jit)   {
+        char cb[120];
+        static int cci = 1;
+        if (cci) {
+           memset(B$JIT$->ccbuf, ' ', sizeof(B$JIT$->ccbuf));
+           cci = 0;
+           }
+        sprintf(cb, "make targets=%d %s",
+                TargetActionNum,
+                tg->tg_text );
+        memcpy(B$JIT$->ccbuf, cb, strlen(cb));
+        }
+     for (; i<d->dp_num ; i++)  {
+        struct sym_target *t = d->dp_list[i];
+ 
+        if (t->tg_status == STATUS_UNUSED)  {
+           tg->tg_status = STATUS_BUSY;
+           if (dl_i >= dl_size) {
+              k = (dl_size += DL_ALLOC) * sizeof(struct derive_list);
+              dl = (struct derive_list *) realloc(dl, k);
+              if (!dl) crash("Out of Memory: Derive_Target\n");
+              }
+           dl[dl_i].dl_depend    = d;
+           dl[dl_i].dl_index     = i;
+           dl[dl_i].dl_early     = early_start;
+           dl[dl_i].dl_modtime   = late_modtime;
+           tg = t;
+           dl_i++;
+           goto start;
+           }
+        else if (t->tg_status == STATUS_BUSY)  {
+           k = dl_i;
+           warning("### Loop in dependancy list for \"%s\"\n",tg->tg_text);
+           printf ("#   Traceback: %s",t->tg_text), w_p=t->tg_len+15;
+           while (k>0 && ((t = dl[--k].dl_depend->dp_target)!=d->dp_target)) {
+              if (w_p+t->tg_len >LS_width)
+                 printf("\n#              "), w_p = 15;
+              printf(" -> %s",t->tg_text), w_p += 4+t->tg_len;
+              }
+           printf("\n");
+           }  /* end of busy target */
+        else late_modtime = MAX(late_modtime,t->tg_modtime), late_modtime = MAX(late_modtime, t->tg_umodtime);
+        }     /* end of for loop    */
+     d = d->dp_tgdepend, i = 0;
+     }        /* end of while loop  */
+ 
+  if (debug) {
+     printf("\n  *Deriving: %s",tg->tg_text), w_p = 13 + tg->tg_len;
+     k = dl_i;
+     while (k)   {
+        struct sym_target *t = dl[--k].dl_depend->dp_target;
+        if (w_p + t->tg_len > LS_width)
+           printf("\n             "), w_p = 13;
+        printf(" %s",t->tg_text), w_p += 1+ t->tg_len;
+        }
+     printf("\n");
+     }
+ 
+  if (tg->tg_action) goto exit;
+  last_file      = 0;
+  find_file(tg, &file_names[ 0 ], 0, 1);
+  new_file (tg, &file_names[ 0 ], debug, 0);
+  tg->tg_srch = file_names[0].fi_srch;
+ 
+  if (!tg->tg_action)
+  if ( !tg->tg_phony && (!tg->tg_commands ||
+      (tg->tg_commands->tr_commands->cm_flags&(MC_SI|MC_SI_FILE|MC_SI_ACCT))))
+        early_start = derive_target(tg, late_modtime, debug, verbose);
+     else if (tg->tg_commands || !tg->tg_phony)
+        early_start = derive_targets(tg, late_modtime, debug);
+ 
+ 
+ 
+  if (tg->tg_status != STATUS_COMPLETED && (a = tg->tg_action) &&
+     (a->ta_rule) &&
+     (flg = a->ta_rule->tr_commands->cm_flags &
+        (MC_EARLIER | MC_PREDECESSOR | MC_DEPENDENT)     ) )   {
+     if (!a->ta_predvar && (flg & MC_PREDECESSOR))
+        build_predecessor_list(tg);
+ 
+     if (!a->ta_chngvar && (flg & MC_EARLIER))
+        build_changed_list(tg);
+ 
+     if (!a->ta_dpndvar && (flg & MC_DEPENDENT))
+        build_dependent_list(tg);
+     }
+ 
+exit:
+  if (dl_i)   {
+     dl_i--;
+     d            = dl[dl_i].dl_depend;
+     i            = dl[dl_i].dl_index;
+     early_start  = dl[dl_i].dl_early;
+     late_modtime = MAX(late_modtime, dl[dl_i].dl_modtime);
+     tg           = d->dp_target;
+     goto resume;
+     }
+ 
+  if (dl_size)   {
+     free(dl), dl_size = 0, dl = 0;
+     }
+ 
+  return Errors;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       build_target(tg, ft);
+        PURPOSE:    To return a pointer to a "struct sym_target" which
+                 corresponds to the base file name in "tg" with the
+                 file type indicated by "ft".
+*/
+ 
+ 
+struct sym_target *
+build_target(tg, ft)
+  struct sym_target *tg;
+  struct sym_ftype  *ft;
+{
+  struct file_info  *fi = &file_names[last_file];
+  struct sym_target *t;
+  char               buf[80];
+  int                i = tg->tg_len - tg->tg_suffix_len;
+  int                j = ft->ft_len;
+  int                tgl;
+ 
+  if (tg->tg_ftype == ft) return tg;     /* Already got it! */
+ 
+  if (i > 31)
+     crash("### Target name \"%s\" is too long for CP-6 fid\n",tg->tg_text);
+ 
+  memcpy(buf, tg->tg_text, i);
+  buf[i] = '.';
+  if ((j+i+2) > 63)
+     error("### File type+ \"%s\" is too long, max size=31\n", tg->tg_text), j=31;
+  memcpy(&buf[i+1], ft->ft_text, j);
+  buf[tgl = i + 1 + j] = 0;
+ 
+  t = lookup_sym_target(buf,tgl,0);
+  if (t) return t;
+ 
+  memcpy(fi->fi_tgtext, buf, tgl+1);
+  t = &fake_targets[ last_file ];
+  *t = init_sym_target;
+  t->tg_len = tgl;
+  t->tg_suffix_len = j+1;
+  t->tg_text = fi->fi_tgtext;
+  t->tg_ftype = ft;
+  return t;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       new_file(tg, fi, debug, sif)
+        PURPOSE:    To add filename information to the specified
+                    target.
+        DESCRIPTION:
+           This may not be a "real" target.  When looking for an
+           input file, a "fake" target is allocated when build
+           target is creating a target type that doesn't currently
+           exist.  This routine must turn this fake target into
+           a true "struct sym_target" so that we will find this
+           later when looking for this filename.
+*/
+ 
+struct sym_target *
+new_file(tg, fi, debug, sif)
+  struct sym_target *tg;
+  struct file_info  *fi;
+  int                debug;
+  int                sif;
+{
+  char              *ctime();
+  char              *alloc_text();
+  unsigned long gmt_val1;
+  unsigned long gmt_val2;
+ 
+  if (sif) {  /*  .h.h style rule, make a real fake target.   */
+     struct sym_ftype *ft = tg->tg_ftype;
+     int               p  = tg->tg_len - tg->tg_suffix_len;
+     memcpy(fi->fi_tgtext, tg->tg_text, tg->tg_len+1);
+     memcpy(fi->fi_tgtext+p, ":.", 2);
+     p += 2;
+     memcpy(fi->fi_tgtext+p, ft->ft_text, ft->ft_len+1);
+     p += ft->ft_len;
+     tg = lookup_sym_target(fi->fi_tgtext,p,1);
+     }
+  if (fi->fi_tgtext == tg->tg_text)   {  /* a fake target? */
+     tg = lookup_sym_target(tg->tg_text, tg->tg_len, 1);
+     if (!tg) crash("Out of Memory: Derive\n");
+     }
+ 
+  tg->tg_fid = alloc_text(fi->fi_name[0]+2, fi->fi_name);
+  tg->tg_modtime = fi->fi_mod;
+  if (tg->tg_phony) tg->tg_modtime = END_OF_TIME;
+ 
+  if (fi->fi_uname[0])   {
+     tg->tg_ufid = alloc_text(fi->fi_uname[0]+2, fi->fi_uname);
+     tg->tg_umodtime = fi->fi_umod;
+     }
+ 
+  if (debug)  {
+     gmt_val1 = utstogmt(tg->tg_modtime);
+     if (tg->tg_modtime && tg->tg_modtime != END_OF_TIME)
+        printf("File: %s modified %s",&tg->tg_fid[1],ctime(&gmt_val1));
+     else printf("File: %s does not exist.\n",&tg->tg_fid[1]);
+ 
+     if (tg->tg_ufid) {
+        gmt_val2 = utstogmt(tg->tg_umodtime);
+        if (tg->tg_umodtime && tg->tg_modtime != END_OF_TIME)
+           printf("File: %s modified %s",&tg->tg_ufid[1],ctime(&gmt_val2));
+        else printf("File: %s does not exist.\n",&tg->tg_ufid[1]);
+        }
+     }
+ 
+  return tg;
+}
+ 
+ 
+ 
+ 
+static int forced_online = 0;
+ 
+int
+set_online(struct sym_target *tg, struct sym_target *tgi)
+{
+  int   onl = 0;
+  int   dn;
+  int   dnum;
+  struct dependancy *d = tg->tg_depend;
+ 
+  if (MaxJobs == 0)  {
+     tg->tg_online = 1;
+     return;
+     }
+  if ('*' == tg->tg_fid[1])
+     onl++, forced_online++;
+  else if (tgi && ('*'==tgi->tg_fid[1] || (tgi->tg_ufid&&'*'==tgi->tg_ufid[1])))
+     onl++, forced_online++;
+  else  {
+     if (forced_online)
+     while (d)   {
+        for (dn = 0 ; dn < dnum ; )   {
+           struct sym_target *t = d->dp_list[dn++];
+           if (t->tg_fid && '*' == t->tg_fid[1])  {
+              onl++;
+              goto got_onl;
+              }
+           }
+        d = d->next;
+        }  /* end of while (d)  */
+     }     /* end of else       */
+got_onl:
+  tg->tg_online |= onl;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       new_action(tg, rl, tgi)
+        PURPOSE:    To allocate and return a pointer to a new
+                    "struct target_action".
+ 
+*/
+ 
+struct target_action *
+new_action(tg, rl, tgi)
+  struct sym_target    *tg;
+  struct target_rule   *rl;
+  struct sym_target    *tgi;
+{
+  int                   i;
+  struct target_action *rs;
+ 
+  set_online(tg, tgi);
+  if (!target_action_head)   {
+     i = ALLOC_NUM;
+     rs = (struct target_action*)malloc(sizeof(struct target_action)*ALLOC_NUM);
+     if (!(target_action_head = rs)) crash("Out of memory: DERIVE");
+     mem_actionlist[0] += sizeof(struct target_action) * ALLOC_NUM;
+     while(--i) rs->next = rs+1, rs++;
+     rs->next = 0;
+     }
+  mem_actionlist[1] += sizeof(struct target_action);
+  rs = target_action_head;
+  target_action_head = rs->next;
+  rs->next = 0;
+  rs->ta_predvar = 0;
+  rs->ta_chngvar = 0;
+  rs->ta_dpndvar = 0;
+  rs->ta_target  = tg;
+  rs->ta_rule    = rl;
+  rs->ta_sysid   = 0;
+  rs->ta_flags   = 0;
+  rs->ta_tginput = tgi;
+  if (tgi && tg) {
+     if (tg->tg_owner) {
+        if(!tgi->tg_owner)
+           tgi->tg_owner = tg->tg_owner;
+        }
+     else if (tgi->tg_owner) tg->tg_owner = tgi->tg_owner;
+     }
+ 
+  TargetActionNum++;
+  if (TargetActionNum > TargetActionSize)   {
+     struct target_action **t;
+     int i = ALLOC_NUM<<2;
+     t = (struct target_action**)realloc(TargetActions,(TargetActionSize+=i)<<2);
+     if (!t) crash("Out of Memory: Derive\n");
+     TargetActions = t;
+     }
+  TargetActions[TargetActionNum-1] = rs;
+  return rs;
+}
+ 
+ 
+/*D*    NAME:             delayed_target(struct sym_target *tg)
+        PURPOSE:          To create a fake action for this target if
+                          any of its dependencies are produced by actions.
+        DESCRIPTION:
+           This function is invoked when a rule to produce a target cannot
+           be found and it doesn't have a corresponding source file.
+*/
+ 
+unsigned
+delayed_target(tg, early_start)
+  struct sym_target *tg;
+  unsigned          early_start;
+{
+  struct dependancy *d = tg->tg_depend;
+  struct file_info  *of= &file_names[0];
+  int               da = 0;     /*  Number of dependency actions */
+  int               st = STATUS_COMPLETED;  /* Default status    */
+ 
+  while (d)   {
+     int dn = 0, dnum = d->dp_num;
+     while (dn < dnum) {
+        struct sym_target *t = d->dp_list[dn++];
+        if (t->tg_action) {     /* if depenency is produced...   */
+           da++;
+           if (t->tg_status==STATUS_WAITING) st = STATUS_WAITING;
+           }
+        }     /*    End of while (dn<dnum)  */
+     d = d->next;
+     }        /*    End of while (d)        */
+ 
+  if (da)  {  /*    if there were dependency actions... */
+     tg->tg_action = new_action(tg, (struct target_rule*)0, (struct sym_target*)0);
+     tg->tg_status = st;
+     if (st == STATUS_COMPLETED && !tg->tg_modtime)  /* File exist? */
+        error("### Error: Can't find and can't build target %s\n",tg->tg_text);
+     else if (options['v'])
+        warning("### Warning: %s assumed to be built as dependent side-effect\n",tg->tg_text);
+     if (st == STATUS_WAITING && !tg->tg_modtime && tg->tg_srch) {
+        fid_ins_acct(tg->tg_srch->accts[0].text, of->fi_name);
+        tg->tg_fid = alloc_text(of->fi_name[0]+2, of->fi_name);
+        }
+     if (st == STATUS_WAITING)
+        tg->tg_modtime = early_start = -1;
+     else tg->tg_modtime = MAX(early_start, tg->tg_modtime);
+     return 1;
+     }
+  return 0;
+}
+ 
+ 
+ 
+/*D*    NAME:             derive_depinput(tg, rft)
+        PURPOSE:          To locate the input file for a target.
+        DESCRIPTION:
+           This function is invoked when a required target has a dependancy
+           which has the same base file name.  In this case, the plan is to
+           check each of these dependencies to determine if it is an input
+           file that could produce the required output file type.  If it does,
+           then we assume that it is the intended input for this target.
+ 
+           This function returns a pointer to the correct production rule to
+           produce the target or a NULL pointer if there is no built-in rule
+           that can produce the required input file type from one of the same
+           named dependencies.
+*/
+struct sym_target *
+derive_depinput(tg)
+  struct sym_target *tg;
+{
+  struct sym_ftype     *rft = tg->tg_ftype;    /* Required output file type */
+  struct dependancy    *d   = tg->tg_depend;   /* Head of dependancy list   */
+  int                   tg_blen = tg->tg_len - tg->tg_suffix_len;
+  struct sym_target    *get_rule();
+ 
+  while (d)   {
+     int   dn, dnum = d->dp_num;
+     for (dn = 0; dn<dnum ; ) {
+        struct sym_target    *t = d->dp_list[dn++];
+        if (tg_blen == t->tg_len - t->tg_suffix_len && !memcmp(tg->tg_text,t->tg_text,tg_blen)){
+           struct sym_ftype  *fi = t->tg_ftype;
+           struct sym_target *tr = 0;
+           while (tr = get_rule(tr, rft, 1))   {
+              if (tr->tg_inftype == fi)
+                 return tr;
+              }  /*       end of while (get_rule)    */
+           }     /*  end of: if (base == depbase)    */
+        }        /*  end of: for loop                */
+     d = d->next;
+     }           /*  end of: while (d)               */
+  return 0;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:             derive_target(tg)
+        PURPOSE:          To initiate all of the action entries
+                       required to produce the specified target.
+        DESCRIPTION:
+           All of the dependancies for this target must have already
+           been derived.  A target is produced in one of two ways:
+ 
+           1. Explicit commands were entered to build the target.
+ 
+              In this case, we can immediately determine the method
+              of producing this target.  If the commands reference
+              the special macro $< or $@, then this command
+              produces as single file for each invokation.
+              Otherwise, all of the targets mentioned on the
+              dependancy line for these commands are assumed to be
+              produced.
+ 
+           2. The other method of producing a file (and more often
+              used) is to use an implcit rule.  In this case, MAKE
+              searches for an existing input file that could produce
+              the required output file.  This may involve two steps
+              such as running LEX to produce C source and then
+              running the C compiler to produce the appropriate
+              object unit.
+ 
+           This function determines which case is appropriate for
+           building the specified target, builds
+           "struct target_action" entries, creates "struct sym_target"
+           entries for any input files that are found and updates the
+           status of the input target.
+*/
+ 
+unsigned
+derive_target(tg, early_start, debug, verbose)
+  struct sym_target    *tg;
+  timetype              early_start;
+  int                   debug;
+  int                   verbose;
+{
+  int                   flavor, sif;
+  struct sym_target    *tr;
+  struct sym_target    *t;
+  struct sym_ftype     *rft = tg->tg_ftype;
+  struct file_info     *cf, *of, *tgfi = &file_names[0];
+  struct sym_target    *stg = 0;
+  struct sym_target    *xtg = 0, *tgo = 0;
+  struct target_rule   *rule = tg->tg_commands, *cmds = 0;
+  struct target_action *action = 0;
+  struct target_action **tga = 0;
+  struct sym_target    *tgroot = tg;
+  timetype              time, itime;
+  int                   Status = STATUS_BUSY;
+  struct sym_target    *get_rule();
+  int                   pr = 0;
+  extern struct target_rule FMT_compile, COPY_compile;
+ 
+  last_file = 1;
+  if (tg->tg_inftype)  {
+     flavor = 4;
+     xtg    = tg;
+     }
+  else flavor = (rule) ? 2 : 1;
+ 
+  of = &file_names[0];
+  if (tg->tg_depbase && flavor!=4 && (tr = derive_depinput(tg)))
+     flavor = 5;
+  else tr = (struct sym_target*) 0;
+ 
+  while (tr = get_rule(tr, tg->tg_ftype, flavor, xtg)) {
+     if ( pr = (verbose && debug && flavor!=3))
+        printf("%s ",tr->tg_text);
+     sif = tr->tg_inftype == tr->tg_ftype;
+     t   = build_target(tg,tr->tg_inftype);
+     find_file(t, (cf=&file_names[last_file]), sif, 0);
+     if (t->tg_action || cf->fi_mod != 0 || flavor == 3)  {
+        if (pr) printf("\n"), pr=0;
+        cmds = tr->tg_commands;
+        t    = new_file(t, cf, ((flavor==3)? 0 : debug), sif);
+        if (flavor == 3 || rft != tr->tg_ftype) {/*complex derive*/
+           of = &file_names[++last_file];
+           stg = tg;   /* produce an output target */
+           tgo  = build_target(stg, tr->tg_ftype);
+           if (tg->tg_action)
+              goto try_next_rule;
+           find_file(tgo,of,0,1);
+           xtg = tg  = new_file(tgo, of, ((tgo==tgroot)? 0 : debug),0);
+           tg->tg_srch = of->fi_srch;
+           flavor = 3;
+           }
+found_in_SI:
+        time = MAX(tg->tg_modtime, tg->tg_umodtime);
+        time = (time == END_OF_TIME)? BEGINNING_OF_TIME : time;
+        if (t->tg_old) {  /* treat target as up-to-date */
+           t->tg_modtime = BEGINNING_OF_TIME+1;
+           if (t->tg_umodtime) t->tg_umodtime = BEGINNING_OF_TIME+1;
+           }
+        if (t->tg_new) t->tg_modtime = END_OF_TIME;
+        itime = MAX(t->tg_modtime, t->tg_umodtime);
+        early_start = MAX(early_start,itime);
+        Status = (time>=early_start)? STATUS_COMPLETED:STATUS_WAITING;
+        if (tg->tg_old)  {
+           Status = STATUS_COMPLETED;
+           tg->tg_modtime = time = BEGINNING_OF_TIME+1;    /* don't count mod time */
+           if (tg->tg_umodtime) tg->tg_umodtime = BEGINNING_OF_TIME+1;
+           }
+        if (tg->tg_new) Status = STATUS_WAITING;
+        /**  Put output in 1st directory if we must generate it **/
+        if (tgfi->fi_srch && Status==STATUS_WAITING) {
+           fid_ins_acct(tgfi->fi_srch->accts[0].text,of->fi_name);
+           tg->tg_fid = alloc_text(of->fi_name[0]+2,of->fi_name);
+           }
+        tg->tg_action = action = new_action(tg, (rule)?rule :cmds, t);
+        if (tga) *tga = action;
+        tga  = &action->next;
+        early_start = (Status==STATUS_WAITING)? END_OF_TIME:MAX(time,early_start);
+        tg->tg_status = Status;
+        tg->tg_modtime = early_start;
+        if (flavor == 2 || tgroot == tg) goto exit;
+        flavor = 3;
+        tg     = stg;
+        of = &file_names[0];
+        }  /*  End of "found file" or "complex derivation"    */
+try_next_rule:
+     if (flavor == 5) flavor = 2;
+     }     /*  End of  while...                               */
+ 
+/*   Didn't find any way to generate the target file!
+     No problem if we found the target (if debug is we'll
+     say we couldn't find it, otherwise, this is a serious
+     error.
+*/
+ 
+  of = &file_names[last_file=0];
+  if (pr) printf("\n"), pr=0;
+ 
+/*   Next possibility... we are really looking for an input file for
+     another target.  This is likely to be true if:
+ 
+     1. The file type is associated with implicit input rules
+     2. The target file does not exist
+     3. We inserted the OUPATH (overriding the default SI account)
+ 
+     In this case, see if the file exists in the SIPATH.  If it
+     does, then just return this file's time stamp.
+ 
+     Note:  If there is an explicit rule to generate this file then
+            it is an error.
+*/
+     if (!rule && tg->tg_ftype->ft_in && OUPATH && SIPATH && !memcmp(fid_acct(file_name(tg,0)), SIROOT1, 8))  {
+        char *sf = tg->tg_fid;
+        tg->tg_fid = 0;   /*  Ignore original fid */
+        find_file(tg, (cf = &file_names[0]), 1, 0);
+        if (cf->fi_mod)   {     /* If the file existed...  */
+           tg = new_file(tg, cf, debug, 0);
+           time = MAX(tg->tg_modtime, tg->tg_umodtime);
+           early_start = MAX(early_start, time);
+           tg->tg_status = STATUS_COMPLETED;
+           if (options['v'] > 1)
+              warning("### warning: %s assumed to be an input file not a target\n", tg->tg_text);
+           goto exit;
+           }
+        tg->tg_fid = sf;
+        }
+/*   One interesting possibility to consider:  include files may
+     come from the SI/UI accounts and appear in the OU acction.
+     There is no explicit rule to produce them but they are produced
+     here if there is an OUPATH and an SIPATH specified and if
+     the file that we are looking for should be found in the OUPATH.
+*/
+  if (OUPATH && SIPATH)   {
+     char *acct = fid_acct(tg->tg_fid+1);
+     int   i    = 0;
+     int   j    = OUPATH->naccts;
+     last_file  = 1;
+     while (i < j)  {
+        if (memcmp(acct,OUPATH->accts[i++].text,8) == 0)   {
+           t = build_target(tg, tg->tg_ftype);
+           find_file(t, (cf = &file_names[last_file]),1,0);
+           if (cf->fi_mod && memcmp(OUPATH->accts[i-1].text,fid_acct(cf->fi_name),8)!=0)   {
+              cmds = (cf->fi_umod) ? fmt_cmd : copy_cmd;
+              t    = new_file(t, cf, debug, 1);
+              if (options['v'] > 1)
+                 warning("## warning: %s assumed to be an include file, formatted or copied into the OU account\n",tg->tg_text);
+              goto found_in_SI;
+              break;
+              }
+           }
+        }
+     }
+  tg->tg_modtime = of->fi_mod;
+  tg->tg_umodtime = of->fi_umod;
+ 
+/**  Even more possibilities:
+ 
+     If the target depends upon targets which have actions associated with
+     them, this target could be a side-effect of such a target.
+ 
+     So, when this case is found, we create a fake action to delay the running
+     of targets dependent upon this target.  This fake action will contain no
+     commands, so it will merely be marked completed (or errored if the target
+     doesn't exist at that point) whenever it is ready to run.
+*/
+  if (tg->tg_depend && delayed_target(tg))
+     goto exit;
+ 
+  if (of->fi_mod)   {
+     if (debug)
+        printf("### Warning: no actions found to produce \"%s\"\n",
+               tg->tg_text);
+     tg->tg_status = STATUS_COMPLETED;
+     if ('*' == of->fi_name[1])
+        forced_online++;
+     if (tg->tg_old)   {
+        tg->tg_modtime = BEGINNING_OF_TIME+1;
+        if (tg->tg_umodtime) tg->tg_umodtime = BEGINNING_OF_TIME+1;
+        }
+     if (tg->tg_new) tg->tg_modtime = END_OF_TIME;
+     }
+  else {
+     error("### Error: Can't find and can't build target \"%s\"\n",
+               tg->tg_text);
+     tg->tg_status = STATUS_ERRORED;
+     }
+ 
+exit:
+  return early_start;
+}
+ 
+ 
+unsigned
+derive_targets(tg, early_start, debug)
+  struct sym_target    *tg;
+  timetype              early_start;
+  int                   debug;
+{
+  struct target_rule   *rule = tg->tg_commands;
+  struct dependancy    *d = (rule)? rule->tr_depend : 0;
+  int                single = 0;
+  timetype              xstart;
+  timetype              time;
+  int                   Status;
+  struct sym_target    *t;
+  int                   fixa;
+  struct target_action **tga = &tg->tg_action;
+  struct target_action *action = 0;
+  struct sym_owner *ow = tg->tg_owner;
+  char                 *accts;
+  char                 *fid;
+  int                   told = 0, tnew = 0;
+ 
+  xstart = MAX(file_names[0].fi_mod,file_names[0].fi_umod);
+  if (d && rule->tr_commands->cm_flags & (MC_OU|MC_OU_FILE))
+     single = 1;
+  if (d && options['v'] > 1) {
+     if (d->dp_target != tg && !single) {
+        warning("### multiple targets assumed to be produced by commands to produce target %s\n", tg->tg_text);
+        }
+     }
+  last_file = 1;
+  while (d)   {
+     t = (single) ? tg : d->dp_target;
+     told += t->tg_old;
+     tnew += t->tg_new;
+     if (t != tg)   {  /* Gen names of all other gen'ed files */
+        find_file(t,&file_names[1],0,1);
+        t = new_file(t, &file_names[1], debug, 0);
+        if (!ow) ow = t->tg_owner;
+        time = MAX(file_names[1].fi_mod, file_names[1].fi_umod);
+        xstart = MIN(time,xstart);
+        }
+     d = (single) ? 0 : d->next;
+     }
+ 
+  Status = (xstart < early_start)? STATUS_WAITING : STATUS_COMPLETED;
+  if (tg->tg_phony) Status = STATUS_WAITING;
+  if (told) Status = STATUS_COMPLETED;
+  if (tnew) Status = STATUS_WAITING;
+  early_start = (Status==STATUS_WAITING)? END_OF_TIME : MAX(xstart,early_start);
+  d = (rule) ? rule->tr_depend : 0;
+  fixa = (file_names[0].fi_srch && Status == STATUS_WAITING);
+  accts = (fixa)? file_names[0].fi_srch->accts[0].text : (char*)0;
+  fid   = (fixa)? file_names[2].fi_name : (char *)0;
+ 
+  while (d)   {
+     t = (single) ? tg : d->dp_target;
+     t->tg_status = Status;
+     if (!t->tg_owner) t->tg_owner = ow;
+     if (Status == STATUS_WAITING)  t->tg_modtime = early_start;
+     if (fixa && memcmp(accts,fid_acct(t->tg_fid),8) != 0) {
+        memcpy(fid,t->tg_fid,t->tg_fid[0]+2);
+        fid_ins_acct(accts,fid);
+        t->tg_fid = alloc_text(fid[0]+2,fid);
+        }
+     d = (single) ? 0 : d->next;
+     }
+ 
+  *tga = action = new_action(tg, rule, (struct sym_target*)0);
+  tga  = &action->next;
+  return early_start;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:          insert_rule(struct target_rules *rule)
+        PURPOSE:       To insert a new rule into the list of used
+                       rules.
+        DESCRIPTION:
+           When displaying the rules used in a derivation, this
+           routine is used to insert each rule into the list of
+           used rules and return a unique integer identifying that
+           rule.
+*/
+ 
+struct  target_rule    **Rules = 0;
+int                    RuleSize = 0;
+int                    RuleNum  = 0;
+ 
+int
+insert_rule(rule)
+  struct target_rule  *rule;
+{
+  int i;
+ 
+  for ( i=0 ; i<RuleNum ; i++ )
+     if (Rules[i] == rule) break;
+ 
+  if ( i>= RuleNum )   {
+     if (++RuleNum > RuleSize)  {
+        Rules = (struct target_rule**)realloc(Rules,(RuleSize+=10)<<2);
+        if (!Rules) crash("Out of Memory: dump_rules");
+        }
+     Rules[i] = rule;
+     }
+  return i;
+}
+ 
+ 
+/*D*    NAME:       si_ui_fid(tg)
+        PURPOSE:    To return a pointer to a string identifying a
+                    target file.
+*/
+ 
+char *
+si_ui_fid(tg)
+  struct sym_target *tg;
+{
+  static char b[88];
+  int j;
+ 
+  if (!tg) return "";
+  if (!tg->tg_ufid)
+     return (tg->tg_fid)? tg->tg_fid+1 : "";
+ 
+  memcpy(b,tg->tg_fid+1, j = tg->tg_fid[0]);
+  b[j++] = ',';
+  b[j]   = 0;
+  strcat(b, strchr(tg->tg_ufid,'.'));
+  return b;
+}
+ 
+ 
+/*D*    NAME:       fid_time(tg)
+        PURPOSE:    To return the latest derivation time for
+                    a file in printable form "mm/dd/yy hh:mm".
+*/
+ 
+char *
+fid_time(tg)
+  struct sym_target *tg;
+{
+  static char b[20];
+  timetype time;
+ 
+  b[0] = 0;
+  if (!tg) return "";
+  time = MAX(tg->tg_modtime,tg->tg_umodtime);
+  if ( time==BEGINNING_OF_TIME || time==END_OF_TIME ) return "";
+  strftime(b, 20, "%m/%d/%y %H:%M", localtime(&time));
+  return b;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:          dump_actions(LS_width, verbose)
+        PURPOSE:       To format the contents of the actions generated
+                       by derive.
+*/
+ 
+ 
+CONST char act_fmt[] ="%-*.*s %-5.5s %3d %-*.*s %-*.*s %-14.14s\n";
+CONST char act_tft[] ="%-*.*s %-5.5s %3.3s %-*.*s %-*.*s %-14.14s\n";
+ 
+dump_actions(LS_width, verbose)
+  int            LS_width;
+  int            verbose;
+{
+  int            i, j;
+  int            w_p = 0;
+  int            tw=14, ofw=17, ifw=22, xw=LS_width-80;
+  CONST char    *fmt = act_fmt;
+  CONST char    *tft = act_tft;
+  char *owner;
+  int   ot  = options['e'];
+  struct sym_target *tg;
+ 
+  if (xw > 0) {
+     tw+=xw/7; ofw+=2*xw/7; ifw+=4*xw/7;
+     }
+  printf("\n");
+  owner = (ot) ? "Owner" : "Time";
+  printf(tft,tw,tw,"Target", "State", "Cmd", ofw,ofw,"Output File", ifw,ifw,"Input File", owner);
+ 
+  for ( i=0 ; i<TargetActionNum ; i++ )  {
+ 
+     tg = TargetActions[i]->ta_target;
+     owner = (!ot)? fid_time(tg) : (tg->tg_owner)? tg->tg_owner->ow_text : "";
+     printf(fmt,
+        tw,tw,tg->tg_text,
+        state_names[tg->tg_status+1],
+        insert_rule(TargetActions[i]->ta_rule),
+        ofw,ofw,tg->tg_fid+1,
+        ifw,ifw,si_ui_fid(TargetActions[i]->ta_tginput),
+        owner                   );
+     }
+ 
+  printf("\n\nCommands:   "), w_p = 13;
+ 
+  for ( i=0 ; i<RuleNum ; i++)  {
+     struct target_rule *r = Rules[i];
+     if (r)   {
+        struct sym_target *t = r->tr_depend->dp_target;
+        if (LS_width < (w_p += t->tg_len +1))
+           printf("\n             "), w_p = 13 + t->tg_len + 1;
+        printf(" %s", t->tg_text);
+        }
+     }
+  printf("\n");
+ 
+  if (verbose)   {
+     for ( i=0 ; i<RuleNum ; i++)  {
+        struct target_rule *r = Rules[i];
+        struct command_line *l = (r) ? r->tr_commands->cm_lines : 0;
+        printf("\nCommand %3d: ",i), w_p = 13;
+        for ( j=0 ; j<TargetActionNum ; j++ )
+           if ( TargetActions[j]->ta_rule == r)   {
+              struct sym_target *tg = TargetActions[j]->ta_target;
+              if (LS_width < (w_p += tg->tg_len +1))
+                 printf("\n             "), w_p = 13 + 1 + tg->tg_len;
+              printf(" %s",tg->tg_text);
+              }
+        printf("\n");
+        if (verbose > 1) {
+           while(l) printf(" %s\n", l->cmd_text), l= l->next;
+           printf("\n");
+           }
+        }
+     printf("\n");
+     if (Rules)
+        free(Rules), Rules=0, RuleSize=0, RuleNum=0;
+     }
+}
+ 
+ 
+ 
+void
+generate_action_file(struct _FILE *af)  {
+  int   i;
+ 
+  for ( i=0   ;  i<TargetActionNum ;  i++   )     {
+     struct   target_action *ta = TargetActions[i];
+     struct   sym_target    *tgi   =  ta->ta_tginput;
+     struct   sym_target    *tgo   =  ta->ta_target;
+ 
+     if (tgi)
+     fprintf(af, "%s %s %s %s %s\n",
+        si_ui_fid(tgi),
+        tgi->tg_text,
+        tgo->tg_fid+1,
+        tgo->tg_text,
+        ta->ta_rule->tr_depend->dp_target->tg_text);
+ 
+     }
+ 
+}
+ 
+ 
+ 
+void
+generate_list_file(struct _FILE *af, char *component)   {
+  int                i;
+  char               buf[80];
+  char              *jcl, *file, *owner;
+  struct sym_macro  *mc;
+  int                tlen;
+  struct sym_owner  *own;
+  struct sym_ftype  *ft;
+ 
+  for (i = 0 ; i < TargetActionNum ; )   {
+     struct target_action *ta = TargetActions[i++];
+     struct sym_target    *tg = ta->ta_tginput;
+ 
+     if (tg)  {
+        ft = tg->tg_ftype;
+        tlen = ft->ft_len + 1;
+        memcpy(buf, "..", 2);
+        memcpy(buf+2, ft->ft_text, tlen);
+        mc = lookup_sym_macro(buf, tlen+1, 4);
+        jcl = (mc) ? mc->mc_def : "UNKNOWN";
+ 
+        tlen = *(tg->tg_fid);
+        file = memchr(tg->tg_fid+1, '.', tlen);
+        if (file)   {
+           int tlen = file - tg->tg_fid - 1;
+           memcpy(buf, tg->tg_fid+1, tlen);
+           buf[tlen] = 0;
+           file = buf;
+           }
+        else file = tg->tg_fid+1;
+ 
+        own = tg->tg_owner;
+        if (!own)
+           own = ta->ta_target->tg_owner;
+        if (own)  {
+           owner = strchr(own->ow_text, ' ');
+           if (!owner) owner = own->ow_text;
+           }
+        else owner = "SMITH";
+ 
+        fprintf(af, "%s,JCL:%s,%s         %s\n", file, jcl, component, owner);
+        }  /* end of if input file */
+     }     /* end of for loop      */
+}

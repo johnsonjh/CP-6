@@ -1,0 +1,947 @@
+
+
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=1  
+        1         1             #ifndef NORCSID
+        2         2             static char rcsid[] = "$Header: codegen.c,v 0.6 87/03/10 00:59:51 ceriel Exp $
+                               ";
+        3         3             #endif
+        4         4
+        5         5             #include "assert:h"
+        6         6             #include "param:h"
+        7         7             #include "tables:h"
+        8         8             #include "types:h"
+        9         9             #include <cgg_cg:h>
+       10        10             #include "data:h"
+       11        11             #include "result:h"
+       12        12             #include "state:h"
+       13        13             #include "equiv:h"
+       14        14             #include "extern:h"
+       15        15
+       16        16             /*
+       17        17              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+       18        18              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+       19        19              *
+       20        20              * Author: Hans van Staveren
+       21        21              */
+       22        22
+       23        23             #define ALLOW_NEXTEM  /* code generator is allowed new try of NEXTEM
+       24        24                       in exceptional cases */
+       25        25
+       26        26             #define MAXPATTERN 5
+       27        27             #define MAXREPLLEN 5    /* Max length of EM-replacement, should come from boot
+                                */
+       28        28
+       29        29             byte startupcode[] = { DO_NEXTEM };
+       30        30             extern int zb_auto_info[10];
+       31        31
+       32        32             byte *nextem();
+       33        33             unsigned costcalc();
+       34        34             unsigned docoerc();
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=2  
+       35        35             unsigned stackupto();
+       36        36             string tostring();
+       37        37             string ad2str();
+       38        38
+       39        39             #ifdef NDEBUG
+       40        40   *S*       #define DEBUG(string)
+       41        41   *S*       #else
+       42        42             #include <stdio:h>
+       43        43             #include <system:h>
+       44        44             #define DEBUG(string) {if(Debug) fprintf(stderr,"%-*d%s\n",4*level,level,strin
+                               g);}
+       45        45             #endif
+       46        46
+       47        47             #define BROKE() {assert(origcp!=startupcode);DEBUG("BROKE");totalcost=INFINITY
+                               ;goto doreturn;}
+       48        48             #define CHKCOST() {if (totalcost>=costlimit) BROKE();}
+       49        49
+       50        50             #ifdef TABLEDEBUG
+       51        51             int tablelines[MAXTDBUG];
+       52        52             int ntableline;
+       53        53             int set_fd,set_size;
+       54        54             short *set_val = 0;
+       55        55             char *set_flag = 0;
+       56        56             #endif
+       57        57
+       58        58             unsigned codegen(codep,ply,toplevel,costlimit,forced) byte *codep; unsigned co
+                               stlimit; {
+       59        59    1        #ifndef NDEBUG
+       60        60    1         byte *origcp=codep;
+       61        61    1         static int level=0;
+       62        62    1        #endif
+       63        63    1         unsigned totalcost = 0;
+       64        64    1         int inscoerc=0;
+       65        65    1         int procarg[2];
+       66        66    1        #ifdef ALLOW_NEXTEM
+       67        67    1         int paniced;
+       68        68    1         char *savebp = 0;
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=3  
+       69        69    1        #endif
+       70        70    1         state_t state;
+       71        71    1         int auto_flg, gen_flg = codep != startupcode;
+       72        72    1        #define SAVEST   auto_flg = zb_auto_info[8], zb_auto_info[8] = 1, savestatus(&
+                               state)
+       73        73    1        #define RESTST  restorestatus(&state)
+       74        74    1        #define FREEST  zb_auto_info[8] = auto_flg    /*  turn temp alloc on again */
+       75        75    1        #define SAVEAUTO auto_flg=zb_auto_info[8]; zb_auto_info[8]=gen_flg
+       76        76    1        #define RESTAUTO zb_auto_info[8] = auto_flg
+       77        77    1        #ifdef TABLEDEBUG
+       78        78    1         extern char *tablename;
+       79        79    1        #endif
+       80        80    1
+       81        81    1        #ifndef NDEBUG
+       82        82    1         level++;
+       83        83    1         DEBUG("Entering codegen");
+       84        84    1              if (Debug>2) dump_stack();
+       85        85    1        #endif
+       86        86    1         for (;;) {
+       87        87    2         switch( (*codep++)&037 ) {
+       88        88    3            default:
+       89        89    3         assert(FALSE);
+       90        90    3         /* NOTREACHED */
+       91        91    3        #ifdef TABLEDEBUG
+       92        92    3            case DO_DLINE: {
+       93        93    4         int n;
+       94        94    4
+       95        95    4         getint(n,codep);
+       96        96    4         tablelines[ntableline++] = n;
+       97        97    4         if (ntableline>=MAXTDBUG)
+       98        98    4            ntableline -= MAXTDBUG;
+       99        99    4         if (set_fd)
+      100       100    4            set_val[n>>4] &= ~(1<<(n&017));
+      101       101    4        #ifndef NDEBUG
+      102       102    4         if (Debug)
+      103       103    4            fprintf(stderr,"code from \"%s\", line %d\n",tablename,n);
+      104       104    4        #endif
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=4  
+      105       105    4         break;
+      106       106    4            }
+      107       107    3        #endif
+      108       108    3            case DO_NEXTEM: {
+      109       109    4         byte *bp;
+      110       110    4         int n;
+      111       111    4         unsigned mindistance,dist;
+      112       112    4         register i;
+      113       113    4         int cindex;
+      114       114    4         int npos,pos[MAXRULE];
+      115       115    4         unsigned mincost,t;
+      116       116    4
+      117       117    4         DEBUG("NEXTEM");
+      118       118    4         tokpatlen = 0;
+      119       119    4         nallreg=0;
+      120       120    4         if (toplevel) {
+      121       121    5            garbage_collect();
+      122       122    5            totalcost=0;
+      123       123    5         } else {
+      124       124    5            if (--ply <= 0)
+      125       125    5               goto doreturn;
+      126       126    5         }
+      127       127    4         if (stackheight>MAXFSTACK-7) {
+      128       128    5        #ifndef NDEBUG
+      129       129    5            if (Debug)
+      130       130    5               fprintf(stderr,"Fakestack overflow threatens(%d), action ...\n",stackhe
+                               ight);
+      131       131    5        #endif
+      132       132    5            SAVEAUTO; totalcost += stackupto(&fakestack[6],ply,toplevel); RESTAUTO;
+      133       133    5         }
+      134       134    4        #ifndef ALLOW_NEXTEM
+      135       135   *S*        bp = nextem(toplevel);
+      136       136   *S*       #else
+      137       137    4         paniced=0;
+      138       138    4         savebp = nextem(toplevel);
+      139       139    4            panic:
+      140       140    4         bp = savebp;
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=5  
+      141       141    4        #endif
+      142       142    4         if (bp == 0) {
+      143       143    5            /*
+      144       144    5             * No pattern found, can be pseudo or error
+      145       145    5             * in table.
+      146       146    5             */
+      147       147    5            if (toplevel) {
+      148       148    6               codep--;
+      149       149    6               DEBUG("pseudo");
+      150       150    6               dopseudo();
+      151       151    6            } else
+      152       152    5               goto doreturn;
+      153       153    5         } else {
+      154       154    5        #ifndef NDEBUG
+      155       155    5            chkregs();
+      156       156    5        #endif
+      157       157    5            n = *bp++;
+      158       158    5            if (n==0) { /* "procedure" */
+      159       159    6               getint(i,bp);
+      160       160    6               getint(procarg[0],bp);
+      161       161    6               getint(procarg[1],bp);
+      162       162    6               bp= &pattern[i];
+      163       163    6               n = *bp++;
+      164       164    6               DEBUG("PROC_CALL");
+      165       165    6            }
+      166       166    5            assert(n>0 && n<=MAXRULE);
+      167       167    5            if (n>1) {
+      168       168    6               mindistance = MAXINT; npos=0;
+      169       169    6               for(i=0;i<n;i++) {
+      170       170    7                  getint(cindex,bp);
+      171       171    7                  dist=distance(cindex);
+      172       172    7        #ifndef NDEBUG
+      173       173    7        if (Debug)
+      174       174    7         fprintf(stderr,"distance of pos %d is %u\n",i,dist);
+      175       175    7        #endif
+      176       176    7                  if (dist<=mindistance) {
+      177       177    8                     if (dist<mindistance) {
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=6  
+      178       178    9                        if(dist==0)
+      179       179    9                           goto gotit;
+      180       180    9                        npos=0;
+      181       181    9                        mindistance = dist;
+      182       182    9                     }
+      183       183    8                     pos[npos++] = cindex;
+      184       184    8                  }
+      185       185    7               }
+      186       186    6               assert(mindistance<MAXINT);
+      187       187    6               if (npos>1) {
+      188       188    7                  /*
+      189       189    7                   * More than 1 tokenpattern is a candidate.
+      190       190    7                   * Decision has to be made by lookahead.
+      191       191    7                   */
+      192       192    7                  SAVEST;
+      193       193    7                  mincost = costlimit-totalcost+1;
+      194       194    7                  for(i=0;i<npos;i++) {
+      195       195    8                     t=codegen(&coderules[pos[i]],ply,FALSE,mincost,0);
+      196       196    8        #ifndef NDEBUG
+      197       197    8        if (Debug)
+      198       198    8         fprintf(stderr,"mincost %u,cost %u,pos %d\n",mincost,t,i);
+      199       199    8        #endif
+      200       200    8                     if (t<mincost) {
+      201       201    9                        mincost = t;
+      202       202    9                        cindex = pos[i];
+      203       203    9                     }
+      204       204    8                     RESTST;
+      205       205    8                  }
+      206       206    7                  FREEST;
+      207       207    7                  if (totalcost+mincost>costlimit)
+      208       208    7                     BROKE();
+      209       209    7               } else {
+      210       210    7                  cindex = pos[0];
+      211       211    7               }
+      212       212    6            } else {
+      213       213    6               getint(cindex,bp);
+      214       214    6            }
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=7  
+      215       215    5
+      216       216    5         gotit:
+      217       217    5            /*
+      218       218    5             * Now cindex contains the code-index of the best candidate
+      219       219    5             * so proceed to use it.
+      220       220    5             */
+      221       221    5            codep = &coderules[cindex];
+      222       222    5         }
+      223       223    4         break;
+      224       224    4            }
+      225       225    3            case DO_COERC: {
+      226       226    4         DEBUG("COERC");
+      227       227    4         tokpatlen=1;
+      228       228    4         inscoerc=1;
+      229       229    4         break;
+      230       230    4            }
+      231       231    3            case DO_XXMATCH:
+      232       232    3         DEBUG("XXMATCH");
+      233       233    3            case DO_XMATCH: {
+      234       234    4         register i;
+      235       235    4         int temp;
+      236       236    4
+      237       237    4         DEBUG("XMATCH");
+      238       238    4         tokpatlen=(codep[-1]>>5)&07;
+      239       239    4         for (i=0;i<tokpatlen;i++)
+      240       240    4            getint(temp,codep);
+      241       241    4         break;   /* match already checked by distance() */
+      242       242    4            }
+      243       243    3            case DO_MATCH: {
+      244       244    4         register i;
+      245       245    4         int j;
+      246       246    4         unsigned mincost,t;
+      247       247    4         token_p tp;
+      248       248    4         int size,lsize;
+      249       249    4         int tokexp[MAXPATTERN];
+      250       250    4         int nregneeded;
+      251       251    4         token_p regtp[MAXCREG];
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=8  
+      252       252    4         c3_p regcp[MAXCREG];
+      253       253    4         rl_p regls[MAXCREG];
+      254       254    4         c3_p cp,findcoerc();
+      255       255    4         int sret;
+"zbg$codegen:c.:ZBC3TSI", line 255: (warning) identifier "sret" is not used
+      256       256    4         int stackpad;
+      257       257    4         struct perm *tup,*ntup,*besttup,*tuples();
+      258       258    4
+      259       259    4         DEBUG("MATCH");
+      260       260    4         tokpatlen=(codep[-1]>>5)&07;
+      261       261    4         for(i=0;i<tokpatlen;i++)
+      262       262    4            getint(tokexp[i],codep);
+      263       263    4         tokexp[i] = 0;
+      264       264    4         tp = &fakestack[stackheight-1];
+      265       265    4         i=0;
+      266       266    4         while (i<tokpatlen && tp>=fakestack) {
+      267       267    5            size=tsize(tp);
+      268       268    5            while (i<tokpatlen && (lsize=ssize(tokexp[i]))<=size) {
+      269       269    6               size -= lsize;
+      270       270    6               i++;
+      271       271    6            }
+      272       272    5            if (i<tokpatlen && size!=0) {
+      273       273    6               SAVEAUTO; totalcost += stackupto(tp,ply,toplevel); RESTAUTO;
+      274       274    6               CHKCOST();
+      275       275    6               break;
+      276       276    6            }
+      277       277    5            tp--;
+      278       278    5         }
+      279       279    4         tp = &fakestack[stackheight-1];
+      280       280    4         i=0;
+      281       281    4         while (i<tokpatlen && tp >= fakestack) {
+      282       282    5            size = tsize(tp);
+      283       283    5            lsize= ssize(tokexp[i]);
+      284       284    5            if (size != lsize) {    /* find coercion */
+      285       285    6        #ifdef MAXSPLIT
+      286       286   *S*              sret = split(tp,&tokexp[i],ply,toplevel);
+      287       287   *S*              if (sret==0) {
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=9  
+      288       288   *S*       #endif MAXSPLIT
+      289       289    6                  SAVEAUTO; totalcost += stackupto(tp,ply,toplevel); RESTAUTO;
+      290       290    6                  CHKCOST();
+      291       291    6                  break;
+      292       292    6        #ifdef MAXSPLIT
+      293       293   *S*              }
+      294       294   *S*              i += sret;
+      295       295   *S*       #endif MAXSPLIT
+      296       296    6            } else
+      297       297    5               i += 1;
+      298       298    5            tp--;
+      299       299    5         }
+      300       300    4            nextmatch:
+      301       301    4         tp = &fakestack[stackheight-1];
+      302       302    4         i=0; nregneeded = 0;
+      303       303    4         while (i<tokpatlen && tp>=fakestack) {
+      304       304    5            if (!match(tp,&machsets[tokexp[i]],0)) {
+      305       305    6               cp = findcoerc(tp, &machsets[tokexp[i]]);
+      306       306    6        #ifndef NDEBUG
+      307       307    6        if (Debug>1) fprintf(stderr,"findcoerc returns %d at position %d\n",cp,i);
+      308       308    6        #endif
+      309       309    6               if (cp==0) {
+      310       310    7                  for (j=0;j<nregneeded;j++)
+      311       311    7                     regtp[j] -= (tp-fakestack+1);
+      312       312    7                  SAVEAUTO; totalcost += stackupto(tp,ply,toplevel); RESTAUTO;
+      313       313    7                  CHKCOST();
+      314       314    7                  break;
+      315       315    7               } else {
+      316       316    7                  if (cp->c3_prop<0) {
+      317       317    8                     SAVEAUTO; totalcost+=docoerc(tp,cp,ply,toplevel,0); RESTAUTO;
+      318       318    8                     CHKCOST();
+      319       319    8                  } else {
+      320       320    8        #ifndef NDEBUG
+      321       321    8        if(Debug>1) fprintf(stderr,"Register of type %d needed, remembering...\n",cp->
+                               c3_prop);
+      322       322    8        #endif
+      323       323    8                     assert(nregneeded<MAXCREG);
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=10 
+      324       324    8                     regtp[nregneeded] = tp;
+      325       325    8                     regcp[nregneeded] = cp;
+      326       326    8                     regls[nregneeded] = curreglist;
+      327       327    8                     nregneeded++;
+      328       328    8                  }
+      329       329    7               }
+      330       330    6            }
+      331       331    5            i++; tp--;
+      332       332    5         }
+      333       333    4         if (tokpatlen>stackheight) {
+      334       334    5        #ifndef NDEBUG
+      335       335    5        if(Debug>1) fprintf(stderr,"Pattern too long, %d with only %d items on stack\n
+                               ",
+      336       336    5            tokpatlen,stackheight);
+      337       337    5        #endif
+      338       338    5            stackpad = tokpatlen-stackheight;
+      339       339    5            for (j=stackheight-1;j>=0;j--)
+      340       340    5               fakestack[j+stackpad] = fakestack[j];
+      341       341    5            for (j=0;j<stackpad;j++)
+      342       342    5               fakestack[j].t_token=0;
+      343       343    5            stackheight += stackpad;
+      344       344    5            for (j=0;j<nregneeded;j++)
+      345       345    5               regtp[j] += stackpad;
+      346       346    5            for (tp = &fakestack[stackpad-1];i<tokpatlen && tp>=fakestack;i++,tp--) {
+      347       347    6               cp = findcoerc((token_p) 0, &machsets[tokexp[i]]);
+      348       348    6               if (cp==0) {
+      349       349    7                  for (j=0;j<nregneeded;j++)
+      350       350    7                     myfree(regls[j]);
+      351       351    7        #ifndef ALLOW_NEXTEM
+      352       352   *S*                 assert(!toplevel);
+      353       353   *S*                 BROKE();
+      354       354   *S*       #else
+      355       355    7                  assert(!(toplevel&&paniced));
+      356       356    7                  goto normalfailed;
+      357       357    7        #endif
+      358       358    7               }
+      359       359    6               if (cp->c3_prop<0) {
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=11 
+      360       360    7                  SAVEAUTO; totalcost+=docoerc(tp,cp,ply,toplevel,0); RESTAUTO;
+      361       361    7                  CHKCOST();
+      362       362    7               } else {
+      363       363    7                  assert(nregneeded<MAXCREG);
+      364       364    7                  regtp[nregneeded] = tp;
+      365       365    7                  regcp[nregneeded] = cp;
+      366       366    7                  regls[nregneeded] = curreglist;
+      367       367    7                  nregneeded++;
+      368       368    7               }
+      369       369    6            }
+      370       370    5         } else
+      371       371    4            stackpad=0;
+      372       372    4         assert(i==tokpatlen);
+      373       373    4         if (nregneeded==0)
+      374       374    4            break;
+      375       375    4         SAVEST;
+      376       376    4         mincost=costlimit-totalcost+1;
+      377       377    4         tup = tuples(regls,nregneeded);
+      378       378    4         besttup=0;
+      379       379    4         for (; tup != 0; tup = ntup) {
+      380       380    5        #ifndef NDEBUG
+      381       381    5        if(Debug>1) fprintf(stderr,"Next tuple %d,%d,%d,%d\n",
+      382       382    5               tup->p_rar[0],
+      383       383    5               tup->p_rar[1],
+      384       384    5               tup->p_rar[2],
+      385       385    5               tup->p_rar[3]);
+      386       386    5        #endif
+      387       387    5            ntup = tup->p_next;
+      388       388    5            for (i=0,t=0;i<nregneeded && t<mincost; i++)
+      389       389    5               t += docoerc(regtp[i],regcp[i],ply,FALSE,tup->p_rar[i]);
+      390       390    5            if ( t<mincost && tokpatlen<=stackheight ) {
+      391       391    6        #ifndef NDEBUG
+      392       392    6               if (Debug>2)
+      393       393    6                  fprintf(stderr,"Continuing match after coercions\n");
+      394       394    6        #endif
+      395       395    6               t += codegen(codep,ply,FALSE,mincost-t,0);
+      396       396    6            }
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=12 
+      397       397    5            if ( t<mincost && tokpatlen<=stackheight ) {
+      398       398    6               mincost = t;
+      399       399    6               besttup = tup;
+      400       400    6            } else
+      401       401    5               myfree(tup);
+      402       402    5            RESTST;
+      403       403    5         }
+      404       404    4         FREEST;
+      405       405    4         for (i=0;i<nregneeded;i++)
+      406       406    4            myfree(regls[i]);
+      407       407    4         if (totalcost+mincost>costlimit) {
+      408       408    5            if (besttup)
+      409       409    5               myfree(besttup);
+      410       410    5        normalfailed:   if (stackpad!=tokpatlen) {
+      411       411    6               if (stackpad) {
+      412       412    7                  if (costlimit<MAXINT)
+      413       413    7                     BROKE();
+      414       414    7                  for (i=0;i<stackheight-stackpad;i++)
+      415       415    7                     fakestack[i] = fakestack[i+stackpad];
+      416       416    7                  stackheight -= stackpad;
+      417       417    7                  {SAVEAUTO; totalcost += stackupto(&fakestack[stackheight-1],ply,topl
+                               evel); RESTAUTO;}
+      418       418    7               } else
+      419       419    6                  {SAVEAUTO; totalcost += stackupto(fakestack,ply,toplevel); RESTAUTO;
+                               }
+      420       420    6               CHKCOST();
+      421       421    6               goto nextmatch;
+      422       422    6            }
+      423       423    5            totalcost += mincost;
+      424       424    5        #ifndef ALLOW_NEXTEM
+      425       425   *S*           BROKE();
+      426       426   *S*       #else
+      427       427    5            if (toplevel && !paniced) {
+      428       428    6               stackheight=0;
+      429       429    6               paniced++;
+      430       430    6               DEBUG("PANIC!");
+      431       431    6               goto panic;
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=13 
+      432       432    6            } else
+      433       433    5               BROKE();
+      434       434    5        #endif
+      435       435    5         }
+      436       436    4         for (i=0;i<nregneeded;i++)
+      437       437    4            {SAVEAUTO; totalcost += docoerc(regtp[i],regcp[i],ply,toplevel,besttup->p_
+                               rar[i]); RESTAUTO;}
+      438       438    4         myfree(besttup);
+      439       439    4         break;
+      440       440    4            }
+      441       441    3            case DO_REMOVE: {
+      442       442    4         int texpno,nodeno;
+      443       443    4         token_p tp;
+      444       444    4         struct reginfo *rp;
+      445       445    4
+      446       446    4         DEBUG("REMOVE");
+      447       447    4         if (codep[-1]&32) {
+      448       448    5            getint(texpno,codep);
+      449       449    5            getint(nodeno,codep);
+      450       450    5         } else {
+      451       451    5            getint(texpno,codep);
+      452       452    5            nodeno=0;
+      453       453    5         }
+      454       454    4         for (tp= &fakestack[stackheight-tokpatlen-1];tp>=&fakestack[0];tp--)
+      455       455    4            if (match(tp,&machsets[texpno],nodeno)) {
+      456       456    5               /* investigate possible coercion to register */
+      457       457    5               {SAVEAUTO; totalcost += stackupto(tp,ply,toplevel); RESTAUTO;}
+      458       458    5               CHKCOST();
+      459       459    5               break;
+      460       460    5            }
+      461       461    4         for (rp=machregs;rp<machregs+NREGS;rp++)
+      462       462    4            if (match(&rp->r_contents,&machsets[texpno],nodeno))
+      463       463    4               rp->r_contents.t_token=0;
+      464       464    4         break;
+      465       465    4            }
+      466       466    3            case DO_RREMOVE: {   /* register remove */
+      467       467    4         register i;
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=14 
+      468       468    4         int nodeno;
+      469       469    4         token_p tp;
+      470       470    4         tkdef_p tdp;
+      471       471    4         result_t result;
+      472       472    4
+      473       473    4         DEBUG("RREMOVE");
+      474       474    4         getint(nodeno,codep);
+      475       475    4         result=compute(&enodes[nodeno]);
+      476       476    4         if (result.e_typ!=EV_REG)
+      477       477    4            break;
+      478       478    4         if ( in_stack(result.e_v.e_reg) ) BROKE() ; /* Check aside-stack */
+      479       479    4         for (tp= &fakestack[stackheight-tokpatlen-1];tp>=&fakestack[0];tp--)
+      480       480    4            if (tp->t_token==-1) {
+      481       481    5               if(tp->t_att[0].ar==result.e_v.e_reg)
+      482       482    5                  goto gotone;
+      483       483    5            } else {
+      484       484    5               tdp = &tokens[tp->t_token];
+      485       485    5               for(i=0;i<TOKENSIZE;i++)
+      486       486    5                  if (tdp->t_type[i]==EV_REG &&
+      487       487    5                      tp->t_att[i].ar==result.e_v.e_reg)
+      488       488    5                     goto gotone;
+      489       489    5            }
+      490       490    4         break;
+      491       491    4            gotone:
+      492       492    4         /* investigate possible coercion to register */
+      493       493    4         {SAVEAUTO; totalcost += stackupto(tp,ply,toplevel); RESTAUTO;}
+      494       494    4         CHKCOST();
+      495       495    4         break;
+      496       496    4            }
+      497       497    3            case DO_DEALLOCATE: {
+      498       498    4         register i;
+      499       499    4         tkdef_p tdp;
+      500       500    4         int tinstno;
+      501       501    4         token_t token;
+      502       502    4
+      503       503    4         DEBUG("DEALLOCATE");
+      504       504    4         getint(tinstno,codep);
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=15 
+      505       505    4         instance(tinstno,&token);
+      506       506    4         if (token.t_token==-1)
+      507       507    4            chrefcount(token.t_att[0].ar,-1,TRUE);
+      508       508    4         else {
+      509       509    5            tdp= &tokens[token.t_token];
+      510       510    5            for (i=0;i<TOKENSIZE;i++)
+      511       511    5               if (tdp->t_type[i]==EV_REG)
+      512       512    5                  chrefcount(token.t_att[i].ar,-1,TRUE);
+      513       513    5         }
+      514       514    4         break;
+      515       515    4            }
+      516       516    3            case DO_REALLOCATE: {
+      517       517    4         struct reginfo *rp;
+      518       518    4
+      519       519    4         DEBUG("REALLOCATE");
+      520       520    4         for(rp=machregs+1;rp<machregs+NREGS;rp++)
+      521       521    4            if(rp->r_tcount) {
+      522       522    5               rp->r_refcount -= rp->r_tcount;
+      523       523    5               rp->r_tcount = 0;
+      524       524    5            }
+      525       525    4         break;
+      526       526    4            }
+      527       527    3            case DO_ALLOCATE: {
+      528       528    4         register i;
+      529       529    4         int j;
+      530       530    4         int tinstno;
+      531       531    4         int npos,npos2,pos[NREGS],pos2[NREGS];
+      532       532    4         unsigned mincost,t;
+      533       533    4         struct reginfo *rp,**rpp;
+      534       534    4         token_t token,mtoken,token2;
+      535       535    4         int propno;
+      536       536    4         int exactmatch;
+      537       537    4         int decision;
+      538       538    4
+      539       539    4         if (codep[-1]&32) {
+      540       540    5            getint(propno,codep);
+      541       541    5            getint(tinstno,codep);
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=16 
+      542       542    5            DEBUG("ALLOCATE,INIT");
+      543       543    5         } else {
+      544       544    5            getint(propno,codep);
+      545       545    5            tinstno=0;
+      546       546    5            DEBUG("ALLOCATE,EMPTY");
+      547       547    5         }
+      548       548    4         instance(tinstno,&token);
+      549       549    4         if (!forced) {
+      550       550    5            do {
+      551       551    6               npos=exactmatch=0;
+      552       552    6               for(rpp=reglist[propno];rp= *rpp; rpp++)
+      553       553    6                  if (getrefcount(rp-machregs)==0) {
+      554       554    7                     pos[npos++] = rp-machregs;
+      555       555    7                     if (eqtoken(&rp->r_contents,&token))
+      556       556    7                        exactmatch++;
+      557       557    7                  }
+      558       558    6               /*
+      559       559    6                * Now pos[] contains all free registers with desired
+      560       560    6                * property. If none then some stacking has to take place.
+      561       561    6                */
+      562       562    6               if (npos==0) {
+      563       563    7                     if (stackheight<=tokpatlen) {
+      564       564    8                        if (!toplevel) {
+      565       565    9                           BROKE();
+      566       566    9                        } else {
+      567       567    9                           if (paniced)
+      568       568    9                              fatal("No regs available");
+      569       569    9                           {SAVEAUTO; totalcost += stackupto( &fakestack[0],ply,toplev
+                               el); RESTAUTO;}
+      570       570    9                           goto panic;
+      571       571    9                        }
+      572       572    8                     }
+      573       573    7                     {SAVEAUTO; totalcost += stackupto( &fakestack[0],ply,toplevel); R
+                               ESTAUTO;}
+      574       574    7                     CHKCOST();
+      575       575    7               }
+      576       576    6            } while (npos==0);
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=17 
+      577       577    5            if (!exactmatch) {
+      578       578    6               npos2=npos;
+      579       579    6               for(i=0;i<npos;i++)
+      580       580    6                  pos2[i]=pos[i];
+      581       581    6            } else {
+      582       582    6               /*
+      583       583    6                * Now we are reducing the number of possible registers.
+      584       584    6                * We take only one equally likely register out of every
+      585       585    6                * equivalence class as given by set of properties.
+      586       586    6                */
+      587       587    6               mtoken = token;
+      588       588    6               npos2=0;
+      589       589    6               for(i=0;i<npos;i++)
+      590       590    6                  if (eqtoken(&machregs[pos[i]].r_contents,&mtoken)) {
+      591       591    7                     pos2[npos2++] = pos[i];
+      592       592    7                     for(j=0;j<npos2-1;j++)
+      593       593    7                        if (eqregclass(pos2[j],pos[i])) {
+      594       594    8                           npos2--;
+      595       595    8                           break;
+      596       596    8                        }
+      597       597    7                  }
+      598       598    6            }
+      599       599    5            /*
+      600       600    5             * Now pos2[] contains all possibilities to try, if more than
+      601       601    5             * one, lookahead is necessary.
+      602       602    5             */
+      603       603    5            token2.t_token= -1;
+      604       604    5            for (i=1;i<TOKENSIZE;i++)
+      605       605    5               token2.t_att[i].aw=0;
+      606       606    5            if (npos2==1)
+      607       607    5               decision=pos2[0];
+      608       608    5            else {
+      609       609    6               SAVEST;
+      610       610    6               mincost=costlimit-totalcost+1;
+      611       611    6               for(j=0;j<npos2;j++) {
+      612       612    7                  chrefcount(pos2[j],1,FALSE);
+      613       613    7                  token2.t_att[0].ar=pos2[j];
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=18 
+      614       614    7                  allreg[nallreg++] = pos2[j];
+      615       615    7                  if (token.t_token != 0)
+      616       616    7                     t=move(&token,&token2,ply,FALSE,mincost);
+      617       617    7                  else {
+      618       618    8                     t = 0;
+      619       619    8                     erasereg(pos2[j]);
+      620       620    8                  }
+      621       621    7                  if (t<mincost)
+      622       622    7                     t += codegen(codep,ply,FALSE,mincost-t,0);
+      623       623    7                  if (t<mincost) {
+      624       624    8                     mincost=t;
+      625       625    8                     decision=pos2[j];
+      626       626    8                  }
+      627       627    7                  RESTST;
+      628       628    7               }
+      629       629    6               FREEST;
+      630       630    6               if (totalcost+mincost>costlimit)
+      631       631    6                  BROKE();
+      632       632    6            }
+      633       633    5         } else {
+      634       634    5            decision = forced;
+      635       635    5            if (getrefcount(decision)!=0)
+      636       636    5               BROKE();
+      637       637    5            token2.t_token = -1;
+      638       638    5         }
+      639       639    4         chrefcount(decision,1,FALSE);
+      640       640    4         token2.t_att[0].ar=decision;
+      641       641    4         if (token.t_token != 0) {
+      642       642    5            {SAVEAUTO; totalcost+=move(&token,&token2,ply,toplevel,MAXINT); RESTAUTO;}
+
+      643       643    5            CHKCOST();
+      644       644    5         } else
+      645       645    4            erasereg(decision);
+      646       646    4         allreg[nallreg++]=decision;
+      647       647    4         break;
+      648       648    4            }
+      649       649    3            case DO_INSTR: {
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=19 
+      650       650    4         register i;
+      651       651    4         int n;
+      652       652    4         int tinstno;
+      653       653    4         token_t token;
+      654       654    4         int stringno;
+      655       655    4
+      656       656    4               DEBUG("INSTR");
+      657       657    4         n=((codep[-1]>>5)&07);
+      658       658    4         getint(stringno,codep);
+      659       659    4         if (toplevel) {
+      660       660    5            swtxt();
+      661       661    5            if (stringno>10000) {
+      662       662    6               assert(stringno== 10001 || stringno== 10002);
+      663       663    6               genstr(procarg[stringno-10001]);
+      664       664    6            } else
+      665       665    5               genstr(stringno);
+      666       666    5         }
+      667       667    4         for(i=0;i<n;i++) {
+      668       668    5            getint(tinstno,codep);
+      669       669    5            instance(tinstno,&token);
+      670       670    5            if (toplevel)
+      671       671    5               prtoken(&token,i==0 ? ' ' : ',');
+      672       672    5            if (token.t_token>0)
+      673       673    5               totalcost += tokens[token.t_token].t_cost.ct_space;
+      674       674    5         }
+      675       675    4         if (toplevel)
+      676       676    4            gennl();
+      677       677    4         break;
+      678       678    4            }
+      679       679    3            case DO_MOVE: {
+      680       680    4         int tinstno;
+      681       681    4         token_t token,token2;
+      682       682    4
+      683       683    4         DEBUG("MOVE");
+      684       684    4         getint(tinstno,codep);
+      685       685    4         instance(tinstno,&token);
+      686       686    4         getint(tinstno,codep);
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=20 
+      687       687    4         instance(tinstno,&token2);
+      688       688    4         {SAVEAUTO; totalcost += move(&token,&token2,ply,toplevel,costlimit-totalcost+
+                               1); RESTAUTO;}
+      689       689    4         CHKCOST();
+      690       690    4         break;
+      691       691    4            }
+      692       692    3            case DO_TEST: {
+      693       693    4         int tinstno;
+      694       694    4         token_t token;
+      695       695    4
+      696       696    4         DEBUG("TEST");
+      697       697    4         getint(tinstno,codep);
+      698       698    4         instance(tinstno,&token);
+      699       699    4         {SAVEAUTO; totalcost += test(&token,ply,toplevel,costlimit-totalcost+1); REST
+                               AUTO;}
+      700       700    4         CHKCOST();
+      701       701    4         break;
+      702       702    4            }
+      703       703    3            case DO_SETCC: {
+      704       704    4         int tinstno;
+      705       705    4         token_t token;
+      706       706    4
+      707       707    4               DEBUG("SETCC");
+      708       708    4         getint(tinstno,codep);
+      709       709    4         auto_flg=zb_auto_info[8]++; zb_auto_info[7]++; instance(tinstno,&token); zb_a
+                               uto_info[7]--; zb_auto_info[8]=auto_flg;
+      710       710    4         setcc(&token);
+      711       711    4         break;
+      712       712    4            }
+      713       713    3            case DO_ERASE: {
+      714       714    4         int nodeno;
+      715       715    4         result_t result;
+      716       716    4
+      717       717    4         DEBUG("ERASE");
+      718       718    4         getint(nodeno,codep);
+      719       719    4         result=compute(&enodes[nodeno]);
+      720       720    4         assert(result.e_typ!=EV_INT && result.e_typ!=EV_ADDR);
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=21 
+      721       721    4         if (result.e_typ==EV_REG)
+      722       722    4            erasereg(result.e_v.e_reg);
+      723       723    4         break;
+      724       724    4            }
+      725       725    3            case DO_TOKREPLACE: {
+      726       726    4         register i;
+      727       727    4         int tinstno;
+      728       728    4         int repllen;
+      729       729    4         token_t reptoken[MAXREPLLEN];
+      730       730    4
+      731       731    4         DEBUG("TOKREPLACE");
+      732       732    4         assert(stackheight>=tokpatlen);
+      733       733    4         repllen=(codep[-1]>>5)&07;
+      734       734    4        #ifndef NDEBUG
+      735       735    4              if (Debug>2) dump_stack();
+      736       736    4         if (Debug>2)
+      737       737    4            fprintf(stderr,"Stackheight=%d, tokpatlen=%d, repllen=%d %s\n",
+      738       738    4               stackheight,tokpatlen,repllen,inscoerc ? "(inscoerc)":"");
+      739       739    4        #endif
+      740       740    4         for(i=0;i<repllen;i++) {
+      741       741    5            getint(tinstno,codep);
+      742       742    5            instance(tinstno,&reptoken[i]);
+      743       743    5            tref(&reptoken[i],1);
+      744       744    5         }
+      745       745    4         for(i=0;i<tokpatlen;i++) {
+      746       746    5            if (!inscoerc)
+      747       747    5               tref(&fakestack[stackheight-1],-1);
+      748       748    5            stackheight--;
+      749       749    5         }
+      750       750    4         for (i=0;i<repllen;i++) {
+      751       751    5            assert(stackheight<MAXFSTACK);
+      752       752    5            fakestack[stackheight++] = reptoken[i];
+      753       753    5         }
+      754       754    4         for(i=0;i<nallreg;i++)
+      755       755    4            chrefcount(allreg[i],-1,FALSE);
+      756       756    4        #ifndef NDEBUG
+      757       757    4              if (Debug>2) dump_stack();
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=22 
+      758       758    4        #endif
+      759       759    4         break;
+      760       760    4            }
+      761       761    3            case DO_EMREPLACE: {
+      762       762    4         register i;
+      763       763    4         int j;
+      764       764    4         int nodeno;
+      765       765    4         result_t result;
+      766       766    4         int emrepllen,eminstr;
+      767       767    4
+      768       768    4         DEBUG("EMREPLACE");
+      769       769    4         emrepllen=(codep[-1]>>5)&07;
+      770       770    4         j=emp-emlines;
+      771       771    4         if (emrepllen>j) {
+      772       772    5            assert(nemlines+emrepllen-j<MAXEMLINES);
+      773       773    5            for (i=nemlines;i>=0;i--)
+      774       774    5               emlines[i+emrepllen-j] = emlines[i];
+      775       775    5            nemlines += emrepllen-j;
+      776       776    5            emp += emrepllen-j;
+      777       777    5         }
+      778       778    4         emp -= emrepllen;
+      779       779    4         for (i=0;i<emrepllen;i++) {
+      780       780    5            getint(eminstr,codep);
+      781       781    5            getint(nodeno,codep);
+      782       782    5            emp[i].em_instr = eminstr;
+      783       783    5            result = compute(&enodes[nodeno]);
+      784       784    5            switch(result.e_typ) {
+      785       785    6            default:
+      786       786    6               assert(FALSE);
+      787       787    6            case 0:
+      788       788    6               emp[i].em_optyp = OPNO;
+      789       789    6               emp[i].em_soper = 0;
+      790       790    6               break;
+      791       791    6            case EV_INT:
+      792       792    6               emp[i].em_optyp = OPINT;
+      793       793    6               emp[i].em_soper = tostring(result.e_v.e_con);
+      794       794    6               emp[i].em_u.em_ioper = result.e_v.e_con;
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=23 
+      795       795    6               break;
+      796       796    6            case EV_ADDR:
+      797       797    6               emp[i].em_optyp = OPSYMBOL;
+      798       798    6               emp[i].em_soper = ad2str(result.e_v.e_addr);
+      799       799    6               break;
+      800       800    6            }
+      801       801    5         }
+      802       802    4         if (!toplevel)
+      803       803    4            ply += emrepllen;
+      804       804    4         break;
+      805       805    4            }
+      806       806    3            case DO_COST: {
+      807       807    4         cost_t cost;
+      808       808    4
+      809       809    4         DEBUG("COST");
+      810       810    4         getint(cost.ct_space,codep);
+      811       811    4         getint(cost.ct_time,codep);
+      812       812    4         {SAVEAUTO; totalcost += costcalc(cost); RESTAUTO;}
+      813       813    4         CHKCOST();
+      814       814    4         break;
+      815       815    4            }
+      816       816    3        #ifdef REGVARS
+      817       817    3            case DO_PRETURN: {
+      818       818    4         if (toplevel) {
+      819       819    5            swtxt();
+      820       820    5            regreturn();   /* in mach.c */
+      821       821    5         }
+      822       822    4         break;
+      823       823    4            }
+      824       824    3        #endif
+      825       825    3            case DO_RETURN:
+      826       826    3         DEBUG("RETURN");
+      827       827    3         assert(origcp!=startupcode);
+      828       828    3            doreturn:
+      829       829    3        #ifndef NDEBUG
+      830       830    3         level--;
+      831       831    3        #endif
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=24 
+      832       832    3         return(totalcost);
+      833       833    3         }
+      834       834    2         }
+      835       835    1        }
+      836       836
+      837       837             readcodebytes() {
+      838       838    1        #ifndef CODEINC
+      839       839   *S*        int readcnt, fd;
+      840       840   *S*        extern char *coderulefid;
+      841       841   *S*        extern int ncodebytes;
+      842       842   *S*
+      843       843   *S*        if ((sys_open(coderulefid,OP_READ+OP_BIN,&fd))==0) {
+      844       844   *S*           fatal("Can't open: %s",coderulefid);
+      845       845   *S*        }
+      846       846   *S*        sys_read(fd,coderules,ncodebytes,&readcnt);
+      847       847   *S*        if (ncodebytes != readcnt) {
+      848       848   *S*           error("Short read from code");
+      849       849   *S*        }
+      850       850   *S*        sys_close(fd);
+      851       851   *S*       #endif
+      852       852    1        }
+      853       853
+      854       854             #ifdef TABLEDEBUG
+      855       855             initlset(f) char *f; {
+      856       856    1         extern char *myalloc();
+      857       857    1         int readcnt;
+      858       858    1
+      859       859    1         set_flag = f;
+      860       860    1         if (sys_open(f+1,OP_APPEND+OP_BIN,&set_fd)==0)
+      861       861    1            error("Can't open %s rw",f+1);
+      862       862    1         sys_read(set_fd,&set_size,sizeof(int),&readcnt);
+      863       863    1         set_val=( short *) myalloc(set_size);
+      864       864    1         sys_read(set_fd,set_val,set_size,&readcnt);
+      865       865    1        }
+      866       866
+      867       867             termlset() {
+      868       868    1
+CC.C03    File=zbg$codegen:c.:ZBC3TSI                                               Fri Aug 22 1997  Page=25 
+      869       869    1         if (set_fd) {
+      870       870    2            Z_SYS_FSEEK(set_fd,(long) sizeof(int),0);
+      871       871    2            sys_write(set_fd,set_val,set_size);
+      872       872    2            sys_close(set_fd), set_fd = 0;
+      873       873    2            if (set_flag[0]=='u') {
+      874       874    3               register i;
+      875       875    3
+      876       876    3               fprintf(stderr,"Unused code rules:\n\n");
+      877       877    3               for(i=0;i<8*set_size;i++)
+      878       878    3                  if(set_val[i>>4]&(1<<(i&017)))
+      879       879    3                     fprintf(stderr,"\"%s\", line %d\n",tablename,i);
+      880       880    3            }
+      881       881    2         }
+      882       882    1        }
+      883       883             #endif
+      884       884
+---  Include file information  ---
+
+   zbg$assert:h.:ZBC3TOU. is referenced
+   zbg$param:h.:ZBC3TOU. is referenced
+   tables:h.:ZBC3TOU. is referenced
+   zbg$types:h.:ZBC3TOU. is referenced
+   cgg_cg:h.:ZBC3TOU. is referenced
+   zbg$data:h.:ZBC3TOU. is referenced
+   zbg$result:h.:ZBC3TOU. is referenced
+   zbg$state:h.:ZBC3TOU. is referenced
+   zbg$equiv:h.:ZBC3TOU. is referenced
+   zbg$extern:h.:ZBC3TOU. is referenced
+   stdio:h.:LIB_E05. is referenced
+   system:h.:ZBC3TOU. is referenced
+
+1 warning was detected in the file zbg$codegen:c.:ZBC3TSI

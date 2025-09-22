@@ -1,0 +1,525 @@
+
+
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=1  
+        1         1             /* $Header: read_em.c,v 1.8 87/03/31 08:16:17 ceriel Exp $ */
+        2         2             /*
+        3         3              * (c) copyright 1987 by the Vrije Universiteit, Amsterdam, The Netherlands.
+        4         4              * See the copyright notice in the ACK home directory, in the file "Copyright"
+                               .
+        5         5              */
+        6         6             /*  Read_em: a module to read either compact or human readable EM code.
+        7         7              Exported are the following routines:
+        8         8              EM_open() : has a parameter representing either a pointer to a
+        9         9                    filename or a null pointer, indicating that input is
+       10        10                    from standard input. This routine initializes for
+       11        11                    reading.
+       12        12              EM_getinstr() :   Delivers the next EM instruction in a format
+       13        13                    defined in <em_comp.h>.
+       14        14              Imported are:
+       15        15              The constants COMPACT (either defined or not defined) and
+       16        16              CHECKING (again either defined or not defined),
+       17        17              some routines from the system module. and the em_code module
+       18        18             */
+       19        19
+       20        20             #include <assert.h>
+       21        21             #include <system.h>
+       22        22             #include <em_label.h>
+       23        23             #include <em_arith.h>
+       24        24             #include <em_pseu.h>
+       25        25             #include <em_spec.h>
+       26        26             #include "em_ptyp.h"
+       27        27             #include "em_comp.h"
+       28        28             #include <em_flag.h>
+       29        29             #include <em_mes.h>
+       30        30
+       31        31             /* Buffered input */
+       32        32
+       33        33             #ifdef TM_L66
+       34        34             #define getbyte()  (*_ich ? (*_ich++ & 0777) : _fill())
+       35        35             #else
+       36        36   *S*       #define getbyte()  (*_ich ? (*_ich++ & 0377) : _fill())
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=2  
+       37        37   *S*       #endif
+       38        38             #define ungetbyte(uch)   ((uch) >= 0 && (*--_ich = (uch)))
+       39        39             #define init_input()  (_fill(), _ich--)
+       40        40
+       41        41             #define EOF  -1
+       42        42
+       43        43             static File *fd = 0;
+       44        44             static char *_ich = 0;
+       45        45
+       46        46             PRIVATE int
+       47        47             _fill()
+       48        48             {
+       49        49    1         static char text[BUFSIZ + 1];
+       50        50    1         static int sz;
+       51        51    1
+       52        52    1         if (_ich && _ich < &text[sz]) return _ich++, '\0';
+       53        53    1         _ich = text;
+       54        54    1         if (sys_read(fd, text, BUFSIZ, &sz) &&
+       55        55    1             sz > 0
+       56        56    1            ) {
+       57        57    2            text[sz] = '\0';
+       58        58    2        #ifdef TM_L66
+       59        59    2            return (*_ich++&0777);
+       60        60    2        #else
+       61        61   *S*           return (*_ich++&0377);
+       62        62   *S*       #endif
+       63        63    2         }
+       64        64    1         else {
+       65        65    2            sz = 0;
+       66        66    2            text[0] = 0;
+       67        67    2            return EOF;
+       68        68    2         }
+       69        69    1        }
+       70        70
+       71        71             #define NARGS   3     /* Maximum number of arguments */
+       72        72             #define STRSIZ  256      /* Maximum length of strings */
+       73        73
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=3  
+       74        74             static struct e_instr emhead;  /* Where we put the head */
+       75        75             static struct e_args emargs[NARGS+2];   /* Where we put the arguments.
+       76        76                             We need some more because some
+       77        77                             arguments are constructed
+       78        78                          */
+       79        79             static struct e_args *i_emargs = 0;
+       80        80             #define argentry() (i_emargs++)
+       81        81             static struct string {
+       82        82    1         int length;
+       83        83    1         char str[STRSIZ + 1];
+       84        84    1        } strings[NARGS];     /* Room for strings */
+       85        85             static struct string *i_strings = 0;    /* Index of last one used */
+       86        86             #define stringentry() (i_strings++)
+       87        87
+       88        88             static struct e_args *argp = 0;   /* Indicates arguments yet to be
+       89        89                          delivered
+       90        90                       */
+       91        91             static arith strleft;    /* count # of chars left to read
+       92        92                          in a string
+       93        93                       */
+       94        94
+       95        95             static int state;     /* What state are we in? */
+       96        96             #define CON  01    /* Reading a CON */
+       97        97             #define ROM  02    /* Reading a ROM */
+       98        98             #define MES  03    /* Reading a MES */
+       99        99             #define PSEUMASK 03
+      100       100             #define INSTRING 010     /* Reading a string */
+      101       101
+      102       102             static int EM_initialized;  /* EM_open called? */
+      103       103
+      104       104             static long wordmask[] = {  /* allowed bits in a word */
+      105       105    1        #ifdef  TM_L66
+      106       106    1          0000000000000,
+      107       107    1          0000000000777,
+      108       108    1          0000000777777,
+      109       109    1          0000000000000,
+      110       110    1          0777777777777
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=4  
+      111       111    1        #else
+      112       112   *S*        0x00000000,
+      113       113   *S*        0x000000FF,
+      114       114   *S*        0x0000FFFF,
+      115       115   *S*        0x00000000,
+      116       116   *S*        0xFFFFFFFF
+      117       117   *S*       #endif
+      118       118    1        };
+      119       119
+      120       120             static int wsize, psize; /* word size and pointer size */
+      121       121             int EM_wordsize, EM_pointersize;
+      122       122
+      123       123             #ifdef CHECKING
+      124       124   *S*       static char *argrange = "Argument range error";
+      125       125   *S*       #define check(expr) (expr || !EM_error || (EM_error = argrange))
+      126       126   *S*       #else not CHECKING
+      127       127             #define check(x)   /* nothing */
+      128       128             #endif CHECKING
+      129       129
+      130       130             /* Error handling
+      131       131             */
+      132       132
+      133       133             PRIVATE
+      134       134             xerror(s)
+      135       135              char *s;
+      136       136             {
+      137       137    1         if (emhead.em_type != EM_FATAL) emhead.em_type = EM_ERROR;
+      138       138    1         if (!EM_error) EM_error = s;
+      139       139    1        }
+      140       140
+      141       141             PRIVATE
+      142       142             xfatal(s)
+      143       143              char *s;
+      144       144             {
+      145       145    1         emhead.em_type = EM_FATAL;
+      146       146    1         if (!EM_error) EM_error = s;
+      147       147    1        }
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=5  
+      148       148
+      149       149             #ifdef COMPACT
+      150       150   *S*       #include "readk.c"
+      151       151   *S*       #else not COMPACT
+      152       152             #include "reade.c"
+      153       840             #endif COMPACT
+      154       841
+      155       842             /* EM_open: Open input file, get magic word if COMPACT.
+      156       843             */
+      157       844             EXPORT int
+      158       845             EM_open(filename)
+      159       846              char *filename;
+      160       847             {
+      161       848    1         if (EM_initialized) {
+      162       849    2            EM_error = "EM_open already called";
+      163       850    2            return 0;
+      164       851    2         }
+      165       852    1
+      166       853    1         if (filename) {
+      167       854    2        #ifdef COMPACT
+      168       855   *S*           if (!sys_open(filename, OP_READ+OP_BIN, &fd)) {
+      169       856   *S*       #else
+      170       857    2            if (!sys_open(filename, OP_READ, &fd)) {
+      171       858    3        #endif
+      172       859    3               EM_error = "Could not open input file";
+      173       860    3               return 0;
+      174       861    3            }
+      175       862    2         }
+      176       863    1         else  fd = STDIN;
+      177       864    1         EM_filename = filename;
+      178       865    1         init_input();
+      179       866    1
+      180       867    1        #ifdef COMPACT
+      181       868   *S*        if (get16() != sp_magic) {
+      182       869   *S*           EM_error = "Illegal magic word";
+      183       870   *S*           return 0;
+      184       871   *S*        }
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=6  
+      185       872   *S*       #else not COMPACT
+      186       873    1         inithash(); /* initialize hashtable */
+      187       874    1        #endif COMPACT
+      188       875    1
+      189       876    1         EM_initialized = 1;
+      190       877    1         return 1;
+      191       878    1        }
+      192       879
+      193       880             /* EM_close: Close input file
+      194       881             */
+      195       882             EXPORT
+      196       883             EM_close()
+      197       884             {
+      198       885    1
+      199       886    1         register struct string *pstr;
+      200       887    1
+      201       888    1         if (fd != STDIN) {
+      202       889    2            sys_close(fd);
+      203       890    2            fd = STDIN;
+      204       891    2         }
+      205       892    1         EM_initialized = 0;
+      206       893    1        }
+      207       894
+      208       895
+      209       896             /* startmes: handle the start of a message. The only important thing here
+      210       897              is to get the wordsize and pointer size, and remember that they
+      211       898              have already been read, not only to check that they are not specified
+      212       899              again, but also to deliver the arguments on next calls to EM_getinstr.
+      213       900              This is indicated by the variable "argp".
+      214       901             */
+      215       902             PRIVATE
+      216       903             startmes(p)
+      217       904              register struct e_instr *p;
+      218       905             {
+      219       906    1         register struct e_args *ap;
+      220       907    1
+      221       908    1         ap = getarg(cst_ptyp);
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=7  
+      222       909    1         p->em_arg = ap;
+      223       910    1         state = MES;
+      224       911    1
+      225       912    1         if (ap->em_cst == ms_emx) {
+      226       913    2            if (wsize || psize) {
+      227       914    3               if (!EM_error) EM_error = "Duplicate ms_emx";
+      228       915    3            }
+      229       916    2            argp = ap = getarg(cst_ptyp);
+      230       917    2            wsize = ap->em_cst;
+      231       918    2            EM_wordsize = ap->em_cst;
+      232       919    2            ap->em_next = getarg(cst_ptyp);
+      233       920    2            ap = ap->em_next;
+      234       921    2            psize = ap->em_cst;
+      235       922    2            EM_pointersize = ap->em_cst;
+      236       923    2         }
+      237       924    1        }
+      238       925
+      239       926
+      240       927             /* EM_getinstr: read an "EM_line"
+      241       928             */
+      242       929             EXPORT struct e_instr *
+      243       930             EM_getinstr()
+      244       931             {
+      245       932    1         register struct e_instr *p = &emhead;
+      246       933    1         register struct e_args *args;
+      247       934    1
+      248       935    1         i_emargs = emargs;
+      249       936    1         i_strings = strings;
+      250       937    1         EM_error = 0;
+      251       938    1        #ifdef CHECKING
+      252       939   *S*        if (!EM_initialized) {
+      253       940   *S*           EM_error = "Initialization not done";
+      254       941   *S*           p->em_type = EM_FATAL;
+      255       942   *S*           return p;
+      256       943   *S*        }
+      257       944   *S*       #endif CHECKING
+      258       945    1
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=8  
+      259       946    1         if (argp) { /* We have some arguments left to deliver */
+      260       947    2            args = argp;
+      261       948    2            argp = args->em_next;
+      262       949    2            p->em_type = EM_MESARG;
+      263       950    2            p->em_arg = args;
+      264       951    2            args->em_next = 0;
+      265       952    2            return p;
+      266       953    2         }
+      267       954    1
+      268       955    1         if (!state) {     /* All clear, get a new line */
+      269       956    2            p = gethead();
+      270       957    2            if (!p) {   /* End of file */
+      271       958    3               return p;
+      272       959    3            }
+      273       960    2            switch(p->em_type) {
+      274       961    3            case EM_MNEM: {
+      275       962    4               register int i,j;
+      276       963    4               register struct e_args *ap;
+      277       964    4               extern char em_flag[];
+      278       965    4               extern short em_ptyp[];
+      279       966    4
+      280       967    4               p->em_args = 0;
+      281       968    4               j = em_flag[p->em_opcode - sp_fmnem] & EM_PAR;
+      282       969    4               i = em_ptyp[j];
+      283       970    4               if (j == PAR_NO) {   /* No arguments */
+      284       971    5                  break;
+      285       972    5               }
+      286       973    4        #ifndef COMPACT
+      287       974    4               if (j == PAR_B) i = ptyp(sp_ilb2);
+      288       975    4        #endif COMPACT
+      289       976    4               ap = getarg(i);
+      290       977    4        #ifndef COMPACT
+      291       978    4               if (j == PAR_B) {
+      292       979    5                  ap->em_cst = ap->em_ilb;
+      293       980    5                  ap->em_argtype = cst_ptyp;
+      294       981    5               }
+      295       982    4        #endif COMPACT
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=9  
+      296       983    4               /* range checking
+      297       984    4               */
+      298       985    4        #ifdef CHECKING
+      299       986   *S*              if (wsize <= 4 && psize <= 4) switch(j) {
+      300       987   *S*              case PAR_B:
+      301       988   *S*       #ifdef TM_L66
+      302       989   *S*                 check(ap->em_cst <= 262143);
+      303       990   *S*       #else
+      304       991   *S*                 check(ap->em_cst <= 32767);
+      305       992   *S*       #endif
+      306       993   *S*                 /* Fall through */
+      307       994   *S*              case PAR_N:
+      308       995   *S*                 check(ap->em_cst >= 0);
+      309       996   *S*                 break;
+      310       997   *S*              case PAR_G:
+      311       998   *S*                 if (ap->em_argtype == cst_ptyp) {
+      312       999   *S*                    check(ap->em_cst >= 0);
+      313      1000   *S*                 }
+      314      1001   *S*                 /* Fall through */
+      315      1002   *S*              case PAR_F:
+      316      1003   *S*                 /* ??? not in original em_decode or em_encode */
+      317      1004   *S*              case PAR_L:
+      318      1005   *S*              {  arith m = ap->em_cst >= 0 ? ap->em_cst :
+      319      1006   *S*                              - ap->em_cst;
+      320      1007   *S*
+      321      1008   *S*                 /* Check that the number fits in a pointer */
+      322      1009   *S*                 check((m & ~wordmask[psize]) == 0);
+      323      1010   *S*                 break;
+      324      1011   *S*              }
+      325      1012   *S*              case PAR_W:
+      326      1013   *S*                 if (!ap) break;
+      327      1014   *S*                 check((ap->em_cst & ~wordmask[wsize]) == 0);
+      328      1015   *S*                 /* Fall through */
+      329      1016   *S*              case PAR_S:
+      330      1017   *S*                 check(ap->em_cst > 0);
+      331      1018   *S*                 /* Fall through */
+      332      1019   *S*              case PAR_Z:
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=10 
+      333      1020   *S*                 check(ap->em_cst >= 0 &&
+      334      1021   *S*                       ap->em_cst % wsize == 0);
+      335      1022   *S*                 break;
+      336      1023   *S*              case PAR_O:
+      337      1024   *S*                 check(ap->em_cst > 0 &&
+      338      1025   *S*                             ( ap->em_cst % wsize == 0 ||
+      339      1026   *S*                    wsize % ap->em_cst == 0));
+      340      1027   *S*                 break;
+      341      1028   *S*              case PAR_R:
+      342      1029   *S*                 check(ap->em_cst >= 0 && ap->em_cst <= 2);
+      343      1030   *S*                 break;
+      344      1031   *S*              }
+      345      1032   *S*       #endif CHECKING
+      346      1033    4               p->em_args = ap;
+      347      1034    4        #ifndef COMPACT
+      348      1035    4               checkeol();
+      349      1036    4        #endif COMPACT
+      350      1037    4               }
+      351      1038    3               break;
+      352      1039    3            case EM_PSEU:
+      353      1040    3               /* handle a pseudo, read possible arguments. CON's and
+      354      1041    3                  ROM's are handled especially: Only one argument is
+      355      1042    3                  read, and a mark is set that an argument list of
+      356      1043    3                  type ROM or CON is in process
+      357      1044    3               */
+      358      1045    3               {
+      359      1046    4               register struct e_args *ap = 0, *ap1;
+      360      1047    4
+      361      1048    4               switch(p->em_opcode) {
+      362      1049    5               case ps_bss:
+      363      1050    5               case ps_hol:
+      364      1051    5                  ap = getarg(cst_ptyp);
+      365      1052    5                  ap->em_next = ap1 = getarg(par_ptyp);
+      366      1053    5                  ap->em_next->em_next = ap1 = getarg(cst_ptyp);
+      367      1054    5        #ifdef CHECKING
+      368      1055   *S*                 /* Check that the last value is 0 or 1
+      369      1056   *S*                 */
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=11 
+      370      1057   *S*                 if (ap1->em_cst != 1 && ap1->em_cst != 0) {
+      371      1058   *S*                   if (! EM_error)
+      372      1059   *S*                    EM_error="Third argument of hol/bss not 0/1";
+      373      1060   *S*                 }
+      374      1061   *S*       #endif CHECKING
+      375      1062    5                  break;
+      376      1063    5               case ps_exa:
+      377      1064    5               case ps_ina:
+      378      1065    5                  ap = getarg(lab_ptyp);
+      379      1066    5                  break;
+      380      1067    5               case ps_exp:
+      381      1068    5               case ps_inp:
+      382      1069    5                  ap = getarg(pro_ptyp);
+      383      1070    5                  break;
+      384      1071    5               case ps_exc:
+      385      1072    5                  ap = getarg(cst_ptyp);
+      386      1073    5                  ap->em_next = getarg(cst_ptyp);
+      387      1074    5                  break;
+      388      1075    5               case ps_pro:
+      389      1076    5                  ap = getarg(pro_ptyp);
+      390      1077    5                  ap->em_next = getarg(cst_ptyp|ptyp(sp_cend));
+      391      1078    5                  break;
+      392      1079    5               case ps_end:
+      393      1080    5                  ap = getarg(cst_ptyp|ptyp(sp_cend));
+      394      1081    5                  break;
+      395      1082    5               case ps_con:
+      396      1083    5                  ap = getarg(val_ptyp);
+      397      1084    5                  state |= CON;
+      398      1085    5                  break;
+      399      1086    5               case ps_rom:
+      400      1087    5                  ap = getarg(val_ptyp);
+      401      1088    5                  state |= ROM;
+      402      1089    5                  break;
+      403      1090    5               default:
+      404      1091    5                  xerror("Bad pseudo");
+      405      1092    5                  break;
+      406      1093    5               }
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=12 
+      407      1094    4               p->em_args = ap;
+      408      1095    4               }
+      409      1096    3        #ifndef COMPACT
+      410      1097    3               if (p->em_opcode != ps_con && p->em_opcode != ps_rom) {
+      411      1098    4                  checkeol();
+      412      1099    4               }
+      413      1100    3        #endif COMPACT
+      414      1101    3               break;
+      415      1102    3            case EM_STARTMES:
+      416      1103    3               startmes(p);
+      417      1104    3               break;
+      418      1105    3            }
+      419      1106    2            if (!wsize && !EM_error) {
+      420      1107    3               wsize = 2;
+      421      1108    3               psize = 2;
+      422      1109    3               EM_error = "EM code should start with mes 2";
+      423      1110    3            }
+      424      1111    2            return p;
+      425      1112    2         }
+      426      1113    1
+      427      1114    1         if (state & INSTRING) { /* We already delivered part of a string.
+      428      1115    2                     Deliver the next part
+      429      1116    2                  */
+      430      1117    2            register struct string *s;
+      431      1118    2
+      432      1119    2            s = getstring(0);
+      433      1120    2            args = argentry();
+      434      1121    2            args->em_next = 0;
+      435      1122    2            args->em_argtype = str_ptyp;
+      436      1123    2            args->em_str = s->str;
+      437      1124    2            args->em_size = s->length;
+      438      1125    2            switch(state & PSEUMASK) {
+      439      1126    3            default:
+      440      1127    3               assert(0);
+      441      1128    3            case MES:
+      442      1129    3               if (!EM_error)
+      443      1130    3                  EM_error = "String too long in message";
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=13 
+      444      1131    3               p->em_type = EM_MESARG;
+      445      1132    3               p->em_arg = args;
+      446      1133    3               break;
+      447      1134    3            case CON:
+      448      1135    3               p->em_type = EM_PSEU;
+      449      1136    3               p->em_opcode = ps_con;
+      450      1137    3               p->em_args = args;
+      451      1138    3               break;
+      452      1139    3            case ROM:
+      453      1140    3               p->em_type = EM_PSEU;
+      454      1141    3               p->em_opcode = ps_rom;
+      455      1142    3               p->em_args = args;
+      456      1143    3               break;
+      457      1144    3            }
+      458      1145    2            return p;
+      459      1146    2         }
+      460      1147    1
+      461      1148    1         /* Here, we are in a state reading arguments */
+      462      1149    1         args=getarg(any_ptyp);
+      463      1150    1         if (EM_error && p->em_type != EM_FATAL) {
+      464      1151    2            return p;
+      465      1152    2         }
+      466      1153    1         if (!args) {   /* No more arguments */
+      467      1154    2        #ifndef COMPACT
+      468      1155    2            checkeol();
+      469      1156    2        #endif
+      470      1157    2            if (state == MES) {
+      471      1158    3               state = 0;
+      472      1159    3               p->em_type = EM_ENDMES;
+      473      1160    3               return p;
+      474      1161    3            }
+      475      1162    2            /* Here, we have to get the next instruction */
+      476      1163    2            state = 0;
+      477      1164    2            return EM_getinstr();
+      478      1165    2         }
+      479      1166    1
+      480      1167    1         /* Here, there was an argument */
+CC.C03    File=zbm$read$read_em:c.:ZBC3TOU                                          Fri Aug 22 1997  Page=14 
+      481      1168    1         if (state == MES) {
+      482      1169    2            p->em_type = EM_MESARG;
+      483      1170    2            p->em_arg = args;
+      484      1171    2            return p;
+      485      1172    2         }
+      486      1173    1         p->em_type = EM_PSEU;
+      487      1174    1         p->em_args = args;
+      488      1175    1         if (state == CON) p->em_opcode = ps_con;
+      489      1176    1         else  p->em_opcode = ps_rom;
+      490      1177    1         return p;
+      491      1178    1        }
+      492      1179
+---  Include file information  ---
+
+   assert:h.:LIB_E05. is referenced
+   system:h.:ZBC3TOU. is referenced
+   em_label:h.:ZBC3TOU. is referenced
+   em_arith:h.:ZBC3TOU. is referenced
+   em_pseu:h.:ZBC3TOU. is referenced
+   em_spec:h.:ZBC3TOU. is referenced
+   em_ptyp:h.:ZBC3TOU. is referenced
+   zbm$em_comp:h.:ZBC3TOU. is referenced
+   em_flag:h.:ZBC3TOU. is referenced
+   em_mes:h.:ZBC3TOU. is referenced
+   zbm$read$reade:c.:ZBC3TOU. is referenced
+   ctype:h.:LIB_E05. is referenced
+
+No diagnostics were issued in the file zbm$read$read_em:c.:ZBC3TOU

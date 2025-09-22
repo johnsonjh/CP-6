@@ -1,0 +1,1337 @@
+
+
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=1  
+A        1         1             /*M*    make_build:c   -- To build the target based upon actions    */
+A        2         2             /*T***********************************************************/
+A        3         3             /*T*                                                         */
+A        4         4             /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+A        5         5             /*T*                                                         */
+A        6         6             /*T***********************************************************/
+A        7         7
+A        8         8             /*F*    NAME:          build(test,verbose)
+A        9         9                     PURPOSE:       To take the action list provided by the derive
+A       10        10                                 function and (hopefully) produce the required
+A       11        11                                 target.
+A       12        12
+A       13        13                     DESCRIPTION:
+A       14        14
+A       15        15                        This function classifies each action based upon the
+A       16        16                        associated target.  It then scans the list of targets
+A       17        17                        that are waiting to run and inserts them into the
+A       18        18                        "ready-to-run" queue via the schedule function.
+A       19        19
+A       20        20                        The run function takes each target in the ready-to-run
+A       21        21                        queue and submits them into the batch queue.
+A       22        22
+A       23        23                        The "updatejobs" function checks the current status
+A       24        24                        of the running jobs and promotes each completed job
+A       25        25                        into either the errored or completed queue.  If any
+A       26        26                        jobs have completed successfully, the schedule function
+A       27        27                        is run to add more jobs to the ready to run queue.
+A       28        28
+A       29        29                        This function stops when there are no jobs running and
+A       30        30                        the schedule function cannot find a job to run.
+A       31        31
+A       32        32                        A summary should be produced at this point indicating
+A       33        33                        the reason why any jobs found in the waiting queue
+A       34        34                        cannot be run.  A full summary should include the
+A       35        35                        sysids of the jobs that produced or failed to produce
+A       36        36                        each target.
+A       37        37             */
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=2  
+A       38        38
+A       39        39             #include   <stdio.h>
+A       40        40             #include   <stdlib.h>
+A       41        41             #include   <string.h>
+A       42        42             #include   <ctype.h>
+A       43        43             #include   <errno.h>
+A       44        44             #include   <b$jit_c.h>
+A       45        45             #include   "MAKE_Cc14"
+A       46        46
+A       47        47             struct b_jit  *jptr;
+A       48        48             int            num_jobs_run = 0;
+A       49        49             int  JCLflags = 0;
+A       50        50             int  JCLdefault = 0;
+A       51        51
+A       52        52             #define JCL_BANG   01
+A       53        53             #define JCL_SKIP   02
+A       54        54             #define JCL_NCHK   04  /* Don't check stepcc */
+A       55        55             #define JCL_ECHO  010  /* Echo command       */
+A       56        56             #define JCL_CCOM  020  /* Insert commas in !command  */
+A       57        57             #define JCL_ICOM  040  /* Insert commas in some input*/
+A       58        58             #define JCL_CONT 0100  /* Command continuation w/commas */
+A       59        59
+A       60        60             #ifdef RU
+A       61        61             extern int MAKE_ONLINE_MAGIC;
+A       62        62             #endif
+A       63        63
+A       64        64             char JclFid[32];       /* holds jcl commands to batch   */
+A       65        65
+A       66        66             FILE *jcl;             /* file pointer for jcl          */
+A       67        67
+A       68        68             char BatchIt[40]              = {"batch "};
+A       69        69             char XeqIt[40]                = {"xeq "};
+A       70        70             CONST char saved_var[]        = {"saved_image_MAKE"};
+A       71        71             char saved_fid[32]            = {""};
+A       72        72             char SaveIt[60]               = {"save over "};
+A       73        73
+A       74        74             char *CONST command_commas[]   =  {"LINK", "COPY", "C", "L"};
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=3  
+A       75        75             char *CONST icommand_commas[]  =  {"LEMUR", "PCL"};
+A       76        76             char *CONST command_incommas[] =  {"COPY", "C", "LIST", "L"};
+A       77        77
+A       78        78             static int testing  = 0;
+A       79        79             static int touching = 0;
+A       80        80             static int run_online = 0;
+A       81        81             static char buf[80];
+A       82        82
+A       83        83             char *ExpandMacros();
+A       84        84             char *gen_spec_name();
+A       85        85             extern char *fid_filename(), *fid_acct();
+A       86        86
+A       87        87
+A       88        88             CONST int  spec_char_table[129] = {
+A       89        89    1         /*0 1 2 3 4  5 6 7 8 9  A 1 2 3 4  5 6 7 8 9  B 1 2 3 4  5 6 7 8 9*/
+A       90        90    1           2,2,2,2,2, 2,2,2,2,2, 2,2,2,2,2, 2,2,2,2,2, 2,2,2,2,2, 2,2,2,2,2,
+A       91        91    1           2,2,1,2,2, 0,0,2,2,7, 6,6,0,2,1, 4,0,0,0,0, 0,0,0,0,0, 0,0,0,0,2,
+A       92        92    1           2,2,2,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0,
+A       93        93    1           0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0,
+A       94        94    1           0,0,0,0,0, 0,0,3,-1 };
+A       95        95
+A       96        96             #define char_code(n) ((n<129)? spec_char_table[n] : 2)
+A       97        97
+A       98        98
+A       99        99             /*D*    NAME:       classify_actions()
+A      100       100                     PURPOSE:    To scan the list of actions and classify each
+A      101       101                                 and insert it into the correct queue.
+A      102       102             */
+A      103       103
+A      104       104             void
+A      105       105             classify_actions()
+A      106       106             {
+A      107       107    1          int   i;
+A      108       108    1
+A      109       109    1          for ( i=0 ; i<7 ; i++)  state_inserts[i] = &target_states[i];
+A      110       110    1
+A      111       111    1          for ( i=0 ; i<TargetActionNum ; i++ )  {
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=4  
+A      112       112    2             struct target_action *act = TargetActions[i];
+A      113       113    2             struct sym_target    *tg  = act->ta_target;
+A      114       114    2             int                   st  = tg->tg_status;
+A      115       115    2
+A      116       116    2             (*state_inserts[st]) = tg;
+A      117       117    2             state_inserts[st]    = &tg->tg_stchain;
+A      118       118    2             tg->tg_stchain       = 0;
+A      119       119    2
+A      120       120    2             state_counts[st]++;
+A      121       121    2             while (act->next && act->next->ta_target->tg_status == st)
+A      122       122    2                i++, act = act->next;
+A      123       123    2             }
+A      124       124    1        }
+A      125       125
+A      126       126
+A      127       127
+A      128       128
+A      129       129             /*D*    NAME:       schedule(LS_width)
+A      130       130                     PURPOSE:    To find targets that may be produced.
+A      131       131             */
+A      132       132
+A      133       133             int
+A      134       134             schedule(LS_width)
+A      135       135             {
+A      136       136    1          struct sym_target **tgpp = &target_states[STATUS_WAITING];
+A      137       137    1          struct sym_target  *tg   = target_states [STATUS_WAITING];
+A      138       138    1          int                 rs   = 0;
+A      139       139    1          int                 w_p  = 0;
+A      140       140    1
+A      141       141    1          while(tg)   {
+A      142       142    2             struct sym_target *ntg = tg->tg_stchain;
+A      143       143    2             struct target_action *act = tg->tg_action;
+A      144       144    2             struct sym_target **ntgpp = &tg->tg_stchain;
+A      145       145    2
+A      146       146    2             while (act) {
+A      147       147    3                struct dependancy *d = act->ta_target->tg_depend;
+A      148       148    3                while (d)   {  /* while there are dependancies to check  */
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=5  
+A      149       149    4                   int dn, dnum = d->dp_num;
+A      150       150    4                   for ( dn=0 ; dn<dnum ; dn++ ) {
+A      151       151    5                      if ( d->dp_list[dn]->tg_status < STATUS_COMPLETED)
+A      152       152    5                         goto next_action; /* Not ready to run */
+A      153       153    5                      }
+A      154       154    4                   d = d->dp_tgdepend;
+A      155       155    4                   }
+A      156       156    3                act = act->next;
+A      157       157    3                }
+A      158       158    2        /* Found a target that can be produced!                     */
+A      159       159    2             (*state_inserts[STATUS_RUNABLE]) = tg;
+A      160       160    2             state_inserts  [STATUS_RUNABLE]  = &tg->tg_stchain;
+A      161       161    2             tg->tg_stchain = 0;
+A      162       162    2             state_counts   [STATUS_RUNABLE]++;
+A      163       163    2             state_counts   [STATUS_WAITING]--;
+A      164       164    2             *tgpp = ntg;
+A      165       165    2             ntgpp = tgpp;
+A      166       166    2             rs++;
+A      167       167    2             if (!w_p) {
+A      168       168    3                if (!touching)
+A      169       169    3                     printf("*  Ready to run:");
+A      170       170    3                else printf("*      Touching:");
+A      171       171    3                w_p = 16;
+A      172       172    3                }
+A      173       173    2             if ((w_p + 1 + tg->tg_len) > LS_width)
+A      174       174    2                printf("\n*               "), w_p = 16;
+A      175       175    2             printf(" %s",tg->tg_text), w_p += 1 + tg->tg_len;
+A      176       176    2        next_action:
+A      177       177    2             tg = ntg;
+A      178       178    2             tgpp = ntgpp;
+A      179       179    2             }
+A      180       180    1          if (w_p) printf("\n");
+A      181       181    1          return rs;
+A      182       182    1        }
+A      183       183
+A      184       184
+A      185       185
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=6  
+A      186       186
+A      187       187             /*D*    NAME:          build_state
+A      188       188                     PURPOSE:       To summarize the state table information.
+A      189       189             */
+A      190       190
+A      191       191             void
+A      192       192             build_state() {
+A      193       193    1          char cb[120];  /* temp area to hold fake ccbuf */
+A      194       194    1          static cci = 1;
+A      195       195    1
+A      196       196    1          if (B$JIT$->active.jit) {
+A      197       197    2             memset(B$JIT$->ccbuf, ' ', sizeof(B$JIT$->ccbuf));
+A      198       198    2             cci = 0;
+A      199       199    2             sprintf(cb, "Wt=%d,Rdy=%d,Run=%d,Er=%d,Ok=%d",
+A      200       200    2                     state_counts[1], state_counts[2], state_counts[3],
+A      201       201    2                     state_counts[4], state_counts[5]                  );
+A      202       202    2             memcpy(B$JIT$->ccbuf, cb, strlen(cb));
+A      203       203    2             }
+A      204       204    1          printf("*  Dependency wait=%d, Waiting to run=%d, Running=%d, Errored=%d, Co
+A                               mpleted=%d\n",
+A      205       205    1                 state_counts[1], state_counts[2], state_counts[3],
+A      206       206    1                 state_counts[4], state_counts[5]                   );
+A      207       207    1        }
+A      208       208
+A      209       209
+A      210       210
+A      211       211
+A      212       212             /*D*    NAME:          strlen_b
+A      213       213                     PURPOSE:       To find the length of a string up to and
+A      214       214                                    excluding the first blank.
+A      215       215             */
+A      216       216             int
+A      217       217             strlen_b(st)
+A      218       218               char     *st;
+A      219       219             {
+A      220       220    1          int       rs = 0;
+A      221       221    1
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=7  
+A      222       222    1          while (st[rs] && st[rs] != ' ') rs++;
+A      223       223    1
+A      224       224    1          return rs;
+A      225       225    1        }
+A      226       226
+A      227       227
+A      228       228
+A      229       229
+A      230       230             /*D*    NAME:          define_vars(action)
+A      231       231                     PURPOSE:       To provide definitions for the special macro
+A      232       232                                    names (such as $<, $@, ...).
+A      233       233             */
+A      234       234
+A      235       235             static  char  mc_fids[7][104];
+A      236       236             static  char  mc_accts[7][12];  /* include room for "null" */
+A      237       237             static  char  mc_file[7][32];
+A      238       238             static  struct   {
+A      239       239    1             char  *str;
+A      240       240    1             int    len;
+A      241       241    1             }  mc_vars[21] = {
+A      242       242    1                mc_fids [0], 0, mc_fids [1], 0, mc_fids [2], 0, mc_fids [3],0,
+A      243       243    1                mc_fids [4], 0, mc_fids [5], 0, mc_fids [6], 0,
+A      244       244    1                mc_file [0], 0, mc_file [1], 0, mc_file [2], 0, mc_file [3],0,
+A      245       245    1                mc_file [4], 0, mc_file [5], 0, mc_file [6], 0,
+A      246       246    1                mc_accts[0], 0, mc_accts[1], 0, mc_accts[2], 0, mc_accts[3],0,
+A      247       247    1                mc_accts[4], 0, mc_accts[5], 0, mc_accts[6], 0
+A      248       248    1                };
+A      249       249
+A      250       250
+A      251       251             void
+A      252       252             define_vars(action, LoDo)
+A      253       253               struct target_action *action;
+A      254       254             {
+A      255       255    1          int   i;
+A      256       256    1          int   lastv = (LoDo)? MI_LS : MI_DO;
+A      257       257    1          struct   sym_macro  *mac = sym_macro_specials[ MI_EARLIER ];
+A      258       258    1
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=8  
+A      259       259    1          if (action->ta_chngvar) {
+A      260       260    2             char  *s = action->ta_chngvar;
+A      261       261    2             mac->mc_def = s;
+A      262       262    2             mac->mc_deflen = strlen(s);
+A      263       263    2             }
+A      264       264    1          if (action->ta_predvar) {
+A      265       265    2             char *s = action->ta_predvar;
+A      266       266    2             mac = sym_macro_specials[ MI_PREDECESSOR ];
+A      267       267    2             mac->mc_def    = s;
+A      268       268    2             mac->mc_deflen = strlen(s);
+A      269       269    2             }
+A      270       270    1          if (action->ta_dpndvar) {
+A      271       271    2             char *s = action->ta_dpndvar;
+A      272       272    2             mac = sym_macro_specials[ MI_DEPENDENT ];
+A      273       273    2             mac->mc_def    = s;
+A      274       274    2             mac->mc_deflen = strlen(s);
+A      275       275    2             }
+A      276       276    1
+A      277       277    1          for ( i=MI_BASE ; i<=lastv ; i++ )   {
+A      278       278    2             int            j = i - MI_BASE;
+A      279       279    2             struct sym_macro *mca = sym_macro_specials[j + MI_BASE_ACCT];
+A      280       280    2             struct sym_macro *mcf = sym_macro_specials[j + MI_BASE_FILE];
+A      281       281    2             struct sym_macro *mc  = sym_macro_specials[i];
+A      282       282    2             struct sym_target *tg = action->ta_target;
+A      283       283    2             struct sym_target *tgi= action->ta_tginput;
+A      284       284    2             int   lflags = 0;
+A      285       285    2             char  *fid;
+A      286       286    2
+A      287       287    2             mca->mc_def = mc_accts[j];    mca->mc_deflen = 0;
+A      288       288    2             mcf->mc_def = mc_file [j];    mcf->mc_deflen = 0;
+A      289       289    2             mc ->mc_def = mc_fids [j];    mc ->mc_deflen = 0;
+A      290       290    2
+A      291       291    2             mc_fids [j][0] = 0;     mc_vars[j+ 0].len = 0;
+A      292       292    2             mc_accts[j][0] = 0;     mc_vars[j+ 6].len = 0;
+A      293       293    2             mc_file [j][0] = 0;     mc_vars[j+13].len = 0;
+A      294       294    2
+A      295       295    2             switch (j)  {
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=9  
+A      296       296    3
+A      297       297    3             case 0:     /**  Fill in base target name   **/
+A      298       298    3                mc_fids[0][0] = mc_accts[0][0] = mc_file[0][0] = 127;
+A      299       299    3                memcpy(mc_file [0]+1, fid_filename(tg->tg_text), 32);
+A      300       300    3                memcpy(mc_accts[0]+1,            jptr->faccn,     8);
+A      301       301    3                memcpy(mc_fids [0]+1, mc_file[0]+1,              32);
+A      302       302    3                strcat(mc_fids [0], ".");
+A      303       303    3                strcat(mc_fids [0], mc_accts[0]+1);
+A      304       304    3                lflags = 7;
+A      305       305    3                break;
+A      306       306    3
+A      307       307    3             case 1:     /**   Input file names        **/
+A      308       308    3                if (tgi) {
+A      309       309    4                   lflags = 3;
+A      310       310    4                   mc_fids[1][0] = mc_accts[1][0] = mc_file[1][0] = 127;
+A      311       311    4                   memcpy(mc_accts[1]+1, fid_acct(tgi->tg_fid+1),  8);
+A      312       312    4                   memcpy(mc_file [1]+1, fid_filename(tgi->tg_fid+1), 32);
+A      313       313    4                   memcpy(mc_fids [1]+1, tgi->tg_fid+1, 71);
+A      314       314    4                   if (tgi->tg_ufid) {
+A      315       315    5                      lflags = 7;
+A      316       316    5                      strcat(mc_fids[1], ",\177");
+A      317       317    5                      strcat(mc_fids[1], tgi->tg_ufid+1 );
+A      318       318    5                      }
+A      319       319    4                   else {
+A      320       320    5                      mc_vars[1].len = tgi->tg_fid[0];
+A      321       321    5                      mc->mc_deflen = tgi->tg_fid[0] + 1;
+A      322       322    5                      }
+A      323       323    4                   }
+A      324       324    3                break;
+A      325       325    3
+A      326       326    3             case 2:  /*  Target File name    */
+A      327       327    3                lflags = 3;
+A      328       328    3                mc_fids[2][0] = mc_accts[2][0] = mc_file[2][0] = 127;
+A      329       329    3                memcpy(mc_accts[2]+1, fid_acct(tg->tg_fid+1), 8);
+A      330       330    3                memcpy(mc_file [2]+1, fid_filename(tg->tg_fid+1), 32);
+A      331       331    3                memcpy(mc_fids [2]+1, tg->tg_fid+1, tg->tg_fid[0]+1);
+A      332       332    3                mc_vars[2].len = tg->tg_fid[0]+1;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=10 
+A      333       333    3                mc->mc_deflen = tg->tg_fid[0] + 1;
+A      334       334    3                break;
+A      335       335    3
+A      336       336    3             case 3:  /*  Listing file name   */
+A      337       337    3             case 4:  /*  Diagnostic file name   */
+A      338       338    3                lflags = 3;
+A      339       339    3                mc_fids[j][0] = mc_accts[j][0] = mc_file[j][0] = 127;
+A      340       340    3                memcpy(mc_fids [j]+1, (fid=gen_spec_name(j-3,tg))+1,    71);
+A      341       341    3                memcpy(mc_accts[j]+1, fid_acct(mc_fids[j]+1),   8);
+A      342       342    3                memcpy(mc_file [j]+1, fid_filename(mc_fids[j]+1), 32);
+A      343       343    3                mc_vars[j].len = fid[0]+1;
+A      344       344    3                mc->mc_deflen  = fid[0]+1;
+A      345       345    3                break;
+A      346       346    3
+A      347       347    3             }
+A      348       348    2             if (lflags & 1)
+A      349       349    2                mca->mc_deflen = mc_vars[j+14].len = strlen_b(mc_accts[j]);
+A      350       350    2             if (lflags & 2)
+A      351       351    2                mcf->mc_deflen = mc_vars[j+ 7].len = strlen_b(mc_file [j]);
+A      352       352    2             if (lflags & 4)
+A      353       353    2                mc ->mc_deflen = mc_vars[j+ 0].len = strlen_b(mc_fids [j]);
+A      354       354    2             while ( fid = memchr(mc_fids[j], '$', mc_vars[j+ 0].len) )
+A      355       355    2                *fid = 128;
+A      356       356    2             while ( fid = memchr(mc_file[j], '$', mc_vars[j+ 7].len) )
+A      357       357    2                *fid = 128;
+A      358       358    2             while ( fid = memchr(mc_accts[j], '$', mc_vars[j+14].len) )
+A      359       359    2                *fid = 128;
+A      360       360    2
+A      361       361    2          }
+A      362       362    1        }
+A      363       363
+A      364       364
+A      365       365
+A      366       366
+A      367       367             /*D*    NAME:       setup_jcl_flags(char *b)
+A      368       368                     PURPOSE:    To scan flags for this line of jcl and to
+A      369       369                                 setup options in JCLflags.
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=11 
+A      370       370             */
+A      371       371
+A      372       372             char *
+A      373       373             setup_jcl_flags(b)
+A      374       374               char *b;
+A      375       375             {
+A      376       376    1          int   c;
+A      377       377    1          int   xflags = JCLflags & JCL_ICOM;
+A      378       378    1
+A      379       379    1          JCLflags &= (JCLflags & JCL_CONT) ? (JCL_CONT | JCL_ICOM) : 0;
+A      380       380    1
+A      381       381    1          while (c = *b++)  {
+A      382       382    2             switch (c)  {
+A      383       383    3
+A      384       384    3             case ' ':
+A      385       385    3                break;      /* Remove leading blanks   */
+A      386       386    3             case '{':
+A      387       387    3             case '}':      /* Comments                */
+A      388       388    3                JCLflags |= JCL_SKIP;
+A      389       389    3                return b;
+A      390       390    3
+A      391       391    3             case '!':
+A      392       392    3                JCLflags |= (JCL_BANG | xflags);
+A      393       393    3                break;
+A      394       394    3
+A      395       395    3             case '-':
+A      396       396    3                JCLflags |= JCL_NCHK;
+A      397       397    3                break;
+A      398       398    3
+A      399       399    3             case '@':
+A      400       400    3                if (!testing)
+A      401       401    3                   JCLflags |= (Silent)? 0 : JCL_ECHO;
+A      402       402    3                break;
+A      403       403    3
+A      404       404    3             default:
+A      405       405    3                return b-1;
+A      406       406    3             }
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=12 
+A      407       407    2          }
+A      408       408    1          return b-1;
+A      409       409    1        }
+A      410       410
+A      411       411
+A      412       412
+A      413       413
+A      414       414             /*D*    NAME:       command_name(char *b)
+A      415       415                     PURPOSE:    To return a pointer to the first token in the
+A      416       416                                 line.
+A      417       417             */
+A      418       418
+A      419       419             char *
+A      420       420             command_name(b)
+A      421       421               char  *b;
+A      422       422             {
+A      423       423    1          static char cmd[40];
+A      424       424    1          int         i = 0;
+A      425       425    1
+A      426       426    1          while (*b && *b != ' ' && i<38) cmd[i++] = toupper(*b++);
+A      427       427    1          cmd[i] = 0;
+A      428       428    1          return cmd;
+A      429       429    1        }
+A      430       430
+A      431       431
+A      432       432             /*D*    NAME:       lookup_cmd(char *cmd, char **cmdlist, int ncmds)
+A      433       433                     PURPOSE:    To lookup a command in a command list.
+A      434       434                     DESCRIPTION:
+A      435       435                        Returns 0 if command not in the list, otherwise it returns
+A      436       436                        the 1-origin index of the command found.
+A      437       437             */
+A      438       438
+A      439       439             int
+A      440       440             lookup_cmd(cmd, cmdlist, ncmds)
+A      441       441               char     *cmd;
+A      442       442               char     **cmdlist;
+A      443       443               int      ncmds;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=13 
+A      444       444             {
+A      445       445    1          int      i = 0;
+A      446       446    1
+A      447       447    1          while (i < ncmds)
+A      448       448    1             if (strcmp(cmd, cmdlist[i++])==0) return i;
+A      449       449    1
+A      450       450    1          return 0;
+A      451       451    1        }
+A      452       452
+A      453       453
+A      454       454
+A      455       455
+A      456       456             /*D*    NAME:          print_jcl_line(cmd, commas)
+A      457       457                     PURPOSE:       To send the current command to the terminal
+A      458       458                                (if echo is on) and to the jcl file (if not test).
+A      459       459                     DESCRIPTION:
+A      460       460                        The commas option is used to indicate that commas
+A      461       461                        are to be inserted between tokens found on the current
+A      462       462                        command up to (but not including) the "over", "on",
+A      463       463                        or "into" verb.
+A      464       464
+A      465       465                        Each token that could be a target is examined and mapped
+A      466       466                        into a CP-6 fid if we have derived it.
+A      467       467
+A      468       468                        Lines are broken up into records of 80 characters if the
+A      469       469                        comma option is provided, otherwise records are broken
+A      470       470                        into records of 250 characters.
+A      471       471
+A      472       472             */
+A      473       473
+A      474       474             #define xmit(str, len) \
+A      475       474                                 memcpy(jbuf + w_p, str, len), w_p += len
+A      476       476
+A      477       477             #define xmitc(c)    jbuf[w_p++] = c
+A      478       478
+A      479       479             #define xmitchk(max) (w_p >= (max))?                          \
+A      480       479                                    jbuf[w_p] = 0,                         \
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=14 
+A      481       479                                    fprintf(jcl, "%s;\n", jbuf),           \
+A      482       479                                    ((JCLflags & JCL_ECHO) ?               \
+A      483       479                                       printf("%s;\n", jbuf) : 0),         \
+A      484       479                                    memcpy(jbuf, "  \0\0\0\0\0\0", 9),     \
+A      485       479                                    w_p = 2                                \
+A      486       479                                 :  0
+A      487       487
+A      488       488
+A      489       489
+A      490       490             void
+A      491       491             print_jcl_line(cmd, commas)
+A      492       492               char  *cmd;
+A      493       493               int   commas;
+A      494       494             {
+A      495       495    1          int   c, cc;
+A      496       496    1          char  jbuf[262];
+A      497       497    1          int   w_max = (commas) ? 80 : 254;
+A      498       498    1          int   w_p   = 0;
+A      499       499    1          char  buf[84];
+A      500       500    1          int   pblank = 0;
+A      501       501    1          int   nblank = 0;
+A      502       502    1          int   rcomma = 0;
+A      503       503    1          int   quoted = 0;
+A      504       504    1          struct sym_target *tg;
+A      505       505    1          char  *st;
+A      506       506    1          int   ins;
+A      507       507    1          int   bad = 0;
+A      508       508    1          int   ch_comma  = (JCLflags & JCL_CONT)? ',' : ' ';
+A      509       509    1
+A      510       510    1          if (! (JCLflags & JCL_BANG) ) xmitc('!');
+A      511       511    1
+A      512       512    1          while (c = *cmd++)   {
+A      513       513    2
+A      514       514    2             switch(char_code(c))   {
+A      515       515    3
+A      516       516    3             case 1:
+A      517       517    3                if (pblank)    break;   /* already skipping blanks */
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=15 
+A      518       518    3                if (commas) {
+A      519       519    4                   rcomma = c == ',';
+A      520       520    4                   if (rcomma  || !nblank) pblank = 1;
+A      521       521    4                   break;
+A      522       522    4                   }
+A      523       523    3
+A      524       524    3             case 2:
+A      525       525    3        misc_char:
+A      526       526    3                nblank = 0;
+A      527       527    3        paren_char:
+A      528       528    3                xmitchk(w_max-1);
+A      529       529    3                if (pblank) xmitc(ch_comma), ch_comma = ',';
+A      530       530    3                xmitchk(w_max);
+A      531       531    3                pblank = rcomma = 0;
+A      532       532    3                xmitc(c);
+A      533       533    3                break;
+A      534       534    3             case 6:
+A      535       535    3                if (commas && !rcomma) {
+A      536       536    4                   pblank = 0;
+A      537       537    4                   nblank = 1;
+A      538       538    4                   }
+A      539       539    3                goto paren_char;
+A      540       540    3
+A      541       541    3             case 7:        /*  quote                              */
+A      542       542    3                quoted = !quoted;
+A      543       543    3                if (quoted) xmitchk(w_max - 10);
+A      544       544    3                goto misc_char;
+A      545       545    3
+A      546       546    3
+A      547       547    3             case 3:        /*  inserted special target file name  */
+A      548       548    3                /*  Skip over following name!     */
+A      549       549    3                bad = nblank = rcomma = 0;
+A      550       550    3                st = cmd;   /* Remember start of name  */
+A      551       551    3                if (*cmd == 128) *cmd = '$';
+A      552       552    3                c  = *++cmd;
+A      553       553    3                while ((bad = char_code(c)) <= 0)  {
+A      554       554    4                   if (bad < 0) *cmd = '$';
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=16 
+A      555       555    4                   c = *++cmd;
+A      556       556    4                   }
+A      557       557    3                ins = cmd - st;   /*  Length of possible file name */
+A      558       558    3                if (ins) {        /*  If there's a name            */
+A      559       559    4                   c = *cmd;      /*  save string end char         */
+A      560       560    4                   *cmd = 0;      /*  and make a string            */
+A      561       561    4                   if (pblank)
+A      562       562    4                      if (commas) xmitc(ch_comma), ch_comma = ',';
+A      563       563    4                      else xmitc(' ');
+A      564       564    4                   pblank = 0;    /*  blank passed flag            */
+A      565       565    4                   xmitchk(w_max - ins - 1);
+A      566       566    4                   xmit(st, ins);
+A      567       567    4                   *cmd = c;      /*  restore string end char      */
+A      568       568    4                   }
+A      569       569    3                break;
+A      570       570    3
+A      571       571    3             case 4:        /***     "-"       ***/
+A      572       572    3                nblank = rcomma = 0;
+A      573       573    3                if (pblank) xmitc(ch_comma), ch_comma = ',';
+A      574       574    3                pblank = 0;
+A      575       575    3                xmitchk(w_max-43);
+A      576       576    3                xmitc(c);
+A      577       577    3                c = *cmd++;
+A      578       578    3                if (c) xmitc(c);
+A      579       579    3                break;
+A      580       580    3
+A      581       581    3             default:       /***  Look for a target name  ***/
+A      582       582    3                bad = 0;
+A      583       583    3                nblank = rcomma = 0;
+A      584       584    3        more_default:
+A      585       585    3                ins = 0;
+A      586       586    3                do {
+A      587       587    4                   buf[ins++] = c;
+A      588       588    4                   c = *cmd++;
+A      589       589    4                   cc = char_code(c);
+A      590       590    4                   } while (ins<79 && (cc <= 0 || cc == 4));
+A      591       591    3                cmd--;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=17 
+A      592       592    3                buf[ins] = 0;
+A      593       593    3                st = buf;
+A      594       594    3                if (ins >= 80 || bad)   {
+A      595       595    4                   if (pblank) xmitc(ch_comma), ch_comma = ',';
+A      596       596    4                   restoremoney(buf);
+A      597       597    4                   pblank = 0;
+A      598       598    4                   if (ins > 0) xmit(buf, ins);
+A      599       599    4                   bad++;
+A      600       600    4                   if ( char_code(c) <= 0 ) goto more_default;
+A      601       601    4                   }
+A      602       602    3                else {
+A      603       603    4                   tg = lookup_sym_target(buf,ins,0);
+A      604       604    4                   if (!tg || !tg->tg_fid) {
+A      605       605    5                      restoremoney(buf);
+A      606       606    5                      c  = toupper(buf[0]);
+A      607       607    5                      if (!tg && commas && ins<5 && (c=='O'||c=='I'||c=='T'))  {
+A      608       608    6                         char  vbf[6];
+A      609       609    6                         ins = 0;
+A      610       610    6                         while (buf[ins]) vbf[ins] = toupper(buf[ins]),ins++;
+A      611       611    6                         vbf[ins] = 0;
+A      612       612    6                         if (strcmp(vbf,"ON")==0 || strcmp(vbf,"OVER")==0 ||
+A      613       613    6                             strcmp(vbf,"TO")==0 || strcmp(vbf,"INTO")==0) commas = 0;
+A
+A      614       614    6                         }
+A      615       615    5                      }
+A      616       616    4                   else {
+A      617       617    5                      st = tg->tg_fid+1;
+A      618       618    5                      ins = tg->tg_fid[0];
+A      619       619    5                      if (tg->tg_ufid)  {     /**  if (UI) then... */
+A      620       620    6                         xmitchk(w_max - ins - 1);
+A      621       621    6                         if (pblank)
+A      622       622    6                            if (commas) xmitc(ch_comma), ch_comma = ',';
+A      623       623    6                            else xmitc(' ');
+A      624       624    6                         pblank = 0;
+A      625       625    6                         xmit(st, ins);
+A      626       626    6                         xmitc(',');    /* si,   */
+A      627       627    6                         st  = tg->tg_ufid + 1;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=18 
+A      628       628    6                         ins = tg->tg_ufid[0];
+A      629       629    6                         }
+A      630       630    5                      }
+A      631       631    4                   xmitchk(w_max-2);
+A      632       632    4                   if (pblank)
+A      633       633    4                      if (commas) xmitc(ch_comma), ch_comma = ',';
+A      634       634    4                      else xmitc(' ');
+A      635       635    4                   pblank = 0;
+A      636       636    4                   xmitchk(w_max-ins-2);
+A      637       637    4                   xmit(st, ins);
+A      638       638    4                   }  /* of if found a target name   */
+A      639       639    3                }     /*  Of switch stmt  */
+A      640       640    2             }        /*  of while  stmt  */
+A      641       641    1          c = --*cmd;
+A      642       642    1          if (c == ';' && commas) JCLflags |= JCL_CONT;
+A      643       643    1             else if (JCLflags & JCL_CONT) JCLflags -= JCL_CONT;
+A      644       644    1          jbuf[w_p] = 0;
+A      645       645    1          fprintf(jcl, "%s\n", jbuf);
+A      646       646    1          if ( JCLflags & JCL_ECHO )
+A      647       647    1             printf("%s\n", jbuf);
+A      648       648    1          JCLflags &= ~JCL_ECHO;
+A      649       649    1          if (!testing && !(JCLflags & JCL_NCHK))
+A      650       650    1             fprintf(jcl, "!if STEPCC > 0 then goto ABORT\n");
+A      651       651    1          return;
+A      652       652    1        }
+A      653       653
+A      654       654
+A      655       655
+A      656       656
+A      657       657             /*D*    NAME:       send_jcl(char *line)
+A      658       658                     PURPOSE:    To send a command line out to be processed.
+A      659       659             */
+A      660       660
+A      661       661             void
+A      662       662             send_jcl(line)
+A      663       663               struct   command_line   *line;
+A      664       664             {
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=19 
+A      665       665    1          char  *b     = 0;
+A      666       666    1          char  *cname = 0;
+A      667       667    1          int    c     = 0;
+A      668       668    1          int    commas= 0;
+A      669       669    1
+A      670       670    1          c = line->cmd_len;
+A      671       671    1          b = line->cmd_text;
+A      672       672    1          do {
+A      673       673    2             b = ExpandMacros( b, c);
+A      674       674    2             c = MacRecLen;
+A      675       675    2             } while (MacroSubs > 0);
+A      676       676    1
+A      677       677    1          b = setup_jcl_flags(b);
+A      678       678    1          if (JCLflags & JCL_SKIP) return;    /* Nothing to display!  */
+A      679       679    1          cname = command_name(b);
+A      680       680    1          if (!JCLdefault && !(JCLflags&JCL_BANG) && strcmp(cname,"DEFAULT")==0)
+A      681       681    1             return;
+A      682       682    1          JCLdefault++;
+A      683       683    1
+A      684       684    1          if (JCLflags & JCL_CONT) commas++;
+A      685       685    1          else if (! (JCLflags & JCL_BANG) )  {
+A      686       686    2             if(lookup_cmd(cname,command_commas,sizeof(command_commas)>>2)>0)
+A      687       687    2                JCLflags |= JCL_CCOM, commas++;
+A      688       688    2             if(lookup_cmd(cname,icommand_commas,sizeof(icommand_commas)>>2)>0)
+A      689       689    2                JCLflags |= JCL_ICOM;
+A      690       690    2             }
+A      691       691    1          else {
+A      692       692    2             if ( JCLflags & JCL_ICOM &&
+A      693       693    2                  lookup_cmd(cname, command_incommas, sizeof(command_incommas)>>2)>0)
+A      694       694    2                commas++;
+A      695       695    2             }
+A      696       696    1          print_jcl_line(b, commas);
+A      697       697    1          return;
+A      698       698    1        }
+A      699       699
+A      700       700
+A      701       701
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=20 
+A      702       702
+A      703       703             /*D*    NAME:       update_target_status(tg, queue)
+A      704       704                     PURPOSE:    To update the status of all of the targets
+A      705       705                                 associated with an action.
+A      706       706             */
+A      707       707
+A      708       708             void
+A      709       709             update_target_status( tg, queue )
+A      710       710               struct   sym_target  *tg;
+A      711       711             {
+A      712       712    1          struct   target_action  *act = tg->tg_action;
+A      713       713    1
+A      714       714    1          while (act) {
+A      715       715    2             act->ta_target->tg_status = queue;
+A      716       716    2
+A      717       717    2             if (!act->ta_tginput && act->ta_rule)   {  /* no inputs update all target
+A                               s */
+A      718       718    3                struct dependancy *d = act->ta_rule->tr_depend;
+A      719       719    3                while (d)   {
+A      720       720    4                   d->dp_target->tg_status = queue;
+A      721       721    4                   d = d->next;
+A      722       722    4                   }
+A      723       723    3                }
+A      724       724    2             act = act->next;
+A      725       725    2             }
+A      726       726    1          return;
+A      727       727    1        }
+A      728       728
+A      729       729
+A      730       730
+A      731       731             /*D*    NAME:       requeue_target(tg, queue)
+A      732       732                     PURPOSE:    To insert the specified target into the
+A      733       733                                 specified target state queue.
+A      734       734             */
+A      735       735
+A      736       736             void
+A      737       737             requeue_target(tg, queue)
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=21 
+A      738       738               struct sym_target *tg;
+A      739       739               int                queue;
+A      740       740             {
+A      741       741    1          state_counts[ queue ]++;
+A      742       742    1          (*state_inserts[queue]) = tg;
+A      743       743    1          state_inserts[ queue ]  = &tg->tg_stchain;
+A      744       744    1          tg->tg_stchain          = 0;
+A      745       745    1          return;
+A      746       746    1        }
+A      747       747
+A      748       748
+A      749       749
+A      750       750
+A      751       751             /*D*    NAME:       unlink_target(tgpp, queue)
+A      752       752                     PURPOSE:    To remove a target from a queue.
+A      753       753                     DESCRIPTION:
+A      754       754                        This function removes the target pointed to by the
+A      755       755                        "tgpp" argument from the specified state queue.
+A      756       756             */
+A      757       757
+A      758       758             void
+A      759       759             unlink_target(tgpp, queue, tgppi)
+A      760       760               struct sym_target **tgpp;
+A      761       761               int                 queue;
+A      762       762               struct sym_target ***tgppi;
+A      763       763             {
+A      764       764    1          struct sym_target *tg = *tgpp;
+A      765       765    1
+A      766       766    1          *tgpp = tg->tg_stchain;
+A      767       767    1          state_counts[ queue ]--;
+A      768       768    1          if ( (&tg->tg_stchain) == *tgppi )
+A      769       769    1             *tgppi = tgpp;
+A      770       770    1        }
+A      771       771
+A      772       772
+A      773       773
+A      774       774
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=22 
+A      775       775             /*B*    NAME:       send_defaults(struct target_action *act)
+A      776       776                     PURPOSE:    To send any initial "!default" commands found
+A      777       777                                 in the actions being used.
+A      778       778                     DESCRIPTION:
+A      779       779                        The actions are scanned before the actual initial jcl
+A      780       780                        is generated to give the actions an opportunity to
+A      781       781                        change things with !default commands.  This is intended
+A      782       782                        to permit a target with a very long compile time to have
+A      783       783                        a default to set the time up higher and not force all of
+A      784       784                        the target actions to specify a long compile time.
+A      785       785             */
+A      786       786
+A      787       787             send_defaults(act)
+A      788       788               struct   target_action     *act;
+A      789       789             {
+A      790       790    1          struct   command_line      *ln;
+A      791       791    1          char                       *b;
+A      792       792    1          int                         l;
+A      793       793    1
+A      794       794    1          while (act) {
+A      795       795    2             ln       = act->ta_rule->tr_commands->cm_lines;
+A      796       796    2             while (ln)  {
+A      797       797    3                JCLflags = 0;
+A      798       798    3                l = ln->cmd_len;
+A      799       799    3                b = ln->cmd_text;
+A      800       800    3                do {
+A      801       801    4                   b = ExpandMacros(b, l);
+A      802       802    4                   l = MacRecLen;
+A      803       803    4                   } while (MacroSubs > 0);
+A      804       804    3                b = setup_jcl_flags(b);
+A      805       805    3                if (JCLflags & JCL_SKIP) break;
+A      806       806    3                if ( strcmp(command_name(b), "DEFAULT") != 0 ) break;
+A      807       807    3                JCLflags |= JCL_NCHK;
+A      808       808    3                print_jcl_line(b,0);
+A      809       809    3                ln = ln->next;
+A      810       810    3                }
+A      811       811    2             act = act->next;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=23 
+A      812       812    2             }
+A      813       813    1        }
+A      814       814
+A      815       815
+A      816       816
+A      817       817
+A      818       818             /*D*    NAME:       run_target(struct sym_target **tgp)
+A      819       819                     PURPOSE:    To remove the specified target from the
+A      820       820                                 runable queue and put it into the batch queue.
+A      821       821                     DESCRIPTION:
+A      822       822                        This function removes the target from the runable
+A      823       823                        queue and then performs the following steps:
+A      824       824
+A      825       825                        1. Opens the file to hold the jcl if this is NOT a test.
+A      826       826                        2. cycles through the actions associated with producing
+A      827       827                           this target doing the following:
+A      828       828                           a) defining the special variables for this action
+A      829       829                           b) writing the initial job start jcl the first time
+A      830       830                              through this loop.
+A      831       831                           c) sending each command line associated with this
+A      832       832                              action.
+A      833       833                           d) going to the next action and repeating steps
+A      834       834                              (a) through (d) for every action.
+A      835       835                        3. sends the job terminating jcl if not testing.
+A      836       836                        4. deletes all of the target files associated with these
+A      837       837                           actions.
+A      838       838                        5. batches the job and remembers its sysid in the target
+A      839       839                           action structure.
+A      840       840                        6. Adds the target to the appropriate queue (completed
+A      841       841                           if just testing or the job did complete that quickly,
+A      842       842                           or running if it is running).
+A      843       843             */
+A      844       844
+A      845       845             void
+A      846       846             run_target(tgpp)
+A      847       847               struct   sym_target  **tgpp;
+A      848       848             {
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=24 
+A      849       849    1          struct   sym_target     *tg = *tgpp;
+A      850       850    1          struct   target_action  *act;
+A      851       851    1          struct   command_line   *ln;
+A      852       852    1          int                      job = 1;
+A      853       853    1          int                      acts = 0;
+A      854       854    1          int                      i;
+A      855       855    1          int                      LastJobID;
+A      856       856    1          int                      xeq;
+A      857       857    1
+A      858       858    1          *tgpp = tg->tg_stchain;
+A      859       859    1          if (!tg->tg_stchain)
+A      860       860    1             state_inserts[ STATUS_RUNABLE ] = &target_states[STATUS_RUNABLE];
+A      861       861    1          state_counts[ STATUS_RUNABLE ]--;
+A      862       862    1
+A      863       863    1          act = tg->tg_action;
+A      864       864    1          if (!act->ta_rule)   {
+A      865       865    2             /*  This target has no action, it is produced by one
+A      866       866    2                 of its dependencies.                                 */
+A      867       867    2             i = 0;   /*  no running job   */
+A      868       868    2             if (testing)
+A      869       869    2                goto set_test_status;
+A      870       870    2             else goto set_job_status;
+A      871       871    2             }
+A      872       872    1
+A      873       873    1          if (!testing)  {
+A      874       874    2             jcl = fopen(JclFid, "w");
+A      875       875    2             if (!jcl)
+A      876       876    2                 crash("Can't open jcl file: %s\n%s\n", JclFid,
+A      877       877    2                       strerror(errno));
+A      878       878    2             job = 0;
+A      879       879    2             }
+A      880       880    1          else printf("\n");
+A      881       881    1
+A      882       882    1          while (act) {
+A      883       883    2             JCLflags = JCLdefault = 0;
+A      884       884    2             define_vars(act,acts++);
+A      885       885    2             if (!job)   {
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=25 
+A      886       886    3                job++;
+A      887       887    3                send_defaults(act), JCLdefault = 1;
+A      888       888    3                xeq = (tg->tg_online && jcl_xeq && jcl_xeqend);
+A      889       889    3                if (xeq && ! saved_fid[0]) {
+A      890       890    4                   struct sym_macro *mc = lookup_sym_macro(saved_var,16,2);
+A      891       891    4                   if (!mc) crash("Out of memory: run_target\n");
+A      892       892    4                   tmpnam(saved_fid);
+A      893       893    4                   mc->mc_def    = saved_fid;
+A      894       894    4                   mc->mc_deflen = strlen(saved_fid);
+A      895       895    4                   strcat(SaveIt,saved_fid);
+A      896       896    4                   }
+A      897       897    3                ln = (xeq)? jcl_xeq : jcl_start;
+A      898       898    3                while (ln)  {
+A      899       899    4                   send_jcl(ln);
+A      900       900    4                   ln = ln->next;
+A      901       901    4                   }
+A      902       902    3                JCLflags = 0, JCLdefault = 0;
+A      903       903    3                }
+A      904       904    2             ln = act->ta_rule->tr_commands->cm_lines;
+A      905       905    2             while (ln)  {
+A      906       906    3                send_jcl(ln);
+A      907       907    3                ln = ln->next;
+A      908       908    3                }
+A      909       909    2             act = act->next;
+A      910       910    2             }
+A      911       911    1
+A      912       912    1          if (testing)   {
+A      913       913    2        set_test_status:
+A      914       914    2             requeue_target(tg, STATUS_COMPLETED);
+A      915       915    2             update_target_status(tg, STATUS_COMPLETED);
+A      916       916    2             return;
+A      917       917    2             }
+A      918       918    1          JCLflags = 0;
+A      919       919    1          ln = (xeq)? jcl_xeqend : jcl_end;
+A      920       920    1          while (ln)  {
+A      921       921    2             send_jcl(ln);
+A      922       922    2             ln = ln->next;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=26 
+A      923       923    2             }
+A      924       924    1
+A      925       925    1          fclose(jcl), jcl = 0;
+A      926       926    1          delete_target_files(tg);
+A      927       927    1          if (xeq)   {
+A      928       928    2        #ifndef RU
+A      929       929   *S*            int   steps = jptr->steps;
+A      930       930   *S*       #endif
+A      931       931    2             system( XeqIt );
+A      932       932    2        #ifdef RU
+A      933       933    2             requeue_target(tg, STATUS_RUNNING);
+A      934       934    2             fclose(stdin);
+A      935       935    2             fclose(stdout);
+A      936       936    2             MAKE_ONLINE_MAGIC = RU_WRITTEN_DONE;
+A      937       937    2             GENRU(saved_fid, tg);
+A      938       938    2        #else
+A      939       939   *S*            system(SaveIt);
+A      940       940   *S*            if (steps == jptr->steps)
+A      941       941   *S*               exit(0);
+A      942       942   *S*            i = 0;
+A      943       943   *S*       #endif
+A      944       944    2             }
+A      945       945    1          else  {
+A      946       946    2             LastJobID = jptr->lbjid;
+A      947       947    2             system(BatchIt);
+A      948       948    2             num_jobs_run++;
+A      949       949    2             i = jptr->lbjid;
+A      950       950    2             if (LastJobID == i) i = 0;
+A      951       951    2             tg->tg_action->ta_sysid = i;
+A      952       952    2             }
+A      953       953    1
+A      954       954    1        set_job_status:
+A      955       955    1          job = (i == 0)? ((check_target_status(tg)) ? STATUS_COMPLETED :
+A      956       956    1                STATUS_ERRORED) : STATUS_RUNNING;
+A      957       957    1          requeue_target(tg, job);
+A      958       958    1          update_target_status(tg, job);
+A      959       959    1          return;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=27 
+A      960       960    1        }
+A      961       961
+A      962       962
+A      963       963
+A      964       964
+A      965       965             /*D*    NAME:       touch_or_copy( struct sym_target *tg )
+A      966       966                     PURPOSE:    To touch an individual target file.
+A      967       967
+A      968       968                     DESCRIPTION:
+A      969       969
+A      970       970                     This program attempts to touch the target file.
+A      971       971                     If an error occurs, the most recent version of the
+A      972       972                     target file is located by searching along the search
+A      973       973                     path (stopping at the first file located).
+A      974       974
+A      975       975                     If a file cannot be located, or if the search path
+A      976       976                     does not exist, then an error is reported, otherwise,
+A      977       977                     the file is copied from the search path into the
+A      978       978                     target output account.
+A      979       979             */
+A      980       980
+A      981       981             void
+A      982       982             touch_or_copy(tg)
+A      983       983               struct sym_target *tg;
+A      984       984             {
+A      985       985    1          char *fido = tg->tg_fid;
+A      986       986    1
+A      987       987    1          if (touch(fido + 1))  {       /* Error touching the file */
+A      988       988    2             char fidi[60];    /* File that might work as source */
+A      989       989    2             char iacct[12];   /* Account of possible file       */
+A      990       990    2
+A      991       991    2             memset(fidi, 0, sizeof(fidi));
+A      992       992    2             memset(iacct, 0, sizeof(iacct));
+A      993       993    2             memcpy(fidi, fido, fido[0]+2);
+A      994       994    2
+A      995       995    2             if (tg->tg_srch && srch_file(fidi, tg->tg_srch, 0, iacct) &&
+A      996       996    2                 strcmp(fido, fidi))      {
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=28 
+A      997       997    3                char sys[256];
+A      998       998    3                sprintf(sys, "copy %s over %s (nfa)", fidi+1, fido+1);
+A      999       999    3                printf("# !%s\n", sys);
+A     1000      1000    3                system(sys);
+A     1001      1001    3                }
+A     1002      1002    2             else error("### Error: Cannot touch and cannot locate file %s\n",
+A     1003      1003    2                        fido);
+A     1004      1004    2             }
+A     1005      1005    1        }
+A     1006      1006
+A     1007      1007
+A     1008      1008
+A     1009      1009             /*D*    NAME:       touch_target( struct sym_target **tgp)
+A     1010      1010                     PURPOSE:    To touch the target files associated with
+A     1011      1011                                 the actions for this target.
+A     1012      1012                     DESCRIPTION:
+A     1013      1013                        This function is very similar to run_target in that
+A     1014      1014                        it performs the same functions.  It first removes
+A     1015      1015                        the target from the runable queue and then chases
+A     1016      1016                        through the targets associated with the action
+A     1017      1017                        touching each file.
+A     1018      1018
+A     1019      1019                        This target is then inserted into the COMPLETED queue.
+A     1020      1020             */
+A     1021      1021
+A     1022      1022             void
+A     1023      1023             touch_target(tgpp)
+A     1024      1024               struct   sym_target     **tgpp;
+A     1025      1025             {
+A     1026      1026    1          struct   sym_target      *tg  = *tgpp;
+A     1027      1027    1          struct   target_action   *ta  = tg->tg_action;
+A     1028      1028    1          char                      *fid;
+A"MAKE_SIc01.:XSI", line 1028: (warning) identifier "fid" is not used
+A     1029      1029    1
+A     1030      1030    1          *tgpp = tg->tg_stchain;    /* remove this target from its queue */
+A     1031      1031    1          if (!tg->tg_stchain)
+A     1032      1032    1             state_inserts[ STATUS_RUNABLE ] = &target_states[STATUS_RUNABLE];
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=29 
+A     1033      1033    1          state_counts[ STATUS_RUNABLE ]--;
+A     1034      1034    1
+A     1035      1035    1          while (ta)    {
+A     1036      1036    2             touch_or_copy(ta->ta_target);
+A     1037      1037    2             if (!ta->ta_tginput) {  /* no inputs: touch all targets */
+A     1038      1038    3                struct dependancy *d = ta->ta_rule->tr_depend;
+A     1039      1039    3                while (d)   {
+A     1040      1040    4                   touch_or_copy( d->dp_target );
+A     1041      1041    4                   d = d->next;
+A     1042      1042    4                   }
+A     1043      1043    3                }
+A     1044      1044    2             ta = ta->next;
+A     1045      1045    2             }
+A     1046      1046    1
+A     1047      1047    1          requeue_target(tg, STATUS_COMPLETED);
+A     1048      1048    1          update_target_status(tg, STATUS_COMPLETED);
+A     1049      1049    1          return;
+A     1050      1050    1        }
+A     1051      1051
+A     1052      1052
+A     1053      1053
+A     1054      1054
+A     1055      1055             /*D*    NAME:       run()
+A     1056      1056                     PURPOSE:    To batch (or display jcl) for targets in the
+A     1057      1057                                 runable queue.
+A     1058      1058             */
+A     1059      1059
+A     1060      1060             int
+A     1061      1061             run()
+A     1062      1062             {
+A     1063      1063    1          int   rs = 0;
+A     1064      1064    1
+A     1065      1065    1          while (target_states[STATUS_RUNABLE] &&
+A     1066      1066    1                  state_counts[STATUS_RUNNING] < MaxJobs )   {
+A     1067      1067    2
+A     1068      1068    2             if (!touching)
+A     1069      1069    2                  run_target( &(target_states[STATUS_RUNABLE]) );
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=30 
+A     1070      1070    2             else touch_target( &(target_states[STATUS_RUNABLE]) );
+A     1071      1071    2          rs++;
+A     1072      1072    2          }
+A     1073      1073    1
+A     1074      1074    1          if (rs && !touching) printf("\n");
+A     1075      1075    1          return rs;
+A     1076      1076    1        }
+A     1077      1077
+A     1078      1078
+A     1079      1079
+A     1080      1080
+A     1081      1081
+A     1082      1082             /*D*    NAME:       check_for_completion()
+A     1083      1083                     PURPOSE:    To indicate if any jobs have completed execution
+A     1084      1084                                 and to insert them into the correct completion
+A     1085      1085                                 queue.
+A     1086      1086             */
+A     1087      1087
+A     1088      1088             int
+A     1089      1089             check_for_completion()
+A     1090      1090             {
+A     1091      1091    1          struct      sym_target     **tgp;
+A     1092      1092    1          struct      sym_target      *tg;
+A     1093      1093    1          struct      sym_target     **tgn;
+A     1094      1094    1          struct      target_action   *a;
+A     1095      1095    1          int                          queue;
+A     1096      1096    1          int                          rs = 0;
+A     1097      1097    1
+A     1098      1098    1          locate_running_jobs(JobInfoFid);  /* flag all actions running */
+A     1099      1099    1
+A     1100      1100    1          tgp = &target_states[ STATUS_RUNNING ];
+A     1101      1101    1
+A     1102      1102    1          while (tg = *tgp) {
+A     1103      1103    2             tgn = &tg->tg_stchain;
+A     1104      1104    2             a = tg->tg_action;
+A     1105      1105    2             if (! (a->ta_flags & 1) )  {
+A     1106      1106    3                unlink_target(tgp, STATUS_RUNNING, &state_inserts[STATUS_RUNNING]);
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=31 
+A     1107      1107    3                queue = (check_target_status(tg)) ? STATUS_COMPLETED : STATUS_ERRORED;
+A
+A     1108      1108    3                requeue_target(tg, queue);
+A     1109      1109    3                update_target_status(tg, queue);
+A     1110      1110    3                rs++;
+A     1111      1111    3                IBEX_output_switch = 1;
+A     1112      1112    3                tgn = tgp;
+A     1113      1113    3                }
+A     1114      1114    2             else a->ta_flags &= -2;
+A     1115      1115    2             tgp = tgn;
+A     1116      1116    2             }
+A     1117      1117    1
+A     1118      1118    1          return rs;
+A     1119      1119    1        }
+A     1120      1120
+A     1121      1121
+A     1122      1122
+A     1123      1123
+A     1124      1124
+A     1125      1125             /*D*    NAME:       build()
+A     1126      1126                     PURPOSE:    To perform all of the steps necessary to build
+A     1127      1127                                 the target file of this operation.
+A     1128      1128                     DESCRIPTION:
+A     1129      1129                        This function controls the build process.
+A     1130      1130             */
+A     1131      1131
+A     1132      1132             int
+A     1133      1133             build(test, LS_width, verbose, touch, query)
+A     1134      1134               int            test;
+A"MAKE_SIc01.:XSI", line 1134: (warning) identifier "verbose" is not used
+A     1135      1135               int            LS_width;
+A     1136      1136               int            verbose;
+A     1137      1137               int            touch;
+A     1138      1138               int            query;
+A     1139      1139             {
+A     1140      1140    1          int            rs = 0;
+A     1141      1141    1          int            delay_time = 15;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=32 
+A     1142      1142    1
+A     1143      1143    1          testing  = test;
+A     1144      1144    1          touching = touch;
+A     1145      1145    1
+A     1146      1146    1          jptr = (struct b_jit *) B$JIT$;
+A     1147      1147    1          if (!MaxJobs) MaxJobs = 1;
+A     1148      1148    1        #ifdef RU
+A     1149      1149    1          if (MAKE_ONLINE_MAGIC == RU_WRITTEN_DONE) {
+A     1150      1150    2             MAKE_ONLINE_MAGIC = RU_WRITTEN_INIT;
+A     1151      1151    2             run_online++;
+A     1152      1152    2             goto continue_build;
+A     1153      1153    2             }
+A     1154      1154    1        #endif
+A     1155      1155    1
+A     1156      1156    1          if (!(testing+touching+query))  {
+A     1157      1157    2             tmpnam(JclFid);
+A     1158      1158    2             strcat(BatchIt, JclFid);
+A     1159      1159    2             strcat(XeqIt,   JclFid);
+A     1160      1160    2             }
+A     1161      1161    1          else jcl = stdout;
+A     1162      1162    1
+A     1163      1163    1          if (!jcl_start)   {
+A     1164      1164    2             struct sym_target *tgj = lookup_sym_target(".jcl",    4, 0);
+A     1165      1165    2             struct sym_target *tge = lookup_sym_target(".end",    4, 0);
+A     1166      1166    2             struct sym_target *tgx = lookup_sym_target(".xeq",    4, 0);
+A     1167      1167    2             struct sym_target *tgq = lookup_sym_target(".xeqend", 7, 0);
+A     1168      1168    2             if ( !tgj || !tge ) crash("*** Rule: \".jcl\" or \".end\" missing");
+A     1169      1169    2             jcl_start = tgj->tg_commands->tr_commands->cm_lines;
+A     1170      1170    2             jcl_end   = tge->tg_commands->tr_commands->cm_lines;
+A     1171      1171    2             if (tgx)
+A     1172      1172    2                jcl_xeq   = tgx->tg_commands->tr_commands->cm_lines;
+A     1173      1173    2             if (tgq)
+A     1174      1174    2                jcl_xeqend= tgq->tg_commands->tr_commands->cm_lines;
+A     1175      1175    2             if (!jcl_start || !jcl_end)
+A     1176      1176    2                if (testing)
+A     1177      1177    2                   warning("### Rule .jcl or .end is empty!");
+A     1178      1178    2                else crash("*** Rule .jcl or .end is empty!");
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=33 
+A     1179      1179    2             }
+A     1180      1180    1
+A     1181      1181    1          classify_actions();
+A     1182      1182    1          rs = state_counts[ STATUS_WAITING ];
+A     1183      1183    1          if (query) return rs;
+A     1184      1184    1          printf("\n");
+A     1185      1185    1          if (!touching)   build_state();
+A     1186      1186    1          IBEX_output_switch = 0;
+A     1187      1187    1
+A     1188      1188    1          if (!schedule(LS_width))   {
+A     1189      1189    2             if (!touching)
+A     1190      1190    2                printf("\nNothing to build\n\n");
+A     1191      1191    2             else printf("\nNothing to touch\n\n");
+A     1192      1192    2             return rs;
+A     1193      1193    2             }
+A     1194      1194    1        continue_build:
+A     1195      1195    1          while(state_counts[STATUS_RUNABLE]+state_counts[STATUS_RUNNING]) {
+A     1196      1196    2             run();
+A     1197      1197    2             if (state_counts[STATUS_RUNNING]!=0) {
+A     1198      1198    3                build_state();
+A     1199      1199    3                do {
+A     1200      1200    4                   if (!run_online)
+A     1201      1201    4                      sleep(delay_time);
+A     1202      1202    4                   run_online = 0;
+A     1203      1203    4                   } while (!check_for_completion());
+A     1204      1204    3                }
+A     1205      1205    2             if ( schedule(LS_width) )
+A     1206      1206    2                if (!touching)  build_state();
+A     1207      1207    2             }     /**  End of major while loop  **/
+A     1208      1208    1
+A     1209      1209    1          if (!touching) build_summary(LS_width);
+A     1210      1210    1          if (!touching)  printf("\n***\n*** Build Complete!\n***\n");
+A     1211      1211    1          if (!jptr->cpflags1.notify && num_jobs_run && state_counts[STATUS_ERRORED])
+A     1212      1212    1             system("check");
+A     1213      1213    1          return state_counts[STATUS_WAITING]+state_counts[STATUS_ERRORED];
+A     1214      1214    1        }
+A     1215      1215
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=34 
+A     1216      1216
+A     1217      1217
+A     1218      1218
+A     1219      1219
+A     1220      1220
+A     1221      1221             build_summary(LS_width)
+A     1222      1222               int            LS_width;
+A     1223      1223             {
+A     1224      1224    1          struct   sym_target     *tg = target_states[STATUS_WAITING];
+A     1225      1225    1          int                     w_p = 0;
+A     1226      1226    1
+A     1227      1227    1          while (tg)  {
+A     1228      1228    2             struct   target_action *act = tg->tg_action;
+A     1229      1229    2             while (act) {
+A     1230      1230    3                struct dependancy *d = act->ta_target->tg_depend;
+A     1231      1231    3                while (d)   {
+A     1232      1232    4                   int dn, dnum = d->dp_num;
+A     1233      1233    4                   for ( dn=0 ; dn<dnum ; dn++)  {
+A     1234      1234    5                      if (d->dp_list[dn]->tg_status < STATUS_COMPLETED)
+A     1235      1235    5                         printf("* %s can't be run because %s is %s\n",
+A     1236      1236    5                            tg->tg_text, d->dp_list[dn]->tg_text,
+A     1237      1237    5                            state_names[1+d->dp_list[dn]->tg_status]);
+A     1238      1238    5                      }
+A     1239      1239    4                   d = d->dp_tgdepend;
+A     1240      1240    4                   }
+A     1241      1241    3                act = act->next;
+A     1242      1242    3                }
+A     1243      1243    2             tg = tg->tg_stchain;
+A     1244      1244    2             }
+A     1245      1245    1
+A     1246      1246    1          tg = target_states[ STATUS_ERRORED ];
+A     1247      1247    1          while (tg)  {
+A     1248      1248    2             if (!w_p)   {
+A     1249      1249    3                printf("\n\n** The following targets had errors:"), w_p = 36;
+A     1250      1250    3                }
+A     1251      1251    2             if ( (w_p+tg->tg_len+1) > LS_width)
+A     1252      1252    2                printf("\n*  "), w_p = 3;
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=35 
+A     1253      1253    2             printf(" %s",tg->tg_text), w_p += tg->tg_len + 1;
+A     1254      1254    2             tg = tg->tg_stchain;
+A     1255      1255    2             }
+A     1256      1256    1
+A     1257      1257    1          if (w_p) printf("\n\n"), w_p = 0;
+A     1258      1258    1          tg = target_states[ STATUS_ERRORED ];
+A     1259      1259    1          if (options['e'])    /* Send EMAIL to failures? */
+A     1260      1260    1          while (tg)  {
+A     1261      1261    2             while (tg && !tg->tg_owner)
+A     1262      1262    2                tg = tg->tg_stchain;
+A     1263      1263    2             if (tg)  {     /* if there's an owner! */
+A     1264      1264    3                FILE *f = 0, *send_email();
+A     1265      1265    3                struct sym_target *t = tg;
+A     1266      1266    3                struct sym_owner  *ow = t->tg_owner;
+A     1267      1267    3
+A     1268      1268    3                while (t)   {  /* while there's more error'ed targets */
+A     1269      1269    4                   if (t->tg_owner == ow) { /* if same owner */
+A     1270      1270    5                      f = send_email(f, t, 1, (char*)0,  (char*)0);
+A     1271      1271    5                      t->tg_owner = 0;
+A     1272      1272    5                      }  /* end of if same owner */
+A     1273      1273    4                   t = t->tg_stchain;
+A     1274      1274    4                   }  /* END of while more error'ed targets  */
+A     1275      1275    3                send_email(f, tg, -1, (char *)0, (char *) 0);
+A     1276      1276    3                }     /* END of there's an owner!            */
+A     1277      1277    2             }        /* END of more error'ed targets        */
+A     1278      1278    1          return 0;
+A     1279      1279    1        }
+A     1280      1280
+A---  Include file information  ---
+A
+A   stdio:h.:LIBRARY. is referenced
+A   stdlib:h.:LIBRARY. is referenced
+A   string:h.:LIBRARY. is referenced
+A   ctype:h.:LIBRARY. is referenced
+A   errno:h.:LIBRARY. is referenced
+A   b$jit_c:h.:LIBRARY. is referenced
+A   xu_cp6_c:h.:LIBRARY. is referenced
+rCC.C03    File=MAKE_SIc01.:XSI                                                      Thu Nov 20 1997  Page=36 
+A   MAKE_Cc14.:XSI. is referenced
+A   MAKE_Cc13.:XSI. is referenced
+C
+A2 warnings were detected in the file MAKE_SIc01.:XSI

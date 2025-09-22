@@ -1,0 +1,605 @@
+/*M* KIPPER.X - CHECK TWO UPDATE PACKETS FOR COLLISIONS */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1990    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+ 
+/*X* DMR,PLM=5,IND=3,CTI=3,SDI=3,MCL=10,CSI=0,ECI=0,CLM=25 */
+ 
+                                   /*
+                                        Author: J.L.Joseph, LADC
+                                        Date: 11/29/90
+                                                                  */
+ 
+/*
+ 
+KIPPER solves the problem of knowing if two plus-packets collide so
+that you can safely
+ 
+    COPY new_update_file INTO update_file.controlled_account
+ 
+KIPPER does this by merging the two update files into a single
+update file, then passing the single update file to KEYUP.X for
+rekeying, at which time KEYUP will complain if there's any problems
+in the file(s).  The files are merged by creating a single keyed
+scratch file whose keys are the plus-packet line numbers plus a tag
+indicating which file it came from.
+ 
+KIPPER's command-line syntax is simple:
+ 
+    !KIPPER.X update_file1,update_file2
+ 
+KIPPER depends on IBEX setting M$SI and M$UI for him...or the
+user doing the !SETs prior to calling him.
+ 
+*/
+ 
+KIPPER: PROC MAIN;
+ 
+                         /* system INCLUDE files here */
+ 
+%INCLUDE CP_6;
+%INCLUDE CP_6_SUBS;
+%INCLUDE B_ERRORS_C;
+ 
+                         /* declare a based version of a DCB */
+ 
+     %F$DCB;
+ 
+                        /* declare a based structure for the TCB
+                           and altret frame in the TCB here */
+ 
+     %B$TCB;
+     %B$ALT;
+ 
+ 
+                         /* DCB declarations here */
+ 
+DCL M$SI DCB;            /* source file (update file #1) */
+DCL M$UI DCB;            /* update file (update file #2) */
+ 
+DCL M$DO DCB;            /* diagnostics get printed here */
+ 
+DCL M$SCRATCH DCB;      /* scratch file for KEYUP is written
+                           through this DCB */
+ 
+DCL M$SCRATCH2 DCB;     /* this DCB is only used for deleting
+                           the scratch file */
+ 
+ 
+                        /* monitor-service macros are declared
+                           in this section */
+ 
+ 
+                        /* this FPT is used to open the scratch
+                           file as a totally new file for output,
+                           deleting any existing file of the same
+                           name.   It creates the scratch file as
+                           a keyed file (ORG=KEYED, ASN=FILE),
+                           whose keys will be added randomly
+                           (ACS=DIRECT). it is later modified
+                           dynamically to do the same operation on
+                           the DCB M$SCRATCH2 */
+ 
+%FPT_OPEN (FPTN=OPEN_SCRATCH,
+                         DCB=M$SCRATCH,
+                         FUN=CREATE,
+                         EXIST=NEWFILE,
+                         ACS=DIRECT,
+                         ORG=KEYED,
+                         ASN=FILE,
+                         CTG=YES,
+                         NAME=SCRFILE);
+ 
+ 
+                        /* this VLP is used by the preceding OPEN
+                           FPT and contains the name of the file
+                           we're going to use as the scratch file
+                           */
+ 
+          %VLP_NAME (FPTN=SCRFILE,
+                         NAME='*$$$$$$$$UPCHUCK');
+ 
+ 
+                        /* This FPT is used to do the TEST OPENs
+                           of the input files (basically, we want
+                           to see if they exist).  The FPT is
+                           changed dynamically to do the OPEN on
+                           the M$SI and M$UI DCBs */
+ 
+    %FPT_OPEN (FPTN=OPEN_IN_TEST,
+                        FUN=IN,
+                        TEST=YES);
+ 
+ 
+                        /* this FPT for M$CLOSE is used to close
+                           the scratch file and not delete it
+                           (DISP=SAVE) */
+ 
+     %FPT_CLOSE (FPTN=CLOSE_SCRATCH,
+                         DCB=M$SCRATCH,
+                         DISP=SAVE);
+ 
+ 
+                        /* this CLOSE FPT is used to delete the
+                           scratch file after it has been reopened
+                           using the modified OPEN_SCRATCH FPT
+                           after the return from KEYUP */
+ 
+     %FPT_CLOSE (FPTN=CLOSE_SCRATCH_DELETE,
+                         DCB=M$SCRATCH2,
+                         DISP=RELEASE);
+ 
+ 
+                        /* these two FPTs are used to do the READs
+                           on the two update files */
+ 
+     %FPT_READ (FPTN=READ_SI,
+                         DCB=M$SI,
+                         BUF=LINEBUF);
+ 
+     %FPT_READ (FPTN=READ_UI,
+                         DCB=M$UI,
+                         BUF=LINEBUF);
+ 
+ 
+                        /* this FPT is used when we're doing the
+                           WRITEs to the scratch file.  Note that
+                           it writes with a KEY contained in a
+                           data area and a BUFfer in a data area */
+ 
+     %FPT_WRITE (FPTN=WRITE_SCRATCH,
+                         DCB=M$SCRATCH,
+                         KEY=KEYBUF,
+                         BUF=LINEBUF);
+ 
+ 
+                        /* this WRITE FPT is used if we want to
+                           write an error message to the standard
+                           diagnostic output location.  Note that
+                           it presumes we're going to put a
+                           character string containing the message
+                           into the LINEBUF before we do the write
+                           */
+ 
+     %FPT_WRITE (FPTN=WRITE_DIAG,
+                         DCB=M$DO,
+                         BUF=LINEBUF);
+ 
+ 
+                        /* this FPT is used when we want to go to
+                           KEYUP to perform the actual overlap
+                           checking.  It uses the expensive form of
+                           the call, which goes through IBEX before
+                           starting KEYUP, but that's the
+                           easiest way to get the input DCB set */
+ 
+     %FPT_LINK (FPTN=KEYUP_IT,
+                         ECHO=NO,
+                         CP_CMD = KEYUP_CMD,
+                         TEXTC=NO);
+ 
+ 
+                        /* when we EXIT, we'll want to signal IBEX
+                           whether or not the check was successful
+                           so we need an EXIT FPT to do that. */
+ 
+     %FPT_EXIT (FPTN=EXIT_STEPCC);
+ 
+ 
+                        /* save a 255-character buffer for reading
+                           the update files */
+ 
+DCL LINEBUF CHAR(255) STATIC;
+ 
+ 
+                        /* this allocates and defines the layout
+                           of the buffer used as the key for the
+                           scratch file.  The layout is important:
+ 
+ 
+                           ------------------------------------
+                           | S |   DATA_              | * | F |
+                           ------------------------------------
+ 
+ 
+                           S (SIZE_) is used to size the key. It's
+                             initialized to 7 and left alone after
+                             that. The structure inside the key is
+                             setup so the compiler initializes
+                             this accurately.
+ 
+                           DATA_ is 'primary' key. We'll store the
+                             first value appearing on each
+                             plus-line in this field,
+                             right-justifying it in this field
+ 
+                           * is a filler initialized to a space.
+ 
+                           F (FILE_) is a single byte set to the
+                             "number" of the input file.  By
+                             putting a '1' or a '2' here (to
+                             indicate file 1 or file 2) we can
+                             guarantee that updates destined for
+                             the same position won't clobber each
+                             other in the scratch file */
+ 
+DCL 1 KEYBUF STATIC,
+       2 SIZE_ UBIN BYTE CALIGNED INIT(SIZEC(KEYBUF.KEYDAT)),
+       2 KEYDAT,
+          3 DATA_ CHAR(5) CALIGNED,
+          3 * CHAR(1) CALIGNED INIT(' '),
+          3 FILE_ CHAR(1) CALIGNED;
+ 
+ 
+                        /* this character string is intialized to
+                           the same thing we would type at the IBEX
+                           prompt if we wanted to KEYUP the scratch
+                           file.  It's used in the M$LINK FPT above
+                           */
+ 
+DCL KEYUP_CMD CHAR(0) STATIC INIT('KEYUP.X *$$$$$$$$UPCHUCK');
+ 
+ 
+                         /* loop counters and index variables */
+ 
+DCL I SBIN STATIC;
+DCL J SBIN STATIC;
+ 
+ 
+                        /* ARS# stores a copy of the DCB's ARS#
+                           (actual record size) to be used when
+                           we write the scratch file */
+ 
+DCL ARS# SBIN;
+ 
+ 
+                         /* generate a linker-satisfied pointer to
+                            the task control block */
+ 
+DCL B$TCB$ PTR SYMREF;
+ 
+%EJECT;
+ 
+ 
+ 
+/* BEGIN KIPPER MAIN */
+ 
+ 
+                        /* First we check the DCBs to see if any
+                           assignments have been made that assign
+                           the DCBs to disk files.  If not, bail
+                           out. */
+ 
+     IF (DCBADDR(DCBNUM(M$SI))->F$DCB.ASN# ~= %FILE#) OR
+        (DCBADDR(DCBNUM(M$UI))->F$DCB.ASN# ~= %FILE#)
+     THEN DO;
+        LINEBUF = ' **** MUST HAVE FILES! ';
+        CALL M$WRITE (WRITE_DIAG);
+        CALL M$XXX;
+        END;
+ 
+ 
+                        /* check the M$SI file and see if it
+                           exists...if not, tell the user and bail
+                           out */
+ 
+     OPEN_IN_TEST.V.DCB# = DCBNUM(M$SI);
+ 
+     CALL M$OPEN (OPEN_IN_TEST)
+     WHENALTRETURN DO;
+        CALL M$MERC;
+        CALL M$EXIT;   /*?* check to see if this has the right
+                          STEPCC effects */
+        END;
+ 
+ 
+                         /* and do the same for the M$UI file */
+ 
+     OPEN_IN_TEST.V.DCB# = DCBNUM(M$UI);
+ 
+     CALL M$OPEN (OPEN_IN_TEST)
+     WHENALTRETURN DO;
+        CALL M$MERC;
+        CALL M$EXIT;
+        END;
+ 
+                        /* now, since we know the input files are
+                           there, we can open (CREATE) the scratch
+                           file */
+ 
+     CALL M$OPEN (OPEN_SCRATCH)
+     WHENALTRETURN DO;
+        CALL M$MERC;
+        CALL M$EXIT;
+        END;
+ 
+                        /* first file processing loop: read the
+                            M$SI file and if the first character
+                            of the line is a '+', call the routine
+                            that builds the key and writes it to
+                            the scratch file */
+ 
+     DO WHILE ('1'B);
+ 
+                        /* we must clear the buffer before each
+                           read */
+        LINEBUF = ' ';
+ 
+                         /* do the read */
+ 
+        CALL M$READ (READ_SI)
+        WHENALTRETURN DO;
+ 
+                       /* if the alternate return happened for
+                          any other reason than end-of-file,
+                          we report it and bail out */
+ 
+           IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE ~= %E$EOF
+           THEN DO;
+              CALL M$MERC;
+              CALL CLOSE_AND_DELETE;
+              CALL M$EXIT;
+              END;
+ 
+                        /* it was an EOF, so go handle the next
+                           file */
+ 
+           ELSE DO;
+              GOTO HANDLE_UI;
+              END;
+           END;
+ 
+                        /* if the first character's a '+', it must
+                           be a plus-command, so put it in the
+                           scratch file */
+ 
+        IF SUBSTR(LINEBUF,0,1) = '+'
+        THEN DO;
+ 
+                        /* get the number of characters read from
+                           the DCB we just read through */
+ 
+           ARS# = DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#;
+ 
+                        /* then call the routine to build the key
+                           and write the record to the scratch
+                           file */
+ 
+           CALL BUILD_KEY('1');
+           END;
+ 
+        END;
+ 
+ 
+                         /* come here on EOF on M$SI file */
+ 
+HANDLE_UI: ;
+ 
+ 
+                        /* second file processing loop: same stuff
+                           as for the first file, but additionally
+                           this loop doesn't put the +END into the
+                           scratch file (we should already have
+                           one from the first file!) */
+ 
+     DO WHILE ('1'B);
+ 
+        LINEBUF = ' ';
+        CALL M$READ (READ_UI)
+        WHENALTRETURN DO;
+           IF B$TCB$->B$TCB.ALT$->B$ALT.ERR.CODE ~= %E$EOF
+           THEN DO;
+              CALL M$MERC;
+              CALL CLOSE_AND_DELETE;
+              CALL M$EXIT;
+              END;
+           ELSE DO;
+              GOTO LINK_KEYUP;
+              END;
+           END;
+ 
+        IF SUBSTR(LINEBUF,0,1) = '+'
+        THEN DO;
+           IF SUBSTR(LINEBUF,0,4) ~= '+END'
+           THEN DO;
+              ARS# = DCBADDR(DCBNUM(M$UI))->F$DCB.ARS#;
+              CALL BUILD_KEY('2');
+              END;
+           END;
+ 
+        END;
+ 
+                        /* come here on EOF from M$UI file then
+                           M$LINK to KEYUP to do the real error
+                           checking! */
+ 
+LINK_KEYUP: ;
+ 
+ 
+                         /* close the scratch file and save it */
+ 
+     CALL M$CLOSE (CLOSE_SCRATCH);
+ 
+                        /* setup our default exit step
+                           condition code */
+ 
+     EXIT_STEPCC.V.STEPCC# = 0;
+ 
+                        /* now go off to KEYUP to do the error
+                           checking!  */
+ 
+     CALL M$LINK (KEYUP_IT)
+     WHENALTRETURN DO;
+ 
+                        /* if KEYUP detects a problem, it M$XXX's,
+                           so we set our local STEPCC, based on
+                           the M$XXX situation (we know this
+                           because the M$LINK ALTRETURNed */
+ 
+        EXIT_STEPCC.V.STEPCC# = 6;
+        END;
+ 
+                         /* dispose of the scratch file */
+ 
+     CALL CLOSE_AND_DELETE;
+ 
+                        /* and exit the program, setting the
+                           STEPCC! */
+ 
+     CALL M$EXIT (EXIT_STEPCC);
+ 
+ 
+/* ******************************************************** */
+ 
+BUILD_KEY: PROC (FILEID);
+ 
+                        /* this internal procedure builds up the
+                           key buffer and writes the data to the
+                           scratch file using the derived key */
+ 
+                         /* passed parameter */
+DCL FILEID CHAR(1);
+ 
+ 
+                         /* blank out any previously used key */
+ 
+     KEYBUF.KEYDAT.DATA_ = ' ';
+ 
+                        /* start setting up the key by storing the
+                           passed 'file identifier' into the key
+                           */
+ 
+     KEYBUF.KEYDAT.FILE_ = FILEID;
+ 
+                        /* since the form of the plus-packets is
+ 
+                           +n[,m]
+ 
+                           to pick up the 'n', we must look for
+                           both the first space and the first
+                           comma in order to figure out where "n"
+                           ends */
+ 
+     CALL INDEX (I, ' ', LINEBUF);
+ 
+     CALL INDEX (J, ',', LINEBUF);
+ 
+                        /* now, if J is less than I, we got a
+                           comma on the line, so we use J to
+                           determine the number of bytes to move
+                           to the key (right-justified).
+                           Otherwise, we use I.
+                        */
+ 
+     IF (J<I)
+     THEN DO;
+        CALL INSERT (KEYBUF.KEYDAT.DATA_,
+           SIZEC(KEYBUF.KEYDAT.DATA_)-(J-1), J-1,
+           SUBSTR(LINEBUF,1,J-1));
+        END;
+     ELSE DO;
+        CALL INSERT (KEYBUF.KEYDAT.DATA_,
+           SIZEC(KEYBUF.KEYDAT.DATA_)-(I-1), I-1,
+           SUBSTR(LINEBUF,1,I-1));
+        END;
+ 
+                         /* if there's an END, we must handle it
+                            specially so it collates right */
+ 
+     IF SUBSTR(LINEBUF,1,I-1) = 'END'
+     THEN DO;
+        KEYBUF.KEYDAT.DATA_ = 'ENDEND';
+        END;
+ 
+                        /* the vector framing the buffer is
+                           modified dynamically so that only the
+                           number of bytes read are written to the
+                           output file.  If we don't do this, then
+                           all 255 bytes of the output buffer
+                           will be written to the file...a real
+                           waste of space */
+ 
+     IF ARS# > 0
+     THEN DO;
+        WRITE_SCRATCH.BUF_.BOUND = ARS# - 1;
+        END;
+     ELSE DO;
+        WRITE_SCRATCH.BUF_.BOUND = 0;
+        END;
+ 
+                        /* finally, the write to the output file
+                           is done! */
+ 
+     CALL M$WRITE (WRITE_SCRATCH)
+     WHENALTRETURN DO;
+                        /* if anything wierd happens, print the
+                           monitor error message, close and delete
+                           the scratch file, and bail out */
+        CALL M$MERC;
+        CALL CLOSE_AND_DELETE;
+        CALL M$XXX;
+        END;
+ 
+ 
+     RETURN;
+ 
+END BUILD_KEY;
+ 
+ 
+/* ******************************************************** */
+ 
+ 
+CLOSE_AND_DELETE: PROC;
+ 
+                        /* internal routine to close the scratch
+                           file, reopen it, and delete it, then
+                           return.  needed in several places
+                           because sometimes this action is needed
+                           when an error occurs */
+ 
+ 
+                        /* first, close the scratch file.  ignore
+                           the alternate return (it may already
+                           be closed) */
+ 
+     CALL M$CLOSE (CLOSE_SCRATCH)
+     WHENALTRETURN DO;
+        END;
+ 
+                        /* here's the tricky code to delete the
+                           scratch file. Since the scratch file
+                           has already been created using
+                           M$SCRATCH, any subsequent attempt from
+                           within this program to open the DCB
+                           CREATE again will simply force the FUN
+                           to UPDATE (this is a feature).  So,
+                           we use a second scratch DCB to access
+                           the file, thus avoiding the feature */
+ 
+                        /* plug the dcb# of the second DCB into
+                           the fpt */
+ 
+     OPEN_SCRATCH.V.DCB# = DCBNUM(M$SCRATCH2);
+ 
+                         /* then open it */
+ 
+     CALL M$OPEN (OPEN_SCRATCH)
+     WHENALTRETURN DO;
+        CALL M$MERC;
+        END;
+ 
+                         /* then delete it */
+ 
+     CALL M$CLOSE (CLOSE_SCRATCH_DELETE)
+     WHENALTRETURN DO;
+        CALL M$MERC;
+        END;
+ 
+     RETURN;
+ 
+END CLOSE_AND_DELETE;
+ 
+END KIPPER;

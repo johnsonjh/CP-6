@@ -1,0 +1,3113 @@
+VERSION E05
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:1    
+        1        1        /*M* GDI$INTERFACE - Interface between FEP debugger and host                  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*             */
+        8        8        /*P* NAME:     GDI$INTERFACE
+        9        9             PURPOSE:  This module contains routines that interface the
+       10       10                       FEP resident debugging routines with the host
+       11       11                       resient debugger.  This module contains routines to
+       12       12                       decode a message receiver from the host (right now
+       13       13                       these messages come only from SATYR) and to send
+       14       14                       a message to the host (right now these messages go
+       15       15                       to the host only through SATYR.
+       16       16                                                                                      */
+       17       17        %EJECT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:2    
+       18       18        /*F* NAME:    GDI$DECODE_MSG
+       19       19             PURPOSE: This routine processes completed messages passed
+       20       20                      by the standalone async hadnler.
+       21       21             CALL:    CALL GDI$DECODE_MSG(SIZE,BUFFER) or
+       22       22                      CALL GDI$DECODE_MSG_WAIT_4_GO
+       23       23             DESCRIPTION:  This routine may be entered in one of two ways.
+       24       24                           It may be called by the SATYR receive code when
+       25       25                           there is a completed buffer to process or it
+       26       26                           may be called from the trap handler when either
+       27       27                           a breakpoint or a trap has occurred and we are
+       28       28                           waiting for the user to type 'GO'.  If we
+       29       29                           are entered normally, from SATYR receive code,
+       30       30                           we are passed a buffer, and a size.  We figure out what
+       31       31                          type of message we got, call the appropriate routine to process it
+       32       32                           and simple return.  If we are entered from the trap
+       33       33                           handler, we look at the flag GD_BFRFULL to
+       34       34                           indicate when SATYR has a complete buffer for us to
+       35       35                           process. We loop until this flag is set.  When set,
+       36       36                           we go about normal message processing.  We do not exit
+       37       37                           this routine until the user has typed GO.  This is
+       38       38                           signified by the GD_STOPT flag.  When we return to the
+       39       39                           trap handler, he will cleanup and return to the monitor
+       40       40                           who will restart the user.  NOTE that when we
+       41       41                           are entered from the trap  handler, we cheat and dip
+       42       42                           into SATYRs receive buffer directly.
+       43       43                                                                                      */
+       44       44        GDI$DECODE_MSG: PROC(SIZE,BUFFER) ALTRET;
+       45       45                                                /* INCLUDES                           */
+       46       46        %INCLUDE LCP_6;
+       47      237        %INCLUDE B_ERRORS_C;
+       48     1364        %INCLUDE GD_STATIC_DATA;
+       49     1837        %INCLUDE GD$MACS_M;
+       50     1875        %INCLUDE GH_HARDWARE_M;                 /* Macros for LEVs etc                */
+       51     1973        %INCLUDE DU_SCODE_C;
+       52     1986        %INCLUDE G_HJIT_M;
+       53     2131        %INCLUDE KH$CHN;
+       54     2253        %INCLUDE G_ROS_M;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:3    
+       55     2335                                                /* ARGS                               */
+       56     2336    1   DCL BUFFER CHAR(SIZE) ALIGNED;          /* Input message                      */
+       57     2337    1   DCL ERROR UBIN;                         /* Report this error                  */
+       58     2338    1   DCL SIZE UBIN;                          /* Size of BUFFER                     */
+       59     2339    1   DCL BUFSIZE UBIN;
+       60     2340    1   DCL MONERR BIT(32);
+       61     2341                                                /* TEMPS                              */
+       62     2342        %FPT_READ(FPTN=GD$READ_FPT,STCLASS="");
+       63     2368        %FPT_DRTN(FPTN=GD$DRTN_FPT,STCLASS="");
+       64     2392        %FPT_UNSHARE(FPTN=UNSHARE_FPT,STCLASS="");
+       65     2415    1   DCL MSG$ PTR;                           /* Pointer to message buffer          */
+       66     2416                                                /* CONSTANTS                          */
+       67     2417    1   DCL M$DEBUG DCB;
+       68     2418        %FPT_READ(FPTN=GD_READ_DEBUG_IFPT,DCB=M$DEBUG,STCLASS=CONSTANT);
+       69     2444        %FPT_DRTN(FPTN=GD_DRTN_IFPT,STCLASS=CONSTANT);
+       70     2468        %FPT_UNSHARE(FPTN=CONST_UNSHARE_FPT,PROG=NO,SLIB=NO,STCLASS=CONSTANT);
+       71     2491                                                /* BASED ITEMS                        */
+       72     2492        %GD$MSG(FPTN=GD$MSG);                   /* Message template                   */
+       73     2648        %G$LOW_MEM(STCLASS="BASED(G$LOW_MEM$)");
+       74     2697        %G$MHJIT(STCLASS="BASED(G$MHJIT$)");
+       75     9571        %INCLUDE G_JIT_M;
+       76     9836        %G$ROS(FULL=YES);
+       77    10787        %G$EXCFR;
+       78    11169    1   DCL MSGBUF CHAR(999) ALIGNED BASED;
+       79    11170    1   DCL WDOG UBIN;                          /* Temp timer cell                    */
+       80    11171        %VLP_SCODE (FPTN=GDI_SCREECH,ERR#=%S$USRREQSCR,SEV=G_SEV_SCREECH#,
+       81    11172                     STCLASS=CONSTANT,FCG=GD,MID=I,MON='1'B);
+       82    11233        %EJECT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:4    
+       83    11234                                                /* EQUATES                            */
+       84    11235        %EQU NO#='0'B;
+       85    11236        %EQU YES#='1'B;
+       86    11237                                                /* SYMREFS                            */
+       87    11238    1   DCL G$MHJIT$ PTR SYMREF;                /* Pointer to MHJIT                   */
+       88    11239    1   DCL G$LOW_MEM$ PTR SYMREF;              /* Low memory pointer                 */
+       89    11240    1   DCL G$ROS$ PTR SYMREF;
+       90    11241    1   DCL G$JIT$ PTR SYMREF;
+       91    11242        %G$JIT;
+       92    11656    1   DCL G$TCB$ PTR SYMREF;
+       93    11657        %G$TCB;
+       94    11678        %G$TSA;
+       95    12066    1   DCL GDA$RCVIOLD ENTRY OPTIONAL;
+       96    12067    1   DCL GDA$REXMT ENTRY(2) ALTRET OPTIONAL;
+       97    12068    1   DCL GDB$BLD_BRKPNT ENTRY(2);            /* Add breakpoint to table            */
+       98    12069    1   DCL GDB$GET_CONTROL ENTRY;              /* Get control of the FEP             */
+       99    12070    1   DCL GDB$KILL_ALLBRKPNTS ENTRY;          /* Clear breakpoint table             */
+      100    12071    1   DCL GDB$KILL_BRKPNT ENTRY(2);           /* Remove single breakpoint from TBL  */
+      101    12072    1   DCL GDB$RESET_BRKPNT ENTRY;             /* Remove all breakpoints from MEM    */
+      102    12073    1   DCL GDB$SET_BRKPNT ENTRY(2);            /* Put breakpoints into memory GO     */
+      103    12074    1   DCL GDI$SEND_ERROR_RESPONSE ENTRY(3);
+      104    12075    1   DCL GDI$SEND_RESPONSE ENTRY(2);         /* Send a responce to the host        */
+      105    12076    1   DCL GDM$DISPLAY ENTRY(2);               /* Routine to display memory          */
+      106    12077    1   DCL GDM$DISPLAY_D ENTRY(2);             /* Routine to display memory, DELTA   */
+      107    12078    1   DCL GDM$MODIFY ENTRY(2);                /* Routine to modify memory           */
+      108    12079    1   DCL GDM$MODIFY_D ENTRY(2);              /* Routine to modify memory, DELTA    */
+      109    12080    1   DCL GDU$DECODE_USE ENTRY(2);            /* Decode USE command                 */
+      110    12081    1   DCL GDM$LCTHAND ENTRY(2);
+      111    12082    1   DCL GDM$LETMEM_D ENTRY(2);
+      112    12083    1   DCL GDM$UNFID ENTRY(2);
+      113    12084    1   DCL GDM$TSA ENTRY(2);
+      114    12085    1   DCL GDU$KTI ENTRY(2);                   /* Routine to set trap bits           */
+      115    12086              %EJECT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:5    
+      116    12087        /*
+      117    12088          Setup pointers so that we use the arguments we were passed
+      118    12089                                                                                      */
+      119    12090    1           MSG$=ADDR(BUFFER);
+      120    12091    1           BUFSIZE=SIZE;
+      121    12092    1           GOTO PROCESS;
+      122    12093        /* */
+      123    12094    1   GDI$DECODE_MSG_WAIT_4_GO: ENTRY ALTRET;
+      124    12095        /* */
+      125    12096        /*
+      126    12097          If we enter here, we want to use the SATYR receive buffer and
+      127    12098          size cells directly
+      128    12099                                                                                      */
+      129    12100    2           DO CASE(GD_DATA.GD.MODE);
+      130    12101    2            CASE(%GD#MODE_USER_DELTA);
+      131    12102    2              GD$READ_FPT=GD_READ_DEBUG_IFPT;
+      132    12103    2              GOTO PMME_IO;
+      133    12104    2            CASE(%GD#MODE_ANLZ);
+      134    12105    2              GD$READ_FPT=GD_READ_DEBUG_IFPT;
+      135    12106    2              GD$READ_FPT.V.DCB#=GD_DATA.GD.HANLZ_DCB;
+      136    12107    2   PMME_IO:   ;
+      137    12108    2              GD$READ_FPT.BUF_=VECTOR(GD_DATA.GDA.RCV.BFR);
+      138    12109    2              GD$READ_FPT.V_=VECTOR(GD$READ_FPT.V);
+      139    12110    2            CASE(%GD#MODE_XDELTA);
+      140    12111    2              WDOG=G$LOW_MEM.WDT_CURR;
+      141    12112    2            END;                           /* END CASE                           */
+      142    12113    1           BUFSIZE=GD_DATA.GDA.BFRSIZ;
+      143    12114    1           MSG$=ADDR(GD_DATA.GDA.RCV.BFR);
+      144    12115        /* */
+      145    12116    2   PROCESS: DO WHILE (%G_YES#);
+      146    12117        /*
+      147    12118          We loop here until SATYR tells us the buffer is OK.  Note that if
+      148    12119          we entered at DECODE_MSG, the flag will have been set immediatly
+      149    12120          before the call.
+      150    12121                                                                                      */
+      151    12122    3              DO CASE(GD_DATA.GD.MODE);
+      152    12123    3               CASE(%GD#MODE_USER_DELTA,%GD#MODE_ANLZ);
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:6    
+      153    12124    3                 GD_DATA.GDA.CONNECTFLG = '1'B;
+      154    12125    4                 CALL M$READ (GD$READ_FPT) WHENALTRETURN DO;
+      155    12126    4                    IF GD_DATA.GD.MODE = %GD#MODE_ANLZ THEN
+      156    12127    4                       IF G$TCB$->G$TCB.ALT$->G$EXCFR.TRLR.ERR.ERR# =
+      157    12128    5                         %E$LDSC THEN DO;
+      158    12129    5                          GD_DATA.GDA.CONNECTFLG = '0'B;
+      159    12130    5                          RETURN;
+      160    12131    5                          END;
+      161    12132    4                       ELSE; /*N* CALL M$SCREECH(SNAP) */
+      162    12133    5                    ELSE IF G$JIT$->G$JIT.FD_ALTERR.ERR# = %E$LDSC THEN DO;
+      163    12134    5                          GD_DATA.GDA.CONNECTFLG = '0'B;
+      164    12135    5                          GOTO QUITFD;
+      165    12136    5                          END;
+      166    12137    4                       ELSE; /*N* CALL M$SCREECH(SUA) */
+      167    12138    4                    END;
+      168    12139    3               CASE(%GD#MODE_XDELTA);
+      169    12140    4                 DO WHILE (NOT(GD_DATA.GD.BFRFULL));
+      170    12141    5                    IF GD_DATA.GD.NEWCTL THEN DO;
+      171    12142    5                       GD_DATA.GD.NEWCTL = '0'B;
+      172    12143    5                       ALTRETURN;
+      173    12144    5                       END;
+      174    12145        /*  Prevent the watchdog timer from running out while host user twiddles      */
+      175    12146    4                    IF G$LOW_MEM.WDT_CURR~=WDOG THEN
+      176    12147    5                    DO;
+      177    12148    5                       G$MHJIT.TICKS=G$MHJIT.TICKS+WDOG-G$LOW_MEM.WDT_CURR;
+      178    12149    5                       IF G$MHJIT.TICKS>1200 THEN
+      179    12150    6                       DO;
+      180    12151    6                          G$MHJIT.UTS=G$MHJIT.UTS+G$MHJIT.TICKS/16;
+      181    12152    6                          G$MHJIT.TICKS=MOD(G$MHJIT.TICKS,16);
+      182    12153    6                          END;
+      183    12154    5                       G$LOW_MEM.WDT_CURR=WDOG;
+      184    12155    5                       END;
+      185    12156    4                    END;
+      186    12157    3               END;                        /* END CASE                           */
+      187    12158        %EJECT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:7    
+      188    12159        /*
+      189    12160          Call the correct routine depending on message function
+      190    12161                                                                                      */
+      191    12162    2              REMEMBER CMD_ERROR IN GD_DATA.GD.ERROR_LOC;
+      192    12163    2              GD_DATA.GD.ANSWERED = '0'B;
+      193    12164    2              GD_DATA.GD.INTERPRETIVE = MSG$->GD$MSG.SUBFB.INTERPRETIVE;
+      194    12165    3              DO CASE (MSG$->GD$MSG.FNC);
+      195    12166
+      196    12167        /* Display memory                                                             */
+      197    12168    3               CASE(%GD#RQSDISPMEM);
+      198    12169    3                 CALL GDM$DISPLAY(BUFSIZE,MSG$->MSGBUF);
+      199    12170
+      200    12171        /* Send back a TSA                                                            */
+      201    12172    3               CASE(%GD#RQSTSA);
+      202    12173    3                 CALL GDM$TSA(BUFSIZE,MSG$->MSGBUF);
+      203    12174        /* Display memory, DELTA-style.                                               */
+      204    12175    3               CASE (%GD#RQSDISPMEM_D);
+      205    12176    3                 CALL GDM$DISPLAY_D (BUFSIZE,MSG$->MSGBUF);
+      206    12177
+      207    12178        /* Modify memory                                                              */
+      208    12179    3               CASE(%GD#RQSMODMEM);
+      209    12180    3                 BUFSIZE=%GD#RSPMODMEMSIZE;
+      210    12181    3                 CALL GDM$MODIFY(BUFSIZE,MSG$->MSGBUF);
+      211    12182
+      212    12183        /* Modify memory, DELTA-style.                                                */
+      213    12184    3               CASE (%GD#RQSMODMEM_D);
+      214    12185    3                 BUFSIZE=%GD#RSPMODMEMSIZE;
+      215    12186    3                 CALL GDM$MODIFY_D (BUFSIZE,MSG$->MSGBUF);
+      216    12187
+      217    12188        /* Request to set a breakpoint                                                */
+      218    12189    3               CASE (%GD#RQSBRKPNT);
+      219    12190    3                 CALL GDB$BLD_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+      220    12191
+      221    12192        /* Request to set a breakpoint, DELTA-style.                                  */
+      222    12193    3               CASE (%GD#RQSBRKPNT_D);
+      223    12194    3                 CALL GDB$BLD_BRKPNT (BUFSIZE,MSG$->MSGBUF);
+      224    12195
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:8    
+      225    12196        /* User has typed GO                                                          */
+      226    12197    3               CASE(%GD#RQSGO);
+      227    12198    3                 CALL GDB$SET_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+      228    12199
+      229    12200        /* Pull all breakpoints                                                       */
+      230    12201    3               CASE(%GD#RQSPULLBRKPNTS);
+      231    12202    3                 CALL GDB$RESET_BRKPNT;
+      232    12203
+      233    12204        /* Kill all breakpoints                                                       */
+      234    12205    3               CASE(%GD#RQSKILLATALL);
+      235    12206    3                 CALL GDB$KILL_ALLBRKPNTS;
+      236    12207        /* If we're still talking to the host, then ACK the request */
+      237    12208    4                 IF GD_DATA.GDA.CONNECTFLG THEN DO;
+      238    12209    4                    CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+      239    12210    4                    END;
+      240    12211
+      241    12212        /* Kill a single breakpoint                                                   */
+      242    12213    3               CASE(%GD#RQSKILLATN);
+      243    12214    3                 CALL GDB$KILL_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+      244    12215
+      245    12216        /* Get control of the FEP                                                     */
+      246    12217    3               CASE(%GD#RQSCONTROL);
+      247    12218    3                 CALL GDB$GET_CONTROL;
+      248    12219
+      249    12220        /* USE command                                                                */
+      250    12221    3               CASE(%GD#RQSUSE);
+      251    12222    3                 CALL GDU$DECODE_USE(BUFSIZE,MSG$->MSGBUF);
+      252    12223
+      253    12224        /* QUIT command                                                               */
+      254    12225    3               CASE(%GD#RQSQUIT);
+      255    12226    4                 IF GD_DATA.GD.MODE = %GD#MODE_XDELTA THEN DO;
+      256    12227    4                    GD_DATA.GD.STOPT = %G_NO#;
+      257    12228    4                    CALL GDB$KILL_ALLBRKPNTS;
+      258    12229    4                    GD_DATA.GD.BRKNUM = 0;
+      259    12230    4                    GOTO ALLDONE;
+      260    12231    4                    END;
+      261    12232    3   QUITFD:
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:9    
+      262    12233    3                 GD$DRTN_FPT = GD_DRTN_IFPT;
+      263    12234    3                 GD$DRTN_FPT.V_ = VECTOR(GD$DRTN_FPT.V);
+      264    12235    3                 GD$DRTN_FPT.V.QUIT = %YES#;
+      265    12236    3                 CALL M$DRTN(GD$DRTN_FPT);
+      266    12237
+      267    12238    3               CASE(%GD#RQSCRASH);
+      268    12239        /*S* SCREECH_CODE: GDI-S$USRREQSCR
+      269    12240             TYPE: SCREECH
+      270    12241             MESSAGE: An LCP-6 XDELTA user requested a SCREECH.
+      271    12242        */
+      272    12243    3                 IF GD_DATA.GD.MODE ~= %GD#MODE_XDELTA THEN
+      273    12244    3                    CALL GDI$SEND_ERROR_RESPONSE(SIZE,BUFFER,%GD#RSPNAK);
+      274    12245    4                 ELSE DO;
+      275    12246    4                    GD_DATA.GD.STOPT = %G_NO#;
+      276    12247    4                    GD_DATA.MISC.SCREECHCODE = GDI_SCREECH;
+      277    12248    4                    GD_DATA.DELTAINFO.TSA$->G$TSA.A$ = ADDR(GD_DATA.MISC.SCREECHCODE);
+      278    12249    4                    RETURN;
+      279    12250    4                    END;
+      280    12251
+      281    12252        /* KILL-FD command                                                            */
+      282    12253    3               CASE(%GD#RQSKILLFD);
+      283    12254    3   KILLFD:
+      284    12255    3                 GD$DRTN_FPT = GD_DRTN_IFPT;
+      285    12256    3                 GD$DRTN_FPT.V_ = VECTOR(GD$DRTN_FPT.V);
+      286    12257    3                 GD$DRTN_FPT.V.KILLFD = %YES#;
+      287    12258    3                 CALL M$DRTN(GD$DRTN_FPT);
+      288    12259
+      289    12260        /* LCT commands                                                               */
+      290    12261    3               CASE(%GD#RQSMODLCT,%GD#RQSDISPLCT);
+      291    12262    3                 CALL GDM$LCTHAND(BUFSIZE,MSG$->MSGBUF);
+      292    12263    3               CASE(%GD#RQSUNFID);
+      293    12264    3                 CALL GDM$UNFID(BUFSIZE,MSG$->MSGBUF);
+      294    12265    3               CASE(%GD#RQSXCON);
+      295    12266    3                 GD$DRTN_FPT = GD_DRTN_IFPT;
+      296    12267    3                 GD$DRTN_FPT.V_=VECTOR(GD$DRTN_FPT.V);
+      297    12268    3                 GD$DRTN_FPT.V.SETECC=%G_YES#;
+      298    12269    3                 GD$DRTN_FPT.V.ECC=%G_XCON#;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:10   
+      299    12270    3                 GD_DATA.GD.STOPT=%G_NO#;
+      300    12271    3                 CALL GDB$SET_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+      301    12272    3                 CALL M$DRTN(GD$DRTN_FPT)
+      302    12273    4                 WHENALTRETURN DO;
+      303    12274    4                    CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,
+      304    12275    4                      %GD#RSPNOXCONCONTROL);
+      305    12276    4                    GD_DATA.GD.STOPT=%G_YES#;
+      306    12277    4                    CALL GDB$RESET_BRKPNT;
+      307    12278    4                    END;
+      308    12279    3               CASE(%GD#RQSLETMEM_D);
+      309    12280    3                 CALL GDM$LETMEM_D(BUFSIZE,MSG$->MSGBUF);
+      310    12281    3               CASE(%GD#RQSUNSHAREALL);
+      311    12282    3                 UNSHARE_FPT = CONST_UNSHARE_FPT;
+      312    12283    3                 UNSHARE_FPT.V_ = VECTOR(UNSHARE_FPT.V);
+      313    12284    3                 UNSHARE_FPT.V.PROG = '1'B;
+      314    12285    3                 UNSHARE_FPT.V.SLIB = '1'B;
+      315    12286    3                 CALL M$UNSHARE(UNSHARE_FPT) ALTRET(UNSHARE_FAILED);
+      316    12287    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+      317    12288    3               CASE(%GD#RQSUNSHAREPROG);
+      318    12289    3                 UNSHARE_FPT = CONST_UNSHARE_FPT;
+      319    12290    3                 UNSHARE_FPT.V_ = VECTOR(UNSHARE_FPT.V);
+      320    12291    3                 UNSHARE_FPT.V.PROG = '1'B;
+      321    12292    3                 CALL M$UNSHARE(UNSHARE_FPT) ALTRET(UNSHARE_FAILED);
+      322    12293    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+      323    12294    3               CASE(%GD#RQSUNSHARELIB);
+      324    12295    3                 UNSHARE_FPT = CONST_UNSHARE_FPT;
+      325    12296    3                 UNSHARE_FPT.V_ = VECTOR(UNSHARE_FPT.V);
+      326    12297    3                 UNSHARE_FPT.V.SLIB = '1'B;
+      327    12298    3                 CALL M$UNSHARE(UNSHARE_FPT) ALTRET(UNSHARE_FAILED);
+      328    12299    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+      329    12300    3               CASE(%GD#RQSKTI);
+      330    12301    3                 CALL GDU$KTI(BUFSIZE,MSG$->MSGBUF);
+      331    12302    3               CASE(%GD#RQSBREAK);
+      332    12303    3                 GD$DRTN_FPT = GD_DRTN_IFPT;
+      333    12304    3                 GD$DRTN_FPT.V_=VECTOR(GD$DRTN_FPT.V);
+      334    12305    3                 GD$DRTN_FPT.V.SETECC=%G_YES#;
+      335    12306    3                 GD$DRTN_FPT.V.ECC=%G_BRK#;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:11   
+      336    12307    3                 GD_DATA.GD.STOPT=%G_NO#;
+      337    12308    3                 CALL GDB$SET_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+      338    12309    3                 CALL M$DRTN(GD$DRTN_FPT)
+      339    12310    4                 WHENALTRETURN DO;
+      340    12311    4                    CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,
+      341    12312    4                      %GD#RSPNOBREAKCONTROL);
+      342    12313    4                    GD_DATA.GD.STOPT=%G_YES#;
+      343    12314    4                    CALL GDB$RESET_BRKPNT;
+      344    12315    4                    END;
+      345    12316    3               CASE(%GD#RQSTRTRANSFERS);
+      346    12317    3                 GD_DATA.GD.TRACE = %TRACE_XFERS;
+      347    12318    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+      348    12319    3               CASE(%GD#RQSTRCALLS);
+      349    12320    3                 GD_DATA.GD.TRACE = %TRACE_CALLS;
+      350    12321    3                 GD_DATA.GD.ONCALLS = '0'B;
+      351    12322    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+      352    12323    3               CASE(%GD#RQSTROFF);
+      353    12324    3                 IF GD_DATA.GD.ONCALLS THEN
+      354    12325    3                    GD_DATA.GD.TRACE = %TRACE_CALLS;
+      355    12326    3                 ELSE GD_DATA.GD.TRACE = %TRACE_OFF;
+      356    12327    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+      357    12328    3               CASE(%GD#RQSONCALLBRKPNT);
+      358    12329    3                 CALL GDB$BLD_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+      359    12330    3               CASE(%GD#RQSONCALLS);
+      360    12331    3                 GD_DATA.GD.ONCALLS = '1'B;
+      361    12332    3                 GD_DATA.GD.OC_BRKNUM = MSG$->GD$MSG.BRKRQS.BRKNUM;
+      362    12333    3                 CALL GDB$BLD_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+      363    12334    3               CASE(%GD#RQSREXMIT#);  /* HOST XDELTA got error on last message   */
+      364    12335    3                 CALL GDA$REXMT(SIZE,BUFFER);
+      365    12336    3               END /* CASE */;
+      366    12337    3              DO WHILE (%NO#);
+      367    12338    3   CMD_ERROR:    ;
+      368    12339    3                 CALL GDI$SEND_ERROR_RESPONSE (BUFSIZE,
+      369    12340    3                   GD_DATA.GDA.RCV.BFR,
+      370    12341    3                   GD_DATA.GD.ERROR);
+      371    12342    3                 END;
+      372    12343    3              DO WHILE(%NO#);
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:12   
+      373    12344    3   UNSHARE_FAILED:
+      374    12345    3                 MSG$->GD$MSG.ERROR_D.ERRCODE = G$JIT$->G$JIT.FD_ALTERR;
+      375    12346    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPNAK);
+      376    12347    3                 END;
+      377    12348        /*
+      378    12349          Indicate we're finished with this buffer
+      379    12350                                                                                      */
+      380    12351    2   ALLDONE:
+      381    12352    2              GD_DATA.GD.BFRFULL=%G_NO#;
+      382    12353        /*
+      383    12354          Start another read if XDELTA mode.
+      384    12355                                                                                      */
+      385    12356    2              IF GD_DATA.GD.MODE=%GD#MODE_XDELTA THEN
+      386    12357    2                 CALL GDA$RCVIOLD;
+      387    12358        /*
+      388    12359          If we are not stopped, we can return
+      389    12360                                                                                      */
+      390    12361    2              IF NOT(GD_DATA.GD.STOPT) THEN
+      391    12362    3              DO;
+      392    12363    3                 RETURN;
+      393    12364    3                 END;
+      394    12365    2              END;
+      395    12366    1   END GDI$DECODE_MSG;
+      396    12367        %EOD;
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:13   
+--  Include file information  --
+
+   G_JIT_M.:E05TOU  is referenced.
+   G_ROS_M.:E05TOU  is referenced.
+   KH$CHN.:E05TOU  is referenced.
+   G_HJIT_M.:E05TOU  is referenced.
+   DU_SCODE_C.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MACS_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure GDI$DECODE_MSG.
+
+   Procedure GDI$DECODE_MSG requires 1281 words for executable code.
+   Procedure GDI$DECODE_MSG requires 50 words of local(AUTO) storage.
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:14   
+
+ Object Unit name= GDI$DECODE_MSG                             File name= GDI$INTERFACE.:E05TOU
+ UTS= JUL 29 '97 21:22:38.88 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   DCB   even  none     0      0  M$DEBUG
+    1  RoData even  UTS     31     1F  GDI$DECODE_MSG
+    2   Proc  even  none  1281    501  GDI$DECODE_MSG
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes    yes     yes      Std        2  GDI$DECODE_MSG
+     2     10          yes     yes      Std        0  GDI$DECODE_MSG_WAIT_4_GO
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:15   
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       2 GDM$DISPLAY
+         yes           Std       2 GDB$BLD_BRKPNT
+         yes           Std       0 GDB$RESET_BRKPNT
+         yes           Std       0 GDB$KILL_ALLBRKPNTS
+         yes           Std       2 GDU$DECODE_USE
+         yes           Std       2 GDM$UNFID
+         yes           Std       2 GDB$KILL_BRKPNT
+         yes    yes    Std       0 GDA$RCVIOLD
+         yes           Std       3 GDI$SEND_ERROR_RESPONSE
+         yes           Std       2 GDM$LETMEM_D
+         yes           Std       2 GDU$KTI
+         yes           Std       2 GDM$TSA
+         yes           Std       2 GDM$DISPLAY_D
+         yes           Std       2 GDM$MODIFY
+         yes           Std       2 GDB$SET_BRKPNT
+ yes     yes    yes    Std       2 GDA$REXMT
+         yes           Std       0 GDB$GET_CONTROL
+         yes           Std       2 GDM$MODIFY_D
+         yes           Std       2 GDM$LCTHAND
+                       nStd      0 X6A_AUTO_2
+                       nStd      0 X6A_ARET
+                       nStd      0 X6A_AALT
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     GD$DELTA_DATA$                        M$DEBUG                               G$MHJIT$
+     G$LOW_MEM$                            G$JIT$                                G$TCB$
+r    G$ROS$
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:16   
+
+
+        1        1        /*M* GDI$INTERFACE - Interface between FEP debugger and host                  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X*             */
+        8        8        /*P* NAME:     GDI$INTERFACE
+        9        9             PURPOSE:  This module contains routines that interface the
+       10       10                       FEP resident debugging routines with the host
+       11       11                       resient debugger.  This module contains routines to
+       12       12                       decode a message receiver from the host (right now
+       13       13                       these messages come only from SATYR) and to send
+       14       14                       a message to the host (right now these messages go
+       15       15                       to the host only through SATYR.
+       16       16                                                                                      */
+       17       17        %EJECT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:17   
+       18       18        /*F* NAME:    GDI$DECODE_MSG
+       19       19             PURPOSE: This routine processes completed messages passed
+       20       20                      by the standalone async hadnler.
+       21       21             CALL:    CALL GDI$DECODE_MSG(SIZE,BUFFER) or
+       22       22                      CALL GDI$DECODE_MSG_WAIT_4_GO
+       23       23             DESCRIPTION:  This routine may be entered in one of two ways.
+       24       24                           It may be called by the SATYR receive code when
+       25       25                           there is a completed buffer to process or it
+       26       26                           may be called from the trap handler when either
+       27       27                           a breakpoint or a trap has occurred and we are
+       28       28                           waiting for the user to type 'GO'.  If we
+       29       29                           are entered normally, from SATYR receive code,
+       30       30                           we are passed a buffer, and a size.  We figure out what
+       31       31                         type of message we got, call the appropriate routine to process it
+       32       32                           and simple return.  If we are entered from the trap
+       33       33                           handler, we look at the flag GD_BFRFULL to
+       34       34                           indicate when SATYR has a complete buffer for us to
+       35       35                           process. We loop until this flag is set.  When set,
+       36       36                           we go about normal message processing.  We do not exit
+       37       37                           this routine until the user has typed GO.  This is
+       38       38                           signified by the GD_STOPT flag.  When we return to the
+       39       39                           trap handler, he will cleanup and return to the monitor
+       40       40                           who will restart the user.  NOTE that when we
+       41       41                           are entered from the trap  handler, we cheat and dip
+       42       42                           into SATYRs receive buffer directly.
+       43       43                                                                                      */
+       44       44        GDI$DECODE_MSG: PROC(SIZE,BUFFER) ALTRET;
+
+     44   2 000000  D380 0000 0000  xent GDI$DECODE_MSG  LNJ,B5   X6A_AUTO_2
+          2 000003       0032 0002                       DC       50,2
+
+       45       45                                                /* INCLUDES                           */
+       46       46        %INCLUDE LCP_6;
+       47      237        %INCLUDE B_ERRORS_C;
+       48     1364        %INCLUDE GD_STATIC_DATA;
+       49     1837        %INCLUDE GD$MACS_M;
+       50     1875        %INCLUDE GH_HARDWARE_M;                 /* Macros for LEVs etc                */
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:18   
+       51     1973        %INCLUDE DU_SCODE_C;
+       52     1986        %INCLUDE G_HJIT_M;
+       53     2131        %INCLUDE KH$CHN;
+       54     2253        %INCLUDE G_ROS_M;
+       55     2335                                                /* ARGS                               */
+       56     2336    1   DCL BUFFER CHAR(SIZE) ALIGNED;          /* Input message                      */
+       57     2337    1   DCL ERROR UBIN;                         /* Report this error                  */
+       58     2338    1   DCL SIZE UBIN;                          /* Size of BUFFER                     */
+       59     2339    1   DCL BUFSIZE UBIN;
+       60     2340    1   DCL MONERR BIT(32);
+       61     2341                                                /* TEMPS                              */
+       62     2342        %FPT_READ(FPTN=GD$READ_FPT,STCLASS="");
+       63     2368        %FPT_DRTN(FPTN=GD$DRTN_FPT,STCLASS="");
+       64     2392        %FPT_UNSHARE(FPTN=UNSHARE_FPT,STCLASS="");
+       65     2415    1   DCL MSG$ PTR;                           /* Pointer to message buffer          */
+       66     2416                                                /* CONSTANTS                          */
+       67     2417    1   DCL M$DEBUG DCB;
+       68     2418        %FPT_READ(FPTN=GD_READ_DEBUG_IFPT,DCB=M$DEBUG,STCLASS=CONSTANT);
+       69     2444        %FPT_DRTN(FPTN=GD_DRTN_IFPT,STCLASS=CONSTANT);
+       70     2468        %FPT_UNSHARE(FPTN=CONST_UNSHARE_FPT,PROG=NO,SLIB=NO,STCLASS=CONSTANT);
+       71     2491                                                /* BASED ITEMS                        */
+       72     2492        %GD$MSG(FPTN=GD$MSG);                   /* Message template                   */
+       73     2648        %G$LOW_MEM(STCLASS="BASED(G$LOW_MEM$)");
+       74     2697        %G$MHJIT(STCLASS="BASED(G$MHJIT$)");
+       75     9571        %INCLUDE G_JIT_M;
+       76     9836        %G$ROS(FULL=YES);
+       77    10787        %G$EXCFR;
+       78    11169    1   DCL MSGBUF CHAR(999) ALIGNED BASED;
+       79    11170    1   DCL WDOG UBIN;                          /* Temp timer cell                    */
+       80    11171        %VLP_SCODE (FPTN=GDI_SCREECH,ERR#=%S$USRREQSCR,SEV=G_SEV_SCREECH#,
+       81    11172                     STCLASS=CONSTANT,FCG=GD,MID=I,MON='1'B);
+       82    11233        %EJECT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:19   
+       83    11234                                                /* EQUATES                            */
+       84    11235        %EQU NO#='0'B;
+       85    11236        %EQU YES#='1'B;
+       86    11237                                                /* SYMREFS                            */
+       87    11238    1   DCL G$MHJIT$ PTR SYMREF;                /* Pointer to MHJIT                   */
+       88    11239    1   DCL G$LOW_MEM$ PTR SYMREF;              /* Low memory pointer                 */
+       89    11240    1   DCL G$ROS$ PTR SYMREF;
+       90    11241    1   DCL G$JIT$ PTR SYMREF;
+       91    11242        %G$JIT;
+       92    11656    1   DCL G$TCB$ PTR SYMREF;
+       93    11657        %G$TCB;
+       94    11678        %G$TSA;
+       95    12066    1   DCL GDA$RCVIOLD ENTRY OPTIONAL;
+       96    12067    1   DCL GDA$REXMT ENTRY(2) ALTRET OPTIONAL;
+       97    12068    1   DCL GDB$BLD_BRKPNT ENTRY(2);            /* Add breakpoint to table            */
+       98    12069    1   DCL GDB$GET_CONTROL ENTRY;              /* Get control of the FEP             */
+       99    12070    1   DCL GDB$KILL_ALLBRKPNTS ENTRY;          /* Clear breakpoint table             */
+      100    12071    1   DCL GDB$KILL_BRKPNT ENTRY(2);           /* Remove single breakpoint from TBL  */
+      101    12072    1   DCL GDB$RESET_BRKPNT ENTRY;             /* Remove all breakpoints from MEM    */
+      102    12073    1   DCL GDB$SET_BRKPNT ENTRY(2);            /* Put breakpoints into memory GO     */
+      103    12074    1   DCL GDI$SEND_ERROR_RESPONSE ENTRY(3);
+      104    12075    1   DCL GDI$SEND_RESPONSE ENTRY(2);         /* Send a responce to the host        */
+      105    12076    1   DCL GDM$DISPLAY ENTRY(2);               /* Routine to display memory          */
+      106    12077    1   DCL GDM$DISPLAY_D ENTRY(2);             /* Routine to display memory, DELTA   */
+      107    12078    1   DCL GDM$MODIFY ENTRY(2);                /* Routine to modify memory           */
+      108    12079    1   DCL GDM$MODIFY_D ENTRY(2);              /* Routine to modify memory, DELTA    */
+      109    12080    1   DCL GDU$DECODE_USE ENTRY(2);            /* Decode USE command                 */
+      110    12081    1   DCL GDM$LCTHAND ENTRY(2);
+      111    12082    1   DCL GDM$LETMEM_D ENTRY(2);
+      112    12083    1   DCL GDM$UNFID ENTRY(2);
+      113    12084    1   DCL GDM$TSA ENTRY(2);
+      114    12085    1   DCL GDU$KTI ENTRY(2);                   /* Routine to set trap bits           */
+      115    12086              %EJECT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:20   
+      116    12087        /*
+      117    12088          Setup pointers so that we use the arguments we were passed
+      118    12089                                                                                      */
+      119    12090    1           MSG$=ADDR(BUFFER);
+
+  12090   2 000005  ECC7 0006                            LDB,B6   @BUFFER,AUTO
+          2 000007  EFC7 0028                            STB,B6   MSG$,AUTO
+
+      120    12091    1           BUFSIZE=SIZE;
+
+  12091   2 000009  DCC7 0004                            LDB,B5   @SIZE,AUTO
+          2 00000B  E805                                 LDR,R6   ,B5
+          2 00000C  EF47 0009                            STR,R6   BUFSIZE,AUTO
+
+      121    12092    1           GOTO PROCESS;
+
+  12092   2 00000E  0F81 0065                            B        s:12116,PREL
+
+      122    12093        /* */
+      123    12094    1   GDI$DECODE_MSG_WAIT_4_GO: ENTRY ALTRET;
+
+  12094   2 000010  D380 0000 0000  xent GDI$DECODE_MSG_*LNJ,B5   X6A_AUTO_2
+          2 000013       0032 0002                       DC       50,2
+
+      124    12095        /* */
+      125    12096        /*
+      126    12097          If we enter here, we want to use the SATYR receive buffer and
+      127    12098          size cells directly
+      128    12099                                                                                      */
+      129    12100    2           DO CASE(GD_DATA.GD.MODE);
+
+  12100   2 000015  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 000018  B846 0130                            LDR,R3   304,B6
+          2 00001A  3D04                                 CMV,R3   4
+          2 00001B  0281 004D                            BGE      s:12113,PREL
+          2 00001D  A830 0000 0023  02                   LDR,R2   s:12100+14,R3
+          2 000020  83A0 0000 0027  02                   JMP      s:12102,R2
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:21   
+          2 000023       0042                            DC       s:12113,PREL
+          2 000024       0000                            DC       s:12102,PREL
+          2 000025       003B                            DC       s:12111,PREL
+          2 000026       000A                            DC       s:12105,PREL
+
+      130    12101    2            CASE(%GD#MODE_USER_DELTA);
+
+      131    12102    2              GD$READ_FPT=GD_READ_DEBUG_IFPT;
+
+  12102   2 000027  AB80 0000 0000  01                   LAB,B2   GD_READ_DEBUG_IFPT
+          2 00002A  2C00                                 LDV,R2   0
+          2 00002B  6C24                                 LDV,R6   36
+          2 00002C  BB87                                 LAB,B3   ,AUTO
+          2 00002D  3C18                                 LDV,R3   24
+          2 00002E  0008                                 MMM
+
+      132    12103    2              GOTO PMME_IO;
+
+  12103   2 00002F  0F81 0010                            B        s:12106,PREL
+
+      133    12104    2            CASE(%GD#MODE_ANLZ);
+
+      134    12105    2              GD$READ_FPT=GD_READ_DEBUG_IFPT;
+
+  12105   2 000031  AB80 0000 0000  01                   LAB,B2   GD_READ_DEBUG_IFPT
+          2 000034  2C00                                 LDV,R2   0
+          2 000035  6C24                                 LDV,R6   36
+          2 000036  BB87                                 LAB,B3   ,AUTO
+          2 000037  3C18                                 LDV,R3   24
+          2 000038  0008                                 MMM
+
+      135    12106    2              GD$READ_FPT.V.DCB#=GD_DATA.GD.HANLZ_DCB;
+
+  12106   2 000039  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 00003C  E846 0179                            LDR,R6   377,B6
+          2 00003E  E7C7 001B                            STH,R6   GD$READ_FPT+15,AUTO
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:22   
+  12106   2                              PMME_IO         null
+      136    12107    2   PMME_IO:   ;
+      137    12108    2              GD$READ_FPT.BUF_=VECTOR(GD_DATA.GDA.RCV.BFR);
+
+  12108   2 000040  EC80 0000 0000  xsym PMME_IO         LDB,B6   GD$DELTA_DATA$
+          2 000043  DBC6 000D                            LAB,B5   13,B6
+          2 000045  DFC7 002D                            STB,B5   WDOG+3,AUTO
+          2 000047  E870 01A1                            LDR,R6   417,IMO
+          2 000049  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 00004B  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 00004D  2C00                                 LDV,R2   0
+          2 00004E  6C06                                 LDV,R6   6
+          2 00004F  BB87                                 LAB,B3   ,AUTO
+          2 000050  3C24                                 LDV,R3   36
+          2 000051  0008                                 MMM
+
+      138    12109    2              GD$READ_FPT.V_=VECTOR(GD$READ_FPT.V);
+
+  12109   2 000052  EBC7 001B                            LAB,B6   GD$READ_FPT+15,AUTO
+          2 000054  EFC7 002D                            STB,B6   WDOG+3,AUTO
+          2 000056  6C05                                 LDV,R6   5
+          2 000057  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 000059  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 00005B  2C00                                 LDV,R2   0
+          2 00005C  6C06                                 LDV,R6   6
+          2 00005D  BB87                                 LAB,B3   ,AUTO
+          2 00005E  3C18                                 LDV,R3   24
+          2 00005F  0008                                 MMM
+          2 000060  0F81 0008                            B        s:12113,PREL
+
+      139    12110    2            CASE(%GD#MODE_XDELTA);
+
+      140    12111    2              WDOG=G$LOW_MEM.WDT_CURR;
+
+  12111   2 000062  DC80 0000 0000  xsym                 LDB,B5   G$LOW_MEM$
+          2 000065  E845 0017                            LDR,R6   23,B5
+          2 000067  EF47 002A                            STR,R6   WDOG,AUTO
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:23   
+
+      141    12112    2            END;                           /* END CASE                           */
+
+      142    12113    1           BUFSIZE=GD_DATA.GDA.BFRSIZ;
+
+  12113   2 000069  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 00006C  E846 0008                            LDR,R6   8,B6
+          2 00006E  EF47 0009                            STR,R6   BUFSIZE,AUTO
+
+      143    12114    1           MSG$=ADDR(GD_DATA.GDA.RCV.BFR);
+
+  12114   2 000070  DBC6 000D                            LAB,B5   13,B6
+          2 000072  DFC7 0028                            STB,B5   MSG$,AUTO
+
+      144    12115        /* */
+      145    12116    2   PROCESS: DO WHILE (%G_YES#);
+
+  12116   2                              PROCESS         null
+      146    12117        /*
+      147    12118          We loop here until SATYR tells us the buffer is OK.  Note that if
+      148    12119          we entered at DECODE_MSG, the flag will have been set immediatly
+      149    12120          before the call.
+      150    12121                                                                                      */
+      151    12122    3              DO CASE(GD_DATA.GD.MODE);
+
+  12122   2 000074  EC80 0000 0000  xsym PROCESS         LDB,B6   GD$DELTA_DATA$
+          2 000077  B846 0130                            LDR,R3   304,B6
+          2 000079  3D04                                 CMV,R3   4
+          2 00007A  0281 0079                            BGE      s:12162,PREL
+          2 00007C  A830 0000 0082  02                   LDR,R2   PROCESS+14,R3
+          2 00007F  83A0 0000 0086  02                   JMP      s:12124,R2
+          2 000082       006E                            DC       s:12162,PREL
+          2 000083       0000                            DC       s:12124,PREL
+          2 000084       0033                            DC       s:12140,PREL
+          2 000085       0000                            DC       s:12124,PREL
+
+      152    12123    3               CASE(%GD#MODE_USER_DELTA,%GD#MODE_ANLZ);
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:24   
+
+      153    12124    3                 GD_DATA.GDA.CONNECTFLG = '1'B;
+
+  12124   2 000086  8946 0009                            LBT,'8000'X       9,B6
+  12124   2 000088       8000
+
+      154    12125    4                 CALL M$READ (GD$READ_FPT) WHENALTRETURN DO;
+
+  12125   2 000089  BBC7 000C                            LAB,B3   GD$READ_FPT,AUTO
+          2 00008B  B870 1542                            LDR,R3   5442,IMO
+          2 00008D  0001                                 MCL
+          2 00008E       0003                            DC       s:12126,PREL
+          2 00008F  0F81 0027                            B        s:12135+2,PREL
+
+      155    12126    4                    IF GD_DATA.GD.MODE = %GD#MODE_ANLZ THEN
+
+  12126   2 000091  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 000094  E846 0130                            LDR,R6   304,B6
+          2 000096  6D03                                 CMV,R6   3
+          2 000097  0981 0011                            BNE      s:12133,PREL
+
+      156    12127    4                       IF G$TCB$->G$TCB.ALT$->G$EXCFR.TRLR.ERR.ERR# =
+
+  12127   2 000099  DC80 0000 0000  xsym                 LDB,B5   G$TCB$
+          2 00009C  CC85                                 LDB,B4   ,B5
+          2 00009D  D844 002C                            LDR,R5   44,B4
+          2 00009F  5043                                 SOR,R5   3
+          2 0000A0  5D0C                                 CMV,R5   12
+          2 0000A1  0981 0015                            BNE      s:12135+2,PREL
+
+      157    12128    5                         %E$LDSC THEN DO;
+
+      158    12129    5                          GD_DATA.GDA.CONNECTFLG = '0'B;
+
+  12129   2 0000A3  8846 0009                            LBF,'8000'X       9,B6
+  12129   2 0000A5       8000
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:25   
+      159    12130    5                          RETURN;
+
+  12130   2 0000A6  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      160    12131    5                          END;
+      161    12132    4                       ELSE; /*N* CALL M$SCREECH(SNAP) */
+      162    12133    5                    ELSE IF G$JIT$->G$JIT.FD_ALTERR.ERR# = %E$LDSC THEN DO;
+
+  12133   2 0000A9  DC80 0000 0000  xsym                 LDB,B5   G$JIT$
+          2 0000AC  D845 00B5                            LDR,R5   181,B5
+          2 0000AE  5043                                 SOR,R5   3
+          2 0000AF  5D0C                                 CMV,R5   12
+          2 0000B0  0981 0006                            BNE      s:12135+2,PREL
+
+      163    12134    5                          GD_DATA.GDA.CONNECTFLG = '0'B;
+
+  12134   2 0000B2  8846 0009                            LBF,'8000'X       9,B6
+  12134   2 0000B4       8000
+
+      164    12135    5                          GOTO QUITFD;
+
+  12135   2 0000B5  0F81 016A                            B        s:12233,PREL
+          2 0000B7  0F81 003C                            B        s:12162,PREL
+
+      165    12136    5                          END;
+      166    12137    4                       ELSE; /*N* CALL M$SCREECH(SUA) */
+      167    12138    4                    END;
+      168    12139    3               CASE(%GD#MODE_XDELTA);
+
+      169    12140    4                 DO WHILE (NOT(GD_DATA.GD.BFRFULL));
+
+  12140   2 0000B9  0F81 0036                            B        s:12156,PREL
+
+      170    12141    5                    IF GD_DATA.GD.NEWCTL THEN DO;
+
+  12141   2 0000BB  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 0000BE  89C6 014D                            CMZ      333,B6
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:26   
+          2 0000C0  0881 0007                            BAGE     s:12146,PREL
+
+      171    12142    5                       GD_DATA.GD.NEWCTL = '0'B;
+
+  12142   2 0000C2  8846 014D                            LBF,'8000'X       333,B6
+  12142   2 0000C4       8000
+
+      172    12143    5                       ALTRETURN;
+
+  12143   2 0000C5  C380 0000 0000  xent                 LNJ,B4   X6A_AALT
+
+      173    12144    5                       END;
+      174    12145        /*  Prevent the watchdog timer from running out while host user twiddles      */
+      175    12146    4                    IF G$LOW_MEM.WDT_CURR~=WDOG THEN
+
+  12146   2 0000C8  DC80 0000 0000  xsym                 LDB,B5   G$LOW_MEM$
+          2 0000CB  E845 0017                            LDR,R6   23,B5
+          2 0000CD  E947 002A                            CMR,R6   WDOG,AUTO
+          2 0000CF  0901 0020                            BE       s:12156,PREL
+
+      176    12147    5                    DO;
+
+      177    12148    5                       G$MHJIT.TICKS=G$MHJIT.TICKS+WDOG-G$LOW_MEM.WDT_CURR;
+
+  12148   2 0000D1  CC80 0000 0000  xsym                 LDB,B4   G$MHJIT$
+          2 0000D4  D844 0358                            LDR,R5   856,B4
+          2 0000D6  DA47 002A                            ADD,R5   WDOG,AUTO
+          2 0000D8  D256                                 SUB,R5   R6
+          2 0000D9  DF44 0358                            STR,R5   856,B4
+
+      178    12149    5                       IF G$MHJIT.TICKS>1200 THEN
+
+  12149   2 0000DB  D970 04B0                            CMR,R5   1200,IMO
+          2 0000DD  0381 000E                            BLE      s:12154,PREL
+
+      179    12150    6                       DO;
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:27   
+      180    12151    6                          G$MHJIT.UTS=G$MHJIT.UTS+G$MHJIT.TICKS/16;
+
+  12151   2 0000DF  5044                                 SOR,R5   4
+          2 0000E0  F855                                 LDR,R7   R5
+          2 0000E1  6C00                                 LDV,R6   0
+          2 0000E2  8444 0356                            AID      854,B4
+          2 0000E4  8D44 0356                            SDI      854,B4
+
+      181    12152    6                          G$MHJIT.TICKS=MOD(G$MHJIT.TICKS,16);
+
+  12152   2 0000E6  D844 0358                            LDR,R5   856,B4
+          2 0000E8  D570 000F                            AND,R5   15,IMO
+          2 0000EA  DF44 0358                            STR,R5   856,B4
+
+      182    12153    6                          END;
+
+      183    12154    5                       G$LOW_MEM.WDT_CURR=WDOG;
+
+  12154   2 0000EC  E847 002A                            LDR,R6   WDOG,AUTO
+          2 0000EE  EF45 0017                            STR,R6   23,B5
+
+      184    12155    5                       END;
+
+      185    12156    4                    END;
+
+  12156   2 0000F0  82C6 014C                            LB,'2000'X        332,B6
+  12156   2 0000F2       2000
+          2 0000F3  05C8                                 BBF      s:12141,SPREL
+
+      186    12157    3               END;                        /* END CASE                           */
+
+      187    12158        %EJECT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:28   
+      188    12159        /*
+      189    12160          Call the correct routine depending on message function
+      190    12161                                                                                      */
+      191    12162    2              REMEMBER CMD_ERROR IN GD_DATA.GD.ERROR_LOC;
+
+  12162   2 0000F4  EBC0 03BC                            LAB,B6   s:12333,PREL
+          2 0000F6  DC80 0000 0000  xsym                 LDB,B5   GD$DELTA_DATA$
+          2 0000F9  FFC5 0175                            STB,B7   373,B5
+          2 0000FB  EFC5 0177                            STB,B6   375,B5
+
+      192    12163    2              GD_DATA.GD.ANSWERED = '0'B;
+
+  12163   2 0000FD  8845 014C                            LBF,'0002'X       332,B5
+  12163   2 0000FF       0002
+
+      193    12164    2              GD_DATA.GD.INTERPRETIVE = MSG$->GD$MSG.SUBFB.INTERPRETIVE;
+
+  12164   2 000100  CCC7 0028                            LDB,B4   MSG$,AUTO
+          2 000102  E804                                 LDR,R6   ,B4
+          2 000103  600C                                 SOL,R6   12
+          2 000104  EAC5 014C                            SRM,R6,'4000'X    332,B5
+          2 000106       4000
+
+      194    12165    3              DO CASE (MSG$->GD$MSG.FNC);
+
+  12165   2 000107  B284                                 LLH,R3   ,B4
+          2 000108  3D21                                 CMV,R3   33
+          2 000109  0281 03A5                            BGE      s:12337,PREL
+          2 00010B  A830 0000 0111  02                   LDR,R2   s:12165+10,R3
+          2 00010E  83A0 0000 0132  02                   JMP      s:12169,R2
+          2 000111       037D                            DC       s:12337,PREL
+          2 000112       0000                            DC       s:12169,PREL
+          2 000113       0030                            DC       s:12180,PREL
+          2 000114       0056                            DC       s:12190,PREL
+          2 000115       0076                            DC       s:12198,PREL
+          2 000116       0086                            DC       s:12202,PREL
+          2 000117       008E                            DC       s:12206,PREL
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:29   
+          2 000118       02FD                            DC       s:12317,PREL
+          2 000119       00B1                            DC       s:12214,PREL
+          2 00011A       0314                            DC       s:12320,PREL
+          2 00011B       032E                            DC       s:12324,PREL
+          2 00011C       0163                            DC       s:12262,PREL
+          2 00011D       0163                            DC       s:12262,PREL
+          2 00011E       00C1                            DC       s:12218,PREL
+          2 00011F       0066                            DC       s:12194,PREL
+          2 000120       0020                            DC       s:12176,PREL
+          2 000121       0043                            DC       s:12185,PREL
+          2 000122       0173                            DC       s:12264,PREL
+          2 000123       010F                            DC       s:12243,PREL
+          2 000124       0375                            DC       s:12335,PREL
+          2 000125       0183                            DC       s:12266,PREL
+          2 000126       00C9                            DC       s:12222,PREL
+          2 000127       00D9                            DC       s:12226,PREL
+          2 000128       0142                            DC       s:12253,PREL
+          2 000129       0291                            DC       s:12301,PREL
+          2 00012A       02A1                            DC       s:12303,PREL
+          2 00012B       0010                            DC       s:12173,PREL
+          2 00012C       034E                            DC       s:12329,PREL
+          2 00012D       035E                            DC       s:12331,PREL
+          2 00012E       01EF                            DC       s:12282,PREL
+          2 00012F       025C                            DC       s:12295,PREL
+          2 000130       0227                            DC       s:12289,PREL
+          2 000131       01DF                            DC       s:12280,PREL
+
+      195    12166
+      196    12167        /* Display memory                                                             */
+      197    12168    3               CASE(%GD#RQSDISPMEM);
+
+      198    12169    3                 CALL GDM$DISPLAY(BUFSIZE,MSG$->MSGBUF);
+
+  12169   2 000132  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000134  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 000136  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 000138  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:30   
+          2 00013A  CBF0 0200                            LAB,B4   512,IMO
+          2 00013C  E380 0000 0000  xent                 LNJ,B6   GDM$DISPLAY
+          2 00013F       0001                            DC       s:12169+14,PREL
+          2 000140  0F81 036E                            B        s:12337,PREL
+
+      199    12170
+      200    12171        /* Send back a TSA                                                            */
+      201    12172    3               CASE(%GD#RQSTSA);
+
+      202    12173    3                 CALL GDM$TSA(BUFSIZE,MSG$->MSGBUF);
+
+  12173   2 000142  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000144  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 000146  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 000148  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 00014A  CBF0 0200                            LAB,B4   512,IMO
+          2 00014C  E380 0000 0000  xent                 LNJ,B6   GDM$TSA
+          2 00014F       0001                            DC       s:12173+14,PREL
+          2 000150  0F81 035E                            B        s:12337,PREL
+
+      203    12174        /* Display memory, DELTA-style.                                               */
+      204    12175    3               CASE (%GD#RQSDISPMEM_D);
+
+      205    12176    3                 CALL GDM$DISPLAY_D (BUFSIZE,MSG$->MSGBUF);
+
+  12176   2 000152  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000154  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 000156  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 000158  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 00015A  CBF0 0200                            LAB,B4   512,IMO
+          2 00015C  E380 0000 0000  xent                 LNJ,B6   GDM$DISPLAY_D
+          2 00015F       0001                            DC       s:12176+14,PREL
+          2 000160  0F81 034E                            B        s:12337,PREL
+
+      206    12177
+      207    12178        /* Modify memory                                                              */
+      208    12179    3               CASE(%GD#RQSMODMEM);
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:31   
+
+      209    12180    3                 BUFSIZE=%GD#RSPMODMEMSIZE;
+
+  12180   2 000162  6C40                                 LDV,R6   64
+          2 000163  EF47 0009                            STR,R6   BUFSIZE,AUTO
+
+      210    12181    3                 CALL GDM$MODIFY(BUFSIZE,MSG$->MSGBUF);
+
+  12181   2 000165  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000167  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 000169  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 00016B  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 00016D  CBF0 0200                            LAB,B4   512,IMO
+          2 00016F  E380 0000 0000  xent                 LNJ,B6   GDM$MODIFY
+          2 000172       0001                            DC       s:12181+14,PREL
+          2 000173  0F81 033B                            B        s:12337,PREL
+
+      211    12182
+      212    12183        /* Modify memory, DELTA-style.                                                */
+      213    12184    3               CASE (%GD#RQSMODMEM_D);
+
+      214    12185    3                 BUFSIZE=%GD#RSPMODMEMSIZE;
+
+  12185   2 000175  6C40                                 LDV,R6   64
+          2 000176  EF47 0009                            STR,R6   BUFSIZE,AUTO
+
+      215    12186    3                 CALL GDM$MODIFY_D (BUFSIZE,MSG$->MSGBUF);
+
+  12186   2 000178  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 00017A  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 00017C  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 00017E  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000180  CBF0 0200                            LAB,B4   512,IMO
+          2 000182  E380 0000 0000  xent                 LNJ,B6   GDM$MODIFY_D
+          2 000185       0001                            DC       s:12186+14,PREL
+          2 000186  0F81 0328                            B        s:12337,PREL
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:32   
+      216    12187
+      217    12188        /* Request to set a breakpoint                                                */
+      218    12189    3               CASE (%GD#RQSBRKPNT);
+
+      219    12190    3                 CALL GDB$BLD_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+
+  12190   2 000188  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 00018A  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 00018C  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 00018E  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000190  CBF0 0200                            LAB,B4   512,IMO
+          2 000192  E380 0000 0000  xent                 LNJ,B6   GDB$BLD_BRKPNT
+          2 000195       0001                            DC       s:12190+14,PREL
+          2 000196  0F81 0318                            B        s:12337,PREL
+
+      220    12191
+      221    12192        /* Request to set a breakpoint, DELTA-style.                                  */
+      222    12193    3               CASE (%GD#RQSBRKPNT_D);
+
+      223    12194    3                 CALL GDB$BLD_BRKPNT (BUFSIZE,MSG$->MSGBUF);
+
+  12194   2 000198  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 00019A  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 00019C  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 00019E  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0001A0  CBF0 0200                            LAB,B4   512,IMO
+          2 0001A2  E380 0000 0000  xent                 LNJ,B6   GDB$BLD_BRKPNT
+          2 0001A5       0001                            DC       s:12194+14,PREL
+          2 0001A6  0F81 0308                            B        s:12337,PREL
+
+      224    12195
+      225    12196        /* User has typed GO                                                          */
+      226    12197    3               CASE(%GD#RQSGO);
+
+      227    12198    3                 CALL GDB$SET_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+
+  12198   2 0001A8  CFC7 002E                            STB,B4   WDOG+4,AUTO
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:33   
+          2 0001AA  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 0001AC  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 0001AE  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0001B0  CBF0 0200                            LAB,B4   512,IMO
+          2 0001B2  E380 0000 0000  xent                 LNJ,B6   GDB$SET_BRKPNT
+          2 0001B5       0001                            DC       s:12198+14,PREL
+          2 0001B6  0F81 02F8                            B        s:12337,PREL
+
+      228    12199
+      229    12200        /* Pull all breakpoints                                                       */
+      230    12201    3               CASE(%GD#RQSPULLBRKPNTS);
+
+      231    12202    3                 CALL GDB$RESET_BRKPNT;
+
+  12202   2 0001B8  CBF0 0000                            LAB,B4   0,IMO
+          2 0001BA  E380 0000 0000  xent                 LNJ,B6   GDB$RESET_BRKPNT
+          2 0001BD       0001                            DC       s:12202+6,PREL
+          2 0001BE  0F81 02F0                            B        s:12337,PREL
+
+      232    12203
+      233    12204        /* Kill all breakpoints                                                       */
+      234    12205    3               CASE(%GD#RQSKILLATALL);
+
+      235    12206    3                 CALL GDB$KILL_ALLBRKPNTS;
+
+  12206   2 0001C0  CBF0 0000                            LAB,B4   0,IMO
+          2 0001C2  E380 0000 0000  xent                 LNJ,B6   GDB$KILL_ALLBRKPNTS
+          2 0001C5       0001                            DC       s:12208,PREL
+
+      236    12207        /* If we're still talking to the host, then ACK the request */
+      237    12208    4                 IF GD_DATA.GDA.CONNECTFLG THEN DO;
+
+  12208   2 0001C6  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 0001C9  89C6 0009                            CMZ      9,B6
+          2 0001CB  0881 02E3                            BAGE     s:12337,PREL
+
+      238    12209    4                    CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:34   
+
+  12209   2 0001CD  DBF0 0023                            LAB,B5   35,IMO
+          2 0001CF  DFC7 0030                            STB,B5   WDOG+6,AUTO
+          2 0001D1  CCC7 0028                            LDB,B4   MSG$,AUTO
+          2 0001D3  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 0001D5  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 0001D7  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 0001D9  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0001DB  CBF0 0300                            LAB,B4   768,IMO
+          2 0001DD  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 0001E0       0001                            DC       s:12210,PREL
+
+      239    12210    4                    END;
+
+  12210   2 0001E1  0F81 02CD                            B        s:12337,PREL
+
+      240    12211
+      241    12212        /* Kill a single breakpoint                                                   */
+      242    12213    3               CASE(%GD#RQSKILLATN);
+
+      243    12214    3                 CALL GDB$KILL_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+
+  12214   2 0001E3  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 0001E5  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 0001E7  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 0001E9  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0001EB  CBF0 0200                            LAB,B4   512,IMO
+          2 0001ED  E380 0000 0000  xent                 LNJ,B6   GDB$KILL_BRKPNT
+          2 0001F0       0001                            DC       s:12214+14,PREL
+          2 0001F1  0F81 02BD                            B        s:12337,PREL
+
+      244    12215
+      245    12216        /* Get control of the FEP                                                     */
+      246    12217    3               CASE(%GD#RQSCONTROL);
+
+      247    12218    3                 CALL GDB$GET_CONTROL;
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:35   
+  12218   2 0001F3  CBF0 0000                            LAB,B4   0,IMO
+          2 0001F5  E380 0000 0000  xent                 LNJ,B6   GDB$GET_CONTROL
+          2 0001F8       0001                            DC       s:12218+6,PREL
+          2 0001F9  0F81 02B5                            B        s:12337,PREL
+
+      248    12219
+      249    12220        /* USE command                                                                */
+      250    12221    3               CASE(%GD#RQSUSE);
+
+      251    12222    3                 CALL GDU$DECODE_USE(BUFSIZE,MSG$->MSGBUF);
+
+  12222   2 0001FB  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 0001FD  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 0001FF  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 000201  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000203  CBF0 0200                            LAB,B4   512,IMO
+          2 000205  E380 0000 0000  xent                 LNJ,B6   GDU$DECODE_USE
+          2 000208       0001                            DC       s:12222+14,PREL
+          2 000209  0F81 02A5                            B        s:12337,PREL
+
+      252    12223
+      253    12224        /* QUIT command                                                               */
+      254    12225    3               CASE(%GD#RQSQUIT);
+
+      255    12226    4                 IF GD_DATA.GD.MODE = %GD#MODE_XDELTA THEN DO;
+
+  12226   2 00020B  E845 0130                            LDR,R6   304,B5
+          2 00020D  6D02                                 CMV,R6   2
+          2 00020E  0981 0011                            BNE      s:12233,PREL
+
+      256    12227    4                    GD_DATA.GD.STOPT = %G_NO#;
+
+  12227   2 000210  8845 014C                            LBF,'0004'X       332,B5
+  12227   2 000212       0004
+
+      257    12228    4                    CALL GDB$KILL_ALLBRKPNTS;
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:36   
+  12228   2 000213  CBF0 0000                            LAB,B4   0,IMO
+          2 000215  E380 0000 0000  xent                 LNJ,B6   GDB$KILL_ALLBRKPNTS
+          2 000218       0001                            DC       s:12229,PREL
+
+      258    12229    4                    GD_DATA.GD.BRKNUM = 0;
+
+  12229   2 000219  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 00021C  8746 0158                            CL       344,B6
+
+      259    12230    4                    GOTO ALLDONE;
+
+  12230   2 00021E  0F81 02C6                            B        s:12347,PREL
+
+      260    12231    4                    END;
+      261    12232    3   QUITFD:
+      262    12233    3                 GD$DRTN_FPT = GD_DRTN_IFPT;
+
+  12233   2 000220  AB80 0000 0000  01   QUITFD          LAB,B2   GD_READ_DEBUG_IFPT
+          2 000223  2C24                                 LDV,R2   36
+          2 000224  6C0C                                 LDV,R6   12
+          2 000225  BB87                                 LAB,B3   ,AUTO
+          2 000226  3C3C                                 LDV,R3   60
+          2 000227  0008                                 MMM
+
+      263    12234    3                 GD$DRTN_FPT.V_ = VECTOR(GD$DRTN_FPT.V);
+
+  12234   2 000228  EBC7 0022                            LAB,B6   GD$DRTN_FPT+4,AUTO
+          2 00022A  EFC7 002D                            STB,B6   WDOG+3,AUTO
+          2 00022C  6C03                                 LDV,R6   3
+          2 00022D  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 00022F  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 000231  2C00                                 LDV,R2   0
+          2 000232  6C06                                 LDV,R6   6
+          2 000233  BB87                                 LAB,B3   ,AUTO
+          2 000234  3C3C                                 LDV,R3   60
+          2 000235  0008                                 MMM
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:37   
+      264    12235    3                 GD$DRTN_FPT.V.QUIT = %YES#;
+
+  12235   2 000236  8947 0022                            LBT,'4000'X       GD$DRTN_FPT+4,AUTO
+  12235   2 000238       4000
+
+      265    12236    3                 CALL M$DRTN(GD$DRTN_FPT);
+
+  12236   2 000239  BBC7 001E                            LAB,B3   GD$DRTN_FPT,AUTO
+          2 00023B  B870 04D2                            LDR,R3   1234,IMO
+          2 00023D  0001                                 MCL
+          2 00023E       0000                            DC       s:12236+5,PREL
+          2 00023F  0F81 026F                            B        s:12337,PREL
+
+      266    12237
+      267    12238    3               CASE(%GD#RQSCRASH);
+
+      268    12239        /*S* SCREECH_CODE: GDI-S$USRREQSCR
+      269    12240             TYPE: SCREECH
+      270    12241             MESSAGE: An LCP-6 XDELTA user requested a SCREECH.
+      271    12242        */
+      272    12243    3                 IF GD_DATA.GD.MODE ~= %GD#MODE_XDELTA THEN
+
+  12243   2 000241  E845 0130                            LDR,R6   304,B5
+          2 000243  6D02                                 CMV,R6   2
+          2 000244  0901 0017                            BE       s:12246,PREL
+
+      273    12244    3                    CALL GDI$SEND_ERROR_RESPONSE(SIZE,BUFFER,%GD#RSPNAK);
+
+  12244   2 000246  BBF0 0034                            LAB,B3   52,IMO
+          2 000248  BFC7 0030                            STB,B3   WDOG+6,AUTO
+          2 00024A  ACC7 0006                            LDB,B2   @BUFFER,AUTO
+          2 00024C  AFC7 002E                            STB,B2   WDOG+4,AUTO
+          2 00024E  9CC7 0004                            LDB,B1   @SIZE,AUTO
+          2 000250  9FC7 002C                            STB,B1   WDOG+2,AUTO
+          2 000252  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000254  CBF0 0300                            LAB,B4   768,IMO
+          2 000256  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:38   
+          2 000259       0001                            DC       s:12244+20,PREL
+          2 00025A  0F81 0254                            B        s:12337,PREL
+
+      274    12245    4                 ELSE DO;
+
+      275    12246    4                    GD_DATA.GD.STOPT = %G_NO#;
+
+  12246   2 00025C  8845 014C                            LBF,'0004'X       332,B5
+  12246   2 00025E       0004
+
+      276    12247    4                    GD_DATA.MISC.SCREECHCODE = GDI_SCREECH;
+
+  12247   2 00025F  AB80 0000 0000  01                   LAB,B2   GD_READ_DEBUG_IFPT
+          2 000262  2C38                                 LDV,R2   56
+          2 000263  6C06                                 LDV,R6   6
+          2 000264  BBC5 01AB                            LAB,B3   427,B5
+          2 000266  3C00                                 LDV,R3   0
+          2 000267  0008                                 MMM
+
+      277    12248    4                    GD_DATA.DELTAINFO.TSA$->G$TSA.A$ = ADDR(GD_DATA.MISC.SCREECHCODE);
+
+  12248   2 000268  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 00026B  DCC6 0006                            LDB,B5   6,B6
+          2 00026D  CBC6 01AB                            LAB,B4   427,B6
+          2 00026F  CFC5 0006                            STB,B4   6,B5
+
+      278    12249    4                    RETURN;
+
+  12249   2 000271  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      279    12250    4                    END;
+      280    12251
+      281    12252        /* KILL-FD command                                                            */
+      282    12253    3               CASE(%GD#RQSKILLFD);
+
+      283    12254    3   KILLFD:
+      284    12255    3                 GD$DRTN_FPT = GD_DRTN_IFPT;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:39   
+
+  12255   2 000274  AB80 0000 0000  01   KILLFD          LAB,B2   GD_READ_DEBUG_IFPT
+          2 000277  2C24                                 LDV,R2   36
+          2 000278  6C0C                                 LDV,R6   12
+          2 000279  BB87                                 LAB,B3   ,AUTO
+          2 00027A  3C3C                                 LDV,R3   60
+          2 00027B  0008                                 MMM
+
+      285    12256    3                 GD$DRTN_FPT.V_ = VECTOR(GD$DRTN_FPT.V);
+
+  12256   2 00027C  EBC7 0022                            LAB,B6   GD$DRTN_FPT+4,AUTO
+          2 00027E  EFC7 002D                            STB,B6   WDOG+3,AUTO
+          2 000280  6C03                                 LDV,R6   3
+          2 000281  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 000283  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 000285  2C00                                 LDV,R2   0
+          2 000286  6C06                                 LDV,R6   6
+          2 000287  BB87                                 LAB,B3   ,AUTO
+          2 000288  3C3C                                 LDV,R3   60
+          2 000289  0008                                 MMM
+
+      286    12257    3                 GD$DRTN_FPT.V.KILLFD = %YES#;
+
+  12257   2 00028A  8947 0022                            LBT,'2000'X       GD$DRTN_FPT+4,AUTO
+  12257   2 00028C       2000
+
+      287    12258    3                 CALL M$DRTN(GD$DRTN_FPT);
+
+  12258   2 00028D  BBC7 001E                            LAB,B3   GD$DRTN_FPT,AUTO
+          2 00028F  B870 04D2                            LDR,R3   1234,IMO
+          2 000291  0001                                 MCL
+          2 000292       0000                            DC       s:12258+5,PREL
+          2 000293  0F81 021B                            B        s:12337,PREL
+
+      288    12259
+      289    12260        /* LCT commands                                                               */
+      290    12261    3               CASE(%GD#RQSMODLCT,%GD#RQSDISPLCT);
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:40   
+
+      291    12262    3                 CALL GDM$LCTHAND(BUFSIZE,MSG$->MSGBUF);
+
+  12262   2 000295  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000297  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 000299  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 00029B  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 00029D  CBF0 0200                            LAB,B4   512,IMO
+          2 00029F  E380 0000 0000  xent                 LNJ,B6   GDM$LCTHAND
+          2 0002A2       0001                            DC       s:12262+14,PREL
+          2 0002A3  0F81 020B                            B        s:12337,PREL
+
+      292    12263    3               CASE(%GD#RQSUNFID);
+
+      293    12264    3                 CALL GDM$UNFID(BUFSIZE,MSG$->MSGBUF);
+
+  12264   2 0002A5  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 0002A7  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 0002A9  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 0002AB  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0002AD  CBF0 0200                            LAB,B4   512,IMO
+          2 0002AF  E380 0000 0000  xent                 LNJ,B6   GDM$UNFID
+          2 0002B2       0001                            DC       s:12264+14,PREL
+          2 0002B3  0F81 01FB                            B        s:12337,PREL
+
+      294    12265    3               CASE(%GD#RQSXCON);
+
+      295    12266    3                 GD$DRTN_FPT = GD_DRTN_IFPT;
+
+  12266   2 0002B5  AB80 0000 0000  01                   LAB,B2   GD_READ_DEBUG_IFPT
+          2 0002B8  2C24                                 LDV,R2   36
+          2 0002B9  6C0C                                 LDV,R6   12
+          2 0002BA  BB87                                 LAB,B3   ,AUTO
+          2 0002BB  3C3C                                 LDV,R3   60
+          2 0002BC  0008                                 MMM
+
+      296    12267    3                 GD$DRTN_FPT.V_=VECTOR(GD$DRTN_FPT.V);
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:41   
+
+  12267   2 0002BD  EBC7 0022                            LAB,B6   GD$DRTN_FPT+4,AUTO
+          2 0002BF  EFC7 002D                            STB,B6   WDOG+3,AUTO
+          2 0002C1  6C03                                 LDV,R6   3
+          2 0002C2  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 0002C4  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 0002C6  2C00                                 LDV,R2   0
+          2 0002C7  6C06                                 LDV,R6   6
+          2 0002C8  BB87                                 LAB,B3   ,AUTO
+          2 0002C9  3C3C                                 LDV,R3   60
+          2 0002CA  0008                                 MMM
+
+      297    12268    3                 GD$DRTN_FPT.V.SETECC=%G_YES#;
+
+  12268   2 0002CB  8947 0022                            LBT,'8000'X       GD$DRTN_FPT+4,AUTO
+  12268   2 0002CD       8000
+
+      298    12269    3                 GD$DRTN_FPT.V.ECC=%G_XCON#;
+
+  12269   2 0002CE  6C02                                 LDV,R6   2
+          2 0002CF  E7C7 0023                            STH,R6   GD$DRTN_FPT+5,AUTO
+
+      299    12270    3                 GD_DATA.GD.STOPT=%G_NO#;
+
+  12270   2 0002D1  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 0002D4  8846 014C                            LBF,'0004'X       332,B6
+          2 0002D6       0004
+
+      300    12271    3                 CALL GDB$SET_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+
+  12271   2 0002D7  DCC7 0028                            LDB,B5   MSG$,AUTO
+          2 0002D9  DFC7 002E                            STB,B5   WDOG+4,AUTO
+          2 0002DB  CBC7 0009                            LAB,B4   BUFSIZE,AUTO
+          2 0002DD  CFC7 002C                            STB,B4   WDOG+2,AUTO
+          2 0002DF  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0002E1  CBF0 0200                            LAB,B4   512,IMO
+          2 0002E3  E380 0000 0000  xent                 LNJ,B6   GDB$SET_BRKPNT
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:42   
+          2 0002E6       0001                            DC       s:12272,PREL
+
+      301    12272    3                 CALL M$DRTN(GD$DRTN_FPT)
+
+  12272   2 0002E7  BBC7 001E                            LAB,B3   GD$DRTN_FPT,AUTO
+          2 0002E9  B870 04D2                            LDR,R3   1234,IMO
+          2 0002EB  0001                                 MCL
+          2 0002EC       0003                            DC       s:12274,PREL
+          2 0002ED  0F81 0021                            B        s:12278,PREL
+
+      302    12273    4                 WHENALTRETURN DO;
+
+      303    12274    4                    CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,
+
+  12274   2 0002EF  EBF0 0036                            LAB,B6   54,IMO
+          2 0002F1  EFC7 0030                            STB,B6   WDOG+6,AUTO
+          2 0002F3  DCC7 0028                            LDB,B5   MSG$,AUTO
+          2 0002F5  DFC7 002E                            STB,B5   WDOG+4,AUTO
+          2 0002F7  CBC7 0009                            LAB,B4   BUFSIZE,AUTO
+          2 0002F9  CFC7 002C                            STB,B4   WDOG+2,AUTO
+          2 0002FB  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0002FD  CBF0 0300                            LAB,B4   768,IMO
+          2 0002FF  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 000302       0001                            DC       s:12276,PREL
+
+      304    12275    4                      %GD#RSPNOXCONCONTROL);
+      305    12276    4                    GD_DATA.GD.STOPT=%G_YES#;
+
+  12276   2 000303  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 000306  8946 014C                            LBT,'0004'X       332,B6
+          2 000308       0004
+
+      306    12277    4                    CALL GDB$RESET_BRKPNT;
+
+  12277   2 000309  CBF0 0000                            LAB,B4   0,IMO
+          2 00030B  E380 0000 0000  xent                 LNJ,B6   GDB$RESET_BRKPNT
+          2 00030E       0001                            DC       s:12278,PREL
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:43   
+
+      307    12278    4                    END;
+
+  12278   2 00030F  0F81 019F                            B        s:12337,PREL
+
+      308    12279    3               CASE(%GD#RQSLETMEM_D);
+
+      309    12280    3                 CALL GDM$LETMEM_D(BUFSIZE,MSG$->MSGBUF);
+
+  12280   2 000311  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000313  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 000315  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 000317  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000319  CBF0 0200                            LAB,B4   512,IMO
+          2 00031B  E380 0000 0000  xent                 LNJ,B6   GDM$LETMEM_D
+          2 00031E       0001                            DC       s:12280+14,PREL
+          2 00031F  0F81 018F                            B        s:12337,PREL
+
+      310    12281    3               CASE(%GD#RQSUNSHAREALL);
+
+      311    12282    3                 UNSHARE_FPT = CONST_UNSHARE_FPT;
+
+  12282   2 000321  AB80 0000 0000  01                   LAB,B2   GD_READ_DEBUG_IFPT
+          2 000324  2C30                                 LDV,R2   48
+          2 000325  6C08                                 LDV,R6   8
+          2 000326  BB87                                 LAB,B3   ,AUTO
+          2 000327  3C48                                 LDV,R3   72
+          2 000328  0008                                 MMM
+
+      312    12283    3                 UNSHARE_FPT.V_ = VECTOR(UNSHARE_FPT.V);
+
+  12283   2 000329  EBC7 0027                            LAB,B6   UNSHARE_FPT+3,AUTO
+          2 00032B  EFC7 002D                            STB,B6   WDOG+3,AUTO
+          2 00032D  6C01                                 LDV,R6   1
+          2 00032E  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 000330  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 000332  2C00                                 LDV,R2   0
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:44   
+          2 000333  6C06                                 LDV,R6   6
+          2 000334  BB87                                 LAB,B3   ,AUTO
+          2 000335  3C48                                 LDV,R3   72
+          2 000336  0008                                 MMM
+
+      313    12284    3                 UNSHARE_FPT.V.PROG = '1'B;
+
+  12284   2 000337  8947 0027                            LBT,'8000'X       UNSHARE_FPT+3,AUTO
+  12284   2 000339       8000
+
+      314    12285    3                 UNSHARE_FPT.V.SLIB = '1'B;
+
+  12285   2 00033A  8947 0027                            LBT,'4000'X       UNSHARE_FPT+3,AUTO
+  12285   2 00033C       4000
+
+      315    12286    3                 CALL M$UNSHARE(UNSHARE_FPT) ALTRET(UNSHARE_FAILED);
+
+  12286   2 00033D  BBC7 0024                            LAB,B3   UNSHARE_FPT,AUTO
+          2 00033F  B870 04D3                            LDR,R3   1235,IMO
+          2 000341  0001                                 MCL
+          2 000342       0188                            DC       s:12345,PREL
+
+      316    12287    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+
+  12287   2 000343  EBF0 0023                            LAB,B6   35,IMO
+          2 000345  EFC7 0030                            STB,B6   WDOG+6,AUTO
+          2 000347  DCC7 0028                            LDB,B5   MSG$,AUTO
+          2 000349  DFC7 002E                            STB,B5   WDOG+4,AUTO
+          2 00034B  CBC7 0009                            LAB,B4   BUFSIZE,AUTO
+          2 00034D  CFC7 002C                            STB,B4   WDOG+2,AUTO
+          2 00034F  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000351  CBF0 0300                            LAB,B4   768,IMO
+          2 000353  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 000356       0001                            DC       s:12287+20,PREL
+          2 000357  0F81 0157                            B        s:12337,PREL
+
+      317    12288    3               CASE(%GD#RQSUNSHAREPROG);
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:45   
+
+      318    12289    3                 UNSHARE_FPT = CONST_UNSHARE_FPT;
+
+  12289   2 000359  AB80 0000 0000  01                   LAB,B2   GD_READ_DEBUG_IFPT
+          2 00035C  2C30                                 LDV,R2   48
+          2 00035D  6C08                                 LDV,R6   8
+          2 00035E  BB87                                 LAB,B3   ,AUTO
+          2 00035F  3C48                                 LDV,R3   72
+          2 000360  0008                                 MMM
+
+      319    12290    3                 UNSHARE_FPT.V_ = VECTOR(UNSHARE_FPT.V);
+
+  12290   2 000361  EBC7 0027                            LAB,B6   UNSHARE_FPT+3,AUTO
+          2 000363  EFC7 002D                            STB,B6   WDOG+3,AUTO
+          2 000365  6C01                                 LDV,R6   1
+          2 000366  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 000368  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 00036A  2C00                                 LDV,R2   0
+          2 00036B  6C06                                 LDV,R6   6
+          2 00036C  BB87                                 LAB,B3   ,AUTO
+          2 00036D  3C48                                 LDV,R3   72
+          2 00036E  0008                                 MMM
+
+      320    12291    3                 UNSHARE_FPT.V.PROG = '1'B;
+
+  12291   2 00036F  8947 0027                            LBT,'8000'X       UNSHARE_FPT+3,AUTO
+  12291   2 000371       8000
+
+      321    12292    3                 CALL M$UNSHARE(UNSHARE_FPT) ALTRET(UNSHARE_FAILED);
+
+  12292   2 000372  BBC7 0024                            LAB,B3   UNSHARE_FPT,AUTO
+          2 000374  B870 04D3                            LDR,R3   1235,IMO
+          2 000376  0001                                 MCL
+          2 000377       0153                            DC       s:12345,PREL
+
+      322    12293    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:46   
+  12293   2 000378  EBF0 0023                            LAB,B6   35,IMO
+          2 00037A  EFC7 0030                            STB,B6   WDOG+6,AUTO
+          2 00037C  DCC7 0028                            LDB,B5   MSG$,AUTO
+          2 00037E  DFC7 002E                            STB,B5   WDOG+4,AUTO
+          2 000380  CBC7 0009                            LAB,B4   BUFSIZE,AUTO
+          2 000382  CFC7 002C                            STB,B4   WDOG+2,AUTO
+          2 000384  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000386  CBF0 0300                            LAB,B4   768,IMO
+          2 000388  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 00038B       0001                            DC       s:12293+20,PREL
+          2 00038C  0F81 0122                            B        s:12337,PREL
+
+      323    12294    3               CASE(%GD#RQSUNSHARELIB);
+
+      324    12295    3                 UNSHARE_FPT = CONST_UNSHARE_FPT;
+
+  12295   2 00038E  AB80 0000 0000  01                   LAB,B2   GD_READ_DEBUG_IFPT
+          2 000391  2C30                                 LDV,R2   48
+          2 000392  6C08                                 LDV,R6   8
+          2 000393  BB87                                 LAB,B3   ,AUTO
+          2 000394  3C48                                 LDV,R3   72
+          2 000395  0008                                 MMM
+
+      325    12296    3                 UNSHARE_FPT.V_ = VECTOR(UNSHARE_FPT.V);
+
+  12296   2 000396  EBC7 0027                            LAB,B6   UNSHARE_FPT+3,AUTO
+          2 000398  EFC7 002D                            STB,B6   WDOG+3,AUTO
+          2 00039A  6C01                                 LDV,R6   1
+          2 00039B  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 00039D  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 00039F  2C00                                 LDV,R2   0
+          2 0003A0  6C06                                 LDV,R6   6
+          2 0003A1  BB87                                 LAB,B3   ,AUTO
+          2 0003A2  3C48                                 LDV,R3   72
+          2 0003A3  0008                                 MMM
+
+      326    12297    3                 UNSHARE_FPT.V.SLIB = '1'B;
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:47   
+
+  12297   2 0003A4  8947 0027                            LBT,'4000'X       UNSHARE_FPT+3,AUTO
+  12297   2 0003A6       4000
+
+      327    12298    3                 CALL M$UNSHARE(UNSHARE_FPT) ALTRET(UNSHARE_FAILED);
+
+  12298   2 0003A7  BBC7 0024                            LAB,B3   UNSHARE_FPT,AUTO
+          2 0003A9  B870 04D3                            LDR,R3   1235,IMO
+          2 0003AB  0001                                 MCL
+          2 0003AC       011E                            DC       s:12345,PREL
+
+      328    12299    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+
+  12299   2 0003AD  EBF0 0023                            LAB,B6   35,IMO
+          2 0003AF  EFC7 0030                            STB,B6   WDOG+6,AUTO
+          2 0003B1  DCC7 0028                            LDB,B5   MSG$,AUTO
+          2 0003B3  DFC7 002E                            STB,B5   WDOG+4,AUTO
+          2 0003B5  CBC7 0009                            LAB,B4   BUFSIZE,AUTO
+          2 0003B7  CFC7 002C                            STB,B4   WDOG+2,AUTO
+          2 0003B9  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0003BB  CBF0 0300                            LAB,B4   768,IMO
+          2 0003BD  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 0003C0       0001                            DC       s:12299+20,PREL
+          2 0003C1  0F81 00ED                            B        s:12337,PREL
+
+      329    12300    3               CASE(%GD#RQSKTI);
+
+      330    12301    3                 CALL GDU$KTI(BUFSIZE,MSG$->MSGBUF);
+
+  12301   2 0003C3  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 0003C5  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 0003C7  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 0003C9  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0003CB  CBF0 0200                            LAB,B4   512,IMO
+          2 0003CD  E380 0000 0000  xent                 LNJ,B6   GDU$KTI
+          2 0003D0       0001                            DC       s:12301+14,PREL
+          2 0003D1  0F81 00DD                            B        s:12337,PREL
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:48   
+
+      331    12302    3               CASE(%GD#RQSBREAK);
+
+      332    12303    3                 GD$DRTN_FPT = GD_DRTN_IFPT;
+
+  12303   2 0003D3  AB80 0000 0000  01                   LAB,B2   GD_READ_DEBUG_IFPT
+          2 0003D6  2C24                                 LDV,R2   36
+          2 0003D7  6C0C                                 LDV,R6   12
+          2 0003D8  BB87                                 LAB,B3   ,AUTO
+          2 0003D9  3C3C                                 LDV,R3   60
+          2 0003DA  0008                                 MMM
+
+      333    12304    3                 GD$DRTN_FPT.V_=VECTOR(GD$DRTN_FPT.V);
+
+  12304   2 0003DB  EBC7 0022                            LAB,B6   GD$DRTN_FPT+4,AUTO
+          2 0003DD  EFC7 002D                            STB,B6   WDOG+3,AUTO
+          2 0003DF  6C03                                 LDV,R6   3
+          2 0003E0  EF47 002C                            STR,R6   WDOG+2,AUTO
+          2 0003E2  ABC7 002C                            LAB,B2   WDOG+2,AUTO
+          2 0003E4  2C00                                 LDV,R2   0
+          2 0003E5  6C06                                 LDV,R6   6
+          2 0003E6  BB87                                 LAB,B3   ,AUTO
+          2 0003E7  3C3C                                 LDV,R3   60
+          2 0003E8  0008                                 MMM
+
+      334    12305    3                 GD$DRTN_FPT.V.SETECC=%G_YES#;
+
+  12305   2 0003E9  8947 0022                            LBT,'8000'X       GD$DRTN_FPT+4,AUTO
+  12305   2 0003EB       8000
+
+      335    12306    3                 GD$DRTN_FPT.V.ECC=%G_BRK#;
+
+  12306   2 0003EC  6C01                                 LDV,R6   1
+          2 0003ED  E7C7 0023                            STH,R6   GD$DRTN_FPT+5,AUTO
+
+      336    12307    3                 GD_DATA.GD.STOPT=%G_NO#;
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:49   
+  12307   2 0003EF  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 0003F2  8846 014C                            LBF,'0004'X       332,B6
+          2 0003F4       0004
+
+      337    12308    3                 CALL GDB$SET_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+
+  12308   2 0003F5  DCC7 0028                            LDB,B5   MSG$,AUTO
+          2 0003F7  DFC7 002E                            STB,B5   WDOG+4,AUTO
+          2 0003F9  CBC7 0009                            LAB,B4   BUFSIZE,AUTO
+          2 0003FB  CFC7 002C                            STB,B4   WDOG+2,AUTO
+          2 0003FD  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0003FF  CBF0 0200                            LAB,B4   512,IMO
+          2 000401  E380 0000 0000  xent                 LNJ,B6   GDB$SET_BRKPNT
+          2 000404       0001                            DC       s:12309,PREL
+
+      338    12309    3                 CALL M$DRTN(GD$DRTN_FPT)
+
+  12309   2 000405  BBC7 001E                            LAB,B3   GD$DRTN_FPT,AUTO
+          2 000407  B870 04D2                            LDR,R3   1234,IMO
+          2 000409  0001                                 MCL
+          2 00040A       0003                            DC       s:12311,PREL
+          2 00040B  0F81 0021                            B        s:12315,PREL
+
+      339    12310    4                 WHENALTRETURN DO;
+
+      340    12311    4                    CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,
+
+  12311   2 00040D  EBF0 0033                            LAB,B6   51,IMO
+          2 00040F  EFC7 0030                            STB,B6   WDOG+6,AUTO
+          2 000411  DCC7 0028                            LDB,B5   MSG$,AUTO
+          2 000413  DFC7 002E                            STB,B5   WDOG+4,AUTO
+          2 000415  CBC7 0009                            LAB,B4   BUFSIZE,AUTO
+          2 000417  CFC7 002C                            STB,B4   WDOG+2,AUTO
+          2 000419  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 00041B  CBF0 0300                            LAB,B4   768,IMO
+          2 00041D  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 000420       0001                            DC       s:12313,PREL
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:50   
+
+      341    12312    4                      %GD#RSPNOBREAKCONTROL);
+      342    12313    4                    GD_DATA.GD.STOPT=%G_YES#;
+
+  12313   2 000421  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 000424  8946 014C                            LBT,'0004'X       332,B6
+          2 000426       0004
+
+      343    12314    4                    CALL GDB$RESET_BRKPNT;
+
+  12314   2 000427  CBF0 0000                            LAB,B4   0,IMO
+          2 000429  E380 0000 0000  xent                 LNJ,B6   GDB$RESET_BRKPNT
+          2 00042C       0001                            DC       s:12315,PREL
+
+      344    12315    4                    END;
+
+  12315   2 00042D  0F81 0081                            B        s:12337,PREL
+
+      345    12316    3               CASE(%GD#RQSTRTRANSFERS);
+
+      346    12317    3                 GD_DATA.GD.TRACE = %TRACE_XFERS;
+
+  12317   2 00042F  6C01                                 LDV,R6   1
+          2 000430  EF45 0153                            STR,R6   339,B5
+
+      347    12318    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+
+  12318   2 000432  BBF0 0023                            LAB,B3   35,IMO
+          2 000434  BFC7 0030                            STB,B3   WDOG+6,AUTO
+          2 000436  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000438  ABC7 0009                            LAB,B2   BUFSIZE,AUTO
+          2 00043A  AFC7 002C                            STB,B2   WDOG+2,AUTO
+          2 00043C  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 00043E  CBF0 0300                            LAB,B4   768,IMO
+          2 000440  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 000443       0001                            DC       s:12318+18,PREL
+          2 000444  0F81 006A                            B        s:12337,PREL
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:51   
+
+      348    12319    3               CASE(%GD#RQSTRCALLS);
+
+      349    12320    3                 GD_DATA.GD.TRACE = %TRACE_CALLS;
+
+  12320   2 000446  6C02                                 LDV,R6   2
+          2 000447  EF45 0153                            STR,R6   339,B5
+
+      350    12321    3                 GD_DATA.GD.ONCALLS = '0'B;
+
+  12321   2 000449  8845 014C                            LBF,'1000'X       332,B5
+  12321   2 00044B       1000
+
+      351    12322    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+
+  12322   2 00044C  BBF0 0023                            LAB,B3   35,IMO
+          2 00044E  BFC7 0030                            STB,B3   WDOG+6,AUTO
+          2 000450  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000452  ABC7 0009                            LAB,B2   BUFSIZE,AUTO
+          2 000454  AFC7 002C                            STB,B2   WDOG+2,AUTO
+          2 000456  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000458  CBF0 0300                            LAB,B4   768,IMO
+          2 00045A  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 00045D       0001                            DC       s:12322+18,PREL
+          2 00045E  0F81 0050                            B        s:12337,PREL
+
+      352    12323    3               CASE(%GD#RQSTROFF);
+
+      353    12324    3                 IF GD_DATA.GD.ONCALLS THEN
+
+  12324   2 000460  82C5 014C                            LB,'1000'X        332,B5
+  12324   2 000462       1000
+          2 000463  0581 0006                            BBF      s:12326,PREL
+
+      354    12325    3                    GD_DATA.GD.TRACE = %TRACE_CALLS;
+
+  12325   2 000465  6C02                                 LDV,R6   2
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:52   
+          2 000466  EF45 0153                            STR,R6   339,B5
+          2 000468  0F81 0003                            B        s:12327,PREL
+
+      355    12326    3                 ELSE GD_DATA.GD.TRACE = %TRACE_OFF;
+
+  12326   2 00046A  8745 0153                            CL       339,B5
+
+      356    12327    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPACK);
+
+  12327   2 00046C  BBF0 0023                            LAB,B3   35,IMO
+          2 00046E  BFC7 0030                            STB,B3   WDOG+6,AUTO
+          2 000470  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000472  ABC7 0009                            LAB,B2   BUFSIZE,AUTO
+          2 000474  AFC7 002C                            STB,B2   WDOG+2,AUTO
+          2 000476  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000478  CBF0 0300                            LAB,B4   768,IMO
+          2 00047A  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 00047D       0001                            DC       s:12327+18,PREL
+          2 00047E  0F81 0030                            B        s:12337,PREL
+
+      357    12328    3               CASE(%GD#RQSONCALLBRKPNT);
+
+      358    12329    3                 CALL GDB$BLD_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+
+  12329   2 000480  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000482  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 000484  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 000486  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 000488  CBF0 0200                            LAB,B4   512,IMO
+          2 00048A  E380 0000 0000  xent                 LNJ,B6   GDB$BLD_BRKPNT
+          2 00048D       0001                            DC       s:12329+14,PREL
+          2 00048E  0F81 0020                            B        s:12337,PREL
+
+      359    12330    3               CASE(%GD#RQSONCALLS);
+
+      360    12331    3                 GD_DATA.GD.ONCALLS = '1'B;
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:53   
+  12331   2 000490  8945 014C                            LBT,'1000'X       332,B5
+  12331   2 000492       1000
+
+      361    12332    3                 GD_DATA.GD.OC_BRKNUM = MSG$->GD$MSG.BRKRQS.BRKNUM;
+
+  12332   2 000493  E2C4 0001                            LLH,R6   1,B4
+          2 000495  EF45 0131                            STR,R6   305,B5
+
+      362    12333    3                 CALL GDB$BLD_BRKPNT(BUFSIZE,MSG$->MSGBUF);
+
+  12333   2 000497  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 000499  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 00049B  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 00049D  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 00049F  CBF0 0200                            LAB,B4   512,IMO
+          2 0004A1  E380 0000 0000  xent                 LNJ,B6   GDB$BLD_BRKPNT
+          2 0004A4       0001                            DC       s:12333+14,PREL
+          2 0004A5  0F81 0009                            B        s:12337,PREL
+
+      363    12334    3               CASE(%GD#RQSREXMIT#);  /* HOST XDELTA got error on last message   */
+
+      364    12335    3                 CALL GDA$REXMT(SIZE,BUFFER);
+
+  12335   2 0004A7  BBC7 0004                            LAB,B3   @SIZE,AUTO
+          2 0004A9  CBF0 0200                            LAB,B4   512,IMO
+          2 0004AB  E380 0000 0000  xent                 LNJ,B6   GDA$REXMT
+          2 0004AE       0001                            DC       s:12337,PREL
+
+      365    12336    3               END /* CASE */;
+
+      366    12337    3              DO WHILE (%NO#);
+
+  12337   2 0004AF  0F81 0018                            B        s:12343,PREL
+
+  12333   2                              CMD_ERROR       null
+      367    12338    3   CMD_ERROR:    ;
+      368    12339    3                 CALL GDI$SEND_ERROR_RESPONSE (BUFSIZE,
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:54   
+
+  12339   2 0004B1  EC80 0000 0000  xsym CMD_ERROR       LDB,B6   GD$DELTA_DATA$
+          2 0004B4  DBC6 0174                            LAB,B5   372,B6
+          2 0004B6  DFC7 0030                            STB,B5   WDOG+6,AUTO
+          2 0004B8  CBC6 000D                            LAB,B4   13,B6
+          2 0004BA  CFC7 002E                            STB,B4   WDOG+4,AUTO
+          2 0004BC  BBC7 0009                            LAB,B3   BUFSIZE,AUTO
+          2 0004BE  BFC7 002C                            STB,B3   WDOG+2,AUTO
+          2 0004C0  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+          2 0004C2  CBF0 0300                            LAB,B4   768,IMO
+          2 0004C4  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 0004C7       0001                            DC       s:12343,PREL
+
+      369    12340    3                   GD_DATA.GDA.RCV.BFR,
+      370    12341    3                   GD_DATA.GD.ERROR);
+      371    12342    3                 END;
+
+      372    12343    3              DO WHILE(%NO#);
+
+  12343   2 0004C8  0F81 001C                            B        s:12347,PREL
+
+      373    12344    3   UNSHARE_FAILED:
+      374    12345    3                 MSG$->GD$MSG.ERROR_D.ERRCODE = G$JIT$->G$JIT.FD_ALTERR;
+
+  12345   2 0004CA  EC80 0000 0000  xsym UNSHARE_FAILED  LDB,B6   G$JIT$
+          2 0004CD  8CC6 00B4                            LDI      180,B6
+          2 0004CF  DCC7 0028                            LDB,B5   MSG$,AUTO
+          2 0004D1  8D45 0001                            SDI      1,B5
+
+      375    12346    3                 CALL GDI$SEND_ERROR_RESPONSE(BUFSIZE,MSG$->MSGBUF,%GD#RSPNAK);
+
+  12346   2 0004D3  EBF0 0034                            LAB,B6   52,IMO
+          2 0004D5  EFC7 0030                            STB,B6   WDOG+6,AUTO
+          2 0004D7  DFC7 002E                            STB,B5   WDOG+4,AUTO
+          2 0004D9  CBC7 0009                            LAB,B4   BUFSIZE,AUTO
+          2 0004DB  CFC7 002C                            STB,B4   WDOG+2,AUTO
+          2 0004DD  BBC7 002C                            LAB,B3   WDOG+2,AUTO
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:55   
+          2 0004DF  CBF0 0300                            LAB,B4   768,IMO
+          2 0004E1  E380 0000 0000  xent                 LNJ,B6   GDI$SEND_ERROR_RESPONSE
+          2 0004E4       0001                            DC       s:12347,PREL
+
+      376    12347    3                 END;
+
+      377    12348        /*
+      378    12349          Indicate we're finished with this buffer
+      379    12350                                                                                      */
+      380    12351    2   ALLDONE:
+      381    12352    2              GD_DATA.GD.BFRFULL=%G_NO#;
+
+  12352   2 0004E5  EC80 0000 0000  xsym ALLDONE         LDB,B6   GD$DELTA_DATA$
+          2 0004E8  8846 014C                            LBF,'2000'X       332,B6
+          2 0004EA       2000
+
+      382    12353        /*
+      383    12354          Start another read if XDELTA mode.
+      384    12355                                                                                      */
+      385    12356    2              IF GD_DATA.GD.MODE=%GD#MODE_XDELTA THEN
+
+  12356   2 0004EB  E846 0130                            LDR,R6   304,B6
+          2 0004ED  6D02                                 CMV,R6   2
+          2 0004EE  0981 0007                            BNE      s:12361,PREL
+
+      386    12357    2                 CALL GDA$RCVIOLD;
+
+  12357   2 0004F0  CBF0 0000                            LAB,B4   0,IMO
+          2 0004F2  E380 0000 0000  xent                 LNJ,B6   GDA$RCVIOLD
+          2 0004F5       0001                            DC       s:12361,PREL
+
+      387    12358        /*
+      388    12359          If we are not stopped, we can return
+      389    12360                                                                                      */
+      390    12361    2              IF NOT(GD_DATA.GD.STOPT) THEN
+
+  12361   2 0004F6  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:56   
+          2 0004F9  82C6 014C                            LB,'0004'X        332,B6
+          2 0004FB       0004
+          2 0004FC  0501 FB77                            BBT      s:12116,PREL
+
+      391    12362    3              DO;
+
+      392    12363    3                 RETURN;
+
+  12363   2 0004FE  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      393    12364    3                 END;
+      394    12365    2              END;
+
+      395    12366    1   END GDI$DECODE_MSG;
+      396    12367        %EOD;
+
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:57   
+--  Include file information  --
+
+   G_JIT_M.:E05TOU  is referenced.
+   G_ROS_M.:E05TOU  is referenced.
+   KH$CHN.:E05TOU  is referenced.
+   G_HJIT_M.:E05TOU  is referenced.
+   DU_SCODE_C.:E05TOU  is referenced.
+   GH_HARDWARE_M.:E05TOU  is referenced.
+   GD$MACS_M.:E05TOU  is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   B_ERRORS_C.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure GDI$DECODE_MSG.
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:58   
+
+ **** Variables and constants ****
+
+  ****  Section 001 RoData GDI$DECODE_MSG
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+    18-0-0/w STRC(64)    r     1 CONST_UNSHARE_FPT         1C-0-0/w STRC(48)    r     1 GDI_SCREECH
+    12-0-0/d STRC(96)    r     1 GD_DRTN_IFPT               0-0-0/w STRC(288)   r     1 GD_READ_DEBUG_IFPT
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w PTR         r     1 @BUFFER                    4-0-0/w PTR         r     1 @SIZE
+    *0-0-0/w ACHR        r     1 BUFFER                     9-0-0/w UBIN(16)    r     1 BUFSIZE
+    1E-0-0/d STRC(96)    r     1 GD$DRTN_FPT                C-0-0/w STRC(288)   r     1 GD$READ_FPT
+    28-0-0/w PTR         r     1 MSG$                      *0-0-0/w UBIN(16)    r     1 SIZE
+    24-0-0/w STRC(64)    r     1 UNSHARE_FPT               2A-0-0/w UBIN(16)    r     1 WDOG
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 G$JIT$                     0-0-0/w PTR         r     1 G$LOW_MEM$
+     0-0-0/w PTR         r     1 G$MHJIT$                   0-0-0/w PTR         r     1 G$TCB$
+     0-0-0/w PTR         r     1 GD$DELTA_DATA$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(736)   r     1 G$EXCFR                    0-0-0/w STRC(5616)  r     1 G$JIT
+     0-0-0/w STRC(4096)  r     1 G$LOW_MEM                  0-0-0/w STRC(27232) r     1 G$MHJIT
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:59   
+     0-0-0/w STRC(96)    r     1 G$TCB                      0-0-0/w STRC(928)   r     1 G$TSA
+     0-0-0/w STRC(3344)  r     1 GD$MSG                     0-0-0/w STRC(16704) r     1 GD_DATA
+     0-0-0N  NULL        r     1 M$DEBUG                    0-0-0/w CHAR(999)   r     1 MSGBUF
+
+
+   Procedure GDI$DECODE_MSG requires 1281 words for executable code.
+   Procedure GDI$DECODE_MSG requires 50 words of local(AUTO) storage.
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:60   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:61   
+          MINI XREF LISTING
+
+ALLDONE
+     12352**LABEL   12230--GOTO
+BUFFER
+      2336**DCL        44--PROC    12090--ASSIGN  12244<>CALL    12335<>CALL
+BUFSIZE
+      2339**DCL     12091<<ASSIGN  12113<<ASSIGN  12169<>CALL    12173<>CALL    12176<>CALL    12180<<ASSIGN
+     12181<>CALL    12185<<ASSIGN  12186<>CALL    12190<>CALL    12194<>CALL    12198<>CALL    12209<>CALL
+     12214<>CALL    12222<>CALL    12262<>CALL    12264<>CALL    12271<>CALL    12274<>CALL    12280<>CALL
+     12287<>CALL    12293<>CALL    12299<>CALL    12301<>CALL    12308<>CALL    12311<>CALL    12318<>CALL
+     12322<>CALL    12327<>CALL    12329<>CALL    12333<>CALL    12339<>CALL    12346<>CALL
+CMD_ERROR
+     12333**LABEL   12162--REMEMBR
+CONST_UNSHARE_FPT
+      2481**DCL     12282>>ASSIGN  12289>>ASSIGN  12295>>ASSIGN
+CONST_UNSHARE_FPT.V
+      2483**DCL      2483--DCLINIT
+G$EXCFR.P$$
+     10856**DCL     10856--REDEF   10856--REDEF
+G$EXCFR.PREVSZ
+     10806**DCL     10806--REDEF
+G$EXCFR.TRLR.ERR.ERR#
+     11163**DCL     12127>>IF
+G$EXCFR.TRLR.EVID
+     11093**DCL     11111--REDEF   11119--REDEF   11119--REDEF
+G$EXCFR.TRLR.SUBC
+     11070**DCL     11070--REDEF   11088--REDEF   11092--REDEF   11092--REDEF
+G$JIT.ERRLOG
+     11586**DCL     11589--REDEF
+G$JIT.FD_ALTERR
+     11613**DCL     12345>>ASSIGN
+G$JIT.FD_ALTERR.ERR#
+     11640**DCL     12133>>IF
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:62   
+G$JIT.JSUNIT
+     11325**DCL     11326--REDEF
+G$JIT.MCLS
+     11324**DCL     11324--REDEF
+G$JIT.TMRZ
+     11593**DCL     11594--REDEF
+G$JIT.USER_EXTIME
+     11317**DCL     11318--REDEF
+G$JIT.USER_MEMTIME
+     11320**DCL     11320--REDEF
+G$JIT.USER_SVTIME
+     11319**DCL     11319--REDEF
+G$JIT$
+     11241**DCL     12133>>IF      12345>>ASSIGN
+G$LOW_MEM.IV.IL$
+      2690**DCL      2690--REDEF
+G$LOW_MEM.IV.INT.I#00$
+      2690**DCL      2690--REDEF
+G$LOW_MEM.IV.INT.I#01$
+      2690**DCL      2690--REDEF
+G$LOW_MEM.IV.INT.I#02$
+      2691**DCL      2691--REDEF
+G$LOW_MEM.IV.INT.I#03$
+      2691**DCL      2691--REDEF
+G$LOW_MEM.IV.INT.I#04$
+      2691**DCL      2692--REDEF
+G$LOW_MEM.IV.INT.I#05$
+      2692**DCL      2692--REDEF
+G$LOW_MEM.IV.INT.I#61$
+      2693**DCL      2693--REDEF
+G$LOW_MEM.IV.INT.I#62$
+      2693**DCL      2693--REDEF
+G$LOW_MEM.IV.INT.I#63$
+      2693**DCL      2693--REDEF
+G$LOW_MEM.TV.T#01$
+      2678**DCL      2678--REDEF
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:63   
+G$LOW_MEM.TV.T#02$
+      2678**DCL      2678--REDEF
+G$LOW_MEM.TV.T#03$
+      2677**DCL      2677--REDEF
+G$LOW_MEM.TV.T#05$
+      2677**DCL      2677--REDEF
+G$LOW_MEM.TV.T#06$
+      2676**DCL      2676--REDEF
+G$LOW_MEM.TV.T#07$
+      2676**DCL      2676--REDEF
+G$LOW_MEM.TV.T#08$
+      2675**DCL      2676--REDEF
+G$LOW_MEM.TV.T#09$
+      2675**DCL      2675--REDEF
+G$LOW_MEM.TV.T#10$
+      2675**DCL      2675--REDEF
+G$LOW_MEM.TV.T#12$
+      2674**DCL      2674--REDEF
+G$LOW_MEM.TV.T#13$
+      2674**DCL      2674--REDEF
+G$LOW_MEM.TV.T#14$
+      2673**DCL      2673--REDEF
+G$LOW_MEM.TV.T#15$
+      2673**DCL      2673--REDEF
+G$LOW_MEM.TV.T#16$
+      2672**DCL      2673--REDEF
+G$LOW_MEM.TV.T#17$
+      2672**DCL      2672--REDEF
+G$LOW_MEM.TV.T#19$
+      2671**DCL      2672--REDEF
+G$LOW_MEM.TV.T#20$
+      2671**DCL      2671--REDEF
+G$LOW_MEM.TV.T#21$
+      2671**DCL      2671--REDEF
+G$LOW_MEM.TV.T#22$
+      2670**DCL      2670--REDEF
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:64   
+G$LOW_MEM.TV.T#23$
+      2670**DCL      2670--REDEF
+G$LOW_MEM.TV.T#24$
+      2669**DCL      2670--REDEF
+G$LOW_MEM.TV.T#25$
+      2669**DCL      2669--REDEF
+G$LOW_MEM.TV.T#26$
+      2669**DCL      2669--REDEF
+G$LOW_MEM.TV.T#27$
+      2668**DCL      2668--REDEF
+G$LOW_MEM.TV.T#28$
+      2668**DCL      2668--REDEF
+G$LOW_MEM.TV.T#29$
+      2667**DCL      2668--REDEF
+G$LOW_MEM.TV.T#30$
+      2667**DCL      2667--REDEF
+G$LOW_MEM.TV.T#31$
+      2667**DCL      2667--REDEF
+G$LOW_MEM.TV.T#32$
+      2666**DCL      2666--REDEF
+G$LOW_MEM.TV.T#33$
+      2666**DCL      2666--REDEF
+G$LOW_MEM.WDT_CURR
+      2654**DCL     12111>>ASSIGN  12146>>IF      12148>>ASSIGN  12154<<ASSIGN
+G$LOW_MEM$
+     11239**DCL      2653--IMP-PTR 12111>>ASSIGN  12146>>IF      12148>>ASSIGN  12154>>ASSIGN
+G$MHJIT.INTCON.HHJIT
+      9176**DCL      9176--REDEF
+G$MHJIT.INTCON.P$$
+      9149**DCL      9149--REDEF
+G$MHJIT.ISA_BIGFOOT.P$$
+      6094**DCL      6094--REDEF
+G$MHJIT.ISA_DBINH.P$$
+      7308**DCL      7308--REDEF
+G$MHJIT.ISA_IDLE.P$$
+      4189**DCL      4189--REDEF
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:65   
+G$MHJIT.ISA_LVL10.P$$
+      7611**DCL      7611--REDEF
+G$MHJIT.ISA_LVL11.P$$
+      7914**DCL      7914--REDEF
+G$MHJIT.ISA_LVL12.P$$
+      8217**DCL      8217--REDEF
+G$MHJIT.ISA_LVL5.P$$
+      6397**DCL      6397--REDEF
+G$MHJIT.ISA_OV.P$$
+      5791**DCL      5791--REDEF
+G$MHJIT.ISA_PFS.P$$
+      5462**DCL      5462--REDEF
+G$MHJIT.ISA_RT_CLOCK.P$$
+      8824**DCL      8824--REDEF
+G$MHJIT.ISA_SATYR_RCV.P$$
+      6701**DCL      6701--REDEF
+G$MHJIT.ISA_SATYR_TRN.P$$
+      7005**DCL      7005--REDEF
+G$MHJIT.ISA_SCHD.P$$
+      8520**DCL      8520--REDEF
+G$MHJIT.ISA_WDOG.P$$
+      5570**DCL      5570--REDEF
+G$MHJIT.TICKS
+      9043**DCL     12148<<ASSIGN  12148>>ASSIGN  12149>>IF      12151>>ASSIGN  12152<<ASSIGN  12152>>ASSIGN
+G$MHJIT.TSA_DB.ISA.P$$
+      4792**DCL      4792--REDEF
+G$MHJIT.TSA_DB.P$$
+      4663**DCL      4663--REDEF    4664--REDEF
+G$MHJIT.TSA_HND.ISA.P$$
+      9370**DCL      9370--REDEF
+G$MHJIT.TSA_HND.P$$
+      9241**DCL      9241--REDEF    9242--REDEF
+G$MHJIT.TSA_MON.ISA.P$$
+      4404**DCL      4404--REDEF
+G$MHJIT.TSA_MON.P$$
+      4275**DCL      4275--REDEF    4276--REDEF
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:66   
+G$MHJIT.TSA_OV.ISA.P$$
+      5180**DCL      5180--REDEF
+G$MHJIT.TSA_OV.P$$
+      5051**DCL      5051--REDEF    5052--REDEF
+G$MHJIT.UTS
+      9043**DCL     12151<<ASSIGN  12151>>ASSIGN
+G$MHJIT$
+     11238**DCL      2714--IMP-PTR 12148>>ASSIGN  12148>>ASSIGN  12149>>IF      12151>>ASSIGN  12151>>ASSIGN
+     12151>>ASSIGN  12152>>ASSIGN  12152>>ASSIGN
+G$ROS.AUTO_DS$
+      9859**DCL      9860--REDEF
+G$ROS.AUTO_T$
+      9860**DCL      9860--REDEF
+G$ROS.CP_ECCB.FLTFLG
+     10474**DCL     10505--REDEF
+G$ROS.DB_ECCB.FLTFLG
+     10398**DCL     10429--REDEF
+G$ROS.JIT.ERRLOG
+     10209**DCL     10212--REDEF
+G$ROS.JIT.JSUNIT
+      9948**DCL      9949--REDEF
+G$ROS.JIT.MCLS
+      9947**DCL      9947--REDEF
+G$ROS.JIT.TMRZ
+     10216**DCL     10217--REDEF
+G$ROS.JIT.USER_EXTIME
+      9940**DCL      9941--REDEF
+G$ROS.JIT.USER_MEMTIME
+      9943**DCL      9943--REDEF
+G$ROS.JIT.USER_SVTIME
+      9942**DCL      9942--REDEF
+G$ROS.M$DEBUG.EOMCHAR
+     10545**DCL     10545--REDEF   10546--REDEF
+G$ROS.M$DEBUG.FLDID
+     10544**DCL     10544--REDEF
+G$ROS.M$DEBUG.RES
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:67   
+     10539**DCL     10540--REDEF
+G$ROS.M$DO.EOMCHAR
+     10750**DCL     10750--REDEF   10751--REDEF
+G$ROS.M$DO.FLDID
+     10749**DCL     10749--REDEF
+G$ROS.M$DO.RES
+     10744**DCL     10745--REDEF
+G$ROS.M$HOST.EOMCHAR
+     10699**DCL     10699--REDEF   10700--REDEF
+G$ROS.M$HOST.FLDID
+     10698**DCL     10698--REDEF
+G$ROS.M$HOST.RES
+     10693**DCL     10694--REDEF
+G$ROS.M$LM.EOMCHAR
+     10596**DCL     10596--REDEF   10597--REDEF
+G$ROS.M$LM.FLDID
+     10595**DCL     10595--REDEF
+G$ROS.M$LM.RES
+     10590**DCL     10591--REDEF
+G$ROS.M$ME.EOMCHAR
+     10648**DCL     10648--REDEF   10649--REDEF
+G$ROS.M$ME.FLDID
+     10647**DCL     10647--REDEF
+G$ROS.M$ME.RES
+     10642**DCL     10643--REDEF
+G$ROS.U_ECCB.FLTFLG
+     10322**DCL     10353--REDEF
+G$TCB.ALT$
+     11675**DCL     12127>>IF
+G$TCB$
+     11656**DCL     12127>>IF
+G$TSA.A$
+     11737**DCL     12248<<ASSIGN
+G$TSA.ISA.P$$
+     11866**DCL     11866--REDEF
+G$TSA.P$$
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:68   
+     11737**DCL     11737--REDEF   11738--REDEF
+GD$DELTA_DATA$
+      1790**DCL      1804--IMP-PTR 12100>>DOCASE  12106>>ASSIGN  12108>>ASSIGN  12113>>ASSIGN  12114>>ASSIGN
+     12122>>DOCASE  12124>>ASSIGN  12126>>IF      12129>>ASSIGN  12134>>ASSIGN  12140>>DOWHILE 12141>>IF
+     12142>>ASSIGN  12162>>REMEMBR 12163>>ASSIGN  12164>>ASSIGN  12208>>IF      12226>>IF      12227>>ASSIGN
+     12229>>ASSIGN  12243>>IF      12246>>ASSIGN  12247>>ASSIGN  12248>>ASSIGN  12248>>ASSIGN  12270>>ASSIGN
+     12276>>ASSIGN  12307>>ASSIGN  12313>>ASSIGN  12317>>ASSIGN  12320>>ASSIGN  12321>>ASSIGN  12324>>IF
+     12325>>ASSIGN  12326>>ASSIGN  12331>>ASSIGN  12332>>ASSIGN  12339>>CALL    12339>>CALL    12352>>ASSIGN
+     12356>>IF      12361>>IF
+GD$DRTN_FPT
+      2381**DCL     12233<<ASSIGN  12236<>CALL    12255<<ASSIGN  12258<>CALL    12266<<ASSIGN  12272<>CALL
+     12303<<ASSIGN  12309<>CALL
+GD$DRTN_FPT.V
+      2383**DCL     12234--ASSIGN  12256--ASSIGN  12267--ASSIGN  12304--ASSIGN
+GD$DRTN_FPT.V.ECC
+      2389**DCL     12269<<ASSIGN  12306<<ASSIGN
+GD$DRTN_FPT.V.KILLFD
+      2388**DCL     12257<<ASSIGN
+GD$DRTN_FPT.V.QUIT
+      2388**DCL     12235<<ASSIGN
+GD$DRTN_FPT.V.SETECC
+      2388**DCL     12268<<ASSIGN  12305<<ASSIGN
+GD$DRTN_FPT.V_
+      2383**DCL     12234<<ASSIGN  12256<<ASSIGN  12267<<ASSIGN  12304<<ASSIGN
+GD$MSG.BRKRQS.BRKNUM
+      2552**DCL     12332>>ASSIGN
+GD$MSG.BRKRQS.IF$CONST.SIZE
+      2560**DCL      2560--REDEF
+GD$MSG.BRKRQS.IF$CONST.TEXT
+      2560**DCL      2561--REDEF    2561--REDEF    2562--REDEF    2563--REDEF
+GD$MSG.BRKRSP.BRK#
+      2574**DCL      2574--REDEF
+GD$MSG.BRKRSP.USER#
+      2574**DCL      2574--REDEF
+GD$MSG.ERROR_D.ERRCODE
+      2515**DCL     12345<<ASSIGN
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:69   
+GD$MSG.FNC
+      2509**DCL     12165>>DOCASE
+GD$MSG.LETMEM_D.VALUE.SIZE
+      2532**DCL      2532--REDEF
+GD$MSG.LETMEM_D.VALUE.TEXT
+      2533**DCL      2533--REDEF    2533--REDEF    2534--REDEF    2535--REDEF
+GD$MSG.MESSAGE
+      2514**DCL      2514--REDEF    2515--REDEF    2515--REDEF    2516--REDEF    2527--REDEF    2540--REDEF
+      2545--REDEF    2552--REDEF    2568--REDEF    2573--REDEF    2579--REDEF    2580--REDEF    2609--REDEF
+      2611--REDEF    2622--REDEF    2629--REDEF    2641--REDEF
+GD$MSG.SUBFB.INTERPRETIVE
+      2513**DCL     12164>>ASSIGN
+GD$MSG.SUBFNC
+      2509**DCL      2509--REDEF    2513--REDEF
+GD$MSG.TSA.I
+      2581**DCL      2581--REDEF
+GD$MSG.TSA.S
+      2583**DCL      2583--REDEF
+GD$MSG.USERQS.ASDT$
+      2609**DCL      2609--REDEF    2610--REDEF
+GD$READ_FPT
+      2355**DCL     12102<<ASSIGN  12105<<ASSIGN  12125<>CALL
+GD$READ_FPT.BUF_
+      2357**DCL     12108<<ASSIGN
+GD$READ_FPT.V
+      2360**DCL     12109--ASSIGN
+GD$READ_FPT.V.DCB#
+      2360**DCL     12106<<ASSIGN
+GD$READ_FPT.V_
+      2357**DCL     12109<<ASSIGN
+GDA$RCVIOLD
+     12066**DCL-ENT 12357--CALL
+GDA$REXMT
+     12067**DCL-ENT 12335--CALL
+GDB$BLD_BRKPNT
+     12068**DCL-ENT 12190--CALL    12194--CALL    12329--CALL    12333--CALL
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:70   
+GDB$GET_CONTROL
+     12069**DCL-ENT 12218--CALL
+GDB$KILL_ALLBRKPNTS
+     12070**DCL-ENT 12206--CALL    12228--CALL
+GDB$KILL_BRKPNT
+     12071**DCL-ENT 12214--CALL
+GDB$RESET_BRKPNT
+     12072**DCL-ENT 12202--CALL    12277--CALL    12314--CALL
+GDB$SET_BRKPNT
+     12073**DCL-ENT 12198--CALL    12271--CALL    12308--CALL
+GDI$SEND_ERROR_RESPONSE
+     12074**DCL-ENT 12209--CALL    12244--CALL    12274--CALL    12287--CALL    12293--CALL    12299--CALL
+     12311--CALL    12318--CALL    12322--CALL    12327--CALL    12339--CALL    12346--CALL
+GDI_SCREECH
+     11199**DCL     12247>>ASSIGN
+GDM$DISPLAY
+     12076**DCL-ENT 12169--CALL
+GDM$DISPLAY_D
+     12077**DCL-ENT 12176--CALL
+GDM$LCTHAND
+     12081**DCL-ENT 12262--CALL
+GDM$LETMEM_D
+     12082**DCL-ENT 12280--CALL
+GDM$MODIFY
+     12078**DCL-ENT 12181--CALL
+GDM$MODIFY_D
+     12079**DCL-ENT 12186--CALL
+GDM$TSA
+     12084**DCL-ENT 12173--CALL
+GDM$UNFID
+     12083**DCL-ENT 12264--CALL
+GDU$DECODE_USE
+     12080**DCL-ENT 12222--CALL
+GDU$KTI
+     12085**DCL-ENT 12301--CALL
+GD_DATA.DELTAINFO.TSA$
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:71   
+      1804**DCL     12248>>ASSIGN
+GD_DATA.GD.ANSWERED
+      1814**DCL     12163<<ASSIGN
+GD_DATA.GD.BFRFULL
+      1811**DCL     12140>>DOWHILE 12352<<ASSIGN
+GD_DATA.GD.BRKNUM
+      1818**DCL     12229<<ASSIGN
+GD_DATA.GD.DYNSP$
+      1817**DCL      1817--REDEF
+GD_DATA.GD.ERROR
+      1825**DCL     12339<>CALL
+GD_DATA.GD.ERROR_LOC
+      1825**DCL     12162<<REMEMBR
+GD_DATA.GD.HANLZ_DCB
+      1825**DCL     12106>>ASSIGN
+GD_DATA.GD.INTERPRETIVE
+      1811**DCL     12164<<ASSIGN
+GD_DATA.GD.MODE
+      1807**DCL     12100>>DOCASE  12122>>DOCASE  12126>>IF      12226>>IF      12243>>IF      12356>>IF
+GD_DATA.GD.NEWCTL
+      1815**DCL     12141>>IF      12142<<ASSIGN
+GD_DATA.GD.OC_BRKNUM
+      1808**DCL     12332<<ASSIGN
+GD_DATA.GD.ONCALLS
+      1812**DCL     12321<<ASSIGN  12324>>IF      12331<<ASSIGN
+GD_DATA.GD.STEP_BRKPNT.ADR$
+      1818**DCL      1819--REDEF
+GD_DATA.GD.STEP_BRKPNT.START$
+      1819**DCL      1819--REDEF
+GD_DATA.GD.STOPT
+      1814**DCL     12227<<ASSIGN  12246<<ASSIGN  12270<<ASSIGN  12276<<ASSIGN  12307<<ASSIGN  12313<<ASSIGN
+     12361>>IF
+GD_DATA.GD.TRACE
+      1817**DCL     12317<<ASSIGN  12320<<ASSIGN  12325<<ASSIGN  12326<<ASSIGN
+GD_DATA.GDA.BFRSIZ
+      1805**DCL     12113>>ASSIGN
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:72   
+GD_DATA.GDA.CONNECTFLG
+      1805**DCL     12124<<ASSIGN  12129<<ASSIGN  12134<<ASSIGN  12208>>IF
+GD_DATA.GDA.RCV.BFR
+      1807**DCL     12108--ASSIGN  12114--ASSIGN  12339<>CALL
+GD_DATA.MISC.SCREECHCODE
+      1833**DCL     12247<<ASSIGN  12248--ASSIGN
+GD_DRTN_IFPT
+      2457**DCL     12233>>ASSIGN  12255>>ASSIGN  12266>>ASSIGN  12303>>ASSIGN
+GD_DRTN_IFPT.V
+      2459**DCL      2459--DCLINIT
+GD_READ_DEBUG_IFPT
+      2431**DCL     12102>>ASSIGN  12105>>ASSIGN
+GD_READ_DEBUG_IFPT.V
+      2436**DCL      2433--DCLINIT
+M$DRTN
+       207**DCL-ENT 12236--CALL    12258--CALL    12272--CALL    12309--CALL
+M$READ
+       218**DCL-ENT 12125--CALL
+M$UNSHARE
+       208**DCL-ENT 12286--CALL    12292--CALL    12298--CALL
+MSG$
+      2415**DCL     12090<<ASSIGN  12114<<ASSIGN  12164>>ASSIGN  12165>>DOCASE  12169>>CALL    12173>>CALL
+     12176>>CALL    12181>>CALL    12186>>CALL    12190>>CALL    12194>>CALL    12198>>CALL    12209>>CALL
+     12214>>CALL    12222>>CALL    12262>>CALL    12264>>CALL    12271>>CALL    12274>>CALL    12280>>CALL
+     12287>>CALL    12293>>CALL    12299>>CALL    12301>>CALL    12308>>CALL    12311>>CALL    12318>>CALL
+     12322>>CALL    12327>>CALL    12329>>CALL    12332>>ASSIGN  12333>>CALL    12345>>ASSIGN  12346>>CALL
+MSGBUF
+     11169**DCL     12169<>CALL    12173<>CALL    12176<>CALL    12181<>CALL    12186<>CALL    12190<>CALL
+     12194<>CALL    12198<>CALL    12209<>CALL    12214<>CALL    12222<>CALL    12262<>CALL    12264<>CALL
+     12271<>CALL    12274<>CALL    12280<>CALL    12287<>CALL    12293<>CALL    12299<>CALL    12301<>CALL
+     12308<>CALL    12311<>CALL    12318<>CALL    12322<>CALL    12327<>CALL    12329<>CALL    12333<>CALL
+     12346<>CALL
+PMME_IO
+     12106**LABEL   12103--GOTO
+PROCESS
+     12116**LABEL   12092--GOTO
+PL6.E3A0      #001=GDI$DECODE_MSG File=GDI$INTERFACE.:E05TSI                     TUE 07/29/97 21:22 Page:73   
+QUITFD
+     12233**LABEL   12135--GOTO
+SIZE
+      2338**DCL        44--PROC     2336--IMP-SIZ 12091>>ASSIGN  12244<>CALL    12244>>CALL    12335<>CALL
+     12335>>CALL
+UNSHARE_FAILED
+     12345**LABEL   12286--CALLALT 12292--CALLALT 12298--CALLALT
+UNSHARE_FPT
+      2405**DCL     12282<<ASSIGN  12286<>CALL    12289<<ASSIGN  12292<>CALL    12295<<ASSIGN  12298<>CALL
+UNSHARE_FPT.V
+      2407**DCL     12283--ASSIGN  12290--ASSIGN  12296--ASSIGN
+UNSHARE_FPT.V.PROG
+      2412**DCL     12284<<ASSIGN  12291<<ASSIGN
+UNSHARE_FPT.V.SLIB
+      2412**DCL     12285<<ASSIGN  12297<<ASSIGN
+UNSHARE_FPT.V_
+      2407**DCL     12283<<ASSIGN  12290<<ASSIGN  12296<<ASSIGN
+WDOG
+     11170**DCL     12111<<ASSIGN  12146>>IF      12148>>ASSIGN  12154>>ASSIGN
+
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:74   
+      397        1        /*T***********************************************************/
+      398        2        /*T*                                                         */
+      399        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      400        4        /*T*                                                         */
+      401        5        /*T***********************************************************/
+      402        6        %EJECT;
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:75   
+      403        7        /*F*   NAME: GDI$SEND_ERROR_RESPONSE
+      404        8               PURPOSE: Send a responce message to the host
+      405        9               CALL: CALL GDI$SEND_RESPONSE(SIZE,BUFFER) or
+      406       10                     CALL GDI$SEND_ERROR_RESPONSE(SIZE,BUFFER,ERROR)
+      407       11               DESCRIPTION:  This routine is used by the rest of the FEP
+      408       12                             resident debugging routines to send responce
+      409       13                             messages back to the host.  If we enter at the ERROR
+      410       14                             entry point, an error responce is built from the
+      411       15                             passed data, otherwise we just call SATYR to send
+      412       16                             a normal responce.
+      413       17                                                                                      */
+      414       18        GDI$SEND_ERROR_RESPONSE: PROC(SIZE,BUFFER,ERROR);
+      415       19                                                /* INCLUDES                           */
+      416       20        %INCLUDE GD_STATIC_DATA;
+      417      493        %INCLUDE LCP_6;
+      418      684        %INCLUDE KH$CHN;
+      419      806        %INCLUDE G_ROS_M;
+      420      888                                                /* BASED                              */
+      421      889        %GD$MSG;
+      422     1045        %G$ROS;
+      423     1089        %G$EXCFR;
+      424     1471                                                /* ARGUMENTS                          */
+      425     1472    1   DCL BUFFER CHAR(SIZE) CALIGNED;         /* Responce buffer                    */
+      426     1473    1   DCL ERROR UBIN;                         /* Error code to pass back            */
+      427     1474    1   DCL SIZE UBIN;                          /* Byte size of responce buffer       */
+      428     1475                                                /* ENTRYS                             */
+      429     1476    1   DCL GDA$XMT ENTRY(2) ALTRET OPTIONAL;     /* Routine to send responce over
+      430     1477                                                  the line                            */
+      431     1478                                                /* SYMREFS                            */
+      432     1479    1   DCL G$ROS$ PTR SYMREF;
+      433     1480                                                /* CONSTANTS                          */
+      434     1481    1   DCL M$DEBUG DCB;
+      435     1482        %FPT_WRITE(FPTN=GD_WRITE_DEBUG_IFPT,DCB=M$DEBUG,RRR=YES,TRANS=YES,STCLASS=CONSTANT);
+      436     1506                                                /* BASED                              */
+      437     1507                                                /* LOCAL                              */
+      438     1508    1   DCL MONERR BIT(32);
+      439     1509        %FPT_WRITE(FPTN=GD$WRITE_FPT,STCLASS="");
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:76   
+      440     1533              %EJECT;
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:77   
+      441     1534        /*
+      442     1535          Build an error responce to be sent
+      443     1536                                                                                      */
+      444     1537    1           ADDR(BUFFER)->GD$MSG.SUBFNC=ADDR(BUFFER)->GD$MSG.FNC;
+      445     1538    1           ADDR(BUFFER)->GD$MSG.FNC=ERROR;
+      446     1539    1           SIZE=2;
+      447     1540        /*
+      448     1541          If we enter here, just call SATYR to send the message
+      449     1542                                                                                      */
+      450     1543    1   GDI$SEND_RESPONSE: ENTRY(SIZE,BUFFER);
+      451     1544        /* */
+      452     1545    1           GD_DATA.GD.ANSWERED = '1'B;
+      453     1546    2           DO CASE(GD_DATA.GD.MODE);
+      454     1547    2            CASE(%GD#MODE_XDELTA);
+      455     1548    2              CALL GDA$XMT (SIZE,BUFFER);
+      456     1549    2            CASE(%GD#MODE_USER_DELTA);
+      457     1550    2              GD$WRITE_FPT=GD_WRITE_DEBUG_IFPT;
+      458     1551    2              GOTO PMME_IO;
+      459     1552    2            CASE(%GD#MODE_ANLZ);
+      460     1553    2              GD$WRITE_FPT=GD_WRITE_DEBUG_IFPT;
+      461     1554    2              GD$WRITE_FPT.V.DCB#=GD_DATA.GD.HANLZ_DCB;
+      462     1555    2   PMME_IO:   ;
+      463     1556    2              VBASE(GD$WRITE_FPT.BUF_)=ADDR(BUFFER);
+      464     1557    2              IF SIZE = 0
+      465     1558    2              THEN SIZE = %GD#RSPBRKSIZ;
+      466     1559    2              VBOUND(GD$WRITE_FPT.BUF_)=SIZE-1;
+      467     1560    2              GD$WRITE_FPT.V_=VECTOR(GD$WRITE_FPT.V);
+      468     1561    3              CALL M$WRITE(GD$WRITE_FPT) WHENALTRETURN DO;
+      469     1562    3                 MONERR = %G$EXCFR#.TRLR.ERR;
+      470     1563    3                 END;
+      471     1564    2            END;                           /* END CASE                           */
+      472     1565    1           RETURN;
+      473     1566    1   END GDI$SEND_ERROR_RESPONSE;
+
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:78   
+--  Include file information  --
+
+   G_ROS_M.:E05TOU  is referenced.
+   KH$CHN.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure GDI$SEND_ERROR_RESPONSE.
+
+   Procedure GDI$SEND_ERROR_RESPONSE requires 205 words for executable code.
+   Procedure GDI$SEND_ERROR_RESPONSE requires 40 words of local(AUTO) storage.
+
+    No errors detected in file GDI$INTERFACE.:E05TSI    .
+
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:79   
+
+ Object Unit name= GDI$SEND_ERROR_RESPONSE                    File name= GDI$INTERFACE.:E05TOU
+ UTS= JUL 29 '97 21:24:39.04 TUE                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0   DCB   even  none     0      0  M$DEBUG
+    1  RoData even  UTS     18     12  GDI$SEND_ERROR_RESPONSE
+    2   Proc  even  none   205     CD  GDI$SEND_ERROR_RESPONSE
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     2      0   yes            yes      Std        3  GDI$SEND_ERROR_RESPONSE
+     2     30                  yes      Std        2  GDI$SEND_RESPONSE
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+ yes     yes    yes    Std       2 GDA$XMT
+                       nStd      0 X6A_AUTO_3
+                       nStd      0 X6A_ARET
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     GD$DELTA_DATA$                        G$ROS$                                M$DEBUG
+r    G$ROS$
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:80   
+
+
+      397        1        /*T***********************************************************/
+      398        2        /*T*                                                         */
+      399        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+      400        4        /*T*                                                         */
+      401        5        /*T***********************************************************/
+      402        6        %EJECT;
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:81   
+      403        7        /*F*   NAME: GDI$SEND_ERROR_RESPONSE
+      404        8               PURPOSE: Send a responce message to the host
+      405        9               CALL: CALL GDI$SEND_RESPONSE(SIZE,BUFFER) or
+      406       10                     CALL GDI$SEND_ERROR_RESPONSE(SIZE,BUFFER,ERROR)
+      407       11               DESCRIPTION:  This routine is used by the rest of the FEP
+      408       12                             resident debugging routines to send responce
+      409       13                             messages back to the host.  If we enter at the ERROR
+      410       14                             entry point, an error responce is built from the
+      411       15                             passed data, otherwise we just call SATYR to send
+      412       16                             a normal responce.
+      413       17                                                                                      */
+      414       18        GDI$SEND_ERROR_RESPONSE: PROC(SIZE,BUFFER,ERROR);
+
+     18   2 000000  D380 0000 0000  xent GDI$SEND_ERROR_*LNJ,B5   X6A_AUTO_3
+          2 000003       0028 0003                       DC       40,3
+
+      415       19                                                /* INCLUDES                           */
+      416       20        %INCLUDE GD_STATIC_DATA;
+      417      493        %INCLUDE LCP_6;
+      418      684        %INCLUDE KH$CHN;
+      419      806        %INCLUDE G_ROS_M;
+      420      888                                                /* BASED                              */
+      421      889        %GD$MSG;
+      422     1045        %G$ROS;
+      423     1089        %G$EXCFR;
+      424     1471                                                /* ARGUMENTS                          */
+      425     1472    1   DCL BUFFER CHAR(SIZE) CALIGNED;         /* Responce buffer                    */
+      426     1473    1   DCL ERROR UBIN;                         /* Error code to pass back            */
+      427     1474    1   DCL SIZE UBIN;                          /* Byte size of responce buffer       */
+      428     1475                                                /* ENTRYS                             */
+      429     1476    1   DCL GDA$XMT ENTRY(2) ALTRET OPTIONAL;     /* Routine to send responce over
+      430     1477                                                  the line                            */
+      431     1478                                                /* SYMREFS                            */
+      432     1479    1   DCL G$ROS$ PTR SYMREF;
+      433     1480                                                /* CONSTANTS                          */
+      434     1481    1   DCL M$DEBUG DCB;
+      435     1482       %FPT_WRITE(FPTN=GD_WRITE_DEBUG_IFPT,DCB=M$DEBUG,RRR=YES,TRANS=YES,STCLASS=CONSTANT);
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:82   
+      436     1506                                                /* BASED                              */
+      437     1507                                                /* LOCAL                              */
+      438     1508    1   DCL MONERR BIT(32);
+      439     1509        %FPT_WRITE(FPTN=GD$WRITE_FPT,STCLASS="");
+      440     1533              %EJECT;
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:83   
+      441     1534        /*
+      442     1535          Build an error responce to be sent
+      443     1536                                                                                      */
+      444     1537    1           ADDR(BUFFER)->GD$MSG.SUBFNC=ADDR(BUFFER)->GD$MSG.FNC;
+
+   1537   2 000005  8CC7 0006                            LDI      @BUFFER,AUTO
+          2 000007  B856                                 LDR,R3   R6
+          2 000008  E570 7FFF                            AND,R6   32767,IMO
+          2 00000A  8D47 001E                            SDI      GD$WRITE_FPT+18,AUTO
+          2 00000C  ECC7 001E                            LDB,B6   GD$WRITE_FPT+18,AUTO
+          2 00000E  304F                                 SOR,R3   15
+          2 00000F  8CC7 0006                            LDI      @BUFFER,AUTO
+          2 000011  A856                                 LDR,R2   R6
+          2 000012  E570 7FFF                            AND,R6   32767,IMO
+          2 000014  8D47 0020                            SDI      GD$WRITE_FPT+20,AUTO
+          2 000016  DCC7 0020                            LDB,B5   GD$WRITE_FPT+20,AUTO
+          2 000018  204F                                 SOR,R2   15
+          2 000019  D2A5                                 LLH,R5   ,B5,R2
+          2 00001A  3E01                                 ADV,R3   1
+          2 00001B  D7B6                                 STH,R5   ,B6,R3
+
+      445     1538    1           ADDR(BUFFER)->GD$MSG.FNC=ERROR;
+
+   1538   2 00001C  8CC7 0006                            LDI      @BUFFER,AUTO
+          2 00001E  B856                                 LDR,R3   R6
+          2 00001F  E570 7FFF                            AND,R6   32767,IMO
+          2 000021  8D47 001E                            SDI      GD$WRITE_FPT+18,AUTO
+          2 000023  ECC7 001E                            LDB,B6   GD$WRITE_FPT+18,AUTO
+          2 000025  304F                                 SOR,R3   15
+          2 000026  CCC7 0008                            LDB,B4   @ERROR,AUTO
+          2 000028  D804                                 LDR,R5   ,B4
+          2 000029  D7B6                                 STH,R5   ,B6,R3
+
+      446     1539    1           SIZE=2;
+
+   1539   2 00002A  BCC7 0004                            LDB,B3   @SIZE,AUTO
+          2 00002C  6C02                                 LDV,R6   2
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:84   
+          2 00002D  EF03                                 STR,R6   ,B3
+          2 00002E  0F81 0006                            B        s:1545,PREL
+
+      447     1540        /*
+      448     1541          If we enter here, just call SATYR to send the message
+      449     1542                                                                                      */
+      450     1543    1   GDI$SEND_RESPONSE: ENTRY(SIZE,BUFFER);
+
+   1543   2 000030  D380 0000 0000  xent GDI$SEND_RESPON*LNJ,B5   X6A_AUTO_3
+          2 000033       0028 0003                       DC       40,3
+
+      451     1544        /* */
+      452     1545    1           GD_DATA.GD.ANSWERED = '1'B;
+
+   1545   2 000035  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 000038  8946 014C                            LBT,'0002'X       332,B6
+          2 00003A       0002
+
+      453     1546    2           DO CASE(GD_DATA.GD.MODE);
+
+   1546   2 00003B  B846 0130                            LDR,R3   304,B6
+          2 00003D  3D04                                 CMV,R3   4
+          2 00003E  0281 008B                            BGE      s:1565,PREL
+          2 000040  A830 0000 0046  02                   LDR,R2   s:1546+11,R3
+          2 000043  83A0 0000 004A  02                   JMP      s:1548,R2
+          2 000046       0080                            DC       s:1565,PREL
+          2 000047       0026                            DC       s:1550,PREL
+          2 000048       0000                            DC       s:1548,PREL
+          2 000049       0030                            DC       s:1553,PREL
+
+      454     1547    2            CASE(%GD#MODE_XDELTA);
+
+      455     1548    2              CALL GDA$XMT (SIZE,BUFFER);
+
+   1548   2 00004A  8CC7 0006                            LDI      @BUFFER,AUTO
+          2 00004C  9856                                 LDR,R1   R6
+          2 00004D  E570 7FFF                            AND,R6   32767,IMO
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:85   
+          2 00004F  8D47 001E                            SDI      GD$WRITE_FPT+18,AUTO
+          2 000051  DCC7 001E                            LDB,B5   GD$WRITE_FPT+18,AUTO
+          2 000053  104F                                 SOR,R1   15
+          2 000054  DFC7 0024                            STB,B5   GD$WRITE_FPT+24,AUTO
+          2 000056  8CC7 0024                            LDI      GD$WRITE_FPT+24,AUTO
+          2 000058  7031                                 DCL,R7   1
+          2 000059  8D47 0026                            SDI      GD$WRITE_FPT+26,AUTO
+          2 00005B  F851                                 LDR,R7   R1
+          2 00005C  6C00                                 LDV,R6   0
+          2 00005D  8447 0026                            AID      GD$WRITE_FPT+26,AUTO
+          2 00005F  7071                                 DCR,R7   1
+          2 000060  8D47 0022                            SDI      GD$WRITE_FPT+22,AUTO
+          2 000062  CCC7 0004                            LDB,B4   @SIZE,AUTO
+          2 000064  CFC7 0020                            STB,B4   GD$WRITE_FPT+20,AUTO
+          2 000066  BBC7 0020                            LAB,B3   GD$WRITE_FPT+20,AUTO
+          2 000068  CBF0 0200                            LAB,B4   512,IMO
+          2 00006A  E380 0000 0000  xent                 LNJ,B6   GDA$XMT
+          2 00006D       0001                            DC       s:1548+36,PREL
+          2 00006E  0F81 005B                            B        s:1565,PREL
+
+      456     1549    2            CASE(%GD#MODE_USER_DELTA);
+
+      457     1550    2              GD$WRITE_FPT=GD_WRITE_DEBUG_IFPT;
+
+   1550   2 000070  AB80 0000 0000  01                   LAB,B2   GD_WRITE_DEBUG_IFPT
+          2 000073  2C00                                 LDV,R2   0
+          2 000074  6C24                                 LDV,R6   36
+          2 000075  BB87                                 LAB,B3   ,AUTO
+          2 000076  3C18                                 LDV,R3   24
+          2 000077  0008                                 MMM
+
+      458     1551    2              GOTO PMME_IO;
+
+   1551   2 000078  0F81 0010                            B        s:1554,PREL
+
+      459     1552    2            CASE(%GD#MODE_ANLZ);
+
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:86   
+      460     1553    2              GD$WRITE_FPT=GD_WRITE_DEBUG_IFPT;
+
+   1553   2 00007A  AB80 0000 0000  01                   LAB,B2   GD_WRITE_DEBUG_IFPT
+          2 00007D  2C00                                 LDV,R2   0
+          2 00007E  6C24                                 LDV,R6   36
+          2 00007F  BB87                                 LAB,B3   ,AUTO
+          2 000080  3C18                                 LDV,R3   24
+          2 000081  0008                                 MMM
+
+      461     1554    2              GD$WRITE_FPT.V.DCB#=GD_DATA.GD.HANLZ_DCB;
+
+   1554   2 000082  EC80 0000 0000  xsym                 LDB,B6   GD$DELTA_DATA$
+          2 000085  E846 0179                            LDR,R6   377,B6
+          2 000087  E7C7 001B                            STH,R6   GD$WRITE_FPT+15,AUTO
+
+   1554   2                              PMME_IO         null
+      462     1555    2   PMME_IO:   ;
+      463     1556    2              VBASE(GD$WRITE_FPT.BUF_)=ADDR(BUFFER);
+
+   1556   2 000089  8CC7 0006            PMME_IO         LDI      @BUFFER,AUTO
+          2 00008B  B856                                 LDR,R3   R6
+          2 00008C  E570 7FFF                            AND,R6   32767,IMO
+          2 00008E  8D47 001E                            SDI      GD$WRITE_FPT+18,AUTO
+          2 000090  ECC7 001E                            LDB,B6   GD$WRITE_FPT+18,AUTO
+          2 000092  304F                                 SOR,R3   15
+          2 000093  EFC7 0020                            STB,B6   GD$WRITE_FPT+20,AUTO
+          2 000095  8CC7 0020                            LDI      GD$WRITE_FPT+20,AUTO
+          2 000097  7031                                 DCL,R7   1
+          2 000098  8D47 0022                            SDI      GD$WRITE_FPT+22,AUTO
+          2 00009A  F853                                 LDR,R7   R3
+          2 00009B  6C00                                 LDV,R6   0
+          2 00009C  8447 0022                            AID      GD$WRITE_FPT+22,AUTO
+          2 00009E  7071                                 DCR,R7   1
+          2 00009F  8D47 0013                            SDI      GD$WRITE_FPT+7,AUTO
+
+      464     1557    2              IF SIZE = 0
+
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:87   
+   1557   2 0000A1  DCC7 0004                            LDB,B5   @SIZE,AUTO
+          2 0000A3  D805                                 LDR,R5   ,B5
+          2 0000A4  5981 0003                            BNEZ,R5  s:1559,PREL
+
+      465     1558    2              THEN SIZE = %GD#RSPBRKSIZ;
+
+   1558   2 0000A6  5C40                                 LDV,R5   64
+          2 0000A7  DF05                                 STR,R5   ,B5
+
+      466     1559    2              VBOUND(GD$WRITE_FPT.BUF_)=SIZE-1;
+
+   1559   2 0000A8  5EFF                                 ADV,R5   -1
+          2 0000A9  DF47 0012                            STR,R5   GD$WRITE_FPT+6,AUTO
+
+      467     1560    2              GD$WRITE_FPT.V_=VECTOR(GD$WRITE_FPT.V);
+
+   1560   2 0000AB  CBC7 001B                            LAB,B4   GD$WRITE_FPT+15,AUTO
+          2 0000AD  CFC7 001F                            STB,B4   GD$WRITE_FPT+19,AUTO
+          2 0000AF  6C05                                 LDV,R6   5
+          2 0000B0  EF47 001E                            STR,R6   GD$WRITE_FPT+18,AUTO
+          2 0000B2  ABC7 001E                            LAB,B2   GD$WRITE_FPT+18,AUTO
+          2 0000B4  2C00                                 LDV,R2   0
+          2 0000B5  6C06                                 LDV,R6   6
+          2 0000B6  BB87                                 LAB,B3   ,AUTO
+          2 0000B7  3C18                                 LDV,R3   24
+          2 0000B8  0008                                 MMM
+
+      468     1561    3              CALL M$WRITE(GD$WRITE_FPT) WHENALTRETURN DO;
+
+   1561   2 0000B9  BBC7 000C                            LAB,B3   GD$WRITE_FPT,AUTO
+          2 0000BB  B870 1543                            LDR,R3   5443,IMO
+          2 0000BD  0001                                 MCL
+          2 0000BE       0003                            DC       s:1562,PREL
+          2 0000BF  0F81 000A                            B        s:1565,PREL
+
+      469     1562    3                 MONERR = %G$EXCFR#.TRLR.ERR;
+
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:88   
+   1562   2 0000C1  EC80 0000 0000  xsym                 LDB,B6   G$ROS$
+          2 0000C4  DCC6 0004                            LDB,B5   4,B6
+          2 0000C6  8CC5 002B                            LDI      43,B5
+          2 0000C8  8D47 000A                            SDI      MONERR,AUTO
+
+      470     1563    3                 END;
+
+      471     1564    2            END;                           /* END CASE                           */
+
+      472     1565    1           RETURN;
+
+   1565   2 0000CA  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+      473     1566    1   END GDI$SEND_ERROR_RESPONSE;
+
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:89   
+--  Include file information  --
+
+   G_ROS_M.:E05TOU  is referenced.
+   KH$CHN.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   GD$MSG_M.:E05TOU  is referenced.
+   GDA_EQUS_E.:E05TOU  is referenced.
+   GD_EQUS_E.:E05TOU  is referenced.
+   GD_DATA_M.:E05TOU  is referenced.
+   GD_STATIC_DATA.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure GDI$SEND_ERROR_RESPONSE.
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:90   
+
+ **** Variables and constants ****
+
+  ****  Section 001 RoData GDI$SEND_ERROR_RESPONSE
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(288)   r     1 GD_WRITE_DEBUG_IFPT
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     6-0-0/w PTR         r     1 @BUFFER                    8-0-0/w PTR         r     1 @ERROR
+     4-0-0/w PTR         r     1 @SIZE                     *0-0-0/c ACHR        r     1 BUFFER
+    *0-0-0/w UBIN(16)    r     1 ERROR                      C-0-0/w STRC(288)   r     1 GD$WRITE_FPT
+     A-0-0/b BIT (32)    r     1 MONERR                    *0-0-0/w UBIN(16)    r     1 SIZE
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w PTR         r     1 G$ROS$                     0-0-0/w PTR         r     1 GD$DELTA_DATA$
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(736)   r     1 G$EXCFR                    0-0-0/w STRC(928)   r     1 G$ROS
+     0-0-0/w STRC(3344)  r     1 GD$MSG                     0-0-0/w STRC(16704) r     1 GD_DATA
+     0-0-0N  NULL        r     1 M$DEBUG
+
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:91   
+
+   Procedure GDI$SEND_ERROR_RESPONSE requires 205 words for executable code.
+   Procedure GDI$SEND_ERROR_RESPONSE requires 40 words of local(AUTO) storage.
+
+    No errors detected in file GDI$INTERFACE.:E05TSI    .
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:92   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:93   
+          MINI XREF LISTING
+
+BUFFER
+      1472**DCL        18--PROC     1537--ASSIGN   1537--ASSIGN   1538--ASSIGN   1543--ENTRY    1548<>CALL
+      1556--ASSIGN
+ERROR
+      1473**DCL        18--PROC     1538>>ASSIGN
+G$EXCFR.P$$
+      1158**DCL      1158--REDEF    1158--REDEF
+G$EXCFR.PREVSZ
+      1108**DCL      1108--REDEF
+G$EXCFR.TRLR.ERR
+      1438**DCL      1562>>ASSIGN
+G$EXCFR.TRLR.EVID
+      1395**DCL      1413--REDEF    1421--REDEF    1421--REDEF
+G$EXCFR.TRLR.SUBC
+      1372**DCL      1372--REDEF    1390--REDEF    1394--REDEF    1394--REDEF
+G$ROS.AUTO_DS$
+      1068**DCL      1069--REDEF
+G$ROS.AUTO_T$
+      1069**DCL      1069--REDEF
+G$ROS.TCB.ALT$
+      1064**DCL      1562>>ASSIGN
+G$ROS$
+      1479**DCL      1562>>ASSIGN
+GD$DELTA_DATA$
+       446**DCL       460--IMP-PTR  1545>>ASSIGN   1546>>DOCASE   1554>>ASSIGN
+GD$MSG.BRKRQS.IF$CONST.SIZE
+       957**DCL       957--REDEF
+GD$MSG.BRKRQS.IF$CONST.TEXT
+       957**DCL       958--REDEF     958--REDEF     959--REDEF     960--REDEF
+GD$MSG.BRKRSP.BRK#
+       971**DCL       971--REDEF
+GD$MSG.BRKRSP.USER#
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:94   
+       971**DCL       971--REDEF
+GD$MSG.FNC
+       906**DCL      1537>>ASSIGN   1538<<ASSIGN
+GD$MSG.LETMEM_D.VALUE.SIZE
+       929**DCL       929--REDEF
+GD$MSG.LETMEM_D.VALUE.TEXT
+       930**DCL       930--REDEF     930--REDEF     931--REDEF     932--REDEF
+GD$MSG.MESSAGE
+       911**DCL       911--REDEF     912--REDEF     912--REDEF     913--REDEF     924--REDEF     937--REDEF
+       942--REDEF     949--REDEF     965--REDEF     970--REDEF     976--REDEF     977--REDEF    1006--REDEF
+      1008--REDEF    1019--REDEF    1026--REDEF    1038--REDEF
+GD$MSG.SUBFNC
+       906**DCL       906--REDEF     910--REDEF    1537<<ASSIGN
+GD$MSG.TSA.I
+       978**DCL       978--REDEF
+GD$MSG.TSA.S
+       980**DCL       980--REDEF
+GD$MSG.USERQS.ASDT$
+      1006**DCL      1006--REDEF    1007--REDEF
+GD$WRITE_FPT
+      1522**DCL      1550<<ASSIGN   1553<<ASSIGN   1561<>CALL
+GD$WRITE_FPT.BUF_
+      1524**DCL      1556<<ASSIGN   1559<<ASSIGN
+GD$WRITE_FPT.V
+      1527**DCL      1560--ASSIGN
+GD$WRITE_FPT.V.DCB#
+      1527**DCL      1554<<ASSIGN
+GD$WRITE_FPT.V_
+      1524**DCL      1560<<ASSIGN
+GDA$XMT
+      1476**DCL-ENT  1548--CALL
+GD_DATA.GD.ANSWERED
+       470**DCL      1545<<ASSIGN
+GD_DATA.GD.DYNSP$
+       473**DCL       473--REDEF
+GD_DATA.GD.HANLZ_DCB
+PL6.E3A0      #002=GDI$SEND_ERROR_RESPONSE File=GDI$INTERFACE.:E05TSI            TUE 07/29/97 21:24 Page:95   
+       481**DCL      1554>>ASSIGN
+GD_DATA.GD.MODE
+       463**DCL      1546>>DOCASE
+GD_DATA.GD.STEP_BRKPNT.ADR$
+       474**DCL       475--REDEF
+GD_DATA.GD.STEP_BRKPNT.START$
+       475**DCL       475--REDEF
+GD_WRITE_DEBUG_IFPT
+      1495**DCL      1550>>ASSIGN   1553>>ASSIGN
+GD_WRITE_DEBUG_IFPT.V
+      1500**DCL      1497--DCLINIT
+M$WRITE
+       666**DCL-ENT  1561--CALL
+MONERR
+      1508**DCL      1562<<ASSIGN
+PMME_IO
+      1554**LABEL    1551--GOTO
+SIZE
+      1474**DCL        18--PROC     1472--IMP-SIZ  1539<<ASSIGN   1543--ENTRY    1548<>CALL     1548>>CALL
+      1557>>IF       1558<<ASSIGN   1559>>ASSIGN

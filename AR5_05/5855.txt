@@ -1,0 +1,2081 @@
+/*M* PMDISP  -- Display performance data gathered by PM */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMC */
+/*P* NAME: PMDISP
+ 
+     PURPOSE: PMDISP analyzes the data gathered by PMON or PM, and produces
+   a display of the percent of data points that fall in the address range
+   of the modules. The display is sorted by amount of data points.
+   Also, if the module has internal procedures that were used,
+   it displays the amount of data points that fall in them as percent of total
+   data points and as percent of data points of the module.me.
+   The percentage of collected data points reflects the percentage
+   of spend execution time if enough data points are collected.
+   The amount of data points should be greater than 10,000.
+   Monitor Calls do create distortions. The modules containing
+   monitor calls report a greater percentage of data points than
+   actual used execution time. Further, the monitor call statement
+   and the statements following the monitor call statement might
+   report a greater  portion of data points as well.
+ 
+   To run the program:
+  !PMDISP.X ru_fid [,pm_data_fid]   [ ON,lsfid] [(option,...)]
+ 
+        The ru_fid specified must be the run unit PMON or PM collects
+        performance data on, otherwise the resulting statistics
+        (if any) is not valid.  The run unit should have debug schema
+        if possible.
+ 
+        The default pm_data_fid is *PM_DATA.  If you have specified
+        the performance data file to be otherwise when you run PMON or
+        PM, then you have to give that file name here, or you can
+        !SET M$UI pm_data_fid before invoking PMDISP.  Please note
+        that '*PM_DATA', being a star file, will be deleted when you
+        log off, so if you want to save it, you must copy it into a
+        permanent file.
+ 
+        All statistics output from PMDISP goes out through M$LO, and
+        the default is the terminal.  If you want the output to go
+        somewhere else, then you must specify lsfid, or you can
+        !SET M$LO lsfid before invoking PMDISP.
+ 
+ 
+   The following options are available:
+ 
+    M=       This option allows to specify external procedure modules
+             for which percentage of data points shall be listed by statements.
+             E.g: M=module_name or M= (module_name1,...,...)
+ 
+                  module_name can be wildcarded with a trailing '?'
+ 
+    MN       This option provides a summary by module and
+             internal procedure of execution.  *DEFAULT*
+ 
+    NM       The no-module option supresses the external procedure
+             module name printout.  It overrides the MN option.
+ 
+    ND       If this option is specified, percentage of data points
+             will be listed by nodes.
+ 
+    PM       This option is used to indicate that the performance data
+             came from a PMON or PM.X run.
+ 
+    CT       Specifies data is from COMTEN device.
+ 
+    R=       This range option permits to specify up to three ranges
+             of addresses for which percentage of data points shall be listed.
+             The addresses are specified in octal.
+             E.g.: R= (17550-17625,17625-17700)
+ 
+    RI       The run-unit in option restores the internal tables
+             and saves the reading of the schema.
+             Note, that the same run-uni must be used and the
+             and the M option cannot be used.
+ 
+    RO       The run-unit out option save the internal tables of
+             PMDISP that were created from the run-unit schema.
+             The run-unit data are written thru the M$RU DCB.
+ 
+    ST       The statistics option reports some additional data
+             relating to the data point gathering test run and the
+             PMDISP execution.  *DEFAULT*
+ 
+    NS       This option causes the statistics not to appear.  It
+             overrides ST option.
+ 
+    $P       The $P option produces PM data during the PMDISP run.
+             (This option has not been fully implemented yet.)
+ 
+ 
+  To learn more, read the documentation on PMON.
+*/
+%EJECT;
+PMDISP: PROC MAIN ALTRET;
+ 
+/*X* DMC,AND,PRB,PLM=5,IND=3,CTI=3,DCI=6,IAD=0,DTI=0,IDT=0,ENI=0,ECI=0,CSI=0,THI=3,DIN=0,SDI=3 */
+ 
+DCL PMSTART ENTRY;
+DCL PMEND ENTRY;
+DCL SORT ENTRY(2);
+ 
+%INCLUDE CP_6;
+%INCLUDE B$JIT;
+%INCLUDE B$OBJECT_C;
+%INCLUDE B$ROSEG;
+%INCLUDE B_SEGIDS_C;
+ 
+%F$DCB;
+DCL B$JIT$ PTR SYMREF READONLY;
+DCL B$TCB$ PTR SYMREF READONLY;
+DCL B$ROS$ PTR SYMREF READONLY;
+%B$HEAD(STCLASS=STATIC);
+%B$TCB;
+%B$ALT;
+%B$DNAME;
+%B$EDEF;
+%B$LOGBLK;
+%B$LBNTRY0;
+%B$LBNTRY1;
+%B$INTNTRY;
+%B$EXST;
+%B$RECORDSUBS;
+%SUB_CST;
+%B$STTYPESUBS;
+%B$STXTYPESUBS;
+%B$TREE_TABLE;
+%RU_FLAVORS;
+ 
+DCL M$SI DCB;
+DCL M$LO DCB;
+DCL M$DO DCB;
+DCL M$UI DCB;
+DCL M$RU DCB;
+ 
+ 
+/*        Read FPTs and read data buffers */
+ 
+%FPT_READ(FPTN=READ_HEAD,BUF=B$HEAD,DCB=M$SI,KEY=RUHEADKEY,KEYS=YES);
+%FPT_READ(FPTN=RD1,DCB=M$SI,KEY=TYPE1,KEYS=YES);
+%FPT_READ(FPTN=RD_LOGICAL,DCB=M$SI,KEY=LOGKEY,KEYS=YES);
+%FPT_READ(FPTN=RD_DEBUG,DCB=M$SI,KEY=DEBUG_KEY,KEYS=YES);
+%FPT_READ(FPTN=READ_RU,DCB=M$SI,KEYS=YES);
+ 
+%FPT_OPEN(FPTN=OP,ASN=FILE,ACS=DIRECT,DCB=M$SI,FUN=IN);
+%FPT_READ(FPTN=RD2,DCB=M$SI,KEY=TYPE4,KEYS=YES);
+%FPT_READ(FPTN=READ_BIRTH,BUF=B$RUBIRTH,DCB=M$SI,KEY=RUBIRTHKEY,KEYS=YES);
+%FPT_READ(FPTN=RD_PM,BUF=PM_BUF,DCB=M$UI);
+%FPT_OPEN(FPTN=OP_PM1,ASN=FILE,DCB=M$UI,FUN=IN,REASSIGN=YES);
+%FPT_OPEN(FPTN=OP_PM2,ASN=FILE,NAME=PM_NAME,DCB=M$UI,FUN=IN,SETDCB=YES);
+%FPT_CLOSE(FPTN=CLS_PM,DCB=M$UI,DISP=SAVE);
+%VLP_NAME(FPTN=PM_NAME,NAME='*PM_DATA');
+%FPT_GDS(FPTN=FPT_GDS);
+%FPT_FDS(FPTN=FPT_FDS,STCLASS=STATIC);
+%VLP_VECTOR(FPTN=GDS_RES,STCLASS=AUTO);
+ 
+DCL BUF1$ PTR;
+DCL BUF2(0:4000) UBIN WORD STATIC;
+DCL LOGBUF(0:8191) UBIN WORD STATIC;
+DCL DEBUG_BUF(0:8191) UBIN WORD STATIC;
+DCL 1 PM_BUF(0:1999) STATIC ALIGNED,
+       2 OVERLAY# UBIN HALF HALIGNED INIT(0*0),
+       2 IC UBIN HALF HALIGNED INIT(0*0);
+DCL FEP_PM_BUF ( 0:1999 ) REDEF PM_BUF UBIN;
+ 
+ 
+ 
+/*        PMDISP structures for storing performance data */
+ 
+DCL 1 EPN(0:0) BASED(EPN$) ALIGNED,       /* Structure for external procedure names */
+       2 COUNT SBIN ALIGNED,
+       2 LOW SBIN,
+       2 OVERLAY# SBIN,
+       2 HIGH UBIN HALF UNAL,
+       2 * UBIN HALF UNAL,
+       2 NPOINTER SBIN;
+ 
+DCL 1 IPN(0:1500) ALIGNED,                   /* Structure for internal procedure names */
+       2 COUNT SBIN ALIGNED,
+       2 LOW SBIN,
+       2 OVERLAY# SBIN,
+       2 HIGH UBIN HALF UNAL,
+       2 LBE UBIN HALF UNAL,
+       2 NPOINTER SBIN HALF UNAL,
+       2 NPTR2 SBIN HALF UNAL;
+ 
+DCL 1 STS(0:0) ALIGNED BASED(STS$),   /* Structure of statements */
+       2 COUNT SBIN ALIGNED,
+       2 LOW SBIN,
+       2 OVERLAY# SBIN,
+       2 HIGH UBIN HALF UNAL,
+       2 * UBIN HALF UNAL,
+       2 STMNT# SBIN HALF UNAL,
+       2 TYPE SBIN HALF UNAL;
+ 
+DCL 1 SEPN(0:0) BASED(SEPN$),            /* Structure to remember   */
+       2 COUNT UBIN HALF UNAL,              /* the modules to analyze  */
+       2 TEXT CHAR(32) UNAL,               /* by statement.           */
+       2 LOW SBIN WORD ALIGNED,
+       2 OVERLAY# SBIN WORD ALIGNED;
+DCL 1 WILD_SEPN(0:0) BASED(WILD_SEPN$),        /* Structure to store */
+       2 NUM_CHAR UBIN HALF UNAL,               /* wildcarded names.  */
+       2 NAME CHAR(32) UNAL;
+ 
+DCL NODE_TABLE(0:19) UBIN STATIC INIT(0*20);
+ 
+DCL 1 RANGES(0:2) STATIC ALIGNED,
+       2 LOW SBIN WORD INIT(0*0),
+       2 HIGH SBIN WORD INIT(-1*0),
+       2 COUNT SBIN WORD INIT(0*0);
+ 
+ 
+DCL SP_P$ PTR STATIC;
+DCL 1 SEPN_BASED BASED(SP_P$) ALIGNED,
+       2 COUNT UBIN HALF UNAL,
+       2 TEXT CHAR(SEPN_BASED.COUNT) UNAL;
+ 
+DCL 1 NODE_NAME BASED,
+       2 SIZE UBIN BYTE UNAL,
+       2 TEXT CHAR(NODE_NAME.SIZE) UNAL;
+ 
+DCL 1 XT,
+       2 EXEC UBIN WORD,
+       2 SERV UBIN WORD;
+ 
+DCL 1 CONTROL BASED,                    /* Based structure to analyze PM data */
+       2 WORD1 UBIN WORD,
+       2 WORD2 UBIN WORD,
+       2 WORD3 UBIN WORD,
+       2 WORD4 UBIN WORD,
+       2 BUF CHAR(76);
+DCL RU_TYPE UBIN;
+ 
+DCL UTS UBIN WORD STATIC INIT(0);
+%B$RUBIRTH;
+DCL 1 RUBIRTHKEY CONSTANT,
+       2 * UBIN BYTE UNAL INIT(5),
+       2 * CHAR(0) UNAL INIT('BIRTH');
+%B$RUHEADKEY(NAME=RUHEADKEY);
+%B$RUKEY(NAME=ROS_KEY, TYPEINIT="(30)");
+%B$RUKEY(NAME=TYPE1,TYPEINIT="(1)");
+%B$RUKEY(NAME=TYPE4,TYPEINIT="(4)");
+%B$DBGKEY(NAME=LOGKEY);
+%B$DBGKEY(NAME=DEBUG_KEY);
+ 
+ 
+DCL NODE SBIN WORD STATIC INIT(0);
+DCL P_ROS SBIN WORD;
+DCL R_ROS SBIN WORD;
+DCL P_TREE SBIN WORD;
+DCL R_TREE SBIN WORD;
+DCL NUM_ENTRIES UBIN WORD;
+DCL DO_PM SBIN WORD STATIC INIT(0);
+DCL DO_ST SBIN WORD STATIC INIT(0);
+DCL DO_MN SBIN WORD STATIC INIT(0);
+DCL COMTEN SBIN WORD STATIC INIT(0);
+DCL EPN_TOTAL SBIN WORD;
+DCL RUF_IN SBIN WORD STATIC INIT(0);
+DCL RUF_OU SBIN WORD STATIC INIT(0);
+DCL MODULE_MIN  SBIN WORD STATIC INIT(262143);
+DCL MODULE_MAX  SBIN WORD STATIC INIT(0);
+DCL MODULE_MISS_CNT SBIN WORD STATIC INIT(0);
+DCL LEN SBIN;
+DCL LVL SBIN;
+DCL FOUND BIT(1);
+DCL PM_TEMP SBIN WORD;
+DCL PM_NODE SBIN WORD;
+DCL SEPN_INDEX SBIN WORD;
+DCL WILD_SEPN_CNT SBIN WORD;
+DCL EPN_CNT SBIN WORD;
+DCL IPN_CNT SBIN WORD;
+DCL STS_CNT SBIN WORD;
+DCL REC_SIZE# UBIN;
+DCL EPN_SIZE# UBIN;
+DCL TEMPTR$ PTR;
+DCL TEMPIND# UBIN;
+DCL MAX_EPN UBIN;
+DCL RANGE_CNT  SBIN WORD STATIC INIT(0);
+DCL SEPN_CNT SBIN WORD;
+DCL SE_PAGE SBIN;
+DCL WI_PAGE SBIN;
+DCL ST_PAGE SBIN;
+DCL PERCENT SBIN WORD;
+DCL PERCENT2 SBIN WORD;
+DCL OFFSET SBIN;
+DCL OLD_INTERNAL SBIN WORD;
+DCL PAGE SBIN;
+DCL LAST_OLAY SBIN WORD;
+DCL NTEMP CHAR(8);
+DCL I SBIN WORD;
+DCL J SBIN WORD;
+DCL K SBIN WORD;
+DCL L SBIN WORD;
+DCL PM_TOTAL SBIN WORD;
+DCL PM_RCNT SBIN WORD;
+DCL TOTAL SBIN WORD;
+ 
+ 
+DCL 1  RU_KEY   STATIC,
+       2  C     UBIN(9)  CALIGNED INIT(3),
+       2  FLD   CHAR(3)           INIT('RU0');
+ 
+DCL 1  RU_KEY_EPN CONSTANT,
+       2  C     UBIN(9)  CALIGNED INIT(3),
+       2  FLD   CHAR(3)           INIT('RUM');
+ 
+DCL 1  RU_KEY_IPN CONSTANT,
+       2  C     UBIN(9)  CALIGNED INIT(3),
+       2  FLD   CHAR(3)           INIT('RUI');
+ 
+DCL 1  RU_KEY_STS CONSTANT,
+       2  C     UBIN(9)  CALIGNED INIT(3),
+       2  FLD   CHAR(3)           INIT('RUS');
+ 
+DCL 1   RU_KEY_SEPN CONSTANT,
+       2 C        UBIN(9) CALIGNED INIT(3),
+       2 FLD      CHAR(3)          INIT('RUT');
+ 
+DCL P$ PTR;
+DCL P2$ PTR;
+DCL PJ$ PTR;
+DCL PE$ PTR;
+DCL B$ PTR;
+DCL NODE$ PTR;
+DCL TREE$ PTR;
+DCL P4$ PTR;
+ 
+DCL 1 POINT STATIC,
+       2 OFFSET BIT(24) UNAL INIT('0'B),
+       2 SEG_ID BIT(12) UNAL INIT(%DS3SID);
+DCL NODE_NAME$ REDEF POINT PTR;
+DCL P3$ REDEF POINT PTR;
+ 
+DCL 1 SEG4$ CONSTANT,
+       2 OFFSET BIT(24) UNAL INIT('0'B),
+       2 SEG_ID BIT(12) UNAL INIT(%DS4SID);
+DCL SEPN$ REDEF SEG4$ PTR;
+ 
+DCL 1 SEG5$ CONSTANT,
+       2 OFFSET BIT(24) UNAL INIT('0'B),
+       2 SEG_ID BIT(12) UNAL INIT(%DS5SID);
+DCL WILD_SEPN$ REDEF SEG5$ PTR;
+ 
+DCL 1 SEG6$ CONSTANT,
+       2 OFFSET BIT(24) UNAL INIT('0'B),
+       2 SEG_ID BIT(12) UNAL INIT(%DS6SID);
+DCL STS$ REDEF SEG6$ PTR;
+ 
+DCL 1 SEG8$ CONSTANT,
+       2 OFFSET BIT(24) UNAL INIT('0'B),
+       2 SEG_ID BIT(12) UNAL INIT(%DS8SID);
+DCL EPN$ REDEF SEG8$ PTR;
+ 
+ 
+/*        Write FPTs and messages */
+ 
+%FPT_WRITE(FPTN=WR,DCB=M$LO,BUF=OUTBUF);
+%FPT_WRITE(FPTN=WR_SPACER,DCB=M$LO,BUF=SPACER);
+%FPT_WRITE(FPTN=WR_SKIP,DCB=M$LO,BUF=SKIP);
+%FPT_WRITE(FPTN=WR2,DCB=M$LO,BUF=OUT2);
+%FPT_WRITE(FPTN=WR_STMNT,DCB=M$LO,BUF=OUT_STMNT);
+%FPT_WRITE(FPTN=WR_XT,DCB=M$LO,BUF=XTBUF);
+%FPT_WRITE(FPTN=WR_FINAL,DCB=M$LO,BUF=FINAL_MESS);
+%FPT_WRITE(FPTN=WRITE,DCB=M$LO);
+ 
+%FPT_WRITE(FPTN=BAD_OPTION,BUF=OPT_ERR,DCB=M$DO);
+%FPT_WRITE(FPTN=WR_NORU,DCB=M$DO,BUF=NO_RU);
+%FPT_WRITE(FPTN=MIXED_UP,BUF=MIXED,DCB=M$DO);
+%FPT_WRITE(FPTN=MATCH_ERR,BUF=MATCHED,DCB=M$DO);
+%FPT_WRITE(FPTN=WR_ERR,DCB=M$DO,BUF=ERR_BUF);
+%FPT_WRITE(FPTN=WR_ERR_MEQ,DCB=M$DO,BUF=ERR_MEQ);
+%FPT_WRITE(FPTN=WRITE_ERR,DCB=M$DO);
+ 
+%FPT_DEVICE(FPTN=HEADER,DCB=M$LO,HDR=HEAD_LINE);
+%FPT_DEVICE(FPTN=NEW_PAGE,DCB=M$LO,PAGE=YES);
+ 
+%VLP_HDR(FPTN=HEAD_LINE,COUNT=106,HEADERHEIGHT=2,RESETPAGE=YES,TITLE=
+'                                                                                                        ');
+DCL 1 HEAD_LN STATIC,
+       2 * UBIN(9) UNAL INIT(105),
+       2 * CHAR(23) INIT('PMDISP B03    CCBUF = '),
+       2 NAMES CHAR(61) INIT(' '),
+       2 DATE CHAR(9) INIT(' '),
+       2 TIME CHAR(6) INIT(' '),
+       2 * CHAR(0) INIT('Page:    ');
+ 
+ 
+%FPT_CLOSE(FPTN=CLS_LO,DCB=M$LO,DISP=SAVE);
+ 
+%FPT_TIME(FPTN=MAKETIME,TIME=FINAL_MESS.TIME,
+              DEST=EXT,SOURCE=UTS,TSTAMP=TEMPTIME);
+%FPT_TIME(FPTN=GETTIME,TIME=TIME_BUF,DATE=DATE_BUF,
+              DEST=LOCAL,SOURCE=CLOCK);
+DCL TEMPTIME SBIN WORD STATIC;
+ 
+DCL ERR_BUF CHAR(0) CONSTANT INIT(' More than 1500 modules or internal names');
+DCL ERR_MEQ CHAR(0)  CONSTANT INIT(' The M= option may not be specified if RI is specified');
+ 
+DCL OPT_ERR CHAR(0) CONSTANT INIT('**** Invalid option');
+DCL 1 OUTBUF STATIC,
+       2 LOC(0:6) CHAR(1) UNAL INIT(' '*0),
+       2 * CHAR(2) INIT('% '),
+       2 NAME CHAR(40) INIT(' ');
+DCL 1 SPACER CONSTANT,
+       2 * CHAR(0) INIT(' -------'),
+       2 * CHAR(1) INIT(' '),
+       2 * CHAR(0) INIT('---------------------------------------');
+DCL SKIP CHAR(2) CONSTANT INIT(' ');
+DCL 1 OUT2 STATIC,
+       2 * CHAR(8) UNAL INIT(' '),
+       2 P1(0:6) CHAR(1) UNAL INIT(' '*0),
+       2 * CHAR(0) UNAL INIT('% ('),
+       2 P2(0:6) CHAR(1) UNAL INIT(' '*0),
+       2 * CHAR(0) UNAL INIT('%) '),
+       2 * CHAR(0) UNAL INIT('['),
+       2 LL CHAR(1) UNAL INIT('?'),
+       2 * CHAR(0) UNAL INIT(']  '),
+       2 NAME CHAR(40) INIT(' ');
+DCL 1 RANGE_MESS STATIC,
+       2 XX,
+          3 * CHAR(0) UNAL INIT(' Range'),
+          3 NUM CHAR(1) UNAL INIT('?'),
+       2 NAME REDEF XX CHAR(7) UNAL;
+DCL 1 OUT_STMNT STATIC,
+       2 * CHAR(1) INIT(' '),
+       2 LINE CHAR(45) INIT('?'),
+       2 * CHAR(0) INIT(' - '),
+       2 COUNT(0:6) CHAR(1) INIT('?'*0),
+       2 * CHAR(1) INIT('%'),
+       2 * CHAR(0) INIT(' ('),
+       2 COUNT2(0:6) CHAR(1) INIT('?'*0),
+       2 * CHAR(0) INIT('%).');
+ 
+DCL 1 PM_RUN STATIC,
+       2 * CHAR(16) INIT('  PM Run CCBUF: '),
+       2 CCBUF CHAR(80) INIT(' ');
+ 
+DCL 1 XTBUF STATIC,
+       2 * CHAR(0) INIT('  Execution time='),
+       2 EXEC(0:6) CHAR(1) UNAL INIT(' '*0),
+       2 * CHAR(0) UNAL INIT('%, Service time='),
+       2 SERV(0:6) CHAR(1) UNAL INIT(' '*0),
+       2 * CHAR(0) UNAL INIT('%.');
+DCL 1 FINAL_MESS STATIC,
+       2 * CHAR(0) INIT('  Total data points='),
+       2 NUM CHAR(8) UNAL INIT('?'),
+       2 * CHAR(0) UNAL INIT('., Total time used='),
+       2 TIME CHAR(11) UNAL INIT('?'),
+       2 * CHAR(0) UNAL INIT('.');
+ 
+DCL HD_PM CHAR(0) CONSTANT INIT(
+ 'PM EXECUTION RUN STATISTICS');
+DCL HD_MOD CHAR(0) CONSTANT INIT(
+ 'LIST OF MODULES');
+DCL HD_ST CHAR(0) CONSTANT INIT(
+ 'LIST OF STATEMENTS');
+DCL HD_RA CHAR(0) CONSTANT INIT(
+ 'LIST OF SPECIFIED RANGES');
+DCL HD_NODE CHAR(0) CONSTANT INIT(
+ 'LIST OF NODES');
+DCL NO_RU CHAR(0) CONSTANT INIT(
+ '**** Error on OPEN of M$SI DCB, either run-unit is not specified or the run unit specified does not exit.');
+DCL MIXED CHAR(0) CONSTANT INIT(
+ '**** Data file contains data from different programs.');
+DCL MATCHED CHAR(0) CONSTANT INIT(
+ '**** Data file was not created with specified rununit.');
+DCL NO_MEM CHAR(0) CONSTANT INIT(
+ 'Not enough memory to run PMDISP. ');
+DCL DATE_BUF CHAR (8) STATIC INIT('99/99/99');
+DCL TIME_BUF CHAR(11) STATIC INIT('99:99:99.99');
+ 
+DCL XFF_INIT_LIB ENTRY ALTRET;
+DCL XFF_7INIT_LIB ENTRY ALTRET;
+DCL DIV ENTRY(3);
+ 
+ 
+ 
+ 
+     CALL XFF_INIT_LIB;
+     CALL XFF_7INIT_LIB;
+ 
+     FPT_GDS.V.SEGSIZE# = 7505;
+     GDS_RES.W2.SEGID# = %DS8SID;
+     CALL GET_MEM;
+     MAX_EPN = 1500;
+     EPN_SIZE# = 7505;
+ 
+     CALL GET_OPTIONS;
+     IF DO_PM = 1 THEN CALL PMSTART;  /** $P option present **/
+ 
+     HEAD_LN.NAMES = SUBSTR(B$JIT.CCBUF,,B$JIT.CCARS);
+     CALL M$TIME(GETTIME);
+     HEAD_LN.DATE = DATE_BUF;
+     HEAD_LN.TIME = SUBSTR(TIME_BUF,,5);
+     HEAD_LINE.TITL = HEAD_LN;
+ 
+     CALL M$DEVICE(HEADER);
+     CALL M$DEVICE(NEW_PAGE);
+ 
+     CALL WILDCARD_CHECK;
+ 
+     CALL READ_RU_INFO;
+ 
+     CALL M$WRITE(WR_SKIP);
+ 
+     CALL SETUP_MODULE_MIN_MAX;
+ 
+     IF COMTEN = 1
+        THEN CALL READ_COMTEN_DATA;
+        ELSE CALL READ_PM_DATA;
+ 
+     CALL WRITE_STATISTICS;
+ 
+     CALL WRITE_NODES;
+ 
+     CALL WRITE_MODULES;
+ 
+     CALL WRITE_STATEMENTS;
+ 
+     CALL WRITE_RANGES;
+ 
+     GDS_RES.W2.SEGID# = %DS7SID;
+     FPT_FDS.V.SEGSIZE# = REC_SIZE#;
+     CALL FREE_MEM;
+     GDS_RES.W2.SEGID# = %DS8SID;
+     FPT_GDS.V.SEGSIZE# = EPN_SIZE#;
+     CALL FREE_MEM;
+ 
+     CALL M$CLOSE(CLS_LO);
+     IF DO_PM = 1 THEN CALL PMEND;
+     CALL M$EXIT;
+ 
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*    NAME:          GET_OPTIONS                            *
+ *                                                            *
+ *      PURPOSE:       To obtain and parse the options on     *
+ *                     the command line.                      *
+ *                                                            *
+ *      DESCRIPTION:   This is not an elegant approach, for   *
+ *                     one thing, the command line may NOT    *
+ *                     be continued.                          *
+ *                                                            *
+ *                     The options we recognize are:          *
+ *                       (0)   CT.......ComTen                *
+ *                       (1)   RI.......Read schema file In   *
+ *                       (2)   RO.......wRite schema Out      *
+ *                       (3)   $P.......Monitor our perfor-   *
+ *                                      mance                 *
+ *                       (4)   ST.......report Statistics     *
+ *                       (5)   NM.......No Module summary     *
+ *                       (6)   ND.......Statistics by Nodes   *
+ *                       (7)   M=.......Module names are      *
+ *                       (8)   R=.......instruction Ranges    *
+ *                                                            *
+ **************************************************************/
+ 
+GET_OPTIONS: PROC;
+/*        Obtain and parse options on invocation line */
+ 
+     LVL       = 0;    /* Paren nesting level */
+     SEPN_CNT  = 0;    /* M= counter          */
+     DO_ST     = 1;    /* Produce statistics  */
+     DO_MN     = 1;    /* Produce module info */
+     COMTEN    = 0;    /* Input data from C10 */
+     RANGE_CNT = 0;    /* Number of Ranges    */
+     SE_PAGE=-1;
+ 
+     IF B$JIT.CCDISP < B$JIT.CCARS THEN
+     DO;
+        I = B$JIT.CCDISP + 1;
+        DO WHILE( I < B$JIT.CCARS );
+           DO SELECT(  SUBSTR(B$JIT.CCBUF,I,2)  );
+           SELECT('CT'); COMTEN = 1; I = I + 2;
+           SELECT('PM'); COMTEN = 0; I = I + 2;
+           SELECT('RI'); RUF_IN = 1; I = I + 2;
+           SELECT('RO'); RUF_OU = 1; I = I + 2;
+           SELECT('$P'); DO_PM = 1; I = I + 2;
+           SELECT('ST'); DO_ST = 1; I = I + 2;
+           SELECT('NS'); DO_ST = 0; I = I + 2;
+           SELECT('MN'); DO_MN = 1; I = I + 2;
+           SELECT('NM'); DO_MN = 0; I = I + 2;
+           SELECT('ND'); NODE=1; I=I+2;
+           SELECT('M=');
+                 I = I + 2; LVL = 0;
+                 DO WHILE(I < B$JIT.CCARS);
+ 
+                    CALL OPT_FIELD(I,J,LEN,LVL) ALTRET(MDONE);
+                    /* If memory is running out, get another page. */
+                    IF SE_PAGE<0 OR ADDR(SEPN(SEPN_CNT+1))>PINCRW(SEPN$,
+                       1024*(SE_PAGE+1)) THEN
+                    DO;
+                       SE_PAGE=SE_PAGE+1;
+                       GDS_RES.W2.SEGID#=%DS4SID;
+                       FPT_GDS.V.SEGSIZE#=1024;
+                       CALL GET_MEM;
+                    END;
+ 
+                    SEPN.COUNT(SEPN_CNT) = LEN;
+                    SEPN.TEXT(SEPN_CNT) = SUBSTR(B$JIT.CCBUF,I,LEN);
+                    I = J;
+                    SEPN_CNT = SEPN_CNT + 1;
+                    IF LVL = 0  OR  SUBSTR(B$JIT.CCBUF,J,1) = ')'
+                       THEN EXIT;
+                    IF SUBSTR(B$JIT.CCBUF,I,1) ~= ',' THEN GOTO ERR;
+                    I = I + 1;
+                    DO WHILE(SUBSTR(B$JIT.CCBUF,I,1) = ' '); I = I+1; END;
+                 END;
+MDONE:           I = J;
+           SELECT('R=');
+                 I = I + 2; LVL = 0;
+                 DO WHILE(I < B$JIT.CCARS);
+                    IF RANGE_CNT > 2 THEN GOTO ERR;
+                    CALL OPT_FIELD(I,J,LEN,LVL) ALTRET(RDONE);
+                    IF SUBSTR(B$JIT.CCBUF,J,1) ~= '-' THEN GOTO ERR;
+                    IF LEN > 6 THEN GOTO ERR;
+                    CALL GET_OCTAL(I,LEN) ALTRET(ERR);
+                    RANGES.LOW(RANGE_CNT) = LEN;
+                    I = J+1;
+                    DO WHILE(SUBSTR(B$JIT.CCBUF,I,1) = ' '); I = I+1; END;
+                    CALL OPT_FIELD(I,J,LEN,LVL) ALTRET(ERR);
+                    IF LEN > 6 THEN GOTO ERR;
+                    CALL GET_OCTAL(I,LEN) ALTRET(ERR);
+                    RANGES.HIGH(RANGE_CNT) = LEN;
+                    RANGE_CNT = RANGE_CNT + 1;
+                    IF LVL = 0  OR  SUBSTR(B$JIT.CCBUF,J,1) = ')'
+                       THEN EXIT;
+                    IF SUBSTR(B$JIT.CCBUF,J,1) ~= ',' THEN GOTO ERR;
+                    I = J+1;
+                    DO WHILE(SUBSTR(B$JIT.CCBUF,I,1) = ' '); I = I+1; END;
+                 END;
+RDONE:           I = J;
+           SELECT(ELSE);
+                 IF   SUBSTR(B$JIT.CCBUF,I+1,1) = ')' OR B$JIT.CCARS <= I+1
+                    THEN I = B$JIT.CCARS + 1;
+                    ELSE GOTO ERR;
+           END;
+           DO WHILE(SUBSTR(B$JIT.CCBUF,I,1) = ' '); I = I+1; END;
+           IF SUBSTR(B$JIT.CCBUF,I,1) = ')' THEN
+           DO;
+              I = I + 1;
+              LVL = LVL - 1;
+           END;
+           DO WHILE(SUBSTR(B$JIT.CCBUF,I,1) = ' '); I = I+1; END;
+           IF SUBSTR(B$JIT.CCBUF,I,1) = ',' THEN I=I+1;
+           DO WHILE(SUBSTR(B$JIT.CCBUF,I,1) = ' '); I = I+1; END;
+        END;
+     END;
+     IF RUF_IN = 1 AND SEPN_CNT > 0 THEN
+     DO;
+        CALL M$WRITE(WR_ERR_MEQ);
+        CALL M$ERR;
+     END;
+     RETURN;
+ERR: CALL M$WRITE(BAD_OPTION);
+     CALL M$ERR;
+ 
+END GET_OPTIONS;
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*     NAME:           WILDCARD_CHECK                       *
+ *                                                            *
+ *       PURPOSE:        To move all the wildcarded names     *
+ *                       from SEPN to WILD_SEPN and compact   *
+ *                       SEPN.                                *
+ *                                                            *
+ **************************************************************/
+ 
+WILDCARD_CHECK:PROC;
+ 
+     SEPN_INDEX=0;
+     WILD_SEPN_CNT=0;
+     WI_PAGE=-1;
+ 
+     /* We need a test here to see if based structure SEPN is properly
+        initialized.  Failure to do so will result in memory fault if
+        SEPN happens to be empty.
+     */
+ 
+     IF SEPN_CNT = 0 THEN RETURN;
+ 
+      /* Move all wildcarded names in SEPN to WILD_SEPN. */
+ 
+     DO WHILE(SEPN_INDEX<=SEPN_CNT-1);
+        IF SUBSTR(SEPN.TEXT(SEPN_INDEX),SEPN.COUNT(SEPN_INDEX)-1,1)='?' THEN
+        DO;
+           IF WI_PAGE<0 OR ADDR(WILD_SEPN(WILD_SEPN_CNT+1))>PINCRW(
+              WILD_SEPN$,1024*(WI_PAGE+1)) THEN
+           DO;
+              WI_PAGE=WI_PAGE+1;
+              GDS_RES.W2.SEGID#=%DS5SID;
+              FPT_GDS.V.SEGSIZE#=1024;
+              CALL GET_MEM;
+           END;
+           WILD_SEPN.NAME(WILD_SEPN_CNT)=SUBSTR(SEPN.TEXT(SEPN_INDEX),0,
+              SEPN.COUNT(SEPN_INDEX)-1);
+           WILD_SEPN.NUM_CHAR(WILD_SEPN_CNT)=SEPN.COUNT(SEPN_INDEX)-1;
+           WILD_SEPN_CNT=WILD_SEPN_CNT+1;
+           SEPN.COUNT(SEPN_INDEX)=0;
+        END;
+        SEPN_INDEX=SEPN_INDEX+1;
+     END;
+ 
+     SEPN_INDEX=0;
+ 
+      /* Compact SEPN. */
+ 
+     DO WHILE(SEPN_INDEX<=SEPN_CNT-1);
+         /* Find an empty slot in SEPN from the beginning. */
+        DO WHILE(SEPN_INDEX<=SEPN_CNT-1);
+           IF SEPN.COUNT(SEPN_INDEX)~=0 THEN SEPN_INDEX=SEPN_INDEX+1;
+              ELSE EXIT;
+        END;
+ 
+         /* Find an external procedure name in SEPN from the end. */
+        DO WHILE(SEPN_INDEX<=SEPN_CNT-1);
+           IF SEPN.COUNT(SEPN_CNT-1)=0 THEN SEPN_CNT=SEPN_CNT-1;
+              ELSE EXIT;
+        END;
+ 
+         /* Move the external procedure information to the empty slot. */
+        IF SEPN_INDEX<=SEPN_CNT-1 THEN
+        DO;
+           SEPN(SEPN_INDEX)=SEPN(SEPN_CNT-1);
+           SEPN_INDEX=SEPN_INDEX+1;
+           SEPN_CNT=SEPN_CNT-1;
+        END;
+     END;
+END WILDCARD_CHECK;
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*    NAME:          READ_RU_INFO                           *
+ *                                                            *
+ *      PURPOSE:       To read the run unit information.      *
+ *                                                            *
+ *      DESCRIPTION:   The run unit schema is read so that    *
+ *                     we can build the following tables of   *
+ *                     information:                           *
+ *                                                            *
+ *                     (1) EPN -- one entry per external pro- *
+ *                                cedure                      *
+ *                                                            *
+ *                     (2) SEPN - one entry per external pro- *
+ *                                cedure specified through M  *
+ *                                option                      *
+ *                                                            *
+ *                     (3) STS -- one entry per executable    *
+ *                                statement of the external   *
+ *                                procedure specified through *
+ *                                M option                    *
+ *                                                            *
+ *                     (4) IPN -- one entry per internal pro- *
+ *                                cedure                      *
+ *                                                            *
+ *                     Tables EPN, STS, IPN are all sorted in *
+ *                     increasing node number, and in each    *
+ *                     node in increasing address.            *
+ *                                                            *
+ **************************************************************/
+ 
+READ_RU_INFO: PROC;
+ 
+DCL FIRST BIT(1) ALIGNED;
+ 
+ 
+/*        Read rununit information */
+ 
+     RD2.BUF_ = VECTOR(BUF2);
+     RD_LOGICAL.BUF_ = VECTOR(LOGBUF);
+     RD_DEBUG.BUF_ = VECTOR(DEBUG_BUF);
+     UTS = 0;
+     SEPN_INDEX=SEPN_CNT-1;
+     EPN_CNT = 0;
+     IPN_CNT = 0;
+     STS_CNT = 0;
+     TYPE1.NODE = 0;
+     TYPE4.NODE = 0;
+     TYPE1.PAGE = 0;
+     TYPE4.PAGE = 0;
+     LOGKEY.NODE = 0;
+     LOGKEY.PAGE = 0;
+     DEBUG_KEY.NODE = 0;
+     DEBUG_KEY.PAGE = 0;
+     FIRST='1'B;
+ 
+     IF RUF_IN ~= 0 THEN
+     DO;
+        CALL READ_RUF_OU ALTRET(BAD_RUF_IN);
+        RETURN;
+     END;
+BAD_RUF_IN:;
+     CALL M$OPEN(OP) ALTRET(BAD_OP); /* OPEN THE RU                       */
+     CALL M$READ(READ_HEAD);
+     CALL M$READ(READ_BIRTH);
+     REC_SIZE# = B$HEAD.NRECSIZE;
+     FPT_GDS.V.SEGSIZE# = REC_SIZE#;
+     GDS_RES.W2.SEGID# = %DS7SID;
+     CALL GET_MEM;
+     RD1.BUF_ = GDS_RES;
+     BUF1$ = GDS_RES.PTR$;
+     CALL M$READ(RD1);               /* READ THE EXT NAMES RECORD          */
+ 
+     DO WHILE('1'B);
+        CALL M$READ(RD2) ALTRET(DEALLOCATE); /* READ THE TYPE 4 RECORD       */
+        NUM_ENTRIES = (DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#)/(SIZEW(B$EDEF)*4);
+ 
+        LAST_OLAY = EPN_CNT;
+        P$ = ADDR(BUF2);
+        DO I = 0 TO NUM_ENTRIES-1;
+           IF P$->B$EDEF.PRI AND P$->B$EDEF.CST ~= %NOTPROC# THEN
+           DO;
+              IF EPN_CNT~=0 AND
+                 P$->B$EDEF.ISADDR=EPN.LOW(EPN_CNT-1)
+                 AND NOT FIRST
+                 THEN
+                 GOTO NEXT;
+              FIRST='0'B;
+              EPN.NPOINTER(EPN_CNT) = P$->B$EDEF.NPOINTER;
+              EPN.COUNT(EPN_CNT) = P$->B$EDEF.ISADDR;
+              EPN.LOW(EPN_CNT) = P$->B$EDEF.ISADDR;
+              EPN.HIGH(EPN_CNT) = BITBIN('777777'O);
+              EPN.OVERLAY#(EPN_CNT) = TYPE4.NODE;
+ 
+ 
+              IF SEPN_CNT ~= 0 OR WILD_SEPN_CNT ~=0 THEN
+              DO;
+                 IF TYPE1.NODE ~= EPN.OVERLAY#(EPN_CNT) THEN
+                 DO;
+                    TYPE1.NODE = EPN.OVERLAY#(EPN_CNT);
+                    CALL M$READ(RD1); /* Get EXT names for NODE */
+                 END;
+ 
+                 /* We need a test here because if there are no wildcarded
+                    names specified then PTR to based structure WILD_SEPN
+                    is not properly initialized at this point.  If we refer
+                    to that structure now, memory fault will result.
+                */
+                 IF WILD_SEPN_CNT ~= 0 THEN DO;
+ 
+                    DO J=0 TO WILD_SEPN_CNT-1;
+                       IF WILD_SEPN.NAME(J)=SUBSTR(PINCRW(BUF1$,
+                          EPN.NPOINTER(EPN_CNT))->B$DNAME.TEXT,0,WILD_SEPN.NUM_CHAR(J)) THEN
+                       DO;
+                          IF ADDR(SEPN(SEPN_CNT+1))>PINCRW(SEPN$,1024*(SE_PAGE+1))
+                             THEN DO;
+                             SE_PAGE=SE_PAGE+1;
+                             GDS_RES.W2.SEGID#=%DS4SID;
+                             FPT_GDS.V.SEGSIZE#=1024;
+                             CALL GET_MEM;
+                          END;
+ 
+                          SEPN.TEXT(SEPN_CNT)=PINCRW(BUF1$,EPN.NPOINTER(EPN_CNT))
+                             ->B$DNAME.TEXT;
+                          SEPN.COUNT(SEPN_CNT)=PINCRW(BUF1$,
+                             EPN.NPOINTER(EPN_CNT))->B$DNAME.COUNT;
+                          SEPN.LOW(SEPN_CNT)=EPN.LOW(EPN_CNT);
+                          SEPN.OVERLAY#(SEPN_CNT)=EPN.OVERLAY#(EPN_CNT);
+                          SEPN_CNT=SEPN_CNT+1;
+                       END;
+                    END;
+                 END;
+                 DO K = 0 TO SEPN_INDEX;
+                    SP_P$ = ADDR(SEPN.COUNT(K));
+                    IF SEPN_BASED = PINCRW(BUF1$,EPN.NPOINTER
+                       (EPN_CNT))->B$DNAME THEN
+                    DO;
+                       SEPN.LOW(K) = EPN.LOW(EPN_CNT);
+                       SEPN.OVERLAY#(K) = EPN.OVERLAY#(EPN_CNT);
+                    END;
+                 END;
+              END;
+              EPN_CNT = EPN_CNT + 1;
+              IF EPN_CNT > MAX_EPN THEN DO;
+                 EPN_SIZE# = EPN_SIZE# + 7505;
+                 FPT_GDS.V.SEGSIZE# = 7505;
+                 GDS_RES.W2.SEGID# = %DS8SID;
+                 CALL GET_MEM;
+                 MAX_EPN = MAX_EPN + 1501;
+              END;
+           END;
+NEXT:      P$ = PINCRW(P$,SIZEW(B$EDEF));
+        END;
+ 
+        TEMPTR$ = ADDR(EPN(LAST_OLAY));
+        TEMPIND# = EPN_CNT - LAST_OLAY;
+        CALL SORT(TEMPTR$,TEMPIND#);
+ 
+ 
+        I = EPN_CNT -2;
+        DO WHILE(I>=LAST_OLAY);
+           EPN.HIGH(I) = EPN.LOW(I+1)-1;
+           EPN.COUNT(I) = 0;
+           I = I - 1;
+        END;
+        EPN.COUNT(EPN_CNT-1) = 0;
+        TYPE4.NODE = TYPE4.NODE + 1;
+        FIRST='1'B;
+     END;
+ 
+DEALLOCATE:
+     GDS_RES.W2.SEGID#=%DS5SID;
+     FPT_FDS.V.SEGSIZE#=(WI_PAGE+1)*1024;
+     CALL FREE_MEM;
+/**/
+/******************************************************************************/
+/******************************************************************************/
+/**/
+ALL_FOUR: ;
+     ST_PAGE=-1;
+     DO I = 0 TO EPN_CNT - 1;
+        LOGKEY.NPOINTER = EPN.NPOINTER(I);
+        LOGKEY.NODE = EPN.OVERLAY#(I);
+        CALL M$READ(RD_LOGICAL) ALTRET(NO_DEBUG);
+        P$ = ADDR(LOGBUF);
+        P2$ = PINCRW(P$,SIZEW(B$LOGBLK)*2);
+        IF P2$->B$LOGBLK.STSIZE = 0 THEN
+           EPN.HIGH(I) = EPN.LOW(I);
+           ELSE DO;
+           OFFSET =P2$->B$LOGBLK.STOFFST+(P2$->B$LOGBLK.STSIZE-1)*SIZEW(B$EXST);
+           PAGE = OFFSET / PINCRW(P$,SIZEW(B$LOGBLK))->B$LBNTRY1.STMNTPSIZ;
+           DEBUG_KEY.NPOINTER = EPN.NPOINTER(I);
+           DEBUG_KEY.NODE = EPN.OVERLAY#(I);
+           DEBUG_KEY.TYPE = %TYPEXST;
+           DEBUG_KEY.PAGE = PAGE;
+           CALL M$READ(RD_DEBUG) ALTRET(NO_DEBUG);
+           OFFSET = OFFSET-PAGE*PINCRW(P$,SIZEW(B$LOGBLK))->B$LBNTRY1.STMNTPSIZ;
+           EPN.HIGH(I) = PINCRW(ADDR(DEBUG_BUF),OFFSET)->B$EXST.ISADDR;
+           IF SEPN_CNT ~= 0 THEN DO;
+              DO K = 0 TO SEPN_CNT;
+                 IF SEPN.LOW(K) = EPN.LOW(I) AND
+                    SEPN.OVERLAY#(K) = EPN.OVERLAY#(I) THEN
+                 DO;
+                    DEBUG_KEY.NPOINTER = EPN.NPOINTER(I);
+                    DEBUG_KEY.NODE = EPN.OVERLAY#(I);
+                    DEBUG_KEY.TYPE = %TYPEXST;
+                    DEBUG_KEY.PAGE = 0;
+                    DO WHILE('1'B);
+                       CALL M$READ(RD_DEBUG) ALTRET(OUT_OF_STMNTS);
+                       PJ$ = ADDR(DEBUG_BUF);
+                       J   = DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#/4;
+                       PE$ = PINCRW(ADDR(DEBUG_BUF),J);
+                       DO WHILE(PJ$ < PE$);
+                          IF ST_PAGE<0 OR ADDR(STS(STS_CNT+1))>PINCRW(STS$,
+                             1024*(ST_PAGE+1)) THEN
+                          DO;
+                             ST_PAGE=ST_PAGE+1;
+                             GDS_RES.W2.SEGID#=%DS6SID;
+                             FPT_GDS.V.SEGSIZE#=1024;
+                             CALL GET_MEM;
+                          END;
+ 
+                          IF STS_CNT~=0 THEN
+                          DO;
+                             IF PJ$->B$EXST.ISADDR=STS.LOW(STS_CNT-1) THEN
+                                STS_CNT=STS_CNT-1;
+                                ELSE DO;
+                                IF EPN.OVERLAY#(I)=STS.OVERLAY#(STS_CNT-1)
+                                   THEN STS.HIGH(STS_CNT-1)=PJ$->B$EXST.ISADDR-1;
+                             END;
+                          END;
+                          STS.LOW(STS_CNT) = PJ$ ->B$EXST.ISADDR;
+                          STS.HIGH(STS_CNT) = PJ$ ->B$EXST.ISADDR;
+                          STS.OVERLAY#(STS_CNT) = EPN.OVERLAY#(I);
+                          STS.STMNT#(STS_CNT) = PJ$->B$EXST.LINENUM;
+                          STS.TYPE(STS_CNT) = PJ$->B$EXST.STTYPE;
+                          STS.COUNT(STS_CNT) = 0;
+                          STS_CNT = STS_CNT + 1;
+ 
+                          PJ$ = PINCRW(PJ$,SIZEW(B$EXST));
+                       END;
+                       DEBUG_KEY.PAGE = DEBUG_KEY.PAGE + 1;
+                    END;
+OUT_OF_STMNTS:      ;
+                 END;
+              END;
+           END;
+           DEBUG_KEY.TYPE = %TYPINTNTRY;
+           DEBUG_KEY.PAGE = 0;
+           OLD_INTERNAL = IPN_CNT;
+           DO WHILE('1'B);
+              CALL M$READ(RD_DEBUG) ALTRET(INT_ENT_END);
+              NUM_ENTRIES = (DCBADDR(DCBNUM(M$SI))->F$DCB.ARS#)/
+                 (SIZEW(B$INTNTRY)*4);
+              P2$ = ADDR(DEBUG_BUF);
+              DO J = 0 TO NUM_ENTRIES-1;
+                 IF P2$->B$INTNTRY.PRI AND P2$->B$INTNTRY.CST~=%NOTPROC# THEN
+                 DO;
+                    IPN.NPOINTER(IPN_CNT) = P2$->B$INTNTRY.NPOINTER;
+                    IPN.NPTR2(IPN_CNT) = DEBUG_KEY.NPOINTER;
+                    IPN.COUNT(IPN_CNT) = P2$->B$INTNTRY.ISADDR;
+                    IPN.LOW(IPN_CNT) = P2$->B$INTNTRY.ISADDR;
+                    IPN.LBE(IPN_CNT) = P2$->B$INTNTRY.LBE;
+                    IPN.OVERLAY#(IPN_CNT) = EPN.OVERLAY#(I);
+                    IPN_CNT = IPN_CNT + 1;
+                    IF IPN_CNT > 1500 THEN
+                    DO;
+                       CALL M$WRITE(WR_ERR);
+                       CALL M$ERR;
+                    END;
+                 END;
+                 P2$ = PINCRW(P2$,SIZEW(B$INTNTRY));
+              END;
+              DEBUG_KEY.PAGE = DEBUG_KEY.PAGE + 1;
+           END;
+INT_ENT_END: ;
+           DO J=OLD_INTERNAL TO IPN_CNT-1;
+              PJ$ = PINCRW(P$,SIZEW(B$LOGBLK)*(IPN.LBE(J)+2));
+              OFFSET = PJ$->B$LOGBLK.STOFFST;
+              OFFSET = OFFSET + (PJ$->B$LOGBLK.STSIZE-1) * SIZEW(B$EXST);
+              PAGE = OFFSET/ PINCRW(P$,SIZEW(B$LOGBLK))->B$LBNTRY1.STMNTPSIZ;
+              DEBUG_KEY.TYPE = %TYPEXST;
+              DEBUG_KEY.NODE = IPN.OVERLAY#(J);
+              DEBUG_KEY.PAGE = PAGE;
+              CALL M$READ(RD_DEBUG);
+              K = PAGE * PINCRW(P$,SIZEW(B$LOGBLK))->B$LBNTRY1.STMNTPSIZ;
+              IPN.HIGH(J) = PINCRW(ADDR(DEBUG_BUF),OFFSET-K)->B$EXST.ISADDR;
+           END;
+NO_DEBUG:  ;
+        END;
+     END;
+ 
+     DO J = 0 TO IPN_CNT - 1;
+        IPN.COUNT(J) = 0;
+     END;
+ 
+/***************************************************************
+ 
+        If the RO option was specified, write out our
+        internal tables now for a possible future run.
+ 
+ **************************************************************/
+ 
+     IF RUF_OU ~= 0 THEN CALL WRITE_RUF_OU;
+     RETURN;
+BAD_OP:
+     CALL M$WRITE(WR_NORU);
+     CALL M$ERR;
+OVER_ERR:
+     CALL M$WRITE(BAD_OPTION);
+     CALL M$ERR;
+END READ_RU_INFO;
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*    NAME:          SETUP_MODULE_MIN_MAX                   *
+ *                                                            *
+ *      PURPOSE:       To indicate the range of module        *
+ *                     procedure.                             *
+ *                                                            *
+ *      DESCRIPTION:   This information is provided primarily *
+ *                     for processors that generate their     *
+ *                     instructions in data and link to them. *
+ *                     Examples of this are APL and IDP.      *
+ *                                                            *
+ **************************************************************/
+ 
+SETUP_MODULE_MIN_MAX: PROC;
+ 
+     DO I = 0 TO EPN_CNT-1;
+        IF EPN.LOW(I) < MODULE_MIN
+           THEN MODULE_MIN = EPN.LOW(I);
+        IF EPN.HIGH(I) > MODULE_MAX
+           THEN MODULE_MAX = EPN.HIGH(I);
+     END;
+     MODULE_MISS_CNT = 0;
+     RETURN;
+ 
+END SETUP_MODULE_MIN_MAX;
+%EJECT;
+/***************************************************************/
+/*                                                            */
+/*I*    NAME:       READ_PM_DATA                              *
+ *                                                            *
+ *      PURPOSE:    To read and process the data file         *
+ *                  produced by PM or PMON.                   *
+ *                                                            *
+ *      DESCRIPTION:   Basically every record in this file    *
+ *                  consists of two half-words.  The first    *
+ *                  half word contains the overlay node and   *
+ *                  the second half word contains the IC.     *
+ *                                                            *
+ *                  For every such word, this routine locates *
+ *                  the associated procedure and statement    *
+ *                  and bumps their counter.                  *
+ *                                                            *
+ **************************************************************/
+ 
+READ_PM_DATA: PROC;
+ 
+DCL  UTSFLAG  UBIN CONSTANT INIT( BITBIN('400000000000'O) );
+ 
+/*           Read execution time scan data  */
+ 
+     CALL M$OPEN(OP_PM2);
+     CALL M$OPEN(OP_PM1);
+     PM_TOTAL = 0;
+     XT.EXEC = 0;
+     XT.SERV = 0;
+     DO WHILE('1'B);
+        CALL M$READ(RD_PM) ALTRET(ALL_READ);
+ 
+        IF ADDR(PM_BUF)->CONTROL.WORD1 = 0 THEN
+        DO;      /***  Analyze Control Record  ***/
+           IF ADDR(PM_BUF)->CONTROL.WORD2 = UTSFLAG THEN
+           DO;   /***  Run-Unit UTS  ***/
+              IF UTS ~= 0 AND UTS ~= ADDR(PM_BUF)->CONTROL.WORD3 THEN
+              DO;   /***  The UTS has changed for the worse  ***/
+                 CALL M$WRITE(MIXED_UP);
+                 CALL M$ERR;
+              END;
+              UTS = ADDR(PM_BUF)->CONTROL.WORD3;
+              RU_TYPE = ADDR(PM_BUF) -> CONTROL.WORD4;
+           END;
+              ELSE
+           DO;   /***  Execution Time Information  ***/
+              XT.EXEC = XT.EXEC + ADDR(PM_BUF)->CONTROL.WORD2;
+              XT.SERV = XT.SERV + ADDR(PM_BUF)->CONTROL.WORD3;
+           END;
+        END;
+           ELSE
+        DO;
+           PM_RCNT = (DCBADDR(DCBNUM(M$UI))->F$DCB.ARS#)/SIZEC(PM_BUF(0));
+           PM_TOTAL = PM_TOTAL + PM_RCNT;
+           DO I = 0 TO PM_RCNT -1;
+              IF RU_TYPE = %HOST_RU
+                 THEN DO;
+                 PM_TEMP = PM_BUF.IC(I);
+                 PM_NODE = PM_BUF.OVERLAY#(I);
+              END;
+                 ELSE DO;
+                 PM_TEMP = FEP_PM_BUF(I);
+                 PM_NODE = 0; /* No L6 program is overlaid */
+              END;
+ 
+              DO J = 0 TO RANGE_CNT - 1;
+                 IF PM_TEMP>=RANGES.LOW(J) AND
+                    PM_TEMP<=RANGES.HIGH(J) THEN
+                    RANGES.COUNT(J) = RANGES.COUNT(J) + 1;
+              END;
+ 
+              IF PM_TEMP < MODULE_MIN  OR
+                 PM_TEMP > MODULE_MAX
+                 THEN MODULE_MISS_CNT = MODULE_MISS_CNT + 1;
+ 
+              L=0;
+              K=EPN_CNT;
+              CALL BINARY_SEARCH(EPN(0),L,K,PM_TEMP,PM_NODE,'0'B);
+              IF FOUND THEN
+                 EPN.COUNT(K) = EPN.COUNT(K) +1;
+ 
+              L=0;
+              K=IPN_CNT;
+              CALL BINARY_SEARCH(IPN(0),L,K,PM_TEMP,PM_NODE,'1'B);
+              DO J = L TO K;
+                 IF PM_NODE = IPN.OVERLAY#(J) THEN
+                 DO;
+                    IF PM_TEMP>=IPN.LOW(J) AND PM_TEMP<=IPN.HIGH(J) THEN
+                       IPN.COUNT(J) = IPN.COUNT(J) + 1;
+                 END;
+              END;
+ 
+              L=0;
+              K=STS_CNT;
+              IF STS_CNT ~= 0 THEN DO; /* This test must be here because of the
+                                          based structure STS */
+                 CALL BINARY_SEARCH(STS(0),L,K,PM_TEMP,PM_NODE,'0'B);
+                 IF FOUND THEN STS.COUNT(K) = STS.COUNT(K) +1;
+              END;
+              IF NODE=1 THEN NODE_TABLE(PM_NODE)=NODE_TABLE(PM_NODE)+1;
+           END;
+        END;
+     END;
+ALL_READ:
+     CALL M$CLOSE(CLS_PM);
+     IF UTS ~= 0 AND UTS ~= B$RUBIRTH.CREATE_UTS THEN
+     DO;
+        CALL M$WRITE(MATCH_ERR);
+     END;
+END READ_PM_DATA;
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*    NAME:          READ_COMTEN_DATA                       *
+ *                                                            *
+ *      PURPOSE:       To read and process the data file      *
+ *                     produced by the COMTEN device.         *
+ *                                                            *
+ **************************************************************/
+ 
+READ_COMTEN_DATA: PROC;
+ 
+DCL 1 PM_BUF STATIC ALIGNED,
+       2 JUNK CHAR(13),
+       2 BUCKET(0:3947),
+          3 FB UBIN BYTE UNAL,
+          3 LB UBIN BYTE UNAL;
+DCL BUCKET_SIZE SBIN WORD CONSTANT SYMDEF INIT(64);
+DCL LOW_ADDR SBIN WORD CONSTANT SYMDEF INIT(0);
+DCL PM_TEMP SBIN WORD;
+ 
+DCL PM_ADDR SBIN WORD;
+%FPT_READ(FPTN=RD_PM,BUF=PM_BUF,DCB=M$UI);
+%FPT_OPEN(FPTN=OP_PM1,ASN=FILE,DCB=M$UI,FUN=IN);
+%FPT_OPEN(FPTN=OP_PM2,ASN=FILE,NAME=PM_NAME,DCB=M$UI,FUN=IN);
+%FPT_CLOSE(FPTN=CLS_PM,DCB=M$UI,DISP=SAVE);
+%VLP_NAME(FPTN=PM_NAME,NAME='TEMP_DATA');
+ 
+ 
+     CALL M$OPEN(OP_PM1) ALTRET(TRY2); /* OPEN M$UI                        */
+     GOTO GOT_PM;
+TRY2: CALL M$OPEN(OP_PM2);            /* OPEN THE TEMP_DATA FILE*/
+GOT_PM: ;
+     PM_TOTAL = 0;
+     XT.EXEC = 0;
+     XT.SERV = 0;
+     DO WHILE('1'B);
+        CALL M$READ(RD_PM) ALTRET(ALL_READ);
+        IF DCBADDR(DCBNUM(M$UI))->F$DCB.ARS# =7909 THEN
+        DO;
+           DO I = 0 TO 3947;
+              PM_TEMP = PM_BUF.BUCKET.FB(I) * 256 + PM_BUF.BUCKET.LB(I);
+              PM_TOTAL = PM_TOTAL + PM_TEMP;
+              IF PM_TEMP > 0 THEN
+              DO;
+                 PM_ADDR =(I*BUCKET_SIZE)+LOW_ADDR;
+                 DO J= 0 TO EPN_CNT -1;
+                    IF (PM_ADDR+6)>=EPN.LOW(J) AND
+                       (PM_ADDR+(BUCKET_SIZE/3))<=EPN.HIGH(J)
+                       THEN EPN.COUNT(J) = EPN.COUNT(J) + PM_TEMP;
+                       ELSE IF PM_ADDR < EPN.LOW(J) THEN
+                          IF PM_ADDR > EPN.HIGH(J-1) AND (PM_ADDR+(BUCKET_SIZE-1)) > EPN.LOW(J)
+                             THEN EPN.COUNT(J) = EPN.COUNT(J) + PM_TEMP;
+                             ELSE
+                             J = EPN_CNT;
+                 END;
+                 DO J=0 TO IPN_CNT -1;
+                    IF(PM_ADDR+6) >=IPN.LOW(J) AND
+                       (PM_ADDR+(2*BUCKET_SIZE/3)) <= IPN.HIGH(J)
+                       THEN IPN.COUNT(J) = IPN.COUNT(J) + PM_TEMP;
+                       ELSE IF PM_ADDR < IPN.LOW(J)
+                          THEN J = IPN_CNT;
+                 END;
+              END;
+           END;
+        END;
+     END;
+ALL_READ:
+     CALL M$CLOSE(CLS_PM);
+END READ_COMTEN_DATA;
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*    NAME:             WRITE_STATISTICS                    *
+ *                                                            *
+ *      PURPOSE:          To display the execution statistics *
+ *                        unless the NST option was specified.*
+ *                                                            *
+ *      DESCRIPTION:      The statistics include the total    *
+ *                        number of datapoints, the execution *
+ *                        and service times.                  *
+ *                                                            *
+ **************************************************************/
+ 
+WRITE_STATISTICS: PROC;
+ 
+     IF DO_ST = 0 THEN RETURN;
+ 
+     WRITE.BUF_ = VECTOR(HD_PM);
+     CALL M$WRITE(WRITE);
+     CALL M$WRITE(WR_SKIP);
+     IF XT.EXEC + XT.SERV > 0 THEN
+     DO;
+        CALL M$WRITE(WR_SKIP);
+        CALL DISP(XTBUF.EXEC,XT.EXEC,(XT.EXEC+XT.SERV));
+        CALL DISP(XTBUF.SERV,XT.SERV,(XT.EXEC+XT.SERV));
+        CALL M$WRITE(WR_XT);
+     END;
+     CALL M$WRITE(WR_SKIP);
+     CALL BINCHAR(FINAL_MESS.NUM,PM_TOTAL);
+     DO J=0 TO 6;
+        IF SUBSTR(FINAL_MESS.NUM,J,1)='0' THEN
+           CALL INSERT(FINAL_MESS.NUM,J,1,' ');
+           ELSE J=7;
+     END;
+     TEMPTIME = XT.EXEC + XT.SERV;
+     CALL M$TIME(MAKETIME);
+     IF XT.EXEC+XT.SERV = 0 THEN
+        WR_FINAL.BUF_.BOUND = 28;
+     CALL M$WRITE(WR_FINAL);
+     CALL M$WRITE(WR_SKIP);
+     CALL M$WRITE(WR_SKIP);
+     CALL M$DEVICE(NEW_PAGE);
+END WRITE_STATISTICS;
+%EJECT;
+ 
+/**************************************************************/
+/*                                                            */
+/*I*     NAME:           WRITE_NODES                          *
+ *                                                            *
+ *       PURPOSE:        To display the execution statistics  *
+ *                       for each node in the program if the  *
+ *                       ND option was specified.             *
+ *                                                            *
+ **************************************************************/
+ 
+WRITE_NODES:PROC;
+ 
+     TOTAL=0;
+ 
+     IF NODE=0 THEN RETURN;
+ 
+     WRITE.BUF_=VECTOR(HD_NODE);
+     CALL M$WRITE(WRITE);
+     CALL M$WRITE(WR_SKIP);
+ 
+     P_ROS=B$HEAD.ROSIZE/1024;
+     R_ROS=MOD(B$HEAD.ROSIZE,1024);
+     P_TREE=B$HEAD.TREEDISP/1024;
+     R_TREE=MOD(B$HEAD.TREEDISP,1024);
+ 
+     /* To get a data segment. */
+     FPT_GDS.V.SEGSIZE#=B$HEAD.ROSIZE-P_TREE*1024;
+     GDS_RES.W2.SEGID#=%DS3SID;
+     CALL GET_MEM;
+ 
+     /* To read in ROS. */
+     J=0;
+     P4$=P3$;
+     ROS_KEY.NODE=0;
+     READ_RU.KEY_=VECTOR(ROS_KEY);
+     READ_RU.BUF_.BOUND=1024*4-1;
+ 
+     DO I=P_TREE TO P_ROS-1;
+        ROS_KEY.PAGE=I*1024;
+        READ_RU.BUF_.BUF$=P4$;
+        CALL M$READ(READ_RU);
+        P4$=PINCRW(P4$,1024);
+        J=J+1;
+     END;
+ 
+     /* To read in the remaining record. */
+     IF R_ROS ~=0 THEN
+     DO;
+        ROS_KEY.PAGE=P_ROS*1024;
+        READ_RU.BUF_.BOUND=R_ROS*4-1;
+        READ_RU.BUF_.BUF$=P4$;
+        CALL M$READ(READ_RU);
+     END;
+ 
+     TREE$=PINCRW(P3$,R_TREE);
+ 
+     DO I=0 TO 19;
+        IF NODE_TABLE(I)>0 THEN
+        DO;
+           NODE$=PINCRW(TREE$,SIZEW(B$TREE_HEADER)+SIZEW(B$TREE_NODE)*I);
+           NODE_NAME$=NODE$->B$TREE_NODE.NAME$;
+           NODE_NAME$=PINCRW(NODE_NAME$,R_TREE);
+           POINT.SEG_ID=%DS3SID;
+           OUTBUF.NAME=NODE_NAME$->NODE_NAME.TEXT;
+           CALL DISP(OUTBUF.LOC,NODE_TABLE(I),PM_TOTAL);
+           TOTAL=TOTAL+PERCENT;
+           CALL M$WRITE(WR);
+        END;
+     END;
+ 
+     CALL M$WRITE(WR_SPACER);
+     OUTBUF.NAME='Total';
+     CALL DISP(OUTBUF.LOC,0,0);
+     CALL M$WRITE(WR);
+     CALL M$DEVICE(NEW_PAGE);
+ 
+     GDS_RES.W2.SEGID#=%DS3SID;
+     FPT_FDS.V.SEGSIZE#=B$HEAD.ROSIZE-P_TREE*1024;
+     CALL FREE_MEM;
+     RETURN;
+ 
+END WRITE_NODES;
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*    NAME:          WRITE_MODULES                          *
+ *                                                            *
+ *      PURPOSE:       To display the summary by modules for  *
+ *                     this PM data.                          *
+ *                                                            *
+ *      DESCRIPTION:   For every module name and every nested *
+ *                     procedure within every module name,    *
+ *                     we display the percentage of run-time  *
+ *                     spent here.                            *
+ *                                                            *
+ **************************************************************/
+ 
+WRITE_MODULES: PROC;
+ 
+     IF DO_MN = 0 THEN RETURN;
+ 
+     WRITE.BUF_ = VECTOR(HD_MOD);
+     CALL M$WRITE(WRITE);
+     CALL M$WRITE(WR_SKIP);
+ 
+/*  Sort external and internal procedure names by number of samples */
+ 
+     TEMPTR$ = ADDR(EPN);
+     CALL SORT(TEMPTR$,EPN_CNT);   /* Sort external names  */
+     TEMPTR$ = ADDR(IPN);
+     CALL SORT(TEMPTR$,IPN_CNT);   /* Sort internal names  */
+ 
+/*  Prepare and print list of external and internal procedures      */
+ 
+     TYPE1.NODE = 0;
+     CALL M$READ(RD1);   /* READ THE TYPE 1 RECORD(EXT NAMES) */
+     TOTAL = 0;
+     I = EPN_CNT -1;
+DO_I: DO WHILE(I>=0); /* Loop through all MODULES that had hits  */
+        IF EPN.COUNT(I) ~= 0 THEN
+        DO;
+           IF EPN.OVERLAY#(I) ~= TYPE1.NODE THEN
+           DO;
+              TYPE1.NODE = EPN.OVERLAY#(I);
+              CALL M$READ(RD1);
+           END;
+           OUTBUF.NAME = PINCRW(BUF1$,EPN.NPOINTER(I))->B$DNAME.TEXT;
+           CALL DISP(OUTBUF.LOC,EPN.COUNT(I),PM_TOTAL);
+           TOTAL = TOTAL + PERCENT;
+           CALL M$WRITE(WR);      /* WRITE OUT THE RESULT       */
+           J = IPN_CNT -1;
+DO_J:      DO WHILE(J>=0);        /* LOOP THROUGH THE INTERNALS */
+              IF IPN.OVERLAY#(J) = EPN.OVERLAY#(I) AND
+                 IPN.NPTR2(J) = EPN.NPOINTER(I) THEN
+                 IF IPN.COUNT(J) ~= 0 THEN
+                 DO;
+                    IF LOGKEY.NPOINTER ~= IPN.NPTR2(J) THEN
+                    DO;
+                       LOGKEY.NPOINTER = IPN.NPTR2(J);
+                       LOGKEY.NODE = IPN.OVERLAY#(J);
+                       CALL M$READ(RD_LOGICAL); /* GET LOGICAL BLOCK RECORD */
+                       P$ = ADDR(LOGBUF);
+                    END;
+                    OFFSET = IPN.NPOINTER(J);
+                    PAGE = OFFSET/PINCRW(P$,SIZEW(B$LOGBLK))->B$LBNTRY1.NAMPSIZ;
+                    DEBUG_KEY.NPOINTER = IPN.NPTR2(J);
+                    DEBUG_KEY.NODE = IPN.OVERLAY#(J);
+                    DEBUG_KEY.TYPE = %TYPDBGNAM;
+                    DEBUG_KEY.PAGE = PAGE;
+                    CALL M$READ(RD_DEBUG); /* GET THE DEBUG NAMES          */
+                    K = PAGE * PINCRW(P$,SIZEW(B$LOGBLK))->B$LBNTRY1.NAMPSIZ;
+                    OUT2.NAME = PINCRW(ADDR(DEBUG_BUF),OFFSET-K)->B$DNAME.TEXT;
+                    CALL BINCHAR(OUT2.LL,
+                       PINCRW(P$,SIZEW(B$LOGBLK)*(2+IPN.LBE(J)))->
+                       B$LOGBLK.LEXLVL);
+                    CALL DISP(OUT2.P1,IPN.COUNT(J),PM_TOTAL);
+                    CALL DISP(OUT2.P2,IPN.COUNT(J),EPN.COUNT(I));
+                    CALL M$WRITE(WR2);
+                 END;
+              J = J -1;
+           END DO_J;
+        END;
+        I = I - 1;
+     END DO_I;
+     OUTBUF.NAME = 'No Module ID';
+     CALL DISP(OUTBUF.LOC,MODULE_MISS_CNT,PM_TOTAL);
+     TOTAL = TOTAL + PERCENT;
+     CALL M$WRITE(WR);
+     CALL M$WRITE(WR_SPACER);
+     OUTBUF.NAME='Total';
+     CALL DISP(OUTBUF.LOC,0,0);      /* WRITE TOTAL             */
+     CALL M$WRITE(WR);
+     CALL M$DEVICE(NEW_PAGE);
+     RETURN;
+ 
+END WRITE_MODULES;
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*    NAME:          WRITE_STATEMENTS                       *
+ *                                                            *
+ *      PURPOSE:       To produce the statement summary for   *
+ *                     the modules specified.                 *
+ *                                                            *
+ **************************************************************/
+ 
+WRITE_STATEMENTS: PROC;
+ 
+/*  Prepare and print statement list of specified external procedure module */
+ 
+DCL X SBIN;
+ 
+     IF STS_CNT = 0 THEN RETURN;
+     TEMPTR$ = ADDR(STS);
+     CALL SORT(TEMPTR$,STS_CNT);
+     EPN_TOTAL = PM_TOTAL;
+     DO L = 0 TO EPN_CNT - 1;
+        DO K = 0 TO SEPN_CNT - 1;
+           IF SEPN.LOW(K)=EPN.LOW(L) AND SEPN.OVERLAY#(K)=EPN.OVERLAY#(L) THEN
+           DO;
+              EPN_TOTAL = EPN.COUNT(L);
+              SP_P$ = ADDR(SEPN.COUNT(K));
+ 
+              I = STS_CNT - 1;
+              X=0;
+              DO WHILE(I >= 0);
+                 IF STS.COUNT(I) ~= 0 AND STS.OVERLAY#(I) = EPN.OVERLAY#(L) AND
+                    STS.LOW(I) >= EPN.LOW(L) AND STS.HIGH(I) <= EPN.HIGH(L) THEN
+                 DO;
+                    IF X = 0 THEN
+                    DO;
+                       WRITE.BUF_ = VECTOR(HD_ST);
+                       CALL M$WRITE(WRITE);
+                       CALL M$WRITE(WR_SKIP);
+                    END;
+                    X=X+1;
+                    CALL DISP(OUT_STMNT.COUNT,STS.COUNT(I),PM_TOTAL);
+                    CALL DISP(OUT_STMNT.COUNT2,STS.COUNT(I),EPN_TOTAL);
+                    CALL BINCHAR(NTEMP,STS.STMNT#(I));
+                    DO J= 0 TO 7;
+                       IF SUBSTR(NTEMP,J,1) ~= '0' THEN GOTO FOUND_DIGIT;
+                    END;
+FOUND_DIGIT:        ;
+                    DO CASE(STS.TYPE(I));
+                    CASE(%S@NULL);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@NULL,']');
+                    CASE(%S@ASSIGNMENT);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@ASSIGNMENT,']');
+                    CASE(%S@CALL);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@CALL,']');
+                    CASE(%S@MONITOR_CALL);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@MONITOR_CALL,']');
+                    CASE(%S@ASL_CALL);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@ASL_CALL,']');
+                    CASE(%S@IF);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@IF,']');
+                    CASE(%S@ELSE);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@ELSE,']');
+                    CASE(%S@CASE);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@CASE,']');
+                    CASE(%S@GOTO);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@GOTO,']');
+                    CASE(%S@RETURN);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@RETURN,']');
+                    CASE(%S@ALTRETURN);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@ALTRETURN,']');
+                    CASE(%S@REMEMBER);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@REMEMBER,']');
+                    CASE(%S@UNWIND);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@UNWIND,']');
+                    CASE(%S@INTRINSIC_CALL);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@INTRINSIC_CALL,']');
+                    CASE(%S@SPOIL);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@SPOIL,']');
+                    CASE(%S@GOTO_SUBSCRIPTED);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@GOTO_SUBSCRIPTED,']');
+                    CASE(%S@ASSIGNED_GOTO);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@ASSIGNED_GOTO,']');
+                    CASE(%S@IF_LOGICAL);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@IF_LOGICAL,']');
+                    CASE(%S@IF_ARITHMETIC);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@IF_ARITHMETIC,']');
+                    CASE(%S@PAUSE);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@PAUSE,']');
+                    CASE(%S@PERFORM);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@PERFORM,']');
+                    CASE(%S@STOP);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@STOP,']');
+                    CASE(%S@I_O);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@I_O,']');
+                    CASE(%S@DO_INDEX);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_INDEX,']');
+                    CASE(%S@DO_WHILE);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_WHILE,']');
+                    CASE(%S@DO_CASE);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_CASE,']');
+                    CASE(%S@DO);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO,']');
+                    CASE(%S@DO_INHIBIT);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_INHIBIT,']');
+                    CASE(%S@DO_INDEX_END);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_INDEX_END,']');
+                    CASE(%S@DO_WHILE_END);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_WHILE_END,']');
+                    CASE(%S@DO_CASE_END);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_CASE_END,']');
+                    CASE(%S@DO_END);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_END,']');
+                    CASE(%S@DO_INHIBIT_END);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@DO_INHIBIT_END,']');
+                    CASE(%S@PROC);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@PROC,']');
+                    CASE(%S@PROC_END);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@PROC_END,']');
+                    CASE(%S@ENTRY);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@ENTRY,']');
+                    CASE(%S@MISC);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [',%T@MISC,']');
+                    CASE(ELSE);
+                          CALL CONCAT(OUT_STMNT.LINE,SEPN_BASED.TEXT,' :',SUBSTR(NTEMP,J,8-J),' [','?',']');
+                    END;
+                    CALL M$WRITE(WR_STMNT);
+                 END;
+                 I = I - 1;
+              END;
+              IF X>0 THEN CALL M$WRITE(WR_SKIP);
+           END;
+        END;
+     END;
+ 
+     CALL M$DEVICE(NEW_PAGE);
+ 
+     /* Free memory space used for SEPN and STS. */
+     GDS_RES.W2.SEGID#=%DS4SID;
+     FPT_FDS.V.SEGSIZE#=(SE_PAGE+1)*1024;
+     CALL FREE_MEM;
+     GDS_RES.W2.SEGID#=%DS6SID;
+     FPT_FDS.V.SEGSIZE#=(ST_PAGE+1)*1024;
+     CALL FREE_MEM;
+     RETURN;
+ 
+END WRITE_STATEMENTS;
+%EJECT;
+/**************************************************************/
+/*                                                            */
+/*I*    NAME:       WRITE_RANGES                              *
+ *                                                            *
+ *      PURPOSE:    To provide the execution range summary    *
+ *                  provided by the R= option.                *
+ *                                                            *
+ **************************************************************/
+ 
+WRITE_RANGES: PROC;
+ 
+/*        Prepare and print R= option data   */
+ 
+     IF RANGE_CNT = 0 THEN RETURN;
+ 
+     WRITE.BUF_ = VECTOR(HD_RA);
+     CALL M$WRITE(WRITE);
+     CALL M$WRITE(WR_SKIP);
+     TOTAL = 0;
+     DO J = 0 TO 2;
+        TOTAL = TOTAL + RANGES.COUNT(J);
+     END;
+     IF TOTAL > 0 THEN
+     DO;
+        CALL M$WRITE(WR_SKIP);
+        DO J = 0 TO 2;
+           CALL BINCHAR(RANGE_MESS.XX.NUM,J);
+           OUTBUF.NAME = RANGE_MESS.NAME;
+           CALL DISP(OUTBUF.LOC,RANGES.COUNT(J),PM_TOTAL);
+           IF RANGES.COUNT(J) > 0 THEN CALL M$WRITE(WR);
+        END;
+        CALL M$WRITE(WR_SKIP);
+     END;
+     RETURN;
+ 
+END WRITE_RANGES;
+%EJECT;
+ 
+/*        Subroutines */
+ 
+OPT_FIELD: PROC(SLOC,ELOC,LEN,LVL) ALTRET;
+ 
+DCL  SLOC  SBIN;
+DCL  ELOC  SBIN;
+DCL  LEN   SBIN;
+DCL  LVL   SBIN;
+ 
+DCL  J     SBIN;
+DCL  I     SBIN;
+ 
+     I = SLOC;
+     DO WHILE(SUBSTR(B$JIT.CCBUF,I,1)=' '); I=I+1; END;
+     IF SUBSTR(B$JIT.CCBUF,I,1) = '(' THEN
+     DO; LVL = LVL + 1; I = I + 1;
+        DO WHILE( SUBSTR(B$JIT.CCBUF,I,1) = ' ' ); I=I+1; END;
+     END;
+     DO J = I TO B$JIT.CCARS;
+        IF SUBSTR(B$JIT.CCBUF,J,1) = ',' OR
+           SUBSTR(B$JIT.CCBUF,J,1) = '(' OR
+           SUBSTR(B$JIT.CCBUF,J,1) = '-' OR
+           SUBSTR(B$JIT.CCBUF,J,1) = ' ' OR
+           SUBSTR(B$JIT.CCBUF,J,1) = ')' THEN EXIT;
+     END;
+     SLOC = I;
+     LEN = J-I;
+     DO WHILE(SUBSTR(B$JIT.CCBUF,J,1)=' '); J=J+1; END;
+     ELOC = J;
+     IF LEN <= 0 THEN ALTRETURN;
+     RETURN;
+END OPT_FIELD;
+/**/
+/******************************************************************************/
+/******************************************************************************/
+/**/
+GET_OCTAL: PROC(SLOC,VALUE) ALTRET;
+ 
+/* Given a starting location (SLOC) in CCBUF and the number of charac-
+   ters from there on (VALUE), this routine translates each of the
+   character into an integer, and eventually the whole string of
+   characters will be translated into a 36-bit UBIN.
+*/
+ 
+DCL SLOC   SBIN;
+DCL VALUE  SBIN;
+ 
+DCL OCT(0:11) REDEF VALUE  UBIN(3) UNAL;
+ 
+DCL I      SBIN;
+DCL J      SBIN;
+DCL K      SBIN;
+DCL L      SBIN;
+DCL O(0:11) UBIN(3) UNAL;
+ 
+     I = SLOC;
+     J = VALUE;
+     O = '0'B;
+     DO K = 0 TO J-1;
+        L = ASCBIN( SUBSTR(B$JIT.CCBUF,I+K,1) ) - ASCBIN('0');
+        IF L < 0 OR L > 7 THEN ALTRETURN;
+        O(12-J+K) = L;
+     END;
+     OCT = O;
+     RETURN;
+END GET_OCTAL;
+/**/
+/******************************************************************************/
+/******************************************************************************/
+/**/
+GET_MEM:PROC;
+ 
+     FPT_GDS.V_=VECTOR(FPT_GDS.V);
+     FPT_GDS.RESULTS_=VECTOR(GDS_RES);
+     CALL M$GDS(FPT_GDS)ALTRET(NO_MEM_ERR);
+     RETURN;
+NO_MEM_ERR:
+     WRITE_ERR.V_=VECTOR(WRITE_ERR.V);
+     WRITE_ERR.BUF_=VECTOR(NO_MEM);
+     CALL M$WRITE(WRITE_ERR);
+     CALL M$ERR;
+END GET_MEM;
+/**/
+/******************************************************************************/
+/******************************************************************************/
+/**/
+FREE_MEM:PROC;
+ 
+     FPT_FDS.V_=VECTOR(FPT_FDS.V);
+     FPT_FDS.RESULTS_=VECTOR(GDS_RES);
+     CALL M$FDS(FPT_FDS);
+END FREE_MEM;
+/**/
+/******************************************************************************/
+/******************************************************************************/
+/**/
+WRITE_RUF_OU: PROC;
+ 
+/* This routine writes out arrays of structures EPN, IPN, STS and SEPN
+   as 4 records to a file (default file is *RU_NAME). */
+ 
+%FPT_OPEN(    FPTN        =  RO_OPEN,
+              DCB         =  M$RU,
+              FUN         =  CREATE,
+              EXIST       =  NEWFILE,
+              ACS         =  DIRECT,
+              ORG         =  KEYED,
+              ASN         =  FILE,
+              NAME        =  RU_NAME,
+              SETDCB      =  YES,
+              TYPE        =  'RO');
+ 
+%VLP_NAME(    FPTN        =  RU_NAME,
+              NAME        =  '*RU_NAME');
+ 
+%FPT_WRITE(   FPTN        =  RO_WRITE,
+              DCB         =  M$RU,
+              KEY         =  RU_KEY);
+ 
+%FPT_CLOSE(   FPTN        =  RO_CLOSE,
+              DCB         =  M$RU,
+              DISP        =  SAVE,
+              RELG        =  YES);
+ 
+     CALL M$OPEN(RO_OPEN) ALTRET(SKIPIT);
+     RO_WRITE.BUF_.BUF$ = ADDR(EPN);
+     IF EPN_CNT > 0
+        THEN RO_WRITE.BUF_.BOUND = EPN_CNT*20 - 1;
+        ELSE RO_WRITE.BUF_.BOUND = 0;
+     RU_KEY = RU_KEY_EPN;
+     CALL M$WRITE(RO_WRITE) ALTRET(SKIPIT);
+ 
+     RO_WRITE.BUF_.BUF$  = ADDR(IPN);
+     IF IPN_CNT > 0
+        THEN RO_WRITE.BUF_.BOUND = IPN_CNT*20 - 1;
+        ELSE RO_WRITE.BUF_.BOUND = 0;
+     RU_KEY = RU_KEY_IPN;
+     CALL M$WRITE(RO_WRITE) ALTRET(SKIPIT);
+ 
+     RO_WRITE.BUF_.BUF$  = ADDR(STS);
+     IF STS_CNT > 0
+        THEN RO_WRITE.BUF_.BOUND = STS_CNT*20 - 1;
+        ELSE RO_WRITE.BUF_.BOUND = 0;
+     RU_KEY = RU_KEY_STS;
+     CALL M$WRITE(RO_WRITE) ALTRET(SKIPIT);
+ 
+     RO_WRITE.BUF_.BUF$  = ADDR(SEPN);
+     IF SEPN_CNT > 0
+        THEN RO_WRITE.BUF_.BOUND = SEPN_CNT*11 - 1;
+        ELSE RO_WRITE.BUF_.BOUND = 0;
+     RU_KEY = RU_KEY_SEPN;
+     CALL M$WRITE(RO_WRITE) ALTRET(SKIPIT);
+ 
+     CALL M$CLOSE(RO_CLOSE) ALTRET(SKIPIT);
+SKIPIT:
+     RETURN;
+END WRITE_RUF_OU;
+/**/
+/******************************************************************************/
+/******************************************************************************/
+/**/
+READ_RUF_OU: PROC ALTRET;
+ 
+%FPT_OPEN(    FPTN        =  RO_OPEN,
+              DCB         =  M$RU,
+              FUN         =  IN,
+              ORG         =  KEYED,
+              ASN         =  FILE,
+              NAME        =  RU_NAME,
+              SETDCB      =  YES,
+              TYPE        =  'RO');
+ 
+%VLP_NAME(    FPTN        =  RU_NAME,
+              NAME        =  '*RU_NAME');
+ 
+%FPT_READ(    FPTN        =  RO_READ,
+              DCB         =  M$RU,
+              KEY         =  RU_KEY,
+              KEYS        =  YES);
+ 
+%FPT_CLOSE(   FPTN        =  RO_CLOSE,
+              DCB         =  M$RU,
+              DISP        =  SAVE,
+              RELG        =  YES);
+ 
+DCL  RODCB$   PTR;
+ 
+     CALL M$OPEN(RO_OPEN) ALTRET(SKIPIT);
+     RODCB$ = DCBADDR( DCBNUM(M$RU) );
+     RO_READ.BUF_      = VECTOR(EPN);
+     RU_KEY = RU_KEY_EPN;
+     CALL M$READ(RO_READ) ALTRET(SKIPIT);
+     EPN_CNT = (RODCB$->F$DCB.ARS#+1)/20;
+ 
+     RO_READ.BUF_      = VECTOR(IPN);
+     RU_KEY = RU_KEY_IPN;
+     CALL M$READ(RO_READ) ALTRET(SKIPIT);
+     IPN_CNT = (RODCB$->F$DCB.ARS#+1)/20;
+ 
+     RO_READ.BUF_      = VECTOR(STS);
+     RU_KEY = RU_KEY_STS;
+     CALL M$READ(RO_READ) ALTRET(SKIPIT);
+     STS_CNT = (RODCB$->F$DCB.ARS#+1)/20;
+ 
+     RO_READ.BUF_      = VECTOR(SEPN);
+     RU_KEY = RU_KEY_SEPN;
+     CALL M$READ(RO_READ) ALTRET(SKIPIT);
+     SEPN_CNT = (RODCB$->F$DCB.ARS#+1)/11;
+ 
+     CALL M$CLOSE(RO_CLOSE) ALTRET(SKIPIT);
+     RETURN;
+SKIPIT: ALTRETURN;
+END READ_RUF_OU;
+/**/
+/******************************************************************************/
+/******************************************************************************/
+/**/
+DISP: PROC(TEXT,X,Y);            /* FORMAT THE PERCENT SO WE CAN READ IT*/
+ 
+DCL TEXT(0:6) CHAR(1) UNAL;
+DCL X SBIN WORD ALIGNED;
+DCL Y SBIN WORD ALIGNED;
+DCL J SBIN WORD;
+DCL CTEMP(0:5) CHAR(1) UNAL;
+DCL CTMP REDEF CTEMP CHAR(6);
+DCL SMALL(0:6) CHAR(1) UNAL CONSTANT INIT(' '*3,'<','.','0','1');
+DCL DLZ BIT(1);
+ 
+ 
+     IF X = 0 AND Y = 0 THEN
+        PERCENT = TOTAL;
+        ELSE
+        CALL DIV(X,Y,PERCENT);
+     IF PERCENT = 0 AND X > 0 THEN
+     DO;
+        DO J=0 TO 6;
+           TEXT(J) = SMALL(J);
+        END;
+     END;
+        ELSE DO;
+        CALL BINCHAR(CTMP,PERCENT);
+        DLZ='1'B;
+        DO J=0 TO 3;
+           IF DLZ AND CTEMP(J)='0' THEN TEXT(J) = ' ';
+              ELSE DO;
+              TEXT(J)=CTEMP(J);
+              DLZ='0'B;
+           END;
+        END;
+        TEXT(4)='.';
+        TEXT(5)=CTEMP(4);
+        TEXT(6) = CTEMP(5);
+     END;
+END DISP;
+/**/
+/******************************************************************************/
+/******************************************************************************/
+/**/
+ 
+/* This routine use binary search algorithm to search an array. */
+ 
+BINARY_SEARCH: PROC(ARRAY,LB,UB,IC,NODE#,ALT_ENT);
+DCL 1 ARRAY(0:0) ALIGNED, /* Array to be searched. */
+       2 COUNT SBIN WORD ALIGNED,
+       2 LOW SBIN WORD,
+       2 OVERLAY# SBIN WORD,
+       2 HIGH UBIN HALF UNAL,
+       2 * UBIN HALF UNAL,
+       2 * SBIN;
+DCL LB SBIN WORD;
+DCL UB SBIN WORD;
+DCL OUB SBIN WORD;
+DCL MIDDLE SBIN WORD;
+DCL IC SBIN WORD;
+DCL NODE# SBIN WORD;
+DCL ALT_ENT BIT(1);
+     MIDDLE=1;
+     FOUND='0'B;
+     OUB = UB;
+ 
+     /* Find the node the data point falls in. */
+ 
+     DO WHILE('1'B);
+        IF LB>UB THEN RETURN;
+        MIDDLE=(UB-LB)/2+LB;
+        IF NODE#=ARRAY.OVERLAY#(MIDDLE) THEN EXIT;
+        IF NODE#>ARRAY.OVERLAY#(MIDDLE) THEN LB=MIDDLE+1;
+        IF NODE#<ARRAY.OVERLAY#(MIDDLE) THEN UB=MIDDLE-1;
+     END;
+     UB=MIDDLE;
+     LB=MIDDLE;
+ 
+     /* Find the range of all the external procedures, internal pocedures, or
+        statements in this node. */
+ 
+     DO WHILE NODE#=ARRAY.OVERLAY#(UB);
+        UB=UB+1;
+        IF UB>OUB THEN EXIT;
+     END;
+     UB=UB-1;
+ 
+     DO WHILE NODE#=ARRAY.OVERLAY#(LB);
+        LB=LB-1;
+        IF LB<0 THEN EXIT;
+     END;
+     LB=LB+1;
+     IF LB<0 THEN LB=0;
+ 
+     IF ALT_ENT THEN RETURN;
+ 
+     /* Find the external procedure, internal procedure or statement the data
+        point falls in. */
+ 
+     DO WHILE (UB>=LB);
+        MIDDLE=(UB-LB)/2+LB;
+        IF IC>=ARRAY.LOW(MIDDLE) AND IC<=ARRAY.HIGH(MIDDLE) THEN
+        DO;
+           FOUND='1'B;
+           GOTO OU;
+        END;
+        IF IC>ARRAY.HIGH(MIDDLE) THEN LB=MIDDLE+1;
+        IF IC<ARRAY.LOW(MIDDLE) THEN UB=MIDDLE-1;
+     END;
+ 
+OU:  K = MIDDLE;
+ 
+END BINARY_SEARCH;
+END PMDISP;
+%EOD;
+/*M* SORT --  PARTITION - EXCHANGE SORT (QUICKSORT) */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* DMC */
+/* This subroutine sorts an array of numbers using the partition
+   exchange sort.  Average number of comparisions is O(n Log2 n)
+   and the worst case is O(n**2). (if the table is
+   already sorted)
+*/
+SORT:   PROC(ARRAY$, N);
+DCL ARRAY$ PTR;
+DCL 1 ARRAY(0:0) BASED(ARRAY$) ALIGNED, /* Array to be sorted */
+      2 KEY SBIN WORD ALIGNED,
+      2 * SBIN WORD,
+      2 * SBIN WORD,
+      2 * SBIN WORD,
+      2 * SBIN WORD;
+DCL N SBIN WORD; /* size of array */
+DCL 1 TEMP ALIGNED,
+      2 KEY SBIN WORD ALIGNED,
+      2 * SBIN WORD,
+      2 * SBIN WORD,
+      2 * SBIN WORD,
+      2 * SBIN WORD;
+DCL TOP SBIN;
+DCL LOWER(0:29) SBIN WORD;
+DCL UPPER(0:29) SBIN WORD;
+DCL LB SBIN WORD; /* Lower bound */
+DCL UB SBIN WORD; /* Upper bound */
+DCL I SBIN WORD;
+DCL J SBIN WORD;
+ 
+ 
+ 
+        TOP=0;
+        LOWER(TOP)=0;
+        UPPER(TOP)=N-1;
+ 
+        DO WHILE(TOP >=0);
+           LB=LOWER(TOP);
+           UB=UPPER(TOP);
+           TOP=TOP-1;
+ 
+           DO WHILE(UB>LB);
+              I=LB;
+              J=UB;
+              TEMP=ARRAY(I);
+ 
+LOOP4:        DO WHILE(TEMP.KEY<ARRAY.KEY(J) AND J >= 0);
+                 J=J-1;
+                 END LOOP4;
+ 
+              IF J<=I THEN ARRAY(I)=TEMP;
+              ELSE DO;
+                 ARRAY(I)=ARRAY(J);
+                 I=I+1;
+ 
+                 DO WHILE(ARRAY.KEY(I)<TEMP.KEY AND I <= N);
+                    I=I+1;
+                    END;
+ 
+                 IF J>I THEN
+                 DO;
+                    ARRAY(J)=ARRAY(I);
+                    J=J-1;
+                    GOTO LOOP4;
+                    END;
+ 
+                 ARRAY(J)= TEMP;
+                 I=J;
+                 END;
+ 
+              TOP=TOP+1;
+ 
+              IF I-LB<UB-I THEN
+              DO;
+                 LOWER(TOP)=I+1;
+                 UPPER(TOP)=UB;
+                 UB=I-1;
+                 END;
+              ELSE DO;
+                 LOWER(TOP)=LB;
+                 UPPER(TOP)=I-1;
+                 LB=I+1;
+                 END;
+              END;
+           END;
+END SORT;

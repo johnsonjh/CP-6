@@ -1,0 +1,1748 @@
+VERSION E05
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:1    
+        1        1        /*M* QBD$DISPLAY:  DISPLAY field, or DISPLAY ALARM.  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMC,PLM=4,IND=0,DCI=4,CSI=2,IAD=2,DTI=2,AND,ECI=0,DIN=2,STI=2 */
+        8        8
+        9        9        /*P*  NAME:         QBD$DISPLAY
+       10       10              PURPOSE:      Display an elementary field DAD, or
+       11       11                            display ALARM (beep the toiminal).
+       12       12              DESCRIPTION:  Execute an DISPLAY op-code, whose argument
+       13       13                            may be a field, a list of fields, or "ALARM",
+       14       14                            depending on a function-code within the op-code
+       15       15                            sequence.
+       16       16        */
+       17       17
+       18       18        QBD$DISPLAY: PROC;
+       19       19
+       20       20        /*D*  NAME:         QBD$DISPLAY
+       21       21              CALL:         CALL QBD$DISPLAY;
+       22       22              PARAMETERS:   None.
+       23       23              INTERFACE:    Called by QAT$TALLYHO when an DISPLAY op-code
+       24       24                            is encountered.
+       25       25              ENVIRONMENT:  Nothing unusual.
+       26       26              INPUT:        QI_1,
+       27       27                            FPL rununit static data following the op-code.
+       28       28              OUTPUT:       Writes a field on the screen, or beeps the terminal.
+       29       29              SCRATCH:      Various otter stuff.
+       30       30              DESCRIPTION:  The DISPLAY verb is divided into two radically different
+       31       31                            types (which probably should have been given separate
+       32       32                            routines to call):
+       33       33                            1)  "DISPLAY fieldname [,fieldname...]"
+       34       34                                uses QCW$WRITE to M$WRITE data to a terminal.
+       35       35                                The fieldname(s) must be elementary, but may be arrays.
+       36       36                                An INVALID clause may be present.
+       37       37                            2)  "DISPLAY ALARM"
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:2    
+       38       38                                uses QCM$MESS to write a BEL character to the terminal.
+       39       39        */
+       40       40
+       41       41          %INCLUDE LCP_6;
+       42      232
+       43      233          %INCLUDE QG_MACRO_M;
+       44      370          %INCLUDE QI_EQUATES_E;
+       45      729          %INCLUDE QI_PERR_C;
+       46      897          %INCLUDE QI_MACROS_M;
+       47     5955          %QI$ALL;
+       48    17068
+       49    17069    1     DCL BEEP BIT(16) CONSTANT INIT('0700'X);
+       50    17070    1     DCL ERROR_STATUS$ PTR;
+       51    17071    1     DCL FIELD_COUNT UBIN;
+       52    17072    1     DCL FIELD_DAD$ PTR;
+       53    17073    1     DCL FIELD_INDEX UBIN;
+       54    17074    1     DCL INSTR$ PTR;
+       55    17075    1     DCL LAST_FILE$ PTR;
+       56    17076
+       57    17077    1     DCL QCE$ERROR_INTERNAL ENTRY (4);
+       58    17078    1     DCL QCF$FIND_CURRENTS ENTRY;
+       59    17079    1     DCL QCM$MESS ENTRY (1);
+       60    17080    1     DCL QCU$USE_INVALID_IO ENTRY (1);
+       61    17081    1     DCL QCW$WRITE ENTRY (1);
+       62    17082
+       63    17083          %SET LISTMAC = '1'B;
+       64    17084
+       65    17085          %INCLUDE QCM_MESS_M;
+       66    17127          %QCM@MESS;
+             17128            %BEGIN_MACRO;
+             17129            %SET LISTDIR = '0'B;
+             17142    1     DCL 1 QCM@MESS ALIGNED,
+             17143    1           2 MESSAGE_LINE_GZ_HEADER$ PTR,
+             17144                           /* Pointer to QI$GZ_HEADER for the
+             17145                              MESSAGE LINE to use.  */
+             17146    1           2 IS_MESSAGE_A_DAD BIT(1) ALIGNED,
+             17147                           /* Set if MESSAGE$ points to a DAD,
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:3    
+             17148                              reset if MESSAGE$ points to text
+             17149                              (in which case MESSAGE_LENGTH is valid).  */
+             17150    1           2 MESSAGE_LENGTH UBIN,
+             17151                           /* Length, in bytes, of the error message.  */
+             17152    1           2 MESSAGE$ PTR,
+             17153                           /* See IS_MESSAGE_A_DAD.  */
+             17154    1           2 FRAME_INDEX UBIN,
+             17155                           /* Index of the current frame.  */
+             17156    1           2 FIELD_INDEX UBIN,
+             17157                           /* Index of the field to re-get (if any).  */
+             17158    1           2 STATUS UBIN,
+             17159                           /* Returned status code:  0 -> Immediate return to level 0;
+             17160                                                    >0 -> Status is ok.  */
+             17161    1           2 FIELD_ERROR_STOP_INDEX UBIN,
+             17162                           /* Passed index for QCG$GET_FIELD processing.  */
+             17163    1           2 VISUAL_ATTRIBUTE UBIN;
+             17164                           /* Matches %EQUs for QI#xxx_VISUAL_ATTR
+             17165                              (currently, blinking or non-blinking message line).  */
+             17172            %ENDIF;
+       67    17175
+       68    17176          %INCLUDE QCU_USE_M;
+       69    17230          %QCU@USE;
+             17231            %BEGIN_MACRO;
+             17232            %SET LISTDIR = '0'B;
+             17245    1     DCL 1 QCU@USE AUTO ALIGNED,
+             17246    1           2 CURR_FRAME$ PTR,
+             17247                          /* Pointer to DAD of current frame or ADDR (NIL).  */
+             17248    1           2 CURR_NODE$ PTR,
+             17249                          /* Pointer to current node or ADDR (NIL).  */
+             17250    1           2 USE_DEFAULT_IO UBIN,
+             17251                          /* For USE procedures which default applies
+             17252                             (see corresponding EQUs).  */
+             17253    1           2 IS_TIME_TO_SAVE_AWAY_FIELDS BIT(1) ALIGNED,
+             17254                          /* If IS_TIME_TO_SAVE_AWAY_FIELDS, then
+             17255                             save the fields within the bounds of
+             17256                             FRAME_START_INDEX, FRAME_STOP_INDEX,
+             17257                             FIELD_START_INDEX, and FIELD_STOP_INDEX
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:4    
+             17258                             before calling the USE procedure.  */
+             17259    1           2 FRAME_START_INDEX UBIN,
+             17260                          /* Foist frame of the CURRENT.FORM$
+             17261                             involved with the I-O error.  */
+             17262    1           2 FRAME_STOP_INDEX UBIN,
+             17263                          /* Larst frame of the CURRENT.FORM$
+             17264                             involved with the I-O error.  */
+             17265    1           2 IS_FIELD_INDEXES_VALID BIT(1) ALIGNED,
+             17266                          /* If IS_FIELD_INDEXES_VALID, use them;
+             17267                             else use all the fields in the frame.  */
+             17268    1           2 FIELD_START_INDEX UBIN,
+             17269                          /* Starting index into QI$GZ_FIELD
+             17270                             which may have values "pushed".  */
+             17271    1           2 FIELD_STOP_INDEX UBIN,
+             17272                          /* Stopping index into QI$GZ_FIELD
+             17273                             which may have values "pushed".  */
+             17274    1           2 IS_CURSOR_POSITION_VALID BIT(1) ALIGNED,
+             17275                          /* If IS_CURSOR_POSITION_VALID, use it;
+             17276                             else allow cursor to default to upper-left-most field.  */
+             17277    1           2 CURSOR_POSITION BIT(16) ALIGNED,
+             17278                          /* POSition of the field on which to place the cursor.  */
+             17279    1           2 STATUS UBIN;
+             17280                          /* Returned action code; see corresponding EQUs.  */
+             17287            %ENDIF;
+       70    17290
+       71    17291          %INCLUDE QCW_WRITE_M;
+       72    17326          %QCW@WRITE;
+             17327            %BEGIN_MACRO ( STCLASS = STCLASS );
+             17328            %SET LISTDIR = '0'B;
+             17341    1     DCL 1 QCW@WRITE ALIGNED,
+             17342    1           2 FRAME_START_INDEX UBIN,
+             17343                          /* Starting index into QI$FORM_FILE.FRAME_LIST_A@P.  */
+             17344    1           2 FRAME_STOP_INDEX UBIN,
+             17345                          /* Stopping index into QI$FORM_FILE.FRAME_LIST_A@P.  */
+             17346    1           2 IS_FIELD_INDEXES_VALID BIT(1) ALIGNED,
+             17347                          /* If IS_FIELD_INDEXES_VALID, use them;
+             17348                             else use all the fields in the frame.  */
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:5    
+             17349    1           2 FIELD_START_INDEX UBIN,
+             17350                          /* Starting index into QI$GZ_FIELD table.  */
+             17351    1           2 FIELD_STOP_INDEX UBIN,
+             17352                          /* Stopping index into QI$GZ_FIELD table.  */
+             17353    1           2 STATUS UBIN,
+             17354                          /* Returned status code:  0 -> Immediate return to level 0;
+             17355                                                   >0 -> Status is ok.  */
+             17356    1           2 FIELD_ERROR_STOP_INDEX UBIN;
+             17357                          /* Passed index for QCG$GET_FIELD processing.  */
+             17364            %ENDIF;
+       73    17367
+       74    17368          %SET LISTMAC = '0'B;
+       75    17369        %EJECT;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:6    
+       76    17370    1       IF QI_1.INSTR$ -> QI$OP_DISPLAY.TYPE = %QI#DISPLAY_FIELD
+       77    17371    1       THEN
+       78    17372    1   DISPLAY_FIELDNAME:
+       79    17373    2         DO;
+       80    17374    2           INSTR$ = QI_1.INSTR$;
+       81    17375    2           FIELD_COUNT = INSTR$ -> QI$OP_DISPLAY.FIELD_COUNT;
+       82    17376    2           QI_1.INSTR$ = PINCRW ( INSTR$, FIELD_COUNT + 2 );
+       83    17377
+       84    17378    2           LAST_FILE$ = ADDR (NIL);
+       85    17379
+       86    17380    2   DISPLAY_ALL_THE_FIELDS:
+       87    17381    3           DO FIELD_INDEX = 0 TO FIELD_COUNT - 1;
+       88    17382
+       89    17383                  %PROC_ADDRESS ( THING@P =
+             17383                      "INSTR$ -> QI$OP_DISPLAY.FIELD_A@P ( FIELD_INDEX )",
+       90    17384                  CHECK_FOR_INDIRECTION = YES,
+       91    17385                  RESULT$ = FIELD_DAD$ );
+       92    17422
+       93    17423                  %IF QI#DEBUG;
+       94    17424
+       95    17425    4             DO CASE ( FIELD_DAD$ -> QI$FIELD_DAD.WORD0_FLAGS.TYPE );
+       96    17426
+       97    17427    4               CASE ( %QI#TYPE_DISPLAY,
+       98    17428    4               %QI#TYPE_ALPHANUMERIC );
+       99    17429
+      100    17430    4               CASE ( ELSE );
+      101    17431    4                 CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_COMPILER_ERROR );
+      102    17432
+      103    17433    4             END;
+      104    17434
+      105    17435                  %ENDIF;
+      106    17436
+      107    17437    3             QI_1.CURRENT.NODE$ = FIELD_DAD$;
+      108    17438
+      109    17439    3   RETRY_FIELD_DISPLAY:
+      110    17440    3             CALL QCF$FIND_CURRENTS;
+      111    17441
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:7    
+      112    17442    3             IF NOT QI_1.CURRENT.FRAME_STATUS$ -> QI$FRAME_STATUS.INDICATORS.IS_ACTIVE
+      113    17443    3             THEN
+      114    17444    4               DO;
+      115    17445    4                 QI_1.ERROR_STATUS = %E$FRAME_NOT_ACTIVE;
+      116    17446    4                 GOTO CHECK_USE_PROCEDURE_OR_INVALID;
+      117    17447    4               END;
+      118    17448
+      119    17449    3             IF NOT QI_1.CURRENT.FORM_STATUS$ -> QI$FORM_STATUS.INDICATORS.OPEN_FLAGS.
+             17449                      IS_OUTPUT
+      120    17450    3             THEN
+      121    17451    4               DO;
+      122    17452    4                 IF NOT QI_1.CURRENT.FORM_STATUS$ -> QI$FORM_STATUS.INDICATORS.
+             17452                          OPEN_FLAGS.IS_INPUT
+      123    17453    4                 THEN
+      124    17454    4                   QI_1.ERROR_STATUS = %E$FILE_NOT_OPEN;
+      125    17455    4                 ELSE
+      126    17456    4                   QI_1.ERROR_STATUS = %E$FILE_NOT_OPEN_OUTPUT;
+      127    17457    4                 GOTO CHECK_USE_PROCEDURE_OR_INVALID;
+      128    17458    4               END;
+      129    17459
+      130    17460                  %IF QI#DEBUG;
+      131    17461
+      132    17462    3             IF NOT QI_1.CURRENT.NODE$ -> QI$FIELD_DAD.WORD0_FLAGS.IO_FLAGS.IS_OUTPUT
+      133    17463    3             THEN
+      134    17464    3               CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_COMPILER_ERROR );
+      135    17465
+      136    17466                  %ENDIF;
+      137    17467
+      138    17468        %EJECT;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:8    
+      139    17469    3             QCW@WRITE.FRAME_START_INDEX = QI_1.CURRENT.FRAME_INDEX;
+      140    17470    3             QCW@WRITE.FRAME_STOP_INDEX = QI_1.CURRENT.FRAME_INDEX;
+      141    17471    3             QCW@WRITE.FIELD_START_INDEX = QI_1.CURRENT.NODE_STATUS$ -> QI$FIELD_STATUS
+             17471                      .GZ.FIELD_START_INDEX;
+      142    17472    3             QCW@WRITE.FIELD_STOP_INDEX = QI_1.CURRENT.NODE_STATUS$ -> QI$FIELD_STATUS.
+             17472                      GZ.FIELD_STOP_INDEX;
+      143    17473
+      144    17474    3             CALL QCW$WRITE ( QCW@WRITE );
+      145    17475
+      146    17476    3             IF QCW@WRITE.STATUS = %QI#USE_INVALID_RETURN
+      147    17477    3             THEN
+      148    17478    3               RETURN;
+      149    17479
+      150    17480    3             IF QI_1.CURRENT.FORM$ -> QI$FORM_FILE.WORD0_FLAGS.IS_ERROR_STATUS_VALID
+      151    17481    3             THEN
+      152    17482    4               DO;
+      153    17483
+      154    17484    4                 IF QI_1.CURRENT.FORM$ ~= LAST_FILE$
+      155    17485    4                 THEN
+      156    17486    5                   DO;
+      157    17487
+      158    17488    5                     LAST_FILE$ = QI_1.CURRENT.FORM$;
+      159    17489
+      160    17490                          %DATA_ADDRESS ( THING@D =
+             17490                              "QI_1.CURRENT.FORM$ -> QI$FORM_FILE.ERROR_STATUS@D",
+      161    17491                          CHECK_FOR_INDIRECTION = NO,
+      162    17492                          RESULT$ = ERROR_STATUS$ );
+      163    17529
+      164    17530    5                     ERROR_STATUS$ -> QI$ERROR_STATUS.TEXT = %QI#OP_DISPLAY_TEXT;
+      165    17531
+      166    17532    5                   END;
+      167    17533
+      168    17534    4               END;
+      169    17535
+      170    17536    3   NEXT_FIELD_PLEASE:
+      171    17537
+      172    17538    3           END DISPLAY_ALL_THE_FIELDS;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:9    
+      173    17539
+      174    17540    2         END DISPLAY_FIELDNAME;
+      175    17541        %EJECT;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:10   
+      176    17542    1       ELSE
+      177    17543    1   DISPLAY_ALARM:
+      178    17544    2         DO;
+      179    17545
+      180    17546    2           QI_1.INSTR$ = ADDR ( QI_1.INSTR$ -> QI$OP_DISPLAY.NEXT_CODE@P );
+      181    17547
+      182    17548    2           QCM@MESS.MESSAGE_LINE_GZ_HEADER$ = QI_1.MESSAGE_LINE_GZ.HEADER$;
+      183    17549    2           QCM@MESS.IS_MESSAGE_A_DAD = %NO;
+      184    17550    2           QCM@MESS.MESSAGE_LENGTH = 1;
+      185    17551    2           QCM@MESS.MESSAGE$ = ADDR ( BEEP );
+      186    17552    2           QCM@MESS.VISUAL_ATTRIBUTE = %QI#OUTPUT_VISUAL_ATTRIBUTE;
+      187    17553
+      188    17554    2           CALL QCM$MESS ( QCM@MESS );
+      189    17555
+      190    17556    2           IF QCM@MESS.STATUS = %QI#USE_INVALID_RETURN
+      191    17557    2           THEN
+      192    17558    2             RETURN;
+      193    17559
+      194    17560    2         END DISPLAY_ALARM;
+      195    17561
+      196    17562    1       RETURN;
+      197    17563
+      198    17564        %EJECT;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:11   
+      199    17565    1   CHECK_USE_PROCEDURE_OR_INVALID:
+      200    17566    1       QCU@USE.USE_DEFAULT_IO = %QI#USE_DEFAULT_NONE;
+      201    17567    1       QCU@USE.IS_TIME_TO_SAVE_AWAY_FIELDS = %NO;
+      202    17568    1       QCU@USE.CURR_FRAME$ = QI_1.CURRENT.FRAME$;
+      203    17569
+      204    17570    1       IF QI_1.CURRENT.NODE$ -> QI$DAD.WORD0_FLAGS.TYPE < %QI#TYPE_MINOR
+      205    17571    1       THEN
+      206    17572    1         QCU@USE.CURR_NODE$ = QI_1.CURRENT.NODE$;
+      207    17573    1       ELSE
+      208    17574    1         QCU@USE.CURR_NODE$ = ADDR (NIL);
+      209    17575
+      210    17576    1       CALL QCU$USE_INVALID_IO ( QCU@USE );
+      211    17577
+      212    17578    2       DO CASE ( QCU@USE.STATUS );
+      213    17579
+      214    17580    2         CASE ( %QI#USE_INVALID_RETURN );
+      215    17581    2           RETURN;
+      216    17582
+      217    17583    2         CASE ( %QI#USE_INVALID_RETRY );
+      218    17584    2           GOTO RETRY_FIELD_DISPLAY;
+      219    17585
+      220    17586    2         CASE ( %QI#USE_INVALID_SKIP_TO_NEXT );
+      221    17587    2           LAST_FILE$ = ADDR (NIL);
+      222    17588    2           GOTO NEXT_FIELD_PLEASE;
+      223    17589
+      224    17590    2         CASE ( ELSE );
+      225    17591    2           CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_INTERPRETER_ERROR );
+      226    17592
+      227    17593    2       END;
+      228    17594
+      229    17595    1   END QBD$DISPLAY;
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:12   
+--  Include file information  --
+
+   QCW_WRITE_M.:E05TOU  is referenced.
+   QCU_USE_M.:E05TOU  is referenced.
+   QCM_MESS_M.:E05TOU  is referenced.
+   QI_MACROS_M.:E05TOU  is referenced.
+   QI_PERR_C.:E05TOU  is referenced.
+   QI_EQUATES_E.:E05TOU  is referenced.
+   QG_MACRO_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure QBD$DISPLAY.
+
+   Procedure QBD$DISPLAY requires 375 words for executable code.
+   Procedure QBD$DISPLAY requires 48 words of local(AUTO) storage.
+
+    No errors detected in file QBD$DISPLAY.:E05TSI    .
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:13   
+
+ Object Unit name= QBD$DISPLAY                                File name= QBD$DISPLAY.:E05TOU
+ UTS= JUL 30 '97 04:46:30.56 WED                              Compiler= PL-6/E31         Sev=      00
+ SharedLib= :SHARED_LCP6_SYSTEM                               Alt SharedLib=
+
+
+    ****  Control sections  ****
+
+ Sect   Type Bound  Init  Size HexSiz  Section name
+    0  RoData even  UTS      2      2  QBD$DISPLAY
+    1   Proc  even  none   375    177  QBD$DISPLAY
+    2  RoData even  none     6      6  QBD$DISPLAY
+
+    ****  Entry defs  ****
+
+                              Check   Calling
+                             calling  sequence
+  Sect HexLoc Primary Altret sequence   type   Parms  Name
+     1      0   yes            yes      Std        0  QBD$DISPLAY
+
+  ****  Entry refs  ****
+
+         Check        Calling
+        calling       sequence
+Altret sequence SRef   type   Args  Name
+         yes           Std       4 QCE$ERROR_INTERNAL
+         yes           Std       0 QCF$FIND_CURRENTS
+         yes           Std       1 QCM$MESS
+         yes           Std       1 QCU$USE_INVALID_IO
+         yes           Std       1 QCW$WRITE
+                       nStd      0 X6A_AUTO_0
+                       nStd      0 X6A_ARET
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:14   
+
+  ****  Data refs  ****
+
+  Flags:  r = read only, s = secondary
+Flgs Name                             Flgs Name                             Flgs Name
+     QI_1                                  QI_4_CHAR_ALPHANUMERIC                QI_31_DIGIT_SLS_DISPLAY
+     QI_16_BIT_BINARY                      QI_32_BIT_BINARY                      QI_31_DIGIT_ST_PACKED
+     QI_PICTURE_STRING                r    G$ROS$
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:15   
+
+
+        1        1        /*M* QBD$DISPLAY:  DISPLAY field, or DISPLAY ALARM.  */
+        2        2        /*T***********************************************************/
+        3        3        /*T*                                                         */
+        4        4        /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+        5        5        /*T*                                                         */
+        6        6        /*T***********************************************************/
+        7        7        /*X* DMC,PLM=4,IND=0,DCI=4,CSI=2,IAD=2,DTI=2,AND,ECI=0,DIN=2,STI=2 */
+        8        8
+        9        9        /*P*  NAME:         QBD$DISPLAY
+       10       10              PURPOSE:      Display an elementary field DAD, or
+       11       11                            display ALARM (beep the toiminal).
+       12       12              DESCRIPTION:  Execute an DISPLAY op-code, whose argument
+       13       13                            may be a field, a list of fields, or "ALARM",
+       14       14                            depending on a function-code within the op-code
+       15       15                            sequence.
+       16       16        */
+       17       17
+       18       18        QBD$DISPLAY: PROC;
+
+     18   1 000000  D380 0000 0000  xent QBD$DISPLAY     LNJ,B5   X6A_AUTO_0
+          1 000003       0030 0000                       DC       48,0
+
+       19       19
+       20       20        /*D*  NAME:         QBD$DISPLAY
+       21       21              CALL:         CALL QBD$DISPLAY;
+       22       22              PARAMETERS:   None.
+       23       23              INTERFACE:    Called by QAT$TALLYHO when an DISPLAY op-code
+       24       24                            is encountered.
+       25       25              ENVIRONMENT:  Nothing unusual.
+       26       26              INPUT:        QI_1,
+       27       27                            FPL rununit static data following the op-code.
+       28       28              OUTPUT:       Writes a field on the screen, or beeps the terminal.
+       29       29              SCRATCH:      Various otter stuff.
+       30       30              DESCRIPTION:  The DISPLAY verb is divided into two radically different
+       31       31                            types (which probably should have been given separate
+       32       32                            routines to call):
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:16   
+       33       33                            1)  "DISPLAY fieldname [,fieldname...]"
+       34       34                                uses QCW$WRITE to M$WRITE data to a terminal.
+       35       35                                The fieldname(s) must be elementary, but may be arrays.
+       36       36                                An INVALID clause may be present.
+       37       37                            2)  "DISPLAY ALARM"
+       38       38                                uses QCM$MESS to write a BEL character to the terminal.
+       39       39        */
+       40       40
+       41       41          %INCLUDE LCP_6;
+       42      232
+       43      233          %INCLUDE QG_MACRO_M;
+       44      370          %INCLUDE QI_EQUATES_E;
+       45      729          %INCLUDE QI_PERR_C;
+       46      897          %INCLUDE QI_MACROS_M;
+       47     5955          %QI$ALL;
+       48    17068
+       49    17069    1     DCL BEEP BIT(16) CONSTANT INIT('0700'X);
+       50    17070    1     DCL ERROR_STATUS$ PTR;
+       51    17071    1     DCL FIELD_COUNT UBIN;
+       52    17072    1     DCL FIELD_DAD$ PTR;
+       53    17073    1     DCL FIELD_INDEX UBIN;
+       54    17074    1     DCL INSTR$ PTR;
+       55    17075    1     DCL LAST_FILE$ PTR;
+       56    17076
+       57    17077    1     DCL QCE$ERROR_INTERNAL ENTRY (4);
+       58    17078    1     DCL QCF$FIND_CURRENTS ENTRY;
+       59    17079    1     DCL QCM$MESS ENTRY (1);
+       60    17080    1     DCL QCU$USE_INVALID_IO ENTRY (1);
+       61    17081    1     DCL QCW$WRITE ENTRY (1);
+       62    17082
+       63    17083          %SET LISTMAC = '1'B;
+       64    17084
+       65    17085          %INCLUDE QCM_MESS_M;
+       66    17127          %QCM@MESS;
+             17128            %BEGIN_MACRO;
+             17129            %SET LISTDIR = '0'B;
+             17142    1     DCL 1 QCM@MESS ALIGNED,
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:17   
+             17143    1           2 MESSAGE_LINE_GZ_HEADER$ PTR,
+             17144                           /* Pointer to QI$GZ_HEADER for the
+             17145                              MESSAGE LINE to use.  */
+             17146    1           2 IS_MESSAGE_A_DAD BIT(1) ALIGNED,
+             17147                           /* Set if MESSAGE$ points to a DAD,
+             17148                              reset if MESSAGE$ points to text
+             17149                              (in which case MESSAGE_LENGTH is valid).  */
+             17150    1           2 MESSAGE_LENGTH UBIN,
+             17151                           /* Length, in bytes, of the error message.  */
+             17152    1           2 MESSAGE$ PTR,
+             17153                           /* See IS_MESSAGE_A_DAD.  */
+             17154    1           2 FRAME_INDEX UBIN,
+             17155                           /* Index of the current frame.  */
+             17156    1           2 FIELD_INDEX UBIN,
+             17157                           /* Index of the field to re-get (if any).  */
+             17158    1           2 STATUS UBIN,
+             17159                           /* Returned status code:  0 -> Immediate return to level 0;
+             17160                                                    >0 -> Status is ok.  */
+             17161    1           2 FIELD_ERROR_STOP_INDEX UBIN,
+             17162                           /* Passed index for QCG$GET_FIELD processing.  */
+             17163    1           2 VISUAL_ATTRIBUTE UBIN;
+             17164                           /* Matches %EQUs for QI#xxx_VISUAL_ATTR
+             17165                              (currently, blinking or non-blinking message line).  */
+             17172            %ENDIF;
+       67    17175
+       68    17176          %INCLUDE QCU_USE_M;
+       69    17230          %QCU@USE;
+             17231            %BEGIN_MACRO;
+             17232            %SET LISTDIR = '0'B;
+             17245    1     DCL 1 QCU@USE AUTO ALIGNED,
+             17246    1           2 CURR_FRAME$ PTR,
+             17247                          /* Pointer to DAD of current frame or ADDR (NIL).  */
+             17248    1           2 CURR_NODE$ PTR,
+             17249                          /* Pointer to current node or ADDR (NIL).  */
+             17250    1           2 USE_DEFAULT_IO UBIN,
+             17251                          /* For USE procedures which default applies
+             17252                             (see corresponding EQUs).  */
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:18   
+             17253    1           2 IS_TIME_TO_SAVE_AWAY_FIELDS BIT(1) ALIGNED,
+             17254                          /* If IS_TIME_TO_SAVE_AWAY_FIELDS, then
+             17255                             save the fields within the bounds of
+             17256                             FRAME_START_INDEX, FRAME_STOP_INDEX,
+             17257                             FIELD_START_INDEX, and FIELD_STOP_INDEX
+             17258                             before calling the USE procedure.  */
+             17259    1           2 FRAME_START_INDEX UBIN,
+             17260                          /* Foist frame of the CURRENT.FORM$
+             17261                             involved with the I-O error.  */
+             17262    1           2 FRAME_STOP_INDEX UBIN,
+             17263                          /* Larst frame of the CURRENT.FORM$
+             17264                             involved with the I-O error.  */
+             17265    1           2 IS_FIELD_INDEXES_VALID BIT(1) ALIGNED,
+             17266                          /* If IS_FIELD_INDEXES_VALID, use them;
+             17267                             else use all the fields in the frame.  */
+             17268    1           2 FIELD_START_INDEX UBIN,
+             17269                          /* Starting index into QI$GZ_FIELD
+             17270                             which may have values "pushed".  */
+             17271    1           2 FIELD_STOP_INDEX UBIN,
+             17272                          /* Stopping index into QI$GZ_FIELD
+             17273                             which may have values "pushed".  */
+             17274    1           2 IS_CURSOR_POSITION_VALID BIT(1) ALIGNED,
+             17275                          /* If IS_CURSOR_POSITION_VALID, use it;
+             17276                             else allow cursor to default to upper-left-most field.  */
+             17277    1           2 CURSOR_POSITION BIT(16) ALIGNED,
+             17278                          /* POSition of the field on which to place the cursor.  */
+             17279    1           2 STATUS UBIN;
+             17280                          /* Returned action code; see corresponding EQUs.  */
+             17287            %ENDIF;
+       70    17290
+       71    17291          %INCLUDE QCW_WRITE_M;
+       72    17326          %QCW@WRITE;
+             17327            %BEGIN_MACRO ( STCLASS = STCLASS );
+             17328            %SET LISTDIR = '0'B;
+             17341    1     DCL 1 QCW@WRITE ALIGNED,
+             17342    1           2 FRAME_START_INDEX UBIN,
+             17343                          /* Starting index into QI$FORM_FILE.FRAME_LIST_A@P.  */
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:19   
+             17344    1           2 FRAME_STOP_INDEX UBIN,
+             17345                          /* Stopping index into QI$FORM_FILE.FRAME_LIST_A@P.  */
+             17346    1           2 IS_FIELD_INDEXES_VALID BIT(1) ALIGNED,
+             17347                          /* If IS_FIELD_INDEXES_VALID, use them;
+             17348                             else use all the fields in the frame.  */
+             17349    1           2 FIELD_START_INDEX UBIN,
+             17350                          /* Starting index into QI$GZ_FIELD table.  */
+             17351    1           2 FIELD_STOP_INDEX UBIN,
+             17352                          /* Stopping index into QI$GZ_FIELD table.  */
+             17353    1           2 STATUS UBIN,
+             17354                          /* Returned status code:  0 -> Immediate return to level 0;
+             17355                                                   >0 -> Status is ok.  */
+             17356    1           2 FIELD_ERROR_STOP_INDEX UBIN;
+             17357                          /* Passed index for QCG$GET_FIELD processing.  */
+             17364            %ENDIF;
+       73    17367
+       74    17368          %SET LISTMAC = '0'B;
+       75    17369        %EJECT;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:20   
+       76    17370    1       IF QI_1.INSTR$ -> QI$OP_DISPLAY.TYPE = %QI#DISPLAY_FIELD
+
+  17370   1 000005  EC80 0000 0006  xsym                 LDB,B6   QI_1+6
+          1 000008  82C6 0001                            LB,'E000'X        1,B6
+          1 00000A       E000
+          1 00000B  0501 00F1                            BBT      s:17544,PREL
+
+       77    17371    1       THEN
+       78    17372    1   DISPLAY_FIELDNAME:
+       79    17373    2         DO;
+
+  17373   1                              DISPLAY_FIELDNA*null
+       80    17374    2           INSTR$ = QI_1.INSTR$;
+
+  17374   1 00000D  EFC7 000A            DISPLAY_FIELDNA*STB,B6   INSTR$,AUTO
+
+       81    17375    2           FIELD_COUNT = INSTR$ -> QI$OP_DISPLAY.FIELD_COUNT;
+
+  17375   1 00000F  E846 0001                            LDR,R6   1,B6
+          1 000011  E570 1FFF                            AND,R6   8191,IMO
+          1 000013  EF47 0006                            STR,R6   FIELD_COUNT,AUTO
+
+       82    17376    2           QI_1.INSTR$ = PINCRW ( INSTR$, FIELD_COUNT + 2 );
+
+  17376   1 000015  F856                                 LDR,R7   R6
+          1 000016  6C00                                 LDV,R6   0
+          1 000017  8447 000A                            AID      INSTR$,AUTO
+          1 000019  8470 0000 0002                       AID      2,IMO
+          1 00001C  8D00 0000 0006  xsym                 SDI      QI_1+6
+
+       83    17377
+       84    17378    2           LAST_FILE$ = ADDR (NIL);
+
+  17378   1 00001F  DB80 0000 0000                       LAB,B5   0
+          1 000022  DFC7 000C                            STB,B5   LAST_FILE$,AUTO
+
+       85    17379
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:21   
+       86    17380    2   DISPLAY_ALL_THE_FIELDS:
+       87    17381    3           DO FIELD_INDEX = 0 TO FIELD_COUNT - 1;
+
+  17381   1 000024  8747 0009            DISPLAY_ALL_THE*CL       FIELD_INDEX,AUTO
+          1 000026  0F81 00CE                            B        s:17534+3,PREL
+
+       88    17382
+       89    17383                  %PROC_ADDRESS ( THING@P =
+             17383                      "INSTR$ -> QI$OP_DISPLAY.FIELD_A@P ( FIELD_INDEX )",
+       90    17384                  CHECK_FOR_INDIRECTION = YES,
+       91    17385                  RESULT$ = FIELD_DAD$ );
+
+  17403   1 000028  ECC7 000A                            LDB,B6   INSTR$,AUTO
+          1 00002A  B847 0009                            LDR,R3   FIELD_INDEX,AUTO
+          1 00002C  3E02                                 ADV,R3   2
+          1 00002D  A836                                 LDR,R2   ,B6,R3
+          1 00002E  F852                                 LDR,R7   R2
+          1 00002F  6C00                                 LDV,R6   0
+          1 000030  8400 0000 0002  xsym                 AID      QI_1+2
+          1 000033  8D47 0007                            SDI      FIELD_DAD$,AUTO
+
+  17405   1 000035  DCC7 0007                            LDB,B5   FIELD_DAD$,AUTO
+          1 000037  8985                                 CMZ      ,B5
+          1 000038  0881 0019                            BAGE     s:17425,PREL
+
+  17406   1 00003A  ECC7 0007                            LDB,B6   FIELD_DAD$,AUTO
+          1 00003C  E806                                 LDR,R6   ,B6
+          1 00003D  6046                                 SOR,R6   6
+          1 00003E  E570 0001                            AND,R6   1,IMO
+          1 000040  B846 0002                            LDR,R3   2,B6
+          1 000042  A856                                 LDR,R2   R6
+          1 000043  DCA0 0000 0000  xsym                 LDB,B5   QI_1,R2
+          1 000046  DFC7 002E                            STB,B5   QCW@WRITE+7,AUTO
+          1 000048  F853                                 LDR,R7   R3
+          1 000049  6C00                                 LDV,R6   0
+          1 00004A  8447 002E                            AID      QCW@WRITE+7,AUTO
+          1 00004C  8D47 0007                            SDI      FIELD_DAD$,AUTO
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:22   
+
+  17410   1 00004E  ECC7 0007                            LDB,B6   FIELD_DAD$,AUTO
+          1 000050  8986                                 CMZ      ,B6
+          1 000051  0869                                 BAL      s:17406,SPREL
+
+       92    17422
+       93    17423                  %IF QI#DEBUG;
+       94    17424
+       95    17425    4             DO CASE ( FIELD_DAD$ -> QI$FIELD_DAD.WORD0_FLAGS.TYPE );
+
+  17425   1 000052  ECC7 0007                            LDB,B6   FIELD_DAD$,AUTO
+          1 000054  B806                                 LDR,R3   ,B6
+          1 000055  B570 000F                            AND,R3   15,IMO
+          1 000057  3D04                                 CMV,R3   4
+          1 000058  0281 000B                            BGE      s:17431,PREL
+          1 00005A  A830 0000 0060  01                   LDR,R2   s:17425+14,R3
+          1 00005D  83A0 0000 0064  01                   JMP      s:17431,R2
+          1 000060       0009                            DC       s:17437,PREL
+          1 000061       0000                            DC       s:17431,PREL
+          1 000062       0000                            DC       s:17431,PREL
+          1 000063       0009                            DC       s:17437,PREL
+
+       96    17426
+       97    17427    4               CASE ( %QI#TYPE_DISPLAY,
+
+       98    17428    4               %QI#TYPE_ALPHANUMERIC );
+       99    17429
+      100    17430    4               CASE ( ELSE );
+
+      101    17431    4                 CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_COMPILER_ERROR );
+
+  17431   1 000064  BB80 0000 0001  02                   LAB,B3   +1
+          1 000067  CBF0 0100                            LAB,B4   256,IMO
+          1 000069  E380 0000 0000  xent                 LNJ,B6   QCE$ERROR_INTERNAL
+          1 00006C       0001                            DC       s:17437,PREL
+
+      102    17432
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:23   
+      103    17433    4             END;
+
+      104    17434
+      105    17435                  %ENDIF;
+      106    17436
+      107    17437    3             QI_1.CURRENT.NODE$ = FIELD_DAD$;
+
+  17437   1 00006D  ECC7 0007                            LDB,B6   FIELD_DAD$,AUTO
+          1 00006F  EF80 0000 0080  xsym                 STB,B6   QI_1+128
+
+      108    17438
+      109    17439    3   RETRY_FIELD_DISPLAY:
+      110    17440    3             CALL QCF$FIND_CURRENTS;
+
+  17440   1 000072  CBF0 0000            RETRY_FIELD_DIS*LAB,B4   0,IMO
+          1 000074  E380 0000 0000  xent                 LNJ,B6   QCF$FIND_CURRENTS
+          1 000077       0001                            DC       s:17442,PREL
+
+      111    17441
+      112    17442    3             IF NOT QI_1.CURRENT.FRAME_STATUS$ -> QI$FRAME_STATUS.INDICATORS.IS_ACTIVE
+
+  17442   1 000078  EC80 0000 007C  xsym                 LDB,B6   QI_1+124
+          1 00007B  89C6 000C                            CMZ      12,B6
+          1 00007D  0801 0007                            BAL      s:17449,PREL
+
+      113    17443    3             THEN
+      114    17444    4               DO;
+
+      115    17445    4                 QI_1.ERROR_STATUS = %E$FRAME_NOT_ACTIVE;
+
+  17445   1 00007F  6C07                                 LDV,R6   7
+          1 000080  EF00 0000 008C  xsym                 STR,R6   QI_1+140
+
+      116    17446    4                 GOTO CHECK_USE_PROCEDURE_OR_INVALID;
+
+  17446   1 000083  0F81 00A6                            B        s:17566,PREL
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:24   
+      117    17447    4               END;
+      118    17448
+      119    17449    3             IF NOT QI_1.CURRENT.FORM_STATUS$ -> QI$FORM_STATUS.INDICATORS.OPEN_FLAGS.
+             17449                      IS_OUTPUT
+
+  17449   1 000085  DC80 0000 0078  xsym                 LDB,B5   QI_1+120
+          1 000088  82C5 0008                            LB,'0400'X        8,B5
+          1 00008A       0400
+          1 00008B  0501 0012                            BBT      s:17462,PREL
+
+      120    17450    3             THEN
+      121    17451    4               DO;
+
+      122    17452    4                 IF NOT QI_1.CURRENT.FORM_STATUS$ -> QI$FORM_STATUS.INDICATORS.
+             17452                          OPEN_FLAGS.IS_INPUT
+
+  17452   1 00008D  82C5 0008                            LB,'0200'X        8,B5
+  17452   1 00008F       0200
+          1 000090  0501 0007                            BBT      s:17456,PREL
+
+      123    17453    4                 THEN
+      124    17454    4                   QI_1.ERROR_STATUS = %E$FILE_NOT_OPEN;
+
+  17454   1 000092  6C01                                 LDV,R6   1
+          1 000093  EF00 0000 008C  xsym                 STR,R6   QI_1+140
+          1 000096  0F81 0005                            B        s:17457,PREL
+
+      125    17455    4                 ELSE
+      126    17456    4                   QI_1.ERROR_STATUS = %E$FILE_NOT_OPEN_OUTPUT;
+
+  17456   1 000098  6C06                                 LDV,R6   6
+          1 000099  EF00 0000 008C  xsym                 STR,R6   QI_1+140
+
+      127    17457    4                 GOTO CHECK_USE_PROCEDURE_OR_INVALID;
+
+  17457   1 00009C  0F81 008D                            B        s:17566,PREL
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:25   
+      128    17458    4               END;
+      129    17459
+      130    17460                  %IF QI#DEBUG;
+      131    17461
+      132    17462    3             IF NOT QI_1.CURRENT.NODE$ -> QI$FIELD_DAD.WORD0_FLAGS.IO_FLAGS.IS_OUTPUT
+
+  17462   1 00009E  CC80 0000 0080  xsym                 LDB,B4   QI_1+128
+          1 0000A1  8284                                 LB,'4000'X        ,B4
+          1 0000A2       4000
+          1 0000A3  0501 000A                            BBT      s:17469,PREL
+
+      133    17463    3             THEN
+      134    17464    3               CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_COMPILER_ERROR );
+
+  17464   1 0000A5  BB80 0000 0001  02                   LAB,B3   +1
+          1 0000A8  CBF0 0100                            LAB,B4   256,IMO
+          1 0000AA  E380 0000 0000  xent                 LNJ,B6   QCE$ERROR_INTERNAL
+          1 0000AD       0001                            DC       s:17469,PREL
+
+      135    17465
+      136    17466                  %ENDIF;
+      137    17467
+      138    17468        %EJECT;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:26   
+      139    17469    3             QCW@WRITE.FRAME_START_INDEX = QI_1.CURRENT.FRAME_INDEX;
+
+  17469   1 0000AE  E800 0000 007E  xsym                 LDR,R6   QI_1+126
+          1 0000B1  EF47 0027                            STR,R6   QCW@WRITE,AUTO
+
+      140    17470    3             QCW@WRITE.FRAME_STOP_INDEX = QI_1.CURRENT.FRAME_INDEX;
+
+  17470   1 0000B3  EF47 0028                            STR,R6   QCW@WRITE+1,AUTO
+
+      141    17471    3            QCW@WRITE.FIELD_START_INDEX = QI_1.CURRENT.NODE_STATUS$ -> QI$FIELD_STATUS
+             17471                      .GZ.FIELD_START_INDEX;
+
+  17471   1 0000B5  EC80 0000 0082  xsym                 LDB,B6   QI_1+130
+          1 0000B8  D806                                 LDR,R5   ,B6
+          1 0000B9  DF47 002A                            STR,R5   QCW@WRITE+3,AUTO
+
+      142    17472    3            QCW@WRITE.FIELD_STOP_INDEX = QI_1.CURRENT.NODE_STATUS$ -> QI$FIELD_STATUS.
+             17472                      GZ.FIELD_STOP_INDEX;
+
+  17472   1 0000BB  C846 0001                            LDR,R4   1,B6
+          1 0000BD  CF47 002B                            STR,R4   QCW@WRITE+4,AUTO
+
+      143    17473
+      144    17474    3             CALL QCW$WRITE ( QCW@WRITE );
+
+  17474   1 0000BF  DBC7 0027                            LAB,B5   QCW@WRITE,AUTO
+          1 0000C1  DFC7 002E                            STB,B5   QCW@WRITE+7,AUTO
+          1 0000C3  BBC7 002E                            LAB,B3   QCW@WRITE+7,AUTO
+          1 0000C5  CBF0 0100                            LAB,B4   256,IMO
+          1 0000C7  E380 0000 0000  xent                 LNJ,B6   QCW$WRITE
+          1 0000CA       0001                            DC       s:17476,PREL
+
+      145    17475
+      146    17476    3             IF QCW@WRITE.STATUS = %QI#USE_INVALID_RETURN
+
+  17476   1 0000CB  E847 002C                            LDR,R6   QCW@WRITE+5,AUTO
+          1 0000CD  6981 0004                            BNEZ,R6  s:17480,PREL
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:27   
+
+      147    17477    3             THEN
+      148    17478    3               RETURN;
+
+  17478   1 0000CF  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      149    17479
+      150    17480    3             IF QI_1.CURRENT.FORM$ -> QI$FORM_FILE.WORD0_FLAGS.IS_ERROR_STATUS_VALID
+
+  17480   1 0000D2  EC80 0000 0076  xsym                 LDB,B6   QI_1+118
+          1 0000D5  8286                                 LB,'4000'X        ,B6
+          1 0000D6       4000
+          1 0000D7  0581 001A                            BBF      s:17534,PREL
+
+      151    17481    3             THEN
+      152    17482    4               DO;
+
+      153    17483
+      154    17484    4                 IF QI_1.CURRENT.FORM$ ~= LAST_FILE$
+
+  17484   1 0000D9  EDC7 000C                            CMB,B6   LAST_FILE$,AUTO
+          1 0000DB  0901 0016                            BE       s:17534,PREL
+
+      155    17485    4                 THEN
+      156    17486    5                   DO;
+
+      157    17487
+      158    17488    5                     LAST_FILE$ = QI_1.CURRENT.FORM$;
+
+  17488   1 0000DD  EFC7 000C                            STB,B6   LAST_FILE$,AUTO
+
+      159    17489
+      160    17490                          %DATA_ADDRESS ( THING@D =
+             17490                              "QI_1.CURRENT.FORM$ -> QI$FORM_FILE.ERROR_STATUS@D",
+      161    17491                          CHECK_FOR_INDIRECTION = NO,
+      162    17492                          RESULT$ = ERROR_STATUS$ );
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:28   
+  17510   1 0000DF  B846 0003                            LDR,R3   3,B6
+          1 0000E1  F853                                 LDR,R7   R3
+          1 0000E2  6C00                                 LDV,R6   0
+          1 0000E3  8400 0000 0000  xsym                 AID      QI_1
+          1 0000E6  8D47 0004                            SDI      ERROR_STATUS$,AUTO
+
+      163    17529
+      164    17530    5                     ERROR_STATUS$ -> QI$ERROR_STATUS.TEXT = %QI#OP_DISPLAY_TEXT;
+
+  17530   1 0000E8  DB80 0000 0000  00                   LAB,B5   BEEP
+          1 0000EB  CCC7 0004                            LDB,B4   ERROR_STATUS$,AUTO
+          1 0000ED  0021                                 ALR      ;
+          1 0000EE       4205 0001                                ALPHANUM(1,B5,,2),;
+          1 0000F0       4804 0000                                ALPHANUM(0,B4,,8,FILL)
+
+      165    17531
+      166    17532    5                   END;
+
+      167    17533
+      168    17534    4               END;
+
+      169    17535
+      170    17536    3   NEXT_FIELD_PLEASE:
+      171    17537
+      172    17538    3           END DISPLAY_ALL_THE_FIELDS;
+
+  17538   1 0000F2  437F                 NEXT_FIELD_PLEA*CSYNC    s:17530+9,SPREL
+          1 0000F3  8AC7 0009                            INC      FIELD_INDEX,AUTO
+          1 0000F5  E847 0009                            LDR,R6   FIELD_INDEX,AUTO
+          1 0000F7  E947 0006                            CMR,R6   FIELD_COUNT,AUTO
+          1 0000F9  0201 FF2E                            BL       s:17403,PREL
+
+      173    17539
+      174    17540    2         END DISPLAY_FIELDNAME;
+
+  17540   1 0000FB  0F81 002B                            B        s:17562,PREL
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:29   
+      175    17541        %EJECT;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:30   
+      176    17542    1       ELSE
+      177    17543    1   DISPLAY_ALARM:
+      178    17544    2         DO;
+
+  17544   1                              DISPLAY_ALARM   null
+      179    17545
+      180    17546    2           QI_1.INSTR$ = ADDR ( QI_1.INSTR$ -> QI$OP_DISPLAY.NEXT_CODE@P );
+
+  17546   1 0000FD  DBC6 0002            DISPLAY_ALARM   LAB,B5   2,B6
+          1 0000FF  DF80 0000 0006  xsym                 STB,B5   QI_1+6
+
+      181    17547
+      182    17548    2           QCM@MESS.MESSAGE_LINE_GZ_HEADER$ = QI_1.MESSAGE_LINE_GZ.HEADER$;
+
+  17548   1 000102  EC80 0000 0064  xsym                 LDB,B6   QI_1+100
+          1 000105  EFC7 000E                            STB,B6   QCM@MESS,AUTO
+
+      183    17549    2           QCM@MESS.IS_MESSAGE_A_DAD = %NO;
+
+  17549   1 000107  8747 0010                            CL       QCM@MESS+2,AUTO
+
+      184    17550    2           QCM@MESS.MESSAGE_LENGTH = 1;
+
+  17550   1 000109  6C01                                 LDV,R6   1
+          1 00010A  EF47 0011                            STR,R6   QCM@MESS+3,AUTO
+
+      185    17551    2           QCM@MESS.MESSAGE$ = ADDR ( BEEP );
+
+  17551   1 00010C  CB80 0000 0000  00                   LAB,B4   BEEP
+          1 00010F  CFC7 0012                            STB,B4   QCM@MESS+4,AUTO
+
+      186    17552    2           QCM@MESS.VISUAL_ATTRIBUTE = %QI#OUTPUT_VISUAL_ATTRIBUTE;
+
+  17552   1 000111  5C05                                 LDV,R5   5
+          1 000112  DF47 0018                            STR,R5   QCM@MESS+10,AUTO
+
+      187    17553
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:31   
+      188    17554    2           CALL QCM$MESS ( QCM@MESS );
+
+  17554   1 000114  BBC7 000E                            LAB,B3   QCM@MESS,AUTO
+          1 000116  BFC7 002E                            STB,B3   QCW@WRITE+7,AUTO
+          1 000118  BBC7 002E                            LAB,B3   QCW@WRITE+7,AUTO
+          1 00011A  CBF0 0100                            LAB,B4   256,IMO
+          1 00011C  E380 0000 0000  xent                 LNJ,B6   QCM$MESS
+          1 00011F       0001                            DC       s:17556,PREL
+
+      189    17555
+      190    17556    2           IF QCM@MESS.STATUS = %QI#USE_INVALID_RETURN
+
+  17556   1 000120  E847 0016                            LDR,R6   QCM@MESS+8,AUTO
+          1 000122  6981 0004                            BNEZ,R6  s:17562,PREL
+
+      191    17557    2           THEN
+      192    17558    2             RETURN;
+
+  17558   1 000124  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      193    17559
+      194    17560    2         END DISPLAY_ALARM;
+      195    17561
+      196    17562    1       RETURN;
+
+  17562   1 000127  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      197    17563
+      198    17564        %EJECT;
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:32   
+      199    17565    1   CHECK_USE_PROCEDURE_OR_INVALID:
+      200    17566    1       QCU@USE.USE_DEFAULT_IO = %QI#USE_DEFAULT_NONE;
+
+  17566   1 00012A  8747 001D            CHECK_USE_PROCE*CL       QCU@USE+4,AUTO
+
+      201    17567    1       QCU@USE.IS_TIME_TO_SAVE_AWAY_FIELDS = %NO;
+
+  17567   1 00012C  8747 001E                            CL       QCU@USE+5,AUTO
+
+      202    17568    1       QCU@USE.CURR_FRAME$ = QI_1.CURRENT.FRAME$;
+
+  17568   1 00012E  DC80 0000 007A  xsym                 LDB,B5   QI_1+122
+          1 000131  DFC7 0019                            STB,B5   QCU@USE,AUTO
+
+      203    17569
+      204    17570    1       IF QI_1.CURRENT.NODE$ -> QI$DAD.WORD0_FLAGS.TYPE < %QI#TYPE_MINOR
+
+  17570   1 000133  CC80 0000 0080  xsym                 LDB,B4   QI_1+128
+          1 000136  D804                                 LDR,R5   ,B4
+          1 000137  D570 000F                            AND,R5   15,IMO
+          1 000139  5D08                                 CMV,R5   8
+          1 00013A  0281 0005                            BGE      s:17574,PREL
+
+      205    17571    1       THEN
+      206    17572    1         QCU@USE.CURR_NODE$ = QI_1.CURRENT.NODE$;
+
+  17572   1 00013C  CFC7 001B                            STB,B4   QCU@USE+2,AUTO
+          1 00013E  0F81 0006                            B        s:17576,PREL
+
+      207    17573    1       ELSE
+      208    17574    1         QCU@USE.CURR_NODE$ = ADDR (NIL);
+
+  17574   1 000140  BB80 0000 0000                       LAB,B3   0
+          1 000143  BFC7 001B                            STB,B3   QCU@USE+2,AUTO
+
+      209    17575
+      210    17576    1       CALL QCU$USE_INVALID_IO ( QCU@USE );
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:33   
+
+  17576   1 000145  BBC7 0019                            LAB,B3   QCU@USE,AUTO
+          1 000147  BFC7 002E                            STB,B3   QCW@WRITE+7,AUTO
+          1 000149  BBC7 002E                            LAB,B3   QCW@WRITE+7,AUTO
+          1 00014B  CBF0 0100                            LAB,B4   256,IMO
+          1 00014D  E380 0000 0000  xent                 LNJ,B6   QCU$USE_INVALID_IO
+          1 000150       0001                            DC       s:17578,PREL
+
+      211    17577
+      212    17578    2       DO CASE ( QCU@USE.STATUS );
+
+  17578   1 000151  B847 0026                            LDR,R3   QCU@USE+13,AUTO
+          1 000153  3D03                                 CMV,R3   3
+          1 000154  0281 0016                            BGE      s:17591,PREL
+          1 000156  A830 0000 015C  01                   LDR,R2   s:17578+11,R3
+          1 000159  83A0 0000 015F  01                   JMP      s:17581,R2
+          1 00015C       0000                            DC       s:17581,PREL
+          1 00015D       0003                            DC       s:17584,PREL
+          1 00015E       0005                            DC       s:17587,PREL
+
+      213    17579
+      214    17580    2         CASE ( %QI#USE_INVALID_RETURN );
+
+      215    17581    2           RETURN;
+
+  17581   1 00015F  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+      216    17582
+      217    17583    2         CASE ( %QI#USE_INVALID_RETRY );
+
+      218    17584    2           GOTO RETRY_FIELD_DISPLAY;
+
+  17584   1 000162  0F81 FF0F                            B        s:17440,PREL
+
+      219    17585
+      220    17586    2         CASE ( %QI#USE_INVALID_SKIP_TO_NEXT );
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:34   
+      221    17587    2           LAST_FILE$ = ADDR (NIL);
+
+  17587   1 000164  EB80 0000 0000                       LAB,B6   0
+          1 000167  EFC7 000C                            STB,B6   LAST_FILE$,AUTO
+
+      222    17588    2           GOTO NEXT_FIELD_PLEASE;
+
+  17588   1 000169  0F81 FF88                            B        s:17534,PREL
+
+      223    17589
+      224    17590    2         CASE ( ELSE );
+
+      225    17591    2           CALL QCE$ERROR_INTERNAL ( %E$INTERNAL_INTERPRETER_ERROR );
+
+  17591   1 00016B  BB80 0000 0004  02                   LAB,B3   +4
+          1 00016E  CBF0 0100                            LAB,B4   256,IMO
+          1 000170  E380 0000 0000  xent                 LNJ,B6   QCE$ERROR_INTERNAL
+          1 000173       0001                            DC       s:17595,PREL
+
+      226    17592
+      227    17593    2       END;
+
+      228    17594
+      229    17595    1   END QBD$DISPLAY;
+
+  17595   1 000174  C380 0000 0000  xent                 LNJ,B4   X6A_ARET
+
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:35   
+--  Include file information  --
+
+   QCW_WRITE_M.:E05TOU  is referenced.
+   QCU_USE_M.:E05TOU  is referenced.
+   QCM_MESS_M.:E05TOU  is referenced.
+   QI_MACROS_M.:E05TOU  is referenced.
+   QI_PERR_C.:E05TOU  is referenced.
+   QI_EQUATES_E.:E05TOU  is referenced.
+   QG_MACRO_M.:E05TOU  is referenced.
+   LCP_6.:E05TOU  cannot be made into a system file and is referenced.
+   G_LCP6_E.:E05TOU  was found in the system file and is referenced.
+   GT_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   KI_CP6.:E05TOU  was found in the system file and is referenced.
+   GF_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GM_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GU_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GJ_LCP6_M.:E05TOU  was found in the system file and is referenced.
+   GH_LCP6_M.:E05TOU  was found in the system file and is referenced.
+      No diagnostics issued in procedure QBD$DISPLAY.
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:36   
+
+ **** Variables and constants ****
+
+  ****  Section 000 RoData QBD$DISPLAY
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/b BIT (16)    r     1 BEEP
+
+  ****  Auto variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     4-0-0/w PTR         r     1 ERROR_STATUS$              6-0-0/w UBIN(16)    r     1 FIELD_COUNT
+     7-0-0/w PTR         r     1 FIELD_DAD$                 9-0-0/w UBIN(16)    r     1 FIELD_INDEX
+     A-0-0/w PTR         r     1 INSTR$                     C-0-0/w PTR         r     1 LAST_FILE$
+     E-0-0/w STRC(176)   r     1 QCM@MESS                  19-0-0/w STRC(224)   r     1 QCU@USE
+    27-0-0/w STRC(112)   r     1 QCW@WRITE
+
+  ****  SYMREF variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/d STRC(2576)  r     1 QI_1
+
+  ****  BASED and DCB variables  ****
+
+  ****  Scalars and arrays  ****
+HexLoc.c.b A Datatyp(siz) R M Lvl/name                 HexLoc.c.b A Datatyp(siz) R M Lvl/name
+
+     0-0-0/w STRC(48)    r     1 QI$DAD                     0-0-0/c STRC(64)    r     1 QI$ERROR_STATUS
+     0-0-0/w STRC(384)   r     1 QI$FIELD_DAD               0-0-0/w STRC(48)    r     1 QI$FIELD_STATUS
+     0-0-0/w STRC(192)   r     1 QI$FORM_FILE               0-0-0/w STRC(144)   r     1 QI$FORM_STATUS
+     0-0-0/w STRC(208)   r     1 QI$FRAME_STATUS            0-0-0/w STRC(48)    r     1 QI$OP_DISPLAY
+     0-0-0/c ASTR(8)     r     1 QI$VARIABLE_IDENTIFIER
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:37   
+
+
+   Procedure QBD$DISPLAY requires 375 words for executable code.
+   Procedure QBD$DISPLAY requires 48 words of local(AUTO) storage.
+
+    No errors detected in file QBD$DISPLAY.:E05TSI    .
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:38   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:39   
+          MINI XREF LISTING
+
+BEEP
+     17069**DCL     17551--ASSIGN
+CHECK_USE_PROCEDURE_OR_INVALID
+     17566**LABEL   17446--GOTO    17457--GOTO
+ERROR_STATUS$
+     17070**DCL     17510<<ASSIGN  17530>>ASSIGN
+FIELD_COUNT
+     17071**DCL     17375<<ASSIGN  17376>>ASSIGN  17381>>DOINDEX
+FIELD_DAD$
+     17072**DCL     17403<<ASSIGN  17405>>DOWHILE 17406<<ASSIGN  17406>>ASSIGN  17406>>ASSIGN  17425>>DOCASE
+     17437>>ASSIGN
+FIELD_INDEX
+     17073**DCL     17381<<DOINDEX 17403>>ASSIGN
+INSTR$
+     17074**DCL     17374<<ASSIGN  17375>>ASSIGN  17376>>ASSIGN  17403>>ASSIGN
+LAST_FILE$
+     17075**DCL     17378<<ASSIGN  17484>>IF      17488<<ASSIGN  17587<<ASSIGN
+NEXT_FIELD_PLEASE
+     17538**LABEL   17588--GOTO
+QCE$ERROR_INTERNAL
+     17077**DCL-ENT 17431--CALL    17464--CALL    17591--CALL
+QCF$FIND_CURRENTS
+     17078**DCL-ENT 17440--CALL
+QCM$MESS
+     17079**DCL-ENT 17554--CALL
+QCM@MESS
+     17142**DCL     17554<>CALL
+QCM@MESS.IS_MESSAGE_A_DAD
+     17146**DCL     17549<<ASSIGN
+QCM@MESS.MESSAGE$
+     17152**DCL     17551<<ASSIGN
+QCM@MESS.MESSAGE_LENGTH
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:40   
+     17150**DCL     17550<<ASSIGN
+QCM@MESS.MESSAGE_LINE_GZ_HEADER$
+     17143**DCL     17548<<ASSIGN
+QCM@MESS.STATUS
+     17158**DCL     17556>>IF
+QCM@MESS.VISUAL_ATTRIBUTE
+     17163**DCL     17552<<ASSIGN
+QCU$USE_INVALID_IO
+     17080**DCL-ENT 17576--CALL
+QCU@USE
+     17245**DCL     17576<>CALL
+QCU@USE.CURR_FRAME$
+     17246**DCL     17568<<ASSIGN
+QCU@USE.CURR_NODE$
+     17248**DCL     17572<<ASSIGN  17574<<ASSIGN
+QCU@USE.IS_TIME_TO_SAVE_AWAY_FIELDS
+     17253**DCL     17567<<ASSIGN
+QCU@USE.STATUS
+     17279**DCL     17578>>DOCASE
+QCU@USE.USE_DEFAULT_IO
+     17250**DCL     17566<<ASSIGN
+QCW$WRITE
+     17081**DCL-ENT 17474--CALL
+QCW@WRITE
+     17341**DCL     17474<>CALL
+QCW@WRITE.FIELD_START_INDEX
+     17349**DCL     17471<<ASSIGN
+QCW@WRITE.FIELD_STOP_INDEX
+     17351**DCL     17472<<ASSIGN
+QCW@WRITE.FRAME_START_INDEX
+     17342**DCL     17469<<ASSIGN
+QCW@WRITE.FRAME_STOP_INDEX
+     17344**DCL     17470<<ASSIGN
+QCW@WRITE.STATUS
+     17353**DCL     17476>>IF
+QGB_PARAM.DVE.DVBYTE.VFC
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:41   
+     11552**DCL     11553--REDEF
+QGB_PARAM.DVE.EOMCHAR
+     11564**DCL     11565--REDEF
+QGB_PARAM.MSG$
+     11546**DCL     11547--REDEF
+QGB_PARAM.UHDR$
+     11571**DCL     11572--REDEF
+QI$ACTIVATION_STATUS
+      9310**DCL      9316--REDEF
+QI$CIP
+      8151**DCL      8221--REDEF
+QI$CIP.CA
+      8156**DCL      8160--REDEF    8163--REDEF    8166--REDEF
+QI$COBOL_DAD.PSEUDO_CIP
+      8395**DCL      8420--REDEF
+QI$COBOL_DAD.PSEUDO_CIP.ALPHANUMERIC
+      8397**DCL      8402--REDEF
+QI$COBOL_DAD.PSEUDO_CIP.NUMERIC.CB
+      8403**DCL      8406--REDEF    8409--REDEF
+QI$COBOL_DAD.VARIABLE_LENGTH_ITEMS
+      8431**DCL      8447--REDEF    8455--REDEF    8463--REDEF
+QI$COBOL_DAD.VARIABLE_LENGTH_ITEMS.LEVEL_MULTIPLIERS
+      8432**DCL      8442--REDEF    8445--REDEF
+QI$COBOL_DAD.WORD0
+      8359**DCL      8360--REDEF    8374--REDEF
+QI$COBOL_DAD_P_BITS.P
+      8499**DCL      8505--REDEF
+QI$CONDITION_CONTROL_BLOCK.LIST_A@P
+      7985**DCL      7986--REDEF
+QI$CONDITION_CONTROL_BLOCK.WORD0_FLAGS
+      7981**DCL      7984--REDEF
+QI$CONDITION_LEGAL_BLOCK.ARRAY@P
+      8018**DCL      8019--REDEF    8020--REDEF
+QI$DAD.PSEUDO_CIP
+      8298**DCL      8323--REDEF
+QI$DAD.PSEUDO_CIP.ALPHANUMERIC
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:42   
+      8300**DCL      8305--REDEF
+QI$DAD.PSEUDO_CIP.DATA@
+      8322**DCL     17406>>ASSIGN
+QI$DAD.PSEUDO_CIP.NUMERIC.CB
+      8306**DCL      8309--REDEF    8312--REDEF
+QI$DAD.WORD0
+      8267**DCL      8268--REDEF
+QI$DAD.WORD0_FLAGS.INDIRECT
+      8269**DCL     17405>>DOWHILE
+QI$DAD.WORD0_FLAGS.IS_CONSTANT
+      8274**DCL     17406>>ASSIGN
+QI$DAD.WORD0_FLAGS.TYPE
+      8276**DCL     17570>>IF
+QI$ERROR_MESSAGE_LINE
+     11659**DCL     11661--REDEF
+QI$ERROR_STATUS
+     11656**DCL     11658--REDEF
+QI$ERROR_STATUS.TEXT
+     11657**DCL     17530<<ASSIGN
+QI$FIELD_DAD.ELEMENTARY_ITEM.P
+      8713**DCL      8720--REDEF
+QI$FIELD_DAD.ONE_DIMENSIONAL_ITEM.P
+      8733**DCL      8740--REDEF
+QI$FIELD_DAD.PSEUDO_CIP
+      8640**DCL      8665--REDEF
+QI$FIELD_DAD.PSEUDO_CIP.ALPHANUMERIC
+      8642**DCL      8647--REDEF
+QI$FIELD_DAD.PSEUDO_CIP.NUMERIC.CB
+      8648**DCL      8651--REDEF    8654--REDEF
+QI$FIELD_DAD.TWO_DIMENSIONAL_ITEM.P
+      8753**DCL      8760--REDEF
+QI$FIELD_DAD.VARIABLE_LENGTH_ITEMS
+      8696**DCL      8712--REDEF    8730--REDEF    8748--REDEF
+QI$FIELD_DAD.VARIABLE_LENGTH_ITEMS.LEVEL_MULTIPLIERS
+      8697**DCL      8707--REDEF    8710--REDEF
+QI$FIELD_DAD.WORD0
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:43   
+      8592**DCL      8593--REDEF
+QI$FIELD_DAD.WORD0_FLAGS.IO_FLAGS
+      8596**DCL      8601--REDEF
+QI$FIELD_DAD.WORD0_FLAGS.IO_FLAGS.IS_OUTPUT
+      8597**DCL     17462>>IF
+QI$FIELD_DAD.WORD0_FLAGS.TYPE
+      8618**DCL     17425>>DOCASE
+QI$FIELD_DAD_P.P
+      8794**DCL      8801--REDEF
+QI$FIELD_STATUS.GZ.FIELD_START_INDEX
+      9436**DCL     17471>>ASSIGN
+QI$FIELD_STATUS.GZ.FIELD_STOP_INDEX
+      9438**DCL     17472>>ASSIGN
+QI$FIELD_STATUS.INDICATORS
+      9460**DCL      9492--REDEF
+QI$FIELD_STATUS.INDICATORS.ENABLED_FLAGS
+      9464**DCL      9469--REDEF
+QI$FIELD_STATUS.INDICATORS.OPEN_FLAGS
+      9476**DCL      9483--REDEF
+QI$FIELD_STATUS.INDICATORS.STATE_FLAGS
+      9470**DCL      9475--REDEF
+QI$FILE.WORD0
+      8916**DCL      8917--REDEF
+QI$FILE_STATUS.INDICATORS
+      9753**DCL      9785--REDEF
+QI$FILE_STATUS.INDICATORS.ENABLED_FLAGS
+      9757**DCL      9762--REDEF
+QI$FILE_STATUS.INDICATORS.OPEN_FLAGS
+      9769**DCL      9776--REDEF
+QI$FILE_STATUS.INDICATORS.STATE_FLAGS
+      9763**DCL      9768--REDEF
+QI$FORM_FILE.ERROR_STATUS@D
+      9000**DCL     17510>>ASSIGN
+QI$FORM_FILE.USE_PROCEDURE
+      9016**DCL      9023--REDEF
+QI$FORM_FILE.WORD0
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:44   
+      8970**DCL      8971--REDEF
+QI$FORM_FILE.WORD0_FLAGS.IS_ERROR_STATUS_VALID
+      8975**DCL     17480>>IF
+QI$FORM_STATUS.INDICATORS
+      9874**DCL      9906--REDEF
+QI$FORM_STATUS.INDICATORS.ENABLED_FLAGS
+      9878**DCL      9883--REDEF
+QI$FORM_STATUS.INDICATORS.OPEN_FLAGS
+      9890**DCL      9897--REDEF
+QI$FORM_STATUS.INDICATORS.OPEN_FLAGS.IS_INPUT
+      9894**DCL     17452>>IF
+QI$FORM_STATUS.INDICATORS.OPEN_FLAGS.IS_OUTPUT
+      9891**DCL     17449>>IF
+QI$FORM_STATUS.INDICATORS.STATE_FLAGS
+      9884**DCL      9889--REDEF
+QI$FRAME.WORD0
+      9131**DCL      9132--REDEF
+QI$FRAME_STATUS.INDICATORS
+     10103**DCL     10135--REDEF
+QI$FRAME_STATUS.INDICATORS.ENABLED_FLAGS
+     10107**DCL     10112--REDEF
+QI$FRAME_STATUS.INDICATORS.IS_ACTIVE
+     10105**DCL     17442>>IF
+QI$FRAME_STATUS.INDICATORS.OPEN_FLAGS
+     10119**DCL     10126--REDEF
+QI$FRAME_STATUS.INDICATORS.STATE_FLAGS
+     10113**DCL     10118--REDEF
+QI$GZ_FIELD.DESCRIPTION.IO_FLAGS
+     16985**DCL     16990--REDEF
+QI$IDENTIFIER
+     11662**DCL     11664--REDEF
+QI$INDICATORS
+      9374**DCL      9404--REDEF
+QI$INDICATORS.ENABLED_FLAGS
+      9380**DCL      9385--REDEF
+QI$INDICATORS.OPEN_FLAGS
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:45   
+      9392**DCL      9399--REDEF
+QI$INDICATORS.STATE_FLAGS
+      9386**DCL      9391--REDEF
+QI$MAJOR_NODE.WORD0
+      8830**DCL      8831--REDEF
+QI$MAJOR_STATUS.INDICATORS
+      9553**DCL      9585--REDEF
+QI$MAJOR_STATUS.INDICATORS.ENABLED_FLAGS
+      9557**DCL      9562--REDEF
+QI$MAJOR_STATUS.INDICATORS.OPEN_FLAGS
+      9569**DCL      9576--REDEF
+QI$MAJOR_STATUS.INDICATORS.STATE_FLAGS
+      9563**DCL      9568--REDEF
+QI$MESSAGE_TYPE
+     11653**DCL     11655--REDEF
+QI$MINOR_NODE.WORD0
+      8873**DCL      8874--REDEF
+QI$MINOR_STATUS.INDICATORS
+      9646**DCL      9678--REDEF
+QI$MINOR_STATUS.INDICATORS.ENABLED_FLAGS
+      9650**DCL      9655--REDEF
+QI$MINOR_STATUS.INDICATORS.OPEN_FLAGS
+      9662**DCL      9669--REDEF
+QI$MINOR_STATUS.INDICATORS.STATE_FLAGS
+      9656**DCL      9661--REDEF
+QI$OP_ACCEPT.DATANAME@P
+      6061**DCL      6062--REDEF
+QI$OP_CALL.EPTR$
+      6233**DCL      6234--REDEF
+QI$OP_CLEAR.IO_FLAGS
+      6266**DCL      6269--REDEF
+QI$OP_DISPLAY.FIELD_A@P
+      6533**DCL      6534--REDEF   17403>>ASSIGN
+QI$OP_DISPLAY.FIELD_COUNT
+      6532**DCL     17375>>ASSIGN
+QI$OP_DISPLAY.NEXT_CODE@P
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:46   
+      6534**DCL     17546--ASSIGN
+QI$OP_DISPLAY.TYPE
+      6531**DCL     17370>>IF
+QI$OP_ENABLE.IO_FLAGS
+      6620**DCL      6623--REDEF
+QI$OP_IFCLS.ATTRIBUTE.TYPE
+      6713**DCL      6718--REDEF
+QI$OP_INSPECT.TALLYING_FOR_ITEM@P
+      6947**DCL      6948--REDEF
+QI$OP_INSPECT.TALLYING_INITIAL_ITEM@P
+      6949**DCL      6950--REDEF
+QI$OP_INSPECT.TALLYING_ITEM@P
+      6945**DCL      6946--REDEF
+QI$OP_OPEN.IO_FLAGS
+      7507**DCL      7510--REDEF
+QI$OP_PERFM.BINARY_ITERATION_COUNT@P
+      7545**DCL      7546--REDEF
+QI$PSEUDO_CIP
+      8046**DCL      8070--REDEF
+QI$PSEUDO_CIP.ALPHANUMERIC
+      8050**DCL      8055--REDEF
+QI$PSEUDO_CIP.NUMERIC.CB
+      8056**DCL      8059--REDEF    8062--REDEF
+QI$TERMINAL_ATTRIBUTES
+      9267**DCL      9280--REDEF
+QI$TRAN_FILE.WORD0
+      9052**DCL      9053--REDEF
+QI$TRAN_STATUS.INDICATORS
+      9987**DCL     10019--REDEF
+QI$TRAN_STATUS.INDICATORS.ENABLED_FLAGS
+      9991**DCL      9996--REDEF
+QI$TRAN_STATUS.INDICATORS.OPEN_FLAGS
+     10003**DCL     10010--REDEF
+QI$TRAN_STATUS.INDICATORS.STATE_FLAGS
+      9997**DCL     10002--REDEF
+QI$VARIABLE_IDENTIFIER.LENGTH
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:47   
+     11666**DCL     11667--IMP-SIZ
+QI_1.BASE
+     10195**DCL     10202--REDEF
+QI_1.BASE.DATA$
+     10196**DCL     17510>>ASSIGN
+QI_1.BASE.PROC$
+     10198**DCL     17403>>ASSIGN
+QI_1.BASE_A$
+     10202**DCL     17406>>ASSIGN
+QI_1.CURRENT.FILE$
+     11086**DCL     11088--REDEF   11090--REDEF
+QI_1.CURRENT.FILE_STATUS$
+     11092**DCL     11094--REDEF   11096--REDEF
+QI_1.CURRENT.FORM$
+     11088**DCL     17480>>IF      17484>>IF      17488>>ASSIGN  17510>>ASSIGN
+QI_1.CURRENT.FORM_STATUS$
+     11094**DCL     17449>>IF      17452>>IF
+QI_1.CURRENT.FRAME$
+     11098**DCL     17568>>ASSIGN
+QI_1.CURRENT.FRAME_INDEX
+     11102**DCL     17469>>ASSIGN  17470>>ASSIGN
+QI_1.CURRENT.FRAME_STATUS$
+     11100**DCL     17442>>IF
+QI_1.CURRENT.NODE$
+     11105**DCL     17437<<ASSIGN  17462>>IF      17570>>IF      17572>>ASSIGN
+QI_1.CURRENT.NODE_STATUS$
+     11107**DCL     17471>>ASSIGN  17472>>ASSIGN
+QI_1.DAD
+     10890**DCL     10895--REDEF
+QI_1.ERROR_STATUS
+     11120**DCL     17445<<ASSIGN  17454<<ASSIGN  17456<<ASSIGN
+QI_1.FILE_HEAD
+     11073**DCL     11080--REDEF
+QI_1.INSTR$
+     10203**DCL     17370>>IF      17374>>ASSIGN  17376<<ASSIGN  17546<<ASSIGN  17546>>ASSIGN
+QI_1.IS_ALL_LIT
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:48   
+     10896**DCL     10901--REDEF
+QI_1.IS_FORM_VARIABLE
+     10902**DCL     10907--REDEF
+QI_1.IS_TEMP
+     10908**DCL     10913--REDEF
+QI_1.MESSAGE_LINE_DAD.PSEUDO_CIP
+     11006**DCL     11031--REDEF
+QI_1.MESSAGE_LINE_DAD.PSEUDO_CIP.ALPHANUMERIC
+     11008**DCL     11013--REDEF
+QI_1.MESSAGE_LINE_DAD.PSEUDO_CIP.NUMERIC.CB
+     11014**DCL     11017--REDEF   11020--REDEF
+QI_1.MESSAGE_LINE_DAD.WORD0
+     10975**DCL     10976--REDEF
+QI_1.MESSAGE_LINE_GZ.HEADER$
+     11052**DCL     17548>>ASSIGN
+QI_1.OFFSET
+     10914**DCL     10919--REDEF
+QI_1.OP.CIP
+     10275**DCL     10726--REDEF
+QI_1.OP.CIP.AUX
+     10641**DCL     10712--REDEF
+QI_1.OP.CIP.AUX.CD
+     10686**DCL     10689--REDEF   10693--REDEF   10696--REDEF
+QI_1.OP.CIP.S
+     10345**DCL     10416--REDEF
+QI_1.OP.CIP.S.CD
+     10390**DCL     10393--REDEF   10397--REDEF   10400--REDEF
+QI_1.OP.CIP.T
+     10493**DCL     10564--REDEF
+QI_1.OP.CIP.T.CD
+     10538**DCL     10541--REDEF   10545--REDEF   10548--REDEF
+QI_1.OP.DATA
+     10733**DCL     10737--REDEF
+QI_1.OP.FILL_CHAR
+     10857**DCL     10860--REDEF
+QI_1.OP.INX
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:49   
+     10790**DCL     10794--REDEF   10795--REDEF   10799--REDEF
+QI_1.OP.LEN
+     10773**DCL     10777--REDEF   10778--REDEF   10782--REDEF   10783--REDEF   10787--REDEF
+QI_1.OP.LEN.AUX
+     10776**DCL     11677--IMP-SIZ
+QI_1.OP.LEN.S
+     10774**DCL     11673--IMP-SIZ
+QI_1.OP.LEN.T
+     10775**DCL     11675--IMP-SIZ
+QI_1.OP.PICTURE_STRING
+     10843**DCL     10846--REDEF   10847--REDEF   10850--REDEF   10851--REDEF   10854--REDEF
+QI_1.OP.ROUND
+     10876**DCL     10877--REDEF   10878--REDEF
+QI_1.OP.SRCH_VRFY_ELEMS
+     10812**DCL     10815--REDEF
+QI_1.OPENED_COUNT
+     11081**DCL     11084--REDEF
+QI_1.OTTER_SPACE
+     10920**DCL     10925--REDEF
+QI_1.PICTURE_STRING
+     10926**DCL     10931--REDEF
+QI_1.SPECIAL_NAMES
+     11109**DCL     11118--REDEF
+QI_1.TYPE
+     10932**DCL     10937--REDEF
+QI_16_BIT_BINARY
+     16122**DCL     16192--REDEF
+QI_16_BIT_BINARY.CB
+     16141**DCL     16144--REDEF   16148--REDEF   16151--REDEF
+QI_31_DIGIT_SLS_DISPLAY
+     15955**DCL     16025--REDEF
+QI_31_DIGIT_SLS_DISPLAY.CD
+     16002**DCL     16005--REDEF   16009--REDEF   16012--REDEF
+QI_31_DIGIT_ST_PACKED
+     16457**DCL     16527--REDEF
+QI_31_DIGIT_ST_PACKED.CP
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:50   
+     16490**DCL     16493--REDEF   16497--REDEF   16500--REDEF
+QI_32_BIT_BINARY
+     16289**DCL     16359--REDEF
+QI_32_BIT_BINARY.CB
+     16308**DCL     16311--REDEF   16315--REDEF   16318--REDEF
+QI_4_CHAR_ALPHANUMERIC
+     15787**DCL     15857--REDEF
+QI_4_CHAR_ALPHANUMERIC.CA
+     15792**DCL     15796--REDEF   15799--REDEF   15802--REDEF
+QI_ACCUMULATOR_DAD.CIP
+     16800**DCL     16871--REDEF
+QI_ACCUMULATOR_DAD.CIP.CP
+     16831**DCL     16834--REDEF   16838--REDEF   16841--REDEF
+QI_ALR.CIP
+     11752**DCL     12203--REDEF
+QI_ALR.CIP.AUX
+     12118**DCL     12189--REDEF
+QI_ALR.CIP.AUX.CA
+     12121**DCL     12125--REDEF   12128--REDEF   12131--REDEF
+QI_ALR.CIP.S
+     11822**DCL     11893--REDEF
+QI_ALR.CIP.S.CA
+     11825**DCL     11829--REDEF   11832--REDEF   11835--REDEF
+QI_ALR.CIP.T
+     11970**DCL     12041--REDEF
+QI_ALR.CIP.T.CA
+     11973**DCL     11977--REDEF   11980--REDEF   11983--REDEF
+QI_ALR.DATA
+     12210**DCL     12214--REDEF
+QI_ALR.FILL_CHAR
+     12334**DCL     12337--REDEF
+QI_ALR.INX
+     12267**DCL     12271--REDEF   12272--REDEF   12276--REDEF
+QI_ALR.LEN
+     12250**DCL     12254--REDEF   12255--REDEF   12259--REDEF   12260--REDEF   12264--REDEF
+QI_ALR.PICTURE_STRING
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:51   
+     12320**DCL     12323--REDEF   12324--REDEF   12327--REDEF   12328--REDEF   12331--REDEF
+QI_ALR.ROUND
+     12353**DCL     12354--REDEF   12355--REDEF
+QI_ALR.SRCH_VRFY_ELEMS
+     12289**DCL     12292--REDEF
+QI_MAT.CIP
+     15091**DCL     15542--REDEF
+QI_MAT.CIP.AUX
+     15457**DCL     15528--REDEF
+QI_MAT.CIP.AUX.CA
+     15460**DCL     15464--REDEF   15467--REDEF   15470--REDEF
+QI_MAT.CIP.S
+     15161**DCL     15232--REDEF
+QI_MAT.CIP.S.CA
+     15164**DCL     15168--REDEF   15171--REDEF   15174--REDEF
+QI_MAT.CIP.T
+     15309**DCL     15380--REDEF
+QI_MAT.CIP.T.CA
+     15312**DCL     15316--REDEF   15319--REDEF   15322--REDEF
+QI_MAT.DATA
+     15549**DCL     15553--REDEF
+QI_MAT.DEC
+     15617**DCL     15621--REDEF   15622--REDEF   15626--REDEF
+QI_MAT.FILL_CHAR
+     15673**DCL     15676--REDEF
+QI_MAT.LEN
+     15589**DCL     15593--REDEF   15594--REDEF   15598--REDEF   15599--REDEF   15603--REDEF
+QI_MAT.PICTURE_STRING
+     15659**DCL     15662--REDEF   15663--REDEF   15666--REDEF   15667--REDEF   15670--REDEF
+QI_MAT.ROUND
+     15692**DCL     15693--REDEF   15694--REDEF
+QI_MAT.SRCH_VRFY_ELEMS
+     15628**DCL     15631--REDEF
+QI_PICTURE_STRING
+     16625**DCL     16695--REDEF
+QI_PICTURE_STRING.CA
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:52   
+     16630**DCL     16634--REDEF   16637--REDEF   16640--REDEF
+QI_SRCH_VRFY.CIP
+     14422**DCL     14873--REDEF
+QI_SRCH_VRFY.CIP.AUX
+     14788**DCL     14859--REDEF
+QI_SRCH_VRFY.CIP.AUX.CA
+     14791**DCL     14795--REDEF   14798--REDEF   14801--REDEF
+QI_SRCH_VRFY.CIP.S
+     14492**DCL     14563--REDEF
+QI_SRCH_VRFY.CIP.S.CA
+     14495**DCL     14499--REDEF   14502--REDEF   14505--REDEF
+QI_SRCH_VRFY.CIP.T
+     14640**DCL     14711--REDEF
+QI_SRCH_VRFY.CIP.T.CA
+     14643**DCL     14647--REDEF   14650--REDEF   14653--REDEF
+QI_SRCH_VRFY.DATA
+     14880**DCL     14884--REDEF
+QI_SRCH_VRFY.DEC
+     14948**DCL     14952--REDEF   14953--REDEF   14957--REDEF
+QI_SRCH_VRFY.FILL_CHAR
+     15004**DCL     15007--REDEF
+QI_SRCH_VRFY.ROUND
+     15023**DCL     15024--REDEF   15025--REDEF
+QI_SRCH_VRFY.SRCH_RESULT
+     14964**DCL     14967--REDEF   14968--REDEF   14971--REDEF   14972--REDEF   14975--REDEF
+QI_SRCH_VRFY.SRCH_VRFY_ARGS
+     14888**DCL     14892--REDEF   14893--REDEF   14897--REDEF   14898--REDEF   14902--REDEF
+QI_SRCH_VRFY.SRCH_VRFY_ELEMS
+     14959**DCL     14962--REDEF
+QI_TYPE_BINARY_TARGET.CIP
+     13749**DCL     14200--REDEF
+QI_TYPE_BINARY_TARGET.CIP.AUX
+     14115**DCL     14186--REDEF
+QI_TYPE_BINARY_TARGET.CIP.AUX.CA
+     14118**DCL     14122--REDEF   14125--REDEF   14128--REDEF
+QI_TYPE_BINARY_TARGET.CIP.S
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:53   
+     13819**DCL     13890--REDEF
+QI_TYPE_BINARY_TARGET.CIP.S.CA
+     13822**DCL     13826--REDEF   13829--REDEF   13832--REDEF
+QI_TYPE_BINARY_TARGET.CIP.T
+     13967**DCL     14038--REDEF
+QI_TYPE_BINARY_TARGET.CIP.T.CB
+     13984**DCL     13987--REDEF   13991--REDEF   13994--REDEF
+QI_TYPE_BINARY_TARGET.DATA
+     14207**DCL     14211--REDEF
+QI_TYPE_BINARY_TARGET.DEC
+     14275**DCL     14279--REDEF   14280--REDEF   14284--REDEF
+QI_TYPE_BINARY_TARGET.LEN
+     14247**DCL     14251--REDEF   14252--REDEF   14256--REDEF   14257--REDEF   14261--REDEF
+QI_TYPE_BINARY_TARGET.PICTURE_STRING
+     14317**DCL     14320--REDEF   14321--REDEF   14324--REDEF   14325--REDEF   14328--REDEF
+QI_TYPE_BINARY_TARGET.ROUND
+     14350**DCL     14351--REDEF   14352--REDEF
+QI_TYPE_BINARY_TARGET.SIZE_ERROR
+     14336**DCL     14337--REDEF
+QI_TYPE_BINARY_TARGET.SRCH_VRFY_ELEMS
+     14286**DCL     14289--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP
+     12417**DCL     12868--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.AUX
+     12783**DCL     12854--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.AUX.CA
+     12786**DCL     12790--REDEF   12793--REDEF   12796--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.S
+     12487**DCL     12558--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.S.CD
+     12532**DCL     12535--REDEF   12539--REDEF   12542--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.T
+     12635**DCL     12706--REDEF
+QI_TYPE_DISPLAY_SOURCE.CIP.T.CA
+     12638**DCL     12642--REDEF   12645--REDEF   12648--REDEF
+QI_TYPE_DISPLAY_SOURCE.DATA
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:54   
+     12875**DCL     12879--REDEF
+QI_TYPE_DISPLAY_SOURCE.DEC
+     12943**DCL     12947--REDEF   12948--REDEF   12952--REDEF
+QI_TYPE_DISPLAY_SOURCE.LEN
+     12915**DCL     12919--REDEF   12920--REDEF   12924--REDEF   12925--REDEF   12929--REDEF
+QI_TYPE_DISPLAY_SOURCE.PICTURE_STRING
+     12985**DCL     12988--REDEF   12989--REDEF   12992--REDEF   12993--REDEF   12996--REDEF
+QI_TYPE_DISPLAY_SOURCE.ROUND
+     13018**DCL     13019--REDEF   13020--REDEF
+QI_TYPE_DISPLAY_SOURCE.SIZE_ERROR
+     13004**DCL     13005--REDEF
+QI_TYPE_DISPLAY_SOURCE.SRCH_VRFY_ELEMS
+     12954**DCL     12957--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP
+     13083**DCL     13534--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.AUX
+     13449**DCL     13520--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.AUX.CA
+     13452**DCL     13456--REDEF   13459--REDEF   13462--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.S
+     13153**DCL     13224--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.S.CA
+     13156**DCL     13160--REDEF   13163--REDEF   13166--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.T
+     13301**DCL     13372--REDEF
+QI_TYPE_DISPLAY_TARGET.CIP.T.CD
+     13346**DCL     13349--REDEF   13353--REDEF   13356--REDEF
+QI_TYPE_DISPLAY_TARGET.DATA
+     13541**DCL     13545--REDEF
+QI_TYPE_DISPLAY_TARGET.DEC
+     13609**DCL     13613--REDEF   13614--REDEF   13618--REDEF
+QI_TYPE_DISPLAY_TARGET.LEN
+     13581**DCL     13585--REDEF   13586--REDEF   13590--REDEF   13591--REDEF   13595--REDEF
+QI_TYPE_DISPLAY_TARGET.PICTURE_STRING
+     13651**DCL     13654--REDEF   13655--REDEF   13658--REDEF   13659--REDEF   13662--REDEF
+QI_TYPE_DISPLAY_TARGET.ROUND
+PL6.E3A0      #001=QBD$DISPLAY File=QBD$DISPLAY.:E05TSI                          WED 07/30/97 04:46 Page:55   
+     13684**DCL     13685--REDEF   13686--REDEF
+QI_TYPE_DISPLAY_TARGET.SIZE_ERROR
+     13670**DCL     13671--REDEF
+QI_TYPE_DISPLAY_TARGET.SRCH_VRFY_ELEMS
+     13620**DCL     13623--REDEF
+RETRY_FIELD_DISPLAY
+     17440**LABEL   17584--GOTO

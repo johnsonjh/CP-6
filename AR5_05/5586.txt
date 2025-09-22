@@ -1,0 +1,1280 @@
+/*M*    make_build:c   -- To build the target based upon actions    */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+ 
+/*F*    NAME:          build(test,verbose)
+        PURPOSE:       To take the action list provided by the derive
+                    function and (hopefully) produce the required
+                    target.
+ 
+        DESCRIPTION:
+ 
+           This function classifies each action based upon the
+           associated target.  It then scans the list of targets
+           that are waiting to run and inserts them into the
+           "ready-to-run" queue via the schedule function.
+ 
+           The run function takes each target in the ready-to-run
+           queue and submits them into the batch queue.
+ 
+           The "updatejobs" function checks the current status
+           of the running jobs and promotes each completed job
+           into either the errored or completed queue.  If any
+           jobs have completed successfully, the schedule function
+           is run to add more jobs to the ready to run queue.
+ 
+           This function stops when there are no jobs running and
+           the schedule function cannot find a job to run.
+ 
+           A summary should be produced at this point indicating
+           the reason why any jobs found in the waiting queue
+           cannot be run.  A full summary should include the
+           sysids of the jobs that produced or failed to produce
+           each target.
+*/
+ 
+#include   <stdio.h>
+#include   <stdlib.h>
+#include   <string.h>
+#include   <ctype.h>
+#include   <errno.h>
+#include   <b$jit_c.h>
+#include   "MAKE_Cc14"
+ 
+struct b_jit  *jptr;
+int            num_jobs_run = 0;
+int  JCLflags = 0;
+int  JCLdefault = 0;
+ 
+#define JCL_BANG   01
+#define JCL_SKIP   02
+#define JCL_NCHK   04  /* Don't check stepcc */
+#define JCL_ECHO  010  /* Echo command       */
+#define JCL_CCOM  020  /* Insert commas in !command  */
+#define JCL_ICOM  040  /* Insert commas in some input*/
+#define JCL_CONT 0100  /* Command continuation w/commas */
+ 
+#ifdef RU
+extern int MAKE_ONLINE_MAGIC;
+#endif
+ 
+char JclFid[32];       /* holds jcl commands to batch   */
+ 
+FILE *jcl;             /* file pointer for jcl          */
+ 
+char BatchIt[40]              = {"batch "};
+char XeqIt[40]                = {"xeq "};
+CONST char saved_var[]        = {"saved_image_MAKE"};
+char saved_fid[32]            = {""};
+char SaveIt[60]               = {"save over "};
+ 
+char *CONST command_commas[]   =  {"LINK", "COPY", "C", "L"};
+char *CONST icommand_commas[]  =  {"LEMUR", "PCL"};
+char *CONST command_incommas[] =  {"COPY", "C", "LIST", "L"};
+ 
+static int testing  = 0;
+static int touching = 0;
+static int run_online = 0;
+static char buf[80];
+ 
+char *ExpandMacros();
+char *gen_spec_name();
+extern char *fid_filename(), *fid_acct();
+ 
+ 
+CONST int  spec_char_table[129] = {
+ /*0 1 2 3 4  5 6 7 8 9  A 1 2 3 4  5 6 7 8 9  B 1 2 3 4  5 6 7 8 9*/
+   2,2,2,2,2, 2,2,2,2,2, 2,2,2,2,2, 2,2,2,2,2, 2,2,2,2,2, 2,2,2,2,2,
+   2,2,1,2,2, 0,0,2,2,7, 6,6,0,2,1, 4,0,0,0,0, 0,0,0,0,0, 0,0,0,0,2,
+   2,2,2,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0,
+   0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0,
+   0,0,0,0,0, 0,0,3,-1 };
+ 
+#define char_code(n) ((n<129)? spec_char_table[n] : 2)
+ 
+ 
+/*D*    NAME:       classify_actions()
+        PURPOSE:    To scan the list of actions and classify each
+                    and insert it into the correct queue.
+*/
+ 
+void
+classify_actions()
+{
+  int   i;
+ 
+  for ( i=0 ; i<7 ; i++)  state_inserts[i] = &target_states[i];
+ 
+  for ( i=0 ; i<TargetActionNum ; i++ )  {
+     struct target_action *act = TargetActions[i];
+     struct sym_target    *tg  = act->ta_target;
+     int                   st  = tg->tg_status;
+ 
+     (*state_inserts[st]) = tg;
+     state_inserts[st]    = &tg->tg_stchain;
+     tg->tg_stchain       = 0;
+ 
+     state_counts[st]++;
+     while (act->next && act->next->ta_target->tg_status == st)
+        i++, act = act->next;
+     }
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       schedule(LS_width)
+        PURPOSE:    To find targets that may be produced.
+*/
+ 
+int
+schedule(LS_width)
+{
+  struct sym_target **tgpp = &target_states[STATUS_WAITING];
+  struct sym_target  *tg   = target_states [STATUS_WAITING];
+  int                 rs   = 0;
+  int                 w_p  = 0;
+ 
+  while(tg)   {
+     struct sym_target *ntg = tg->tg_stchain;
+     struct target_action *act = tg->tg_action;
+     struct sym_target **ntgpp = &tg->tg_stchain;
+ 
+     while (act) {
+        struct dependancy *d = act->ta_target->tg_depend;
+        while (d)   {  /* while there are dependancies to check  */
+           int dn, dnum = d->dp_num;
+           for ( dn=0 ; dn<dnum ; dn++ ) {
+              if ( d->dp_list[dn]->tg_status < STATUS_COMPLETED)
+                 goto next_action; /* Not ready to run */
+              }
+           d = d->dp_tgdepend;
+           }
+        act = act->next;
+        }
+/* Found a target that can be produced!                     */
+     (*state_inserts[STATUS_RUNABLE]) = tg;
+     state_inserts  [STATUS_RUNABLE]  = &tg->tg_stchain;
+     tg->tg_stchain = 0;
+     state_counts   [STATUS_RUNABLE]++;
+     state_counts   [STATUS_WAITING]--;
+     *tgpp = ntg;
+     ntgpp = tgpp;
+     rs++;
+     if (!w_p) {
+        if (!touching)
+             printf("*  Ready to run:");
+        else printf("*      Touching:");
+        w_p = 16;
+        }
+     if ((w_p + 1 + tg->tg_len) > LS_width)
+        printf("\n*               "), w_p = 16;
+     printf(" %s",tg->tg_text), w_p += 1 + tg->tg_len;
+next_action:
+     tg = ntg;
+     tgpp = ntgpp;
+     }
+  if (w_p) printf("\n");
+  return rs;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:          build_state
+        PURPOSE:       To summarize the state table information.
+*/
+ 
+void
+build_state() {
+  char cb[120];  /* temp area to hold fake ccbuf */
+  static cci = 1;
+ 
+  if (B$JIT$->active.jit) {
+     memset(B$JIT$->ccbuf, ' ', sizeof(B$JIT$->ccbuf));
+     cci = 0;
+     sprintf(cb, "Wt=%d,Rdy=%d,Run=%d,Er=%d,Ok=%d",
+             state_counts[1], state_counts[2], state_counts[3],
+             state_counts[4], state_counts[5]                  );
+     memcpy(B$JIT$->ccbuf, cb, strlen(cb));
+     }
+  printf("*  Dependency wait=%d, Waiting to run=%d, Running=%d, Errored=%d, Completed=%d\n",
+         state_counts[1], state_counts[2], state_counts[3],
+         state_counts[4], state_counts[5]                   );
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:          strlen_b
+        PURPOSE:       To find the length of a string up to and
+                       excluding the first blank.
+*/
+int
+strlen_b(st)
+  char     *st;
+{
+  int       rs = 0;
+ 
+  while (st[rs] && st[rs] != ' ') rs++;
+ 
+  return rs;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:          define_vars(action)
+        PURPOSE:       To provide definitions for the special macro
+                       names (such as $<, $@, ...).
+*/
+ 
+static  char  mc_fids[7][104];
+static  char  mc_accts[7][12];  /* include room for "null" */
+static  char  mc_file[7][32];
+static  struct   {
+     char  *str;
+     int    len;
+     }  mc_vars[21] = {
+        mc_fids [0], 0, mc_fids [1], 0, mc_fids [2], 0, mc_fids [3],0,
+        mc_fids [4], 0, mc_fids [5], 0, mc_fids [6], 0,
+        mc_file [0], 0, mc_file [1], 0, mc_file [2], 0, mc_file [3],0,
+        mc_file [4], 0, mc_file [5], 0, mc_file [6], 0,
+        mc_accts[0], 0, mc_accts[1], 0, mc_accts[2], 0, mc_accts[3],0,
+        mc_accts[4], 0, mc_accts[5], 0, mc_accts[6], 0
+        };
+ 
+ 
+void
+define_vars(action, LoDo)
+  struct target_action *action;
+{
+  int   i;
+  int   lastv = (LoDo)? MI_LS : MI_DO;
+  struct   sym_macro  *mac = sym_macro_specials[ MI_EARLIER ];
+ 
+  if (action->ta_chngvar) {
+     char  *s = action->ta_chngvar;
+     mac->mc_def = s;
+     mac->mc_deflen = strlen(s);
+     }
+  if (action->ta_predvar) {
+     char *s = action->ta_predvar;
+     mac = sym_macro_specials[ MI_PREDECESSOR ];
+     mac->mc_def    = s;
+     mac->mc_deflen = strlen(s);
+     }
+  if (action->ta_dpndvar) {
+     char *s = action->ta_dpndvar;
+     mac = sym_macro_specials[ MI_DEPENDENT ];
+     mac->mc_def    = s;
+     mac->mc_deflen = strlen(s);
+     }
+ 
+  for ( i=MI_BASE ; i<=lastv ; i++ )   {
+     int            j = i - MI_BASE;
+     struct sym_macro *mca = sym_macro_specials[j + MI_BASE_ACCT];
+     struct sym_macro *mcf = sym_macro_specials[j + MI_BASE_FILE];
+     struct sym_macro *mc  = sym_macro_specials[i];
+     struct sym_target *tg = action->ta_target;
+     struct sym_target *tgi= action->ta_tginput;
+     int   lflags = 0;
+     char  *fid;
+ 
+     mca->mc_def = mc_accts[j];    mca->mc_deflen = 0;
+     mcf->mc_def = mc_file [j];    mcf->mc_deflen = 0;
+     mc ->mc_def = mc_fids [j];    mc ->mc_deflen = 0;
+ 
+     mc_fids [j][0] = 0;     mc_vars[j+ 0].len = 0;
+     mc_accts[j][0] = 0;     mc_vars[j+ 6].len = 0;
+     mc_file [j][0] = 0;     mc_vars[j+13].len = 0;
+ 
+     switch (j)  {
+ 
+     case 0:     /**  Fill in base target name   **/
+        mc_fids[0][0] = mc_accts[0][0] = mc_file[0][0] = 127;
+        memcpy(mc_file [0]+1, fid_filename(tg->tg_text), 32);
+        memcpy(mc_accts[0]+1,            jptr->faccn,     8);
+        memcpy(mc_fids [0]+1, mc_file[0]+1,              32);
+        strcat(mc_fids [0], ".");
+        strcat(mc_fids [0], mc_accts[0]+1);
+        lflags = 7;
+        break;
+ 
+     case 1:     /**   Input file names        **/
+        if (tgi) {
+           lflags = 3;
+           mc_fids[1][0] = mc_accts[1][0] = mc_file[1][0] = 127;
+           memcpy(mc_accts[1]+1, fid_acct(tgi->tg_fid+1),  8);
+           memcpy(mc_file [1]+1, fid_filename(tgi->tg_fid+1), 32);
+           memcpy(mc_fids [1]+1, tgi->tg_fid+1, 71);
+           if (tgi->tg_ufid) {
+              lflags = 7;
+              strcat(mc_fids[1], ",\177");
+              strcat(mc_fids[1], tgi->tg_ufid+1 );
+              }
+           else {
+              mc_vars[1].len = tgi->tg_fid[0];
+              mc->mc_deflen = tgi->tg_fid[0] + 1;
+              }
+           }
+        break;
+ 
+     case 2:  /*  Target File name    */
+        lflags = 3;
+        mc_fids[2][0] = mc_accts[2][0] = mc_file[2][0] = 127;
+        memcpy(mc_accts[2]+1, fid_acct(tg->tg_fid+1), 8);
+        memcpy(mc_file [2]+1, fid_filename(tg->tg_fid+1), 32);
+        memcpy(mc_fids [2]+1, tg->tg_fid+1, tg->tg_fid[0]+1);
+        mc_vars[2].len = tg->tg_fid[0]+1;
+        mc->mc_deflen = tg->tg_fid[0] + 1;
+        break;
+ 
+     case 3:  /*  Listing file name   */
+     case 4:  /*  Diagnostic file name   */
+        lflags = 3;
+        mc_fids[j][0] = mc_accts[j][0] = mc_file[j][0] = 127;
+        memcpy(mc_fids [j]+1, (fid=gen_spec_name(j-3,tg))+1,    71);
+        memcpy(mc_accts[j]+1, fid_acct(mc_fids[j]+1),   8);
+        memcpy(mc_file [j]+1, fid_filename(mc_fids[j]+1), 32);
+        mc_vars[j].len = fid[0]+1;
+        mc->mc_deflen  = fid[0]+1;
+        break;
+ 
+     }
+     if (lflags & 1)
+        mca->mc_deflen = mc_vars[j+14].len = strlen_b(mc_accts[j]);
+     if (lflags & 2)
+        mcf->mc_deflen = mc_vars[j+ 7].len = strlen_b(mc_file [j]);
+     if (lflags & 4)
+        mc ->mc_deflen = mc_vars[j+ 0].len = strlen_b(mc_fids [j]);
+     while ( fid = memchr(mc_fids[j], '$', mc_vars[j+ 0].len) )
+        *fid = 128;
+     while ( fid = memchr(mc_file[j], '$', mc_vars[j+ 7].len) )
+        *fid = 128;
+     while ( fid = memchr(mc_accts[j], '$', mc_vars[j+14].len) )
+        *fid = 128;
+ 
+  }
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       setup_jcl_flags(char *b)
+        PURPOSE:    To scan flags for this line of jcl and to
+                    setup options in JCLflags.
+*/
+ 
+char *
+setup_jcl_flags(b)
+  char *b;
+{
+  int   c;
+  int   xflags = JCLflags & JCL_ICOM;
+ 
+  JCLflags &= (JCLflags & JCL_CONT) ? (JCL_CONT | JCL_ICOM) : 0;
+ 
+  while (c = *b++)  {
+     switch (c)  {
+ 
+     case ' ':
+        break;      /* Remove leading blanks   */
+     case '{':
+     case '}':      /* Comments                */
+        JCLflags |= JCL_SKIP;
+        return b;
+ 
+     case '!':
+        JCLflags |= (JCL_BANG | xflags);
+        break;
+ 
+     case '-':
+        JCLflags |= JCL_NCHK;
+        break;
+ 
+     case '@':
+        if (!testing)
+           JCLflags |= (Silent)? 0 : JCL_ECHO;
+        break;
+ 
+     default:
+        return b-1;
+     }
+  }
+  return b-1;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       command_name(char *b)
+        PURPOSE:    To return a pointer to the first token in the
+                    line.
+*/
+ 
+char *
+command_name(b)
+  char  *b;
+{
+  static char cmd[40];
+  int         i = 0;
+ 
+  while (*b && *b != ' ' && i<38) cmd[i++] = toupper(*b++);
+  cmd[i] = 0;
+  return cmd;
+}
+ 
+ 
+/*D*    NAME:       lookup_cmd(char *cmd, char **cmdlist, int ncmds)
+        PURPOSE:    To lookup a command in a command list.
+        DESCRIPTION:
+           Returns 0 if command not in the list, otherwise it returns
+           the 1-origin index of the command found.
+*/
+ 
+int
+lookup_cmd(cmd, cmdlist, ncmds)
+  char     *cmd;
+  char     **cmdlist;
+  int      ncmds;
+{
+  int      i = 0;
+ 
+  while (i < ncmds)
+     if (strcmp(cmd, cmdlist[i++])==0) return i;
+ 
+  return 0;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:          print_jcl_line(cmd, commas)
+        PURPOSE:       To send the current command to the terminal
+                   (if echo is on) and to the jcl file (if not test).
+        DESCRIPTION:
+           The commas option is used to indicate that commas
+           are to be inserted between tokens found on the current
+           command up to (but not including) the "over", "on",
+           or "into" verb.
+ 
+           Each token that could be a target is examined and mapped
+           into a CP-6 fid if we have derived it.
+ 
+           Lines are broken up into records of 80 characters if the
+           comma option is provided, otherwise records are broken
+           into records of 250 characters.
+ 
+*/
+ 
+#define xmit(str, len) \
+                    memcpy(jbuf + w_p, str, len), w_p += len
+ 
+#define xmitc(c)    jbuf[w_p++] = c
+ 
+#define xmitchk(max) (w_p >= (max))?                          \
+                       jbuf[w_p] = 0,                         \
+                       fprintf(jcl, "%s;\n", jbuf),           \
+                       ((JCLflags & JCL_ECHO) ?               \
+                          printf("%s;\n", jbuf) : 0),         \
+                       memcpy(jbuf, "  \0\0\0\0\0\0", 9),     \
+                       w_p = 2                                \
+                    :  0
+ 
+ 
+ 
+void
+print_jcl_line(cmd, commas)
+  char  *cmd;
+  int   commas;
+{
+  int   c, cc;
+  char  jbuf[262];
+  int   w_max = (commas) ? 80 : 254;
+  int   w_p   = 0;
+  char  buf[84];
+  int   pblank = 0;
+  int   nblank = 0;
+  int   rcomma = 0;
+  int   quoted = 0;
+  struct sym_target *tg;
+  char  *st;
+  int   ins;
+  int   bad = 0;
+  int   ch_comma  = (JCLflags & JCL_CONT)? ',' : ' ';
+ 
+  if (! (JCLflags & JCL_BANG) ) xmitc('!');
+ 
+  while (c = *cmd++)   {
+ 
+     switch(char_code(c))   {
+ 
+     case 1:
+        if (pblank)    break;   /* already skipping blanks */
+        if (commas) {
+           rcomma = c == ',';
+           if (rcomma  || !nblank) pblank = 1;
+           break;
+           }
+ 
+     case 2:
+misc_char:
+        nblank = 0;
+paren_char:
+        xmitchk(w_max-1);
+        if (pblank) xmitc(ch_comma), ch_comma = ',';
+        xmitchk(w_max);
+        pblank = rcomma = 0;
+        xmitc(c);
+        break;
+     case 6:
+        if (commas && !rcomma) {
+           pblank = 0;
+           nblank = 1;
+           }
+        goto paren_char;
+ 
+     case 7:        /*  quote                              */
+        quoted = !quoted;
+        if (quoted) xmitchk(w_max - 10);
+        goto misc_char;
+ 
+ 
+     case 3:        /*  inserted special target file name  */
+        /*  Skip over following name!     */
+        bad = nblank = rcomma = 0;
+        st = cmd;   /* Remember start of name  */
+        if (*cmd == 128) *cmd = '$';
+        c  = *++cmd;
+        while ((bad = char_code(c)) <= 0)  {
+           if (bad < 0) *cmd = '$';
+           c = *++cmd;
+           }
+        ins = cmd - st;   /*  Length of possible file name */
+        if (ins) {        /*  If there's a name            */
+           c = *cmd;      /*  save string end char         */
+           *cmd = 0;      /*  and make a string            */
+           if (pblank)
+              if (commas) xmitc(ch_comma), ch_comma = ',';
+              else xmitc(' ');
+           pblank = 0;    /*  blank passed flag            */
+           xmitchk(w_max - ins - 1);
+           xmit(st, ins);
+           *cmd = c;      /*  restore string end char      */
+           }
+        break;
+ 
+     case 4:        /***     "-"       ***/
+        nblank = rcomma = 0;
+        if (pblank) xmitc(ch_comma), ch_comma = ',';
+        pblank = 0;
+        xmitchk(w_max-43);
+        xmitc(c);
+        c = *cmd++;
+        if (c) xmitc(c);
+        break;
+ 
+     default:       /***  Look for a target name  ***/
+        bad = 0;
+        nblank = rcomma = 0;
+more_default:
+        ins = 0;
+        do {
+           buf[ins++] = c;
+           c = *cmd++;
+           cc = char_code(c);
+           } while (ins<79 && (cc <= 0 || cc == 4));
+        cmd--;
+        buf[ins] = 0;
+        st = buf;
+        if (ins >= 80 || bad)   {
+           if (pblank) xmitc(ch_comma), ch_comma = ',';
+           restoremoney(buf);
+           pblank = 0;
+           if (ins > 0) xmit(buf, ins);
+           bad++;
+           if ( char_code(c) <= 0 ) goto more_default;
+           }
+        else {
+           tg = lookup_sym_target(buf,ins,0);
+           if (!tg || !tg->tg_fid) {
+              restoremoney(buf);
+              c  = toupper(buf[0]);
+              if (!tg && commas && ins<5 && (c=='O'||c=='I'||c=='T'))  {
+                 char  vbf[6];
+                 ins = 0;
+                 while (buf[ins]) vbf[ins] = toupper(buf[ins]),ins++;
+                 vbf[ins] = 0;
+                 if (strcmp(vbf,"ON")==0 || strcmp(vbf,"OVER")==0 ||
+                     strcmp(vbf,"TO")==0 || strcmp(vbf,"INTO")==0) commas = 0;
+                 }
+              }
+           else {
+              st = tg->tg_fid+1;
+              ins = tg->tg_fid[0];
+              if (tg->tg_ufid)  {     /**  if (UI) then... */
+                 xmitchk(w_max - ins - 1);
+                 if (pblank)
+                    if (commas) xmitc(ch_comma), ch_comma = ',';
+                    else xmitc(' ');
+                 pblank = 0;
+                 xmit(st, ins);
+                 xmitc(',');    /* si,   */
+                 st  = tg->tg_ufid + 1;
+                 ins = tg->tg_ufid[0];
+                 }
+              }
+           xmitchk(w_max-2);
+           if (pblank)
+              if (commas) xmitc(ch_comma), ch_comma = ',';
+              else xmitc(' ');
+           pblank = 0;
+           xmitchk(w_max-ins-2);
+           xmit(st, ins);
+           }  /* of if found a target name   */
+        }     /*  Of switch stmt  */
+     }        /*  of while  stmt  */
+  c = --*cmd;
+  if (c == ';' && commas) JCLflags |= JCL_CONT;
+     else if (JCLflags & JCL_CONT) JCLflags -= JCL_CONT;
+  jbuf[w_p] = 0;
+  fprintf(jcl, "%s\n", jbuf);
+  if ( JCLflags & JCL_ECHO )
+     printf("%s\n", jbuf);
+  JCLflags &= ~JCL_ECHO;
+  if (!testing && !(JCLflags & JCL_NCHK))
+     fprintf(jcl, "!if STEPCC > 0 then goto ABORT\n");
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       send_jcl(char *line)
+        PURPOSE:    To send a command line out to be processed.
+*/
+ 
+void
+send_jcl(line)
+  struct   command_line   *line;
+{
+  char  *b     = 0;
+  char  *cname = 0;
+  int    c     = 0;
+  int    commas= 0;
+ 
+  c = line->cmd_len;
+  b = line->cmd_text;
+  do {
+     b = ExpandMacros( b, c);
+     c = MacRecLen;
+     } while (MacroSubs > 0);
+ 
+  b = setup_jcl_flags(b);
+  if (JCLflags & JCL_SKIP) return;    /* Nothing to display!  */
+  cname = command_name(b);
+  if (!JCLdefault && !(JCLflags&JCL_BANG) && strcmp(cname,"DEFAULT")==0)
+     return;
+  JCLdefault++;
+ 
+  if (JCLflags & JCL_CONT) commas++;
+  else if (! (JCLflags & JCL_BANG) )  {
+     if(lookup_cmd(cname,command_commas,sizeof(command_commas)>>2)>0)
+        JCLflags |= JCL_CCOM, commas++;
+     if(lookup_cmd(cname,icommand_commas,sizeof(icommand_commas)>>2)>0)
+        JCLflags |= JCL_ICOM;
+     }
+  else {
+     if ( JCLflags & JCL_ICOM &&
+          lookup_cmd(cname, command_incommas, sizeof(command_incommas)>>2)>0)
+        commas++;
+     }
+  print_jcl_line(b, commas);
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       update_target_status(tg, queue)
+        PURPOSE:    To update the status of all of the targets
+                    associated with an action.
+*/
+ 
+void
+update_target_status( tg, queue )
+  struct   sym_target  *tg;
+{
+  struct   target_action  *act = tg->tg_action;
+ 
+  while (act) {
+     act->ta_target->tg_status = queue;
+ 
+     if (!act->ta_tginput && act->ta_rule)   {  /* no inputs update all targets */
+        struct dependancy *d = act->ta_rule->tr_depend;
+        while (d)   {
+           d->dp_target->tg_status = queue;
+           d = d->next;
+           }
+        }
+     act = act->next;
+     }
+  return;
+}
+ 
+ 
+ 
+/*D*    NAME:       requeue_target(tg, queue)
+        PURPOSE:    To insert the specified target into the
+                    specified target state queue.
+*/
+ 
+void
+requeue_target(tg, queue)
+  struct sym_target *tg;
+  int                queue;
+{
+  state_counts[ queue ]++;
+  (*state_inserts[queue]) = tg;
+  state_inserts[ queue ]  = &tg->tg_stchain;
+  tg->tg_stchain          = 0;
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       unlink_target(tgpp, queue)
+        PURPOSE:    To remove a target from a queue.
+        DESCRIPTION:
+           This function removes the target pointed to by the
+           "tgpp" argument from the specified state queue.
+*/
+ 
+void
+unlink_target(tgpp, queue, tgppi)
+  struct sym_target **tgpp;
+  int                 queue;
+  struct sym_target ***tgppi;
+{
+  struct sym_target *tg = *tgpp;
+ 
+  *tgpp = tg->tg_stchain;
+  state_counts[ queue ]--;
+  if ( (&tg->tg_stchain) == *tgppi )
+     *tgppi = tgpp;
+}
+ 
+ 
+ 
+ 
+/*B*    NAME:       send_defaults(struct target_action *act)
+        PURPOSE:    To send any initial "!default" commands found
+                    in the actions being used.
+        DESCRIPTION:
+           The actions are scanned before the actual initial jcl
+           is generated to give the actions an opportunity to
+           change things with !default commands.  This is intended
+           to permit a target with a very long compile time to have
+           a default to set the time up higher and not force all of
+           the target actions to specify a long compile time.
+*/
+ 
+send_defaults(act)
+  struct   target_action     *act;
+{
+  struct   command_line      *ln;
+  char                       *b;
+  int                         l;
+ 
+  while (act) {
+     ln       = act->ta_rule->tr_commands->cm_lines;
+     while (ln)  {
+        JCLflags = 0;
+        l = ln->cmd_len;
+        b = ln->cmd_text;
+        do {
+           b = ExpandMacros(b, l);
+           l = MacRecLen;
+           } while (MacroSubs > 0);
+        b = setup_jcl_flags(b);
+        if (JCLflags & JCL_SKIP) break;
+        if ( strcmp(command_name(b), "DEFAULT") != 0 ) break;
+        JCLflags |= JCL_NCHK;
+        print_jcl_line(b,0);
+        ln = ln->next;
+        }
+     act = act->next;
+     }
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       run_target(struct sym_target **tgp)
+        PURPOSE:    To remove the specified target from the
+                    runable queue and put it into the batch queue.
+        DESCRIPTION:
+           This function removes the target from the runable
+           queue and then performs the following steps:
+ 
+           1. Opens the file to hold the jcl if this is NOT a test.
+           2. cycles through the actions associated with producing
+              this target doing the following:
+              a) defining the special variables for this action
+              b) writing the initial job start jcl the first time
+                 through this loop.
+              c) sending each command line associated with this
+                 action.
+              d) going to the next action and repeating steps
+                 (a) through (d) for every action.
+           3. sends the job terminating jcl if not testing.
+           4. deletes all of the target files associated with these
+              actions.
+           5. batches the job and remembers its sysid in the target
+              action structure.
+           6. Adds the target to the appropriate queue (completed
+              if just testing or the job did complete that quickly,
+              or running if it is running).
+*/
+ 
+void
+run_target(tgpp)
+  struct   sym_target  **tgpp;
+{
+  struct   sym_target     *tg = *tgpp;
+  struct   target_action  *act;
+  struct   command_line   *ln;
+  int                      job = 1;
+  int                      acts = 0;
+  int                      i;
+  int                      LastJobID;
+  int                      xeq;
+ 
+  *tgpp = tg->tg_stchain;
+  if (!tg->tg_stchain)
+     state_inserts[ STATUS_RUNABLE ] = &target_states[STATUS_RUNABLE];
+  state_counts[ STATUS_RUNABLE ]--;
+ 
+  act = tg->tg_action;
+  if (!act->ta_rule)   {
+     /*  This target has no action, it is produced by one
+         of its dependencies.                                 */
+     i = 0;   /*  no running job   */
+     if (testing)
+        goto set_test_status;
+     else goto set_job_status;
+     }
+ 
+  if (!testing)  {
+     jcl = fopen(JclFid, "w");
+     if (!jcl)
+         crash("Can't open jcl file: %s\n%s\n", JclFid,
+               strerror(errno));
+     job = 0;
+     }
+  else printf("\n");
+ 
+  while (act) {
+     JCLflags = JCLdefault = 0;
+     define_vars(act,acts++);
+     if (!job)   {
+        job++;
+        send_defaults(act), JCLdefault = 1;
+        xeq = (tg->tg_online && jcl_xeq && jcl_xeqend);
+        if (xeq && ! saved_fid[0]) {
+           struct sym_macro *mc = lookup_sym_macro(saved_var,16,2);
+           if (!mc) crash("Out of memory: run_target\n");
+           tmpnam(saved_fid);
+           mc->mc_def    = saved_fid;
+           mc->mc_deflen = strlen(saved_fid);
+           strcat(SaveIt,saved_fid);
+           }
+        ln = (xeq)? jcl_xeq : jcl_start;
+        while (ln)  {
+           send_jcl(ln);
+           ln = ln->next;
+           }
+        JCLflags = 0, JCLdefault = 0;
+        }
+     ln = act->ta_rule->tr_commands->cm_lines;
+     while (ln)  {
+        send_jcl(ln);
+        ln = ln->next;
+        }
+     act = act->next;
+     }
+ 
+  if (testing)   {
+set_test_status:
+     requeue_target(tg, STATUS_COMPLETED);
+     update_target_status(tg, STATUS_COMPLETED);
+     return;
+     }
+  JCLflags = 0;
+  ln = (xeq)? jcl_xeqend : jcl_end;
+  while (ln)  {
+     send_jcl(ln);
+     ln = ln->next;
+     }
+ 
+  fclose(jcl), jcl = 0;
+  delete_target_files(tg);
+  if (xeq)   {
+#ifndef RU
+     int   steps = jptr->steps;
+#endif
+     system( XeqIt );
+#ifdef RU
+     requeue_target(tg, STATUS_RUNNING);
+     fclose(stdin);
+     fclose(stdout);
+     MAKE_ONLINE_MAGIC = RU_WRITTEN_DONE;
+     GENRU(saved_fid, tg);
+#else
+     system(SaveIt);
+     if (steps == jptr->steps)
+        exit(0);
+     i = 0;
+#endif
+     }
+  else  {
+     LastJobID = jptr->lbjid;
+     system(BatchIt);
+     num_jobs_run++;
+     i = jptr->lbjid;
+     if (LastJobID == i) i = 0;
+     tg->tg_action->ta_sysid = i;
+     }
+ 
+set_job_status:
+  job = (i == 0)? ((check_target_status(tg)) ? STATUS_COMPLETED :
+        STATUS_ERRORED) : STATUS_RUNNING;
+  requeue_target(tg, job);
+  update_target_status(tg, job);
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       touch_or_copy( struct sym_target *tg )
+        PURPOSE:    To touch an individual target file.
+ 
+        DESCRIPTION:
+ 
+        This program attempts to touch the target file.
+        If an error occurs, the most recent version of the
+        target file is located by searching along the search
+        path (stopping at the first file located).
+ 
+        If a file cannot be located, or if the search path
+        does not exist, then an error is reported, otherwise,
+        the file is copied from the search path into the
+        target output account.
+*/
+ 
+void
+touch_or_copy(tg)
+  struct sym_target *tg;
+{
+  char *fido = tg->tg_fid;
+ 
+  if (touch(fido + 1))  {       /* Error touching the file */
+     char fidi[60];    /* File that might work as source */
+     char iacct[12];   /* Account of possible file       */
+ 
+     memset(fidi, 0, sizeof(fidi));
+     memset(iacct, 0, sizeof(iacct));
+     memcpy(fidi, fido, fido[0]+2);
+ 
+     if (tg->tg_srch && srch_file(fidi, tg->tg_srch, 0, iacct) &&
+         strcmp(fido, fidi))      {
+        char sys[256];
+        sprintf(sys, "copy %s over %s (nfa)", fidi+1, fido+1);
+        printf("# !%s\n", sys);
+        system(sys);
+        }
+     else error("### Error: Cannot touch and cannot locate file %s\n",
+                fido);
+     }
+}
+ 
+ 
+ 
+/*D*    NAME:       touch_target( struct sym_target **tgp)
+        PURPOSE:    To touch the target files associated with
+                    the actions for this target.
+        DESCRIPTION:
+           This function is very similar to run_target in that
+           it performs the same functions.  It first removes
+           the target from the runable queue and then chases
+           through the targets associated with the action
+           touching each file.
+ 
+           This target is then inserted into the COMPLETED queue.
+*/
+ 
+void
+touch_target(tgpp)
+  struct   sym_target     **tgpp;
+{
+  struct   sym_target      *tg  = *tgpp;
+  struct   target_action   *ta  = tg->tg_action;
+  char                      *fid;
+ 
+  *tgpp = tg->tg_stchain;    /* remove this target from its queue */
+  if (!tg->tg_stchain)
+     state_inserts[ STATUS_RUNABLE ] = &target_states[STATUS_RUNABLE];
+  state_counts[ STATUS_RUNABLE ]--;
+ 
+  while (ta)    {
+     touch_or_copy(ta->ta_target);
+     if (!ta->ta_tginput) {  /* no inputs: touch all targets */
+        struct dependancy *d = ta->ta_rule->tr_depend;
+        while (d)   {
+           touch_or_copy( d->dp_target );
+           d = d->next;
+           }
+        }
+     ta = ta->next;
+     }
+ 
+  requeue_target(tg, STATUS_COMPLETED);
+  update_target_status(tg, STATUS_COMPLETED);
+  return;
+}
+ 
+ 
+ 
+ 
+/*D*    NAME:       run()
+        PURPOSE:    To batch (or display jcl) for targets in the
+                    runable queue.
+*/
+ 
+int
+run()
+{
+  int   rs = 0;
+ 
+  while (target_states[STATUS_RUNABLE] &&
+          state_counts[STATUS_RUNNING] < MaxJobs )   {
+ 
+     if (!touching)
+          run_target( &(target_states[STATUS_RUNABLE]) );
+     else touch_target( &(target_states[STATUS_RUNABLE]) );
+  rs++;
+  }
+ 
+  if (rs && !touching) printf("\n");
+  return rs;
+}
+ 
+ 
+ 
+ 
+ 
+/*D*    NAME:       check_for_completion()
+        PURPOSE:    To indicate if any jobs have completed execution
+                    and to insert them into the correct completion
+                    queue.
+*/
+ 
+int
+check_for_completion()
+{
+  struct      sym_target     **tgp;
+  struct      sym_target      *tg;
+  struct      sym_target     **tgn;
+  struct      target_action   *a;
+  int                          queue;
+  int                          rs = 0;
+ 
+  locate_running_jobs(JobInfoFid);  /* flag all actions running */
+ 
+  tgp = &target_states[ STATUS_RUNNING ];
+ 
+  while (tg = *tgp) {
+     tgn = &tg->tg_stchain;
+     a = tg->tg_action;
+     if (! (a->ta_flags & 1) )  {
+        unlink_target(tgp, STATUS_RUNNING, &state_inserts[STATUS_RUNNING]);
+        queue = (check_target_status(tg)) ? STATUS_COMPLETED : STATUS_ERRORED;
+        requeue_target(tg, queue);
+        update_target_status(tg, queue);
+        rs++;
+        IBEX_output_switch = 1;
+        tgn = tgp;
+        }
+     else a->ta_flags &= -2;
+     tgp = tgn;
+     }
+ 
+  return rs;
+}
+ 
+ 
+ 
+ 
+ 
+/*D*    NAME:       build()
+        PURPOSE:    To perform all of the steps necessary to build
+                    the target file of this operation.
+        DESCRIPTION:
+           This function controls the build process.
+*/
+ 
+int
+build(test, LS_width, verbose, touch, query)
+  int            test;
+  int            LS_width;
+  int            verbose;
+  int            touch;
+  int            query;
+{
+  int            rs = 0;
+  int            delay_time = 15;
+ 
+  testing  = test;
+  touching = touch;
+ 
+  jptr = (struct b_jit *) B$JIT$;
+  if (!MaxJobs) MaxJobs = 1;
+#ifdef RU
+  if (MAKE_ONLINE_MAGIC == RU_WRITTEN_DONE) {
+     MAKE_ONLINE_MAGIC = RU_WRITTEN_INIT;
+     run_online++;
+     goto continue_build;
+     }
+#endif
+ 
+  if (!(testing+touching+query))  {
+     tmpnam(JclFid);
+     strcat(BatchIt, JclFid);
+     strcat(XeqIt,   JclFid);
+     }
+  else jcl = stdout;
+ 
+  if (!jcl_start)   {
+     struct sym_target *tgj = lookup_sym_target(".jcl",    4, 0);
+     struct sym_target *tge = lookup_sym_target(".end",    4, 0);
+     struct sym_target *tgx = lookup_sym_target(".xeq",    4, 0);
+     struct sym_target *tgq = lookup_sym_target(".xeqend", 7, 0);
+     if ( !tgj || !tge ) crash("*** Rule: \".jcl\" or \".end\" missing");
+     jcl_start = tgj->tg_commands->tr_commands->cm_lines;
+     jcl_end   = tge->tg_commands->tr_commands->cm_lines;
+     if (tgx)
+        jcl_xeq   = tgx->tg_commands->tr_commands->cm_lines;
+     if (tgq)
+        jcl_xeqend= tgq->tg_commands->tr_commands->cm_lines;
+     if (!jcl_start || !jcl_end)
+        if (testing)
+           warning("### Rule .jcl or .end is empty!");
+        else crash("*** Rule .jcl or .end is empty!");
+     }
+ 
+  classify_actions();
+  rs = state_counts[ STATUS_WAITING ];
+  if (query) return rs;
+  printf("\n");
+  if (!touching)   build_state();
+  IBEX_output_switch = 0;
+ 
+  if (!schedule(LS_width))   {
+     if (!touching)
+        printf("\nNothing to build\n\n");
+     else printf("\nNothing to touch\n\n");
+     return rs;
+     }
+continue_build:
+  while(state_counts[STATUS_RUNABLE]+state_counts[STATUS_RUNNING]) {
+     run();
+     if (state_counts[STATUS_RUNNING]!=0) {
+        build_state();
+        do {
+           if (!run_online)
+              sleep(delay_time);
+           run_online = 0;
+           } while (!check_for_completion());
+        }
+     if ( schedule(LS_width) )
+        if (!touching)  build_state();
+     }     /**  End of major while loop  **/
+ 
+  if (!touching) build_summary(LS_width);
+  if (!touching)  printf("\n***\n*** Build Complete!\n***\n");
+  if (!jptr->cpflags1.notify && num_jobs_run && state_counts[STATUS_ERRORED])
+     system("check");
+  return state_counts[STATUS_WAITING]+state_counts[STATUS_ERRORED];
+}
+ 
+ 
+ 
+ 
+ 
+ 
+build_summary(LS_width)
+  int            LS_width;
+{
+  struct   sym_target     *tg = target_states[STATUS_WAITING];
+  int                     w_p = 0;
+ 
+  while (tg)  {
+     struct   target_action *act = tg->tg_action;
+     while (act) {
+        struct dependancy *d = act->ta_target->tg_depend;
+        while (d)   {
+           int dn, dnum = d->dp_num;
+           for ( dn=0 ; dn<dnum ; dn++)  {
+              if (d->dp_list[dn]->tg_status < STATUS_COMPLETED)
+                 printf("* %s can't be run because %s is %s\n",
+                    tg->tg_text, d->dp_list[dn]->tg_text,
+                    state_names[1+d->dp_list[dn]->tg_status]);
+              }
+           d = d->dp_tgdepend;
+           }
+        act = act->next;
+        }
+     tg = tg->tg_stchain;
+     }
+ 
+  tg = target_states[ STATUS_ERRORED ];
+  while (tg)  {
+     if (!w_p)   {
+        printf("\n\n** The following targets had errors:"), w_p = 36;
+        }
+     if ( (w_p+tg->tg_len+1) > LS_width)
+        printf("\n*  "), w_p = 3;
+     printf(" %s",tg->tg_text), w_p += tg->tg_len + 1;
+     tg = tg->tg_stchain;
+     }
+ 
+  if (w_p) printf("\n\n"), w_p = 0;
+  tg = target_states[ STATUS_ERRORED ];
+  if (options['e'])    /* Send EMAIL to failures? */
+  while (tg)  {
+     while (tg && !tg->tg_owner)
+        tg = tg->tg_stchain;
+     if (tg)  {     /* if there's an owner! */
+        FILE *f = 0, *send_email();
+        struct sym_target *t = tg;
+        struct sym_owner  *ow = t->tg_owner;
+ 
+        while (t)   {  /* while there's more error'ed targets */
+           if (t->tg_owner == ow) { /* if same owner */
+              f = send_email(f, t, 1, (char*)0,  (char*)0);
+              t->tg_owner = 0;
+              }  /* end of if same owner */
+           t = t->tg_stchain;
+           }  /* END of while more error'ed targets  */
+        send_email(f, tg, -1, (char *)0, (char *) 0);
+        }     /* END of there's an owner!            */
+     }        /* END of more error'ed targets        */
+  return 0;
+}
+ 

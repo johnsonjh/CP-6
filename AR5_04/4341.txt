@@ -1,0 +1,1134 @@
+/******************************************************************************/
+/*                                                                            */
+/* Copyright (c) Bull HN Information Systems, Inc., 1989                      */
+/*                                                                            */
+/******************************************************************************/
+
+/******************************************************************************/
+/* This source is compatible with the Microsoft(tm) C Compiler v5.10          */
+/******************************************************************************/
+
+/******************************************************************************/
+/*                                                                            */
+/* cf2vfc - A program to convert continuous form listings to CP-6 unit        */
+/*          record style listings.                                            */
+/*                                                                            */
+/*          Version 1.01 09/25/87                                             */
+/*          Version 1.02 10/29/87                                             */
+/*          Version 1.03 10/30/87                                             */
+/*          Version 1.10 01/08/88                                             */
+/*          Version 1.20 01/12/88                                             */
+/*          Version 1.21 01/18/88                                             */
+/*          Version 2.00 02/01/88                                             */
+/*              First general release version.                                */
+/*          Version 2.10 08/15/88                                             */
+/*              Added error reporting for streams, support for files          */
+/*              that use <lf><cr> for end of line sequences and <CTRL+C>      */
+/*              handling.  Made the VFC defines a little more rational.       */
+/*          Version 2.20 09/14/88                                             */
+/*              Added int 1b and int 23 handling.  If a user types CTRK-BREAK */
+/*              cf2vfc will print a summary and continue.  If s/he types      */
+/*              CTRL-C the summary will be reported and the process will      */
+/*              terminate.  All other keyboard input is ignored.              */
+/*              Added the /D flag to keep cf2vfc from deleting the output     */
+/*              file when it terminates abnormally.                           */
+/*          Version 2.21 05/09/89                                             */
+/*              Fixed a detab problem, compiled with Microsoft C 5.1, and     */
+/*              changed the copyright notice.                                 */
+/*                                                                            */
+/******************************************************************************/
+
+/******************************************************************************/
+/* include files                                                              */
+/******************************************************************************/
+#include <ctype.h>
+#include <dos.h>
+#include <io.h>
+#include <malloc.h>
+#include <memory.h>
+#include <process.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* cf2vfc specific include files */
+#include "ascii.h"                     /* defines for unprintable character */
+#include "cf2vfc.dcl"                  /* function prototypes */
+#include "cp6vfc.h"                    /* defines for CP-6 VFC codes */
+
+/******************************************************************************/
+/* defines                                                                    */
+/******************************************************************************/
+#define TRUE 1
+#define FALSE 0
+
+/* interrupt vector numbers */
+#define INTR_1B 0x1b             /* <Ctrl-Break> */
+#define INTR_23 0x23             /* <Ctrl-C> */
+
+/* Error Codes */
+#define ERR_NOMEM 1              /* Out of dynamic memory */
+#define ERR_WRITE 2              /* Error writing output file */
+#define ERR_BREAK 3              /* User hit break and didn't continue */
+
+/******************************************************************************/
+/* interrupt vectors                                                          */
+/******************************************************************************/
+void (interrupt far *orig_1b_hndlr)();
+void (interrupt far *orig_23_hndlr)();
+
+/******************************************************************************/
+/* typedefs                                                                   */
+/******************************************************************************/
+typedef unsigned BOOLEAN;
+
+/******************************************************************************/
+/* constant declarations                                                      */
+/******************************************************************************/
+const char     orig_progname[] = "cf2vfc";
+const char     version[] = "2.21";
+const char     HB_COPYRIGHT[] = "Copyright (c) Bull HN Information Systems, Inc., 1989";
+const char     grascx[] = "|++++++|+++++++++-++++++++=+++++++++++++";
+static char    stdinstr[] = "stdin";
+static char    stdoutstr[] = "stdout";
+
+/******************************************************************************/
+/* FILE declarations                                                          */
+/******************************************************************************/
+FILE           *infile, *outfile;
+char           *file1, *file2;
+
+/******************************************************************************/
+/* buffer declarations                                                        */
+/******************************************************************************/
+char           *rdbuf;
+char           *bufptr;
+char           *eobuf;
+unsigned char  **ibufptr;
+unsigned char  **obufptr;
+unsigned char  *ff_rec;
+unsigned char  *indent_str;
+char           progname[80];
+char           errbuf[80];
+
+/******************************************************************************/
+/* BOOLEAN declarations                                                       */
+/******************************************************************************/
+BOOLEAN        EOF_flag, FF_flag, CR_flag, LF_flag;
+BOOLEAN        UNPRPRT_flag, GRPRT_flag;
+BOOLEAN        OVER_switch, NOOPTVFC_switch, SCAN_switch;
+BOOLEAN        KOVSTRK_switch, UNDENT_switch, GR_switch;
+BOOLEAN        BREAK_occurred = FALSE;
+BOOLEAN        CTRLC_occurred = FALSE;
+BOOLEAN        DELEO_flag = TRUE;
+               
+/******************************************************************************/
+/* miscellaneous global variables                                             */
+/******************************************************************************/
+unsigned       undent_val;
+int            LINES_per_PAGE, TOP_margin, BOTTOM_margin;
+char           UNPRT_char;
+union          REGS regs;
+
+/******************************************************************************/
+/* scan and general statistical variables                                     */
+/******************************************************************************/
+unsigned       maxlnlen, maxlen, lnind;
+int            maxundent;
+unsigned long  olines, ovlines;
+unsigned long  longln;
+unsigned long  grchars, unprtchars;
+unsigned long  opages, ilines;
+
+
+/******************************************************************************/
+/* main                                                                       */
+/******************************************************************************/
+main(argc, argv)
+int            argc;
+char           *argv[];
+{
+/* local variables */
+   int            tovstrk;
+   int            ibufx, obufx;
+   int            page_lines;
+   int            marginx;
+   char           vfc_char, svfc_char;
+
+/* main code */
+   /* global initialization */
+   initialize(argc, argv);
+
+   /* main loop */
+   while (!EOF_flag) {
+      
+      /* get a page of lines */
+      page_lines = getpage();
+
+      /* process the page */
+      ibufx = 0;
+      while (ibufx < page_lines) {
+
+         /* did we get a user interrupt? */
+         if (BREAK_occurred || CTRLC_occurred)
+            ctrl_brk();
+
+         /* set up the base VFC */
+         if (ibufx == 0 && opages > 1l)
+            vfc_char = VFC_TPU1;
+         else
+            vfc_char = VFC_PU1;
+
+         /* modify the VFC character if at top of page */
+         if (ibufx == 0 && TOP_margin > 0) {
+            marginx = TOP_margin;
+            while (marginx > 15) {
+               fprintf(outfile, "%c\n", vfc_char+14);
+               if (ferror(outfile))
+                  errxit(ERR_WRITE);
+               olines++;
+               marginx -= 15;
+               vfc_char = VFC_PU1;
+               }
+            vfc_char += (char)(marginx - 1);
+            if (*ibufptr[0] != '\n') {
+               fprintf(outfile, "%c\n", vfc_char);
+               if (ferror(outfile))
+                  errxit(ERR_WRITE);
+               olines++;
+               vfc_char = VFC_PU1;
+               }
+            else
+               vfc_char++;
+            }
+
+         /* is there any overstriking? */
+         if (strcspn(ibufptr[ibufx], "\b\r") == strlen(ibufptr[ibufx]))
+
+            /* no, just output the line */
+            ibufx = output_line(vfc_char, ibufx, page_lines, ibufptr[ibufx]);
+         else {
+
+            /* yes, build the overstrike lines */
+            tovstrk = build_output(ibufptr[ibufx]);
+
+            /* set up the vfc characters and output the lines */
+            svfc_char = vfc_char;
+            for (obufx = 0; obufx < tovstrk; obufx++) {
+               if (svfc_char == VFC_PU1 && obufx < tovstrk-1)
+                  vfc_char = VFC_PU0;
+               else if (ibufx == 0 && obufx == 0) {
+                  vfc_char = VFC_TPU0;
+                  svfc_char = VFC_PU1;
+                  }
+               else
+                  vfc_char = svfc_char;
+               ibufx = output_line(vfc_char, ibufx, page_lines, obufptr[obufx]);
+               } /* for each output line */
+
+            /* free the overstrike line buffers */
+            free_bufarray(obufptr, tovstrk);
+
+            /* free the array of pointers to overstrike line buffers */
+            free(obufptr);
+            } /* else the line has overstriking */
+         } /* while not at end of page */
+
+      /* free the input line buffers */
+      free_bufarray(ibufptr, page_lines);
+      } /* while not at end of file */
+
+   /* print a summary of the process */
+   print_summary();
+
+   /* clean up and exit normally */
+   cleanup(0);
+   fprintf(stderr, "\n%s completed successfully.\n", progname);
+   return (0);
+}
+
+
+/******************************************************************************/
+/* getpage - get a page of lines                                              */
+/******************************************************************************/
+getpage()
+{
+   int            plines;
+
+   /* get a page of lines */
+   plines = 0;
+   while (plines < LINES_per_PAGE)
+
+      /* get an input line */
+      if ((ibufptr[plines] = getline(infile)) != NULL)
+         plines++;
+      else
+         break;
+
+   /* get rid of blank input lines at the end of the page (if any) */
+   while (plines > 1 && *ibufptr[plines-1] == '\n')
+      free(ibufptr[--plines]);
+
+   /* if this is the last page and there is only a blank line get rid of it */
+   if (EOF_flag && plines == 1 && *ibufptr[0] == '\n')
+      free(ibufptr[--plines]);
+   else
+      opages++;
+   return (plines);
+}
+
+
+/******************************************************************************/
+/* getline - allocates and reads an input line                                */
+/******************************************************************************/
+char *getline(strm)
+FILE           *strm;
+{
+   int            bufsize;
+   int            bytesrd;
+   unsigned int   i;
+   unsigned int   buflen;
+   char           *buf;
+   static BOOLEAN EOP_flag = FALSE;
+
+   /* if we just got a form feed on the last pass don't return a line */
+   if (EOP_flag) {
+      EOP_flag = FALSE;
+      return (NULL);
+      }
+
+   /* allocate an input line buffer */
+   bufsize = 512;
+   if ((buf = (char *)malloc(bufsize)) == NULL)
+      errxit(ERR_NOMEM);
+   i = 0;
+   while (!EOF_flag) {
+
+      /* check for break */
+      if (BREAK_occurred || CTRLC_occurred)
+         ctrl_brk();
+
+      /* if we need some more data, get some */
+      if (bufptr == eobuf) {
+         if (strm == stdin)
+            if (fgets(rdbuf, 2048, strm) != NULL) {
+               bufptr = rdbuf;
+               eobuf = bufptr + strlen(rdbuf);
+               }
+            else
+               EOF_flag = TRUE;
+         else {
+            if ((bytesrd = read(fileno(strm), rdbuf, 2048)) > 0) {
+               bufptr = rdbuf;
+               eobuf = bufptr + bytesrd;
+               }
+            else if (bytesrd == 0) {
+               EOF_flag = TRUE;
+               bufptr = eobuf = rdbuf;
+               }
+            else {
+               sprintf(errbuf, "...%s: error reading file %s", progname, file1);
+               perror(errbuf);
+               fprintf(stderr, "...%s: output file %s may be incomplete\n",
+                               progname, file2);
+               free(buf);
+               EOF_flag = TRUE;
+               return (NULL);
+               }
+            }
+         }
+
+      /* move characters from the read buffer to the line buffer */
+restart:
+      while (bufptr < eobuf) {
+         switch (*bufptr) {
+            case '\r':
+               if (LF_flag) {
+                  LF_flag = FALSE;
+                  bufptr++;
+                  goto restart;
+                  }
+               if (CR_flag)
+                  i--;
+               else
+                  CR_flag = TRUE;
+               break;
+            case ASCII_FF:
+               LF_flag = FALSE;
+               EOP_flag = TRUE;
+               goto finishln;
+               break;
+            case '\n':
+               LF_flag = TRUE;
+finishln:
+               if (CR_flag) {
+                  i--;
+                  CR_flag = FALSE;
+                  }
+               else if (EOF_flag)
+                  if (i == 1 && buf[0] == ASCII_SUB) {
+                     free(buf);
+                     return (NULL);
+                     }
+               buf[i] = '\n';
+               if (i >= bufsize-1) {
+                  bufsize++;
+                  if ((buf = (char *)realloc(buf, bufsize)) == NULL)
+                     errxit(ERR_NOMEM);
+                  }
+               buf[++i] = '\0';
+               bufptr++;
+               if ((buflen = strlen(buf)) > 1)
+                  if (strcspn(buf, " \b\t\r\n") == buflen) {
+                     buf[0] = '\n';
+                     buf[1] = '\0';
+                     buf = (char *)realloc(buf, 2);
+                     }
+                  else {
+                     buf = detab(buf);
+                     make_printable(buf);
+                     }
+               ilines++;
+               return (buf);
+               break;
+            default:
+               LF_flag = CR_flag = FALSE;
+               break;
+            }
+         buf[i++] = *(bufptr++);
+         if (i >= bufsize-1) {
+            bufsize += 128;
+            if ((buf = (char *)realloc(buf, bufsize)) == NULL)
+               errxit(ERR_NOMEM);
+            }
+         }
+      }
+   if (i > 0)
+      goto finishln;
+   else
+      return (NULL);
+}
+
+
+/******************************************************************************/
+/* count_tabs - count the number of tab characters in the line                */
+/******************************************************************************/
+count_tabs(bufptr)
+char           *bufptr;
+{
+   unsigned int   ntabs;
+
+   ntabs = 0;
+   while (*bufptr != '\0')
+      ntabs += (unsigned int)(*bufptr++ == '\t');
+   return (ntabs);
+}
+
+
+/******************************************************************************/
+/* detab - expand tabs using the IBM standard columns of 9,17,25,...          */
+/******************************************************************************/
+char *detab(bufptr)
+char           *bufptr;
+{
+   char           *tbuf;
+   char           *retptr;
+   unsigned int   tcharx, blankx, colpos, nblanks, ntabs;
+   
+   retptr = bufptr;
+   if ((ntabs = count_tabs(bufptr)) > 0) {
+ 
+      /* make sure the buffer is large enough to hold the detabed line */
+      if ((retptr = (char *)realloc(retptr, strlen(retptr)+ntabs*8+1)) == NULL)
+         errxit(ERR_NOMEM);
+      tcharx = colpos = 0;
+
+      /* get a buffer for expanding the tabs in the input buffer */
+      if ((tbuf = (char *)calloc(strlen(bufptr)+ntabs*8+1, sizeof(char))) == NULL)
+         errxit(ERR_NOMEM);
+      while (*bufptr != '\0') {
+         switch (*bufptr) {
+            case '\b':                        /* Back Space */
+               if (colpos > 0)
+                  colpos--;
+               tbuf[tcharx++] = '\b';
+               break;
+            case '\r':                        /* Carriage Return */
+               tbuf[tcharx++] = '\r';
+               colpos = 0;
+               break;
+            case '\t':                        /* Tab */
+               tbuf[tcharx++] = ' ';
+               nblanks = 7 - colpos % 8;
+               for (blankx = 0; blankx < nblanks; blankx++) {
+                  tbuf[tcharx++] = ' ';
+                  colpos++;
+                  }
+               colpos++;
+               break;
+            default:
+               tbuf[tcharx++] = *bufptr;
+               colpos++;   
+            }
+         bufptr++;
+         }
+
+      /* move the detabbed line back where it started */
+      /* bufptr points at a buffer that is able to hold the expanded line */
+      strcpy(retptr, tbuf);
+      free(tbuf);
+
+      /* free some of the buffer if we can */
+      if ((retptr = (char *)realloc(retptr, strlen(retptr)+1)) == NULL)
+         errxit(ERR_NOMEM);
+      }
+
+   return (retptr);
+}
+
+
+/******************************************************************************/
+/* make_printable - turn all IBM extended characters into ASCII printables    */
+/******************************************************************************/
+void make_printable(inbuf)
+unsigned char  *inbuf;
+{
+
+   /* translate non-ASCII characters into something printable on CP-6 */
+   while (*inbuf != ASCII_NUL) {
+      if (!isprint(*inbuf))
+         if (*inbuf < ASCII_BS || *inbuf > ASCII_CR || *inbuf == ASCII_VT) {
+            if ((GR_switch || SCAN_switch) &&
+                *inbuf > (unsigned char)'\xb2' &&
+                *inbuf < (unsigned char)'\xdb') {
+               if (!SCAN_switch && !GRPRT_flag) {
+                  fprintf(stderr, "...IBM line graphics characters were encountered.\n");
+                  GRPRT_flag = TRUE;
+                  }
+               *inbuf = grascx[*inbuf-(unsigned char)'\xb3'];
+               grchars++;
+               }
+            else {
+               *inbuf = UNPRT_char;
+               unprtchars++;
+               if (!SCAN_switch && !UNPRPRT_flag) {
+                  fprintf(stderr, "...The input file has characters that aren't printable on CP-6.\n");
+                  UNPRPRT_flag = TRUE;
+                  }
+               }
+            }
+      inbuf++;
+      }
+   return;
+}
+
+
+/******************************************************************************/
+/* priortize - when killing overstriking this routine chooses between two     */
+/*             characters to determine which one to keep                      */
+/******************************************************************************/
+char prioritize(oldchr, newchr)
+char           oldchr, newchr;
+{
+   if (isalnum(oldchr))
+      return (oldchr);
+   else if (isalnum(newchr))
+      return (newchr);
+   else
+      return (oldchr);
+}
+
+
+/******************************************************************************/
+/* build_output - build the output lines                                      */
+/******************************************************************************/
+int build_output(inbuf)
+char           inbuf[];
+{
+   unsigned int   ibuflen, tovstrk, colpos, charx, ovstrkx, numobufs;
+   int            *ovstrk;
+
+   /* allocate an array of pointers to potential output buffers */
+   numobufs = 20;
+   if ((obufptr = (char **)calloc(numobufs, sizeof(char *))) == NULL)
+      errxit(ERR_NOMEM);
+
+   /* allocate an array of overstrike counters */
+   ibuflen = strlen(inbuf);
+   if ((ovstrk = (unsigned int *)calloc(ibuflen+1, sizeof(int))) == NULL)
+      errxit(ERR_NOMEM);
+
+   /* allocate the first output buffer */
+   obufptr[0] = alloc_string(ibuflen);
+
+   /* build the overstrike lines */
+   tovstrk = charx = colpos = 0;
+   while (inbuf[charx] != '\0') {
+      switch (inbuf[charx]) {
+         case '\b':
+            if (colpos > 0)
+               colpos--;
+            break;
+         case '\r':
+            colpos = 0;
+            break;
+         case '\n':
+            for (ovstrkx = 0; ovstrkx <= tovstrk; ovstrkx++) {
+               colpos = ibuflen;
+               while (obufptr[ovstrkx][colpos-1] == ' ' && colpos > 0)
+                  colpos--;
+               obufptr[ovstrkx][colpos++] = '\n';
+               obufptr[ovstrkx][colpos] = '\0';
+               }
+            break;
+         case ' ':
+            colpos++;
+            break;
+         default:
+
+            /* if there are no overstrikes allowed, choose a character */
+            if (KOVSTRK_switch)
+               obufptr[0][colpos++] = prioritize(obufptr[0][colpos], inbuf[charx]);
+            else {
+               if (obufptr[ovstrk[colpos]][colpos] != ' ') {
+
+                  /* do we need to allocate another output buffer? */
+                  if (ovstrk[colpos] == tovstrk) {
+
+                     /* if necessary, allocate the some more pointer space */
+                     if (++tovstrk == numobufs)
+                        if ((obufptr = (char **)realloc(obufptr, sizeof(char *)*(++numobufs))) == NULL)
+                           errxit(ERR_NOMEM);
+
+                     /* allocate the next output buffer */
+                     obufptr[tovstrk] = alloc_string(ibuflen);
+                     }
+                  ovstrk[colpos]++;
+                  }
+               obufptr[ovstrk[colpos]][colpos] = inbuf[charx];
+               colpos++;
+               }
+            break;
+         } /* switch input character */
+      charx++;
+      } /* while not at end of input line */
+
+   /* get rid of the array of overstrike counters */
+   free(ovstrk);
+   return (tovstrk+1);
+}
+
+
+/******************************************************************************/
+/* output_line - either gather statistics or output the line                  */
+/******************************************************************************/
+int output_line(vfc_char, ibufx, lastbufx, bufptr)
+char           vfc_char;
+unsigned int   ibufx, lastbufx;
+char           *bufptr;
+{
+   /* if we can, do some output optimization */
+   if (!NOOPTVFC_switch && vfc_char != VFC_PU0 && vfc_char != VFC_TPU0) {
+      if (lastbufx - ibufx > 13)
+         lastbufx = ibufx + 13;
+      while (ibufx <= lastbufx)
+         if (undent_val >= strlen(ibufptr[ibufx+1]) - 1 ||
+             *ibufptr[ibufx+1] == '\n') {
+            vfc_char++;
+            ibufx++;
+            }
+         else
+            break;
+      }
+
+   /* either just collect some statistics or output the line */
+   if (SCAN_switch)
+      scan(bufptr);
+   else {
+      if (undent_val >= strlen(bufptr))
+         fprintf(outfile, "%c\n", vfc_char);
+      else
+         fprintf(outfile, "%c%s%s", vfc_char, indent_str, bufptr+undent_val);
+      if (ferror(outfile))
+         errxit(ERR_WRITE);
+      }
+   olines++;
+
+   /* tell the caller which input line to process next */
+   if (vfc_char != VFC_PU0 && vfc_char != VFC_TPU0)
+      ++ibufx;
+   return (ibufx);
+}
+
+
+/******************************************************************************/
+/* scan - gather incremental statistics on the file                           */
+/******************************************************************************/
+void scan(buf)
+char           *buf;
+{
+   int            buflen;
+
+   if ((buflen = strlen(buf)) > 1) {
+      lnind = strspn(buf, " \n");
+      if (maxundent == -1 || maxundent > lnind)
+         maxundent = lnind;
+      if (maxlen < buflen - 1)
+         maxlen = buflen - 1;
+      if (buflen > 85)
+         longln++;
+      }
+   return;
+}
+
+
+/******************************************************************************/
+/* alloc_string - allocate a string of length len and concat a '\0'           */
+/******************************************************************************/
+char *alloc_string(len)
+int            len;
+{
+   char           *bufptr;
+
+   if ((bufptr = (char *)malloc(len+1)) == NULL)
+      errxit(ERR_NOMEM);
+   else {
+      memset(bufptr, ' ', len);
+      *(bufptr+len) = '\0';
+      return (bufptr);
+      }
+}
+
+                
+/******************************************************************************/
+/* free_bufarray - free an array of buffers                                   */
+/******************************************************************************/
+void free_bufarray(arrayptr, num)
+void           **arrayptr;
+int            num;
+{
+   int            i;
+
+   for (i = 0; i<num; i++)
+      free(arrayptr[i]);
+
+   return;
+}
+
+
+/******************************************************************************/
+/* print_summary - print a summary of the process                             */
+/******************************************************************************/
+void print_summary()
+{
+   /* strings for singular and plural output */
+   static char    *singular_str = "";
+   static char    *plural_str = "s";
+   static char    *was_str = "was";
+   static char    *were_str = "were";
+   static char    *grstr, *olistr, *ilistr, *uptstr, *mxlstr, *pgsstr, *llstr;
+   static char    *iliwstr, *grwstr, *llwstr, *uptwstr;
+                  
+   grstr = olistr = ilistr = uptstr = mxlstr = pgsstr = llstr = plural_str;
+   iliwstr = grwstr = llwstr = uptwstr = were_str;
+   if (opages == 1l)
+      pgsstr = singular_str;
+   if (ilines == 1l) {
+      iliwstr = was_str;
+      ilistr = singular_str;
+      }
+   if (olines == 1l)
+      olistr = singular_str;
+   if (grchars == 1l) {
+      grwstr = was_str;
+      grstr = singular_str;
+      }
+   if (unprtchars == 1l) {
+      uptwstr = was_str;
+      uptstr = singular_str;
+      }
+   if (maxlen == 1)
+      mxlstr = singular_str;
+   if (longln == 1l) {
+      llstr = singular_str;
+      llwstr = was_str;
+      }
+   fprintf(stderr, "\nSummary:\n");
+   if (SCAN_switch) {
+      fprintf(stderr, "   Input file: %s\n", file1);
+      fprintf(stderr, "   There %s %ld input line%s.\n", iliwstr, ilines, ilistr);
+      fprintf(stderr, "   %ld line%s (%ld page%s) would be output.\n", olines, olistr, opages, pgsstr);
+      fprintf(stderr, "   The longest output line has %d character%s.\n", maxlen, mxlstr);
+      if (longln > 0l)
+         fprintf(stderr, "   There %s %ld line%s with more than 84 characters.\n", llwstr, longln, llstr);
+      if (maxundent > 0)
+         fprintf(stderr, "   The maximum undent value that won't cause loss of characters is %d.\n", maxundent);
+      else
+         fprintf(stderr, "   You would lose some text if you undented.\n");
+      if (grchars > 0l) {
+         fprintf(stderr, "   %ld IBM line graphics character%s could be translated.\n", grchars, grstr);
+         if (unprtchars > 0l)
+            fprintf(stderr, "   %ld other unprintable character%s %s found.\n", unprtchars, uptstr, uptwstr);
+         }
+      else if (unprtchars > 0l)
+         fprintf(stderr, "   %ld unprintable character%s %s found.\n", unprtchars, uptstr, uptwstr);
+      }
+   else {
+      fprintf(stderr, "   Input file: %s, Output file: %s\n", file1, file2);
+      fprintf(stderr, "   %ld line%s input, %ld line%s (%ld page%s) output.\n", ilines, ilistr, olines, olistr, opages, pgsstr);
+      if (grchars > 0l) {
+         fprintf(stderr, "   %ld IBM line graphics character%s %s translated.\n", grchars, grstr, grwstr);
+         if (unprtchars > 0l)
+            fprintf(stderr, "   %ld other unprintable character%s %s changed to '%c'.\n", unprtchars, uptstr, uptwstr, UNPRT_char);
+         }
+      else if (unprtchars > 0l)
+         fprintf(stderr, "   %ld unprintable character%s %s changed to '%c'.\n", unprtchars, uptstr, uptwstr, UNPRT_char);
+      }
+   return;
+}
+
+
+/******************************************************************************/
+/* initialize - initialize global variables and parse the command line        */
+/******************************************************************************/
+void initialize(argc, argv)
+int            argc;
+char           *argv[];
+{
+   int            i, j;
+   int            nfiles;
+
+   /* initialize variables */
+   nfiles = 0;
+   undent_val = 0;
+   maxundent = -1;
+   ilines = olines = ovlines = opages = longln = grchars = unprtchars = 0l;
+   maxlen = 0;
+   TOP_margin = BOTTOM_margin = 0;
+   LINES_per_PAGE = 66;
+   OVER_switch = NOOPTVFC_switch = KOVSTRK_switch = FALSE;
+   SCAN_switch = GR_switch = FALSE;
+   UNPRPRT_flag = GRPRT_flag = FALSE;
+   EOF_flag = FF_flag = LF_flag = FALSE;
+   DELEO_flag = TRUE;
+   UNPRT_char = '#';
+
+   /* check OS version and set up program name accordingly */
+   if (_osmajor < 3)
+      strcpy(progname, "cf2vfc");
+   else {
+      i = strlen(argv[0]) - 4;
+      argv[0][i--] = '\0';
+      while (argv[0][i] != '\\' && argv[0][i] != ':')
+         i--;
+      strcpy(progname, &argv[0][i+1]);
+      strlwr(progname);
+      }
+
+   /* print out greeting */
+   fprintf(stderr, " %s v%s\n", progname, version);
+
+   for (i = 1; i < argc; i++) {
+      strupr(argv[i]);
+      switch (*argv[i]) {
+         case '/':
+         case '-':
+            argv[i]++;
+            while (*argv[i] != '\0') {
+               switch (*argv[i]) {
+                  case 'B':
+                     if ((BOTTOM_margin = atoi(argv[i]+1)) < 0) {
+                        fprintf(stderr, "...The bottom margin value must be non-negative.\n");
+                        abort();
+                        }
+                     while (isdigit(*(argv[i]+1)) || *(argv[i]+1) == '-')
+                        argv[i]++;
+                     break;
+                  case 'D':
+                     DELEO_flag = FALSE;
+                     break;
+                  case 'G':
+                     GR_switch = TRUE;
+                     break;
+                  case 'H':
+                  case '?':
+                     help(0);
+                     exit(0);
+                     break;
+                  case 'I':
+                     j = atoi(argv[i]+1);
+                     if (j < 0)
+                        undent_val = abs(j);
+                     else
+                        indent_str = alloc_string(j);
+                     while (isdigit(*(argv[i]+1)) || *(argv[i]+1) == '-')
+                        argv[i]++;
+                     break;
+                  case 'K':
+                     KOVSTRK_switch = TRUE;
+                     break;
+                  case 'L':
+                     LINES_per_PAGE = atoi(argv[i]+1);
+                     while (isdigit(*(argv[i]+1)) || *(argv[i]+1) == '-')
+                        argv[i]++;
+                     break;
+                  case 'N':
+                     NOOPTVFC_switch = TRUE;
+                     break;
+                  case 'O':
+                     OVER_switch = TRUE;
+                     break;
+                  case 'S':
+                     SCAN_switch = TRUE;
+                     GR_switch = TRUE;
+                     break;
+                  case 'T':
+                     if ((TOP_margin = atoi(argv[i]+1)) < 0) {
+                        fprintf(stderr, "...The top margin must be non-negative.\n");
+                        abort();
+                        }
+                     while (isdigit(*(argv[i]+1)) || *(argv[i]+1) == '-')
+                        argv[i]++;
+                     break;
+                  case 'U':
+                     if ((UNPRT_char = *(argv[i]+1)) == '\0')
+                        UNPRT_char = ' ';
+                     else if (isprint(UNPRT_char))
+                        argv[i]++;
+                     else {
+                        fprintf(stderr, "...The replacement character for unprintables must be printable.\n");
+                        abort();
+                        }
+                     break;
+                  default:
+                     fprintf(stderr, "...Illegal Option [%c].\n", *argv[i]);   
+                     help(2);
+                     exit(3);
+                     break;
+                  }
+               argv[i]++;
+               }
+            break;
+         default:
+            switch (nfiles) {
+               case 0:
+                  file1 = argv[i];
+                  strlwr(file1);
+                  break;
+               case 1:
+                  file2 = argv[i];
+                  strlwr(file2);
+                  break;
+               default:
+                  fprintf(stderr, "...Too many files were specified.\n");
+                  help(1);
+                  abort();
+                  break;
+               }
+            nfiles++;
+         }   
+      }
+
+   if (indent_str == NULL)
+      indent_str = "";
+   if ((LINES_per_PAGE -= BOTTOM_margin + TOP_margin) < 1) {
+      fprintf(stderr, "...There must be at least 1 line per page.\n");
+      fprintf(stderr, "   Check your Top and Bottom Margin values.\n");
+      abort();
+      }
+   if (nfiles == 0) {
+      infile = stdin;
+      file1 = stdinstr;
+      }
+   else if ((infile = fopen(file1, "rb")) == NULL) {
+      fprintf(stderr, "...Couldn't open file %s for input.\n", file1);
+      abort();
+      }
+   if (!SCAN_switch)
+      if (nfiles <= 1) {
+         outfile = stdout;
+         file2 = stdoutstr;
+         }
+      else {
+         if (!OVER_switch)
+            if ((outfile = fopen(file2, "r")) != NULL) {
+               fprintf(stderr, "...The output file %s already exists.\n", file2);
+               abort();
+               }
+         if ((outfile = fopen(file2, "w")) == NULL) {
+            fprintf(stderr, "...Couldn't create file %s.\n", file2);
+            abort();
+            }
+         }
+   if (((bufptr = eobuf = rdbuf = (char *)malloc(2048)) == NULL) ||
+       ((ibufptr = (char **)calloc(LINES_per_PAGE, sizeof(char *)))) == NULL)
+      errxit(ERR_NOMEM);
+
+   /* set up interrupt handlers */
+   orig_1b_hndlr = _dos_getvect(INTR_1B);
+   orig_23_hndlr = _dos_getvect(INTR_23);
+   _dos_setvect(INTR_1B, int1b_hndlr);
+   _dos_setvect(INTR_23, int23_hndlr);
+
+   return;
+}
+
+
+/******************************************************************************/
+/* help - print some hopefully useful information for the user                */
+/******************************************************************************/
+void help(hlptyp)
+int         hlptyp;
+{
+   switch (hlptyp) {
+      case 0:
+         break;
+      case 1:
+         goto prtsyn;
+         break;
+      case 2:
+         goto prtopts;
+         break;
+      default:
+         break;
+      }
+
+   fprintf(stderr, "   %s - Translate continuous form to CP-6 unit record format.\n\n", progname);
+prtsyn:
+   fprintf(stderr, "   Syntax:  %s [options] [input-file [output-file]]\n\n", progname);
+   fprintf(stderr, "            The input and output files default to stdin\n");
+   fprintf(stderr, "            and stdout, respectively.  Options may be concatenated.\n\n");
+   fprintf(stderr, "   Example: %s /gnoi-8u$ file.d1 file.d2\n\n", progname);
+   fprintf(stderr, "   Note:    <Ctrl-Break> and <Ctrl-C> may be used to interrupt\n");
+   fprintf(stderr, "            processing.  Both will print an intermediate summary.\n");
+   fprintf(stderr, "            In the case of <Ctrl-Break> the process will continue,\n");
+   fprintf(stderr, "            whereas, <Ctrl-C> will cause the process to terminate.\n\n");
+   if (hlptyp == 1) {
+      fprintf(stderr, "   For more help invoke %s with the /? option.\n", progname);
+      return;
+      }
+prtopts:
+   fprintf(stderr, "   Legal Options Are:\n");
+   fprintf(stderr, "     /Bnn        Set Bottom Margin to nn lines.\n");
+   fprintf(stderr, "     /D          Don't delete the output file when %s terminates\n", progname);
+   fprintf(stderr, "                 abnormally.\n");
+   fprintf(stderr, "     /G          Translate IBM line graphics to '|', '-', '+' and '='.\n");
+   fprintf(stderr, "     /H, /?      This message.\n");
+   fprintf(stderr, "     /I[[-][nn]] Indent [-]nn spaces.\n");
+   fprintf(stderr, "     /Lnn        Page length.\n");
+   fprintf(stderr, "     /N          Don't optimize VFC.  No VFC optimizations\n");
+   fprintf(stderr, "                 other than top of form and deleting blank\n");
+   fprintf(stderr, "                 lines at the end of a page will be done.\n");
+   fprintf(stderr, "     /O          Overwrite output-file if it already exists.\n");
+   fprintf(stderr, "     /K          Remove overstrikes according to the following\n");
+   fprintf(stderr, "                 priorities:\n");
+   fprintf(stderr, "                    1.  the leftmost character in the record has the\n");
+   fprintf(stderr, "                        highest priority, all other things being equal\n");
+   fprintf(stderr, "                    2.  alphanumeric\n");
+   fprintf(stderr, "                    3.  printable ascii\n");
+   fprintf(stderr, "                    4.  if both are unprintable either the '#' character\n");
+   fprintf(stderr, "                        or the character specified in the /U option is\n");
+   fprintf(stderr, "                        used.\n");
+   fprintf(stderr, "     /S          Scan the input file to determine the maximum output\n");
+   fprintf(stderr, "                 line length (not including the VFC character) and\n");
+   fprintf(stderr, "                 safe undent value.  No output file will be created.\n");
+   fprintf(stderr, "                 However, a summary report for the input and output\n");
+   fprintf(stderr, "                 files will be produced.  The K, N, B, L and T options\n");
+   fprintf(stderr, "                 will affect the summary report for the output file.\n");
+   fprintf(stderr, "     /Tnn        Set Top Margin to nn lines.\n");
+   fprintf(stderr, "     /Uc         Translate unprintable characters to c.  Note that if a\n");
+   fprintf(stderr, "                 blank is desired this must be the last option.\n");
+
+   return;
+}
+
+
+/******************************************************************************/
+/* errxit - exit abnormally                                                   */
+/******************************************************************************/
+void errxit(error_code)
+int            error_code;
+{
+   switch (error_code) {
+      case ERR_NOMEM:
+         fprintf(stderr, "...%s: couldn't allocate enough memory.\n", progname);
+         break;
+      case ERR_WRITE:
+         sprintf(errbuf, "...%s: error writing to %s", progname, file2);
+         perror(errbuf);
+         break;
+      case ERR_BREAK:
+         fprintf(stderr, "...%s: processing interrupted by user.\n", progname);
+         break;
+      default:
+         break;
+      }
+
+   cleanup(1);
+   abort();
+}
+
+
+/******************************************************************************/
+/* cleanup - restore original int vectors and close input and output files    */
+/******************************************************************************/
+void cleanup(exittyp)
+int      exittyp;
+{
+   /* close the files */
+   if (infile != stdin)
+      fclose(infile);
+   if (outfile != stdout) {
+      fclose(outfile);
+      if (exittyp && DELEO_flag)
+         remove(file2);   
+      }
+
+   /* restore int1b and int 23 handlers */
+   _dos_setvect(INTR_1B, orig_1b_hndlr);
+   _dos_setvect(INTR_23, orig_23_hndlr);
+
+   return;
+}
+
+
+/******************************************************************************/
+/* ctrl_brk - handle <CTRL-BREAK or CTRL-C> interrupts at a safe time         */
+/******************************************************************************/
+void ctrl_brk()
+{
+   char        ch;
+
+   /* print a summary */
+   fprintf(stderr, " %ld lines input, %ld lines (%ld pages) output.\n",
+           ilines, olines, opages);
+
+   if (CTRLC_occurred)
+      errxit(ERR_BREAK);
+   else
+      BREAK_occurred = FALSE;
+
+   return;
+}
+
+
+/******************************************************************************/
+/* int1b_hndlr - process int 1b                                               */
+/******************************************************************************/
+void interrupt cdecl far int1b_hndlr()
+{
+   BREAK_occurred = TRUE;
+
+   return;
+}
+
+
+/******************************************************************************/
+/* int23_hndlr - process int 23                                               */
+/******************************************************************************/
+void interrupt cdecl far int23_hndlr()
+{
+   CTRLC_occurred = TRUE;
+
+   return;
+}

@@ -1,0 +1,2112 @@
+
+
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    1    
+    1      /*M* LEX_STACKS  -- Parser stack and redefs for typed stack elements */
+    2      /*T***********************************************************/
+    3      /*T*                                                         */
+    4      /*T* Copyright (c) Bull HN Information Systems Inc., 1997    */
+    5      /*T*                                                         */
+    6      /*T***********************************************************/
+    7
+    8      /* Communications between LEX, PARSER, & SEMANTICS */
+    9
+   10    * %EQU LX_MAX = 2000 ;                                      /*#29032*/
+   11      %EQU LA_MAX = 70;
+   12
+   13
+   14      %MACRO LA_STK_INFO(LVL=2);
+   15          %(LVL)      ID      UBIN HALF UNAL,    /* identification number */
+   16          %(LVL)      B       UNAL,
+   17            %(LVL+1)      ERROR   BOOLEAN,
+   18            %(LVL+1)      ROUND   BOOLEAN,
+   19            %(LVL+1)      INTEGER BOOLEAN,
+   20            %(LVL+1)      ALL     BOOLEAN,
+   21    *       %(LVL+1)      NEGATE  BOOLEAN,
+   22    *       %(LVL+1)      *       BIT (1) ,
+   23            %(LVL+1)      HIGH_LEV BOOLEAN,
+   24            %(LVL+1)      *       BIT (11) ,
+   25          %(LVL)      FLAGS REDEF B BIT(18) UNAL,
+   26
+   27          %(LVL)      ST$     PTR,               /* PTR TO ST ITEM (EG, SCALAR)*/
+   28          %(LVL)      DNT$    PTR,               /* PTR TO LEXEME ITEM (IN DNT)*/
+   29          %(LVL)      SYMBOL  SBIN WORD,    /* TERMINAL NUMBER (IE, RW#)  */
+   30          %(LVL)      TYPE    UBIN WORD,    /* TYPE (EG, %TYI, %TYA, ETC) */
+   31          %(LVL)      LINE    UBIN WORD,    /* LINE# OF THIS OCCURRENCE    */
+   32          %(LVL)      COLUMN  UBIN WORD,    /* COL # OF THIS OCCURRENCE    */
+   33
+   34      %MEND;
+   35
+   36      DCL 1 LA_ITEM  BASED ALIGNED,
+   37            %LA_STK_INFO;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    2    
+   38            2 LINK    UBIN WORD ;   /* MAKES LOOK_AHEAD CIRCULAR  */
+   39
+   40      DCL 1 LX_ITEM BASED ALIGNED,
+   41            %LA_STK_INFO;
+   42            2 LINK     PTR;
+   43
+   44      %EQU LENGTH_LX_ITEM = 8;   /* length of the LX_ITEM structure */
+   45
+   46      %MACRO DCL_AUTO_LX_ITEM (@NAME = );
+   47
+   48        DCL 1 @NAME DALIGNED,
+   49              2 * (0:%(LENGTH_LX_ITEM - 1)) SBIN WORD ALIGNED;
+   50
+   51      %MEND;
+   52
+   53
+   54      %EJECT;
+
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    3    
+   55
+   56      /* Data structures which represent the abstract syntax tree */
+   57
+   58      /*V* Several conventions have been adopted for abstract syntax tree
+   59           data structures:
+   60
+   61            1) ID => Each node in the abstract syntax tree must contain
+   62                       an ID field which uniquely identifies the node.
+   63                       The ID field must be the first 18 bits of the
+   64                       structure.  Terminal symbols, for example, have an
+   65                       ID of %TERMINAL(0).  LX_LIST nodes have an
+   66                       ID of %LX_LIST.
+   67
+   68            2) LENGTH => Each node in the abstract syntax tree is
+   69                       "LENGTHW(LX_ITEM)" words (8) by convention.
+   70                       This is to allow manipulation of these nodes on
+   71                       the semantic stack without regard to node type.
+   72                       If you define a structure which differs in length
+   73                       from this convention, you must be responsible for
+   74                       all manipulations of this structure.  In particular,
+   75                       it must not be referenced on the semantic stack.
+   76
+   77            3) LINK => Most abstract syntax tree nodes may be linked into
+   78                       lists.  By convention, the link to the next node in
+   79                       the list must be kept in the last word of the node.
+   80                       This allows common routines to manipulate lists
+   81                       without regard to the node type on the list.
+   82
+   83            4) LIST NODE => One universal list structure has been defined -
+   84                       LX_LIST.  This list structure should be used
+   85                       whenever possible, so that common list processing can be
+   86                       performed on abstract syntax tree nodes.
+   87
+   88            5) B.ERROR => Most nodes in the abstract syntax tree contain
+   89                       an error bit, B.ERROR.  This flag signifies that
+   90                       a syntactic or semantic error has already occurred,
+   91                       so further cascaded semantic errors may result.
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    4    
+   92                       This bit is propagated up the semantic tree.  As
+   93                       each semantic error is detected, the associated error
+   94                       message should be suppressed, although semantic
+   95                       recovery must still be initiated.
+   96      */
+   97
+   98
+   99      /*V*
+  100          All access to the abstract syntax tree is provided through the
+  101          "semantic stack".  In particular, semantic actions have access
+  102          to abstract syntax tree nodes for each terminal and non-terminal
+  103          on the right hand side of each reduction.  This is accomplished
+  104          by referring to the LX_STK stack items down from the value of
+  105          LX_TOP.  For example, the production
+  106
+  107                       P ::= A B C {ACTION}
+  108
+  109          will be represented on the LX_STK when the semantic action
+  110          "ACTION" is executed by
+  111
+  112                       C <- LX_TOP
+  113                       B <- LX_TOP - 1
+  114                       A <- LX_TOP - 2
+  115
+  116          Each terminal symbol on the right hand side of a production is
+  117          represented by an abstract syntax tree node with an ID of %TERMIANL.
+  118          Non-terminals may have an arbitrary type of node, since the creation
+  119          of the node for each non-terminal is handled by the semantic actions.
+  120
+  121          Propagation of abstract syntax tree nodes up the tree  is  done by
+  122          using the left-most abstract syntax tree node on the right hand side
+  123          of the production for the node associated with the left hand side
+  124          non-terminal.  In the above example, the node associated with "A"
+  125          is at LX_STK(LX_TOP - 2) after the semantic action completes will
+  126          be used for the non-terminal "P".  It is the responsibility of the
+  127          semantic actions to set up the nodes for non-terminals, so that
+  128          node propagation will occur correctly.  Note that if the node for the
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    5    
+  129          left-most symbol on the right hand side is not changed, it is propagated
+  130          up the tree for the left hand side non-terminal.
+  131
+  132          Propagation of information up the abstract syntax tree is the method
+  133          of choice for semantic analysis.  As semantic checking and information
+  134          gathering is completed for each portion of the tree, the internal
+  135          language for this section of the program is then generated.
+  136
+  137      */
+  138
+  139
+  140
+  141      /* LX_ITEM.ID values for distinguishing tree nodes */
+  142
+  143      %EQU LX_TERMINAL   = 0;   /* for all terminal symbols returned by LEX */
+  144      %EQU LX_LARGE      = 1;
+  145      %EQU LX_LIST       = 2;
+  146      %EQU LX_REC_DECL   = 3;
+  147      %EQU NO_EXCEPTION_CLAUSE = 0;
+  148      %EQU LX_ETT_ITEM   = 4;
+  149      %EQU BINARY_OP     = 5;
+  150      %EQU UNARY_OP      = 6;
+  151      %EQU ILS_LIST      = 7;
+  152      %EQU COMPUTE_STMT  = 8;
+  153      %EQU ADD_STMT      = 9;
+  154      %EQU SUBTRACT_STMT = 10;
+  155      %EQU MULTIPLY_STMT = 11;
+  156      %EQU DIVIDE_STMT   = 12;
+  157      %EQU DEFERED_QUAL_ID = 13;
+  158      %EQU STRING_STMT = 14;
+  159      %EQU UNSTRING_STMT = 15;
+  160      %EQU CALL_STMT = 16;
+  161      %EQU READ_STMT = 17;
+  162      %EQU WRITE_STMT = 18;
+  163      %EQU DELETE_STMT = 19;
+  164      %EQU REWRITE_STMT = 20;
+  165      %EQU START_STMT = 21;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    6    
+  166
+  167       %EQU LX_REPORT_REC = 22;
+  168       %EQU DEFERED_ACTION = 23;
+  169       %EQU DEFERED_IDENTIFIER = 24;
+  170       %EQU DEFERED_SUM_CLAUSE_LIST = 25;
+  171       %EQU DEFERED_SUM_CLAUSE = 26;
+  172       %EQU DEFERED_ID_TREE = 27;
+  173
+  174       %EQU MIN_DEFERED_ACTION_SIZE = 6;
+  175       %EQU REPORT_REC_MAX_FIELD = 14;
+  176       %EQU NO_REPORT_TYPE = 0;
+  177       %EQU REPORT_HEADING = 1;
+  178       %EQU PAGE_HEADING = 2;
+  179       %EQU CONTROL_HEADING = 3;
+  180       %EQU CONTROL_HEADING_FINAL = 4;
+  181       %EQU TYPE_DETAIL = 5;
+  182       %EQU CONTROL_FOOTING = 6;
+  183       %EQU CONTROL_FOOTING_FINAL =7;
+  184       %EQU PAGE_FOOTING = 8;
+  185       %EQU REPORT_FOOTING = 9;
+  186       %EQU REPORT_LINE_INT = 1;
+  187       %EQU REPORT_LINE_PLUS = 2;
+  188       %EQU REPORT_LINE_NEXT_PAGE = 3;
+  189       %EQU NEXT_GROUP_INT = 1;
+  190       %EQU NEXT_GROUP_PLUS = 2;
+  191       %EQU NEXT_GROUP_NEXT_PAGE = 3;
+  192       %EQU PRE_NEXT_PAGE = 31;
+  193       %EQU REP_ACT_ID         = 0;
+  194       %EQU REP_ACT_ID_REF     = 1;
+  195       %EQU REP_ACT_ID_SUB     = 2;
+  196       %EQU REP_ACT_ID_SUB_REF = 3;
+  197
+  198       %EQU LX_CD_INPUT      = 28;
+  199       %EQU LX_CD_OUTPUT     = 29;
+  200       %EQU LX_CD_I_O        = 30;
+  201       %EQU CD_INPUT_OPTION  = 11;
+  202       %EQU CD_OUTPUT_OPTION = 6;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    7    
+  203       %EQU CD_I_O_OPTION    = 6;
+  204
+  205
+  206
+  207      %EJECT;
+
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    8    
+  208      /* Correspondence of non-terminals with abstract syntax tree nodes */
+  209
+  210      /* DATA DIVISION NODES
+  211
+  212      <ACCESS_mode_is>
+  213      <AREA_AREAS_opt>             => LX_TERMINAL
+  214      <AREA_opt>                   => LX_TERMINAL
+  215      <ARE_opt>                    => LX_TERMINAL
+  216      <ASCENDING_or_DESCENDING>    => LX_TERMINAL
+  217      <AT_opt>                     => LX_TERMINAL
+  218      <BY_opt>                     => LX_TERMINAL
+  219      <CATALOG-NAME_is>
+  220      <CD_I-O_clause>
+  221      <CD_I-O_clause_list>
+  222      <CD_input_clause>
+  223      <CD_input_clause_list>
+  224      <CD_mode_clause>
+  225      <CD_output_clause>
+  226      <CD_output_clause_list>
+  227      <CHARACTERS_opt>             => LX_TERMINAL
+  228      <CHARACTER_opt>              => LX_TERMINAL
+  229      <CLOSE_opt>                  => LX_TERMINAL
+  230      <COLLATING_opt>
+  231      <COMMA_DECIMAL-POINT>
+  232      <CONTAINS_opt>               => LX_TERMINAL
+  233      <CONTROL_is>
+  234      <EVERY_opt>                  => LX_TERMINAL
+  235      <FD_access_clause>
+  236      <FD_clause>
+  237      <FD_clause_list>
+  238      <FD_clause_list_opt>
+  239      <FILE_opt>                   => LX_TERMINAL
+  240      <FILLER_opt>                 => LX_TERMINAL
+  241      <FOR_opt>                    => LX_TERMINAL
+  242      <FROM_opt>                   => LX_TERMINAL
+  243      <IBM_channel_phrase>
+  244      <INDICATE_opt>               => LX_TERMINAL
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    9    
+  245      <INITIAL_opt>                => LX_TERMINAL
+  246      <IN_opt>                     => LX_TERMINAL
+  247      <IS_ARE_opt>                 => LX_TERMINAL
+  248      <IS_CONTAINS_opt>            => LX_TERMINAL
+  249      <IS_opt>                     => LX_TERMINAL
+  250      <I_O_clause>
+  251      <I_O_clause_list>
+  252      <I_O_control_clause>
+  253      <I_O_techniques>
+  254      <KEY_opt>                    => LX_TERMINAL
+  255      <LIMIT_is_opt>
+  256      <LINES_opt>                  => LX_TERMINAL
+  257      <LINE_LINES_opt>             => LX_TERMINAL
+  258      <MESSAGE_opt>                => LX_TERMINAL
+  259      <MODE_opt>                   => LX_TERMINAL
+  260      <NEXT_PAGE>                  => LX_TERMINAL (NEXT)
+  261      <NUMBER_opt>                 => LX_TERMINAL
+  262      <OCCURS_INDEX_clause>        => LX_LIST OF LX_TERMINAL(name)
+  263      <OCCURS_KEY_clause>          => LX_LIST (2 nodes)
+  264                                         Node 1) LX_TERMINAL ( ASC/DES)
+  265                                         Node 2) <qualified_id_list>
+  266      <OF_opt>                     => LX_TERMINAL
+  267      <OF_or_IN>                   => LX_TERMINAL
+  268      <ON_opt>                     => LX_TERMINAL
+  269      <OPERATIONAL_opt>            => LX_TERMINAL
+  270      <OPTIONAL_opt>               => LX_TERMINAL
+  271      <PROCEDURE_swap_div>
+  272      <PROGRAM_opt>                => LX_TERMINAL
+  273      <RECORDS_CHARS_opt>          => LX_TERMINAL
+  274      <RECORD_RECORDS_IS_ARE>
+  275      <RECORD_SORT_MERGE_opt>      => LX_TERMINAL
+  276      <SD_clause>
+  277      <SD_clause_list>
+  278      <SD_clause_list_opt>
+  279      <SIGN_opt>                   => LX_TERMINAL
+  280      <SIZE_opt>                   => LX_TERMINAL
+  281      <STATUS_opt>                 => LX_TERMINAL
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    10   
+  282      <SYMBOLIC_opt>               => LX_TERMINAL
+  283      <SYSTEM_GS>
+  284      <TAPE_opt>                   => LX_TERMINAL
+  285      <TIMES_opt>                  => LX_TERMINAL
+  286      <TO_opt>                     => LX_TERMINAL
+  287      <VALUE_IS>                   => LX_TERMINAL (VALUE,VALUES)
+  288      <VFC_clause>
+  289      <WHEN_opt>                   => LX_TERMINAL
+  290      <WITH_opt>                   => LX_TERMINAL
+  291      <WS_LINKAGE_CONSTANT>        => LX_TERMINAL
+  292      <WS_LINKAGE_CONSTANT_section> => LX_TERMINAL (WS,LINKAGE,CONSTANT)
+  293      <access_clause>
+  294      <alpha_constant>             => LX_TERMINAL
+  295      <alpha_constant_no_ALL>      => LX_TERMINAL
+  296      <alphabet_also_phrases>
+  297      <alphabet_literal_spec>
+  298      <alphabet_literal_specs>
+  299      <alphabet_name>
+  300      <alphabet_name_common>
+  301      <alphabet_phrase>
+  302      <alphabet_type>
+  303      <alternate_record_clause>
+  304      <arith_expr>
+  305      <author_para_opt>
+  306      <basic_access_type>
+  307      <basic_mnemonic_name>
+  308      <basic_select_clause>
+  309      <blank_clause>               => LX_TERMINAL (BLANK)
+  310      <block_clause>
+  311      <block_phrase>
+  312      <cd_name>
+  313      <code_set_clause>
+  314      <collating_sequence>
+  315      <common_initial_choice>
+  316      <common_initial_opt>
+  317      <communication_entry>
+  318      <communication_entry_list>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    11   
+  319      <communication_section>
+  320      <comp_default>
+  321      <computer_name>
+  322      <computer_special_opt>
+  323      <config_i_o>
+  324      <config_section>
+  325      <console_phrase>
+  326      <control_div>
+  327      <control_div_opt>
+  328      <currency_phrase>
+  329      <data_div>
+  330      <data_div_opt>
+  331      <data_name>                  => LX_TERMINAL
+  332      <data_name_filler_list>
+  333      <data_name_list>             => LX_LIST OF LX_TERMINAL
+  334      <data_record_clause>
+  335      <date_compiled_para_opt>
+  336      <date_written_para_opt>
+  337      <dd_clause>                  => LX_LARGE to LX_REC_DECL
+  338      <dd_clauses>                 => LX_LARGE to LX_REC_DECL
+  339      <decimal_phrase>
+  340      <default_clause>
+  341      <default_clause_list>
+  342      <default_section>
+  343      <default_section_opt>
+  344      <delimiter_clause>
+  345      <depending_on_qual_id_opt>   => <qualified_id> or LX_TERMINAL (EMPTY)
+  346      <dn_or_filler_opt>           => LX_TERMINAL (FILLER or name)
+  347      <end_key_clause>
+  348      <end_program>
+  349      <end_program_list>
+  350      <environ_div>
+  351      <environ_div_opt>
+  352      <external_clause>            => LX_TERMINAL (EXTERNAL)
+  353      <external_program>
+  354      <factor>
+  355      <file_control_entry>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    12   
+  356      <file_control_entry_list>
+  357      <file_control_entry_list_opt>
+  358      <file_description_entry>
+  359      <file_description_entry_list>
+  360      <file_name>                  => LX_TERMINAL
+  361      <file_name_list>
+  362      <file_name_position>
+  363      <file_name_position_list>
+  364      <file_section>
+  365      <file_status_clause>
+  366      <global_clause>              => LX_TERMINAL (GLOBAL)
+  367      <ident_div>
+  368      <ident_info_opt>
+  369      <ident_num-lit>
+  370      <identifier>
+  371      <identifier_list>
+  372      <input_output_section>
+  373      <installation_para_opt>
+  374      <int_or_int-TO-int>          => LX_LIST of LX_TERMINAL(per int)
+  375      <integer>                    => LX_TERMINAL
+  376      <integer_list>               => LX_LIST OF LX_TERMINAL
+  377      <internal_program>
+  378      <is_data_name_filler>
+  379      <justified_clause>           => LX_TERMINAL (RIGHT,EMPTY)
+  380      <label_clause>
+  381      <label_name>
+  382      <label_name_list>
+  383      <label_type>
+  384      <lead_trail>                 => LX_TERMINAL ( LEADING,TRAILING)
+  385      <level_no>                   => LX_TERMINAL (number or number_or_para)
+  386      <linage_bottom>
+  387      <linage_clause>
+  388      <linage_footing>
+  389      <linage_prefix>
+  390      <linage_top>
+  391      <line_number_clause>
+  392      <literal>                    => LX_TERMINAL
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    13   
+  393      <literal_thru>               => LX_LIST (1 or 2 nodes)
+  394                                        node 1) LX_TERMINAL (first literal)
+  395                                        node 2, if any) LX_TERMINAL (second literal)
+  396      <literal_thru_list>          => LX_LIST OF <literal_thru>
+  397      <memory_size>
+  398      <message_date_clause>
+  399      <message_time_clause>
+  400      <mnemonic_name>
+  401      <obj_computer_clause>
+  402      <obj_computer_clauses>
+  403      <object_computer_opt>
+  404      <off_phrase>
+  405      <on_off_phrase>
+  406      <on_phrase>
+  407      <on_rerun_file_opt>
+  408      <org_with_clause>
+  409      <organization_clause>
+  410      <organization_relative>
+  411      <padding_clause>
+  412      <page_format_clause>
+  413      <page_format_clause_list>
+  414      <page_phrase>
+  415      <picture_clause>             => LX_TERMINAL (picture_string)
+  416      <privacy_phrase_opt>
+  417      <proc_div>
+  418      <proc_div_opt>
+  419      <procedure_div_using>
+  420      <prog_col_sequence>
+  421      <program>
+  422      <program_name>               => LX_TERMINAL
+  423      <pwr>
+  424      <qualified_id>               => LX_LIST OF LX_TERMINAL
+  425      <qualified_id_integer>
+  426      <qualified_id_list>          => LX_LIST OF <qualified_id>
+  427      <qualified_id_lit>           => LX_TERMINAL or LX_LIST OF LX_ITEM
+  428      <queue_type>
+  429      <record_contains_clause>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    14   
+  430      <record_delimiter_name>
+  431      <record_description_entries> => LX_LARGE to LX_REC_DECL
+  432      <record_description_entry>   => LX_LARGE to LX_REC_DECL
+  433      <record_key_clause>
+  434      <record_varying_from_clause_opt>
+  435      <redefines_clause>           => LX_TERMINAL
+  436      <reference_modification>
+  437      <relative_key_clause>
+  438      <renames_clause>             => LX_LIST of <qualified_id> (1 or 2 nodes)
+  439      <report_clause>
+  440      <report_desc_clause>
+  441      <report_desc_clause_list>
+  442      <report_description_entries>
+  443      <report_description_entry>
+  444      <report_entry>
+  445      <report_entry_clause>
+  446      <report_entry_clause_list>
+  447      <report_entry_list>
+  448      <report_name>
+  449      <report_name_list>
+  450      <report_section>
+  451      <report_type>
+  452      <rerun_every_clause>
+  453      <reserve_clause>
+  454      <section>
+  455      <sections>
+  456      <security_para_opt>
+  457      <segment_limit>
+  458      <select_clause>
+  459      <select_clause_list>
+  460      <separate_character_opt>     => LX_TERMINAL (EMPTY,SEPARATE)
+  461      <sign_clause>                => LX_LIST (2 NODES)
+  462                                        node 1) LX_TERMINAL (LEADING,TRAILING)
+  463                                        node 2) LX_TERMINAL (SEPARATE,EMPTY)
+  464      <sign_is_opt>                => LX_TERMINAL (SIGN,EMPTY)
+  465      <source_computer_opt>
+  466      <special_names_clause>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    15   
+  467      <special_names_clause_list>
+  468      <special_names_opt>
+  469      <status_key_clause>
+  470      <sub_schema_section>
+  471      <subscript_list>
+  472      <subscripts>
+  473      <substitution_section>
+  474      <substitution_section_opt>
+  475      <sum_reset_clause_opt>
+  476      <sum_upon_clause_opt>
+  477      <switch_phrase>
+  478      <symbolic_char_phrase>
+  479      <symbolic_char_phrases>
+  480      <symbolic_phrase>
+  481      <sync_clause>                => LX_TERMINAL ( LEFT,RIGHT,EMPTY)
+  482      <sysin_phrase>
+  483      <sysout_phrase>
+  484      <tape_option>
+  485      <tape_option_list>
+  486      <term>
+  487      <text_length_clause>
+  488      <unary>
+  489      <usage_clause>               => LX_TERMINAL (COMP..DISPLAY)
+  490      <usage_is>
+  491      <usage_type>                 => LX_TERMINAL (COMP..DISPLAY)
+  492      <value_of_clause>
+  493      <value_of_name>
+  494      <value_of_name_list>
+  495
+  496      */
+  497      %EJECT;
+
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    16   
+  498      /* PROCEDURE DIVISION NODES
+  499
+  500      <ADD_body>
+  501      <ADD_to_no_round>
+  502      <ADVANCING_opt>              => LX_TERMINAL
+  503      <ALL_opt>                    => LX_TERMINAL
+  504      <ALL_or_LEADING>             => LX_TERMINAL
+  505      <ALL_or_LEADING_or_FIRST>    => LX_TERMINAL
+  506      <ALL_set_phrase>
+  507      <ALL_set_phrase_opt>
+  508      <ALTER_item>                 => LX_LIST(2) of <procedure_name>
+  509      <ALTER_list>                 => LX_LIST OF <ALTER_item>
+  510      <AND_condition>
+  511      <AND_list_cond_2>
+  512      <ASCENDING_or_DESCENDING>    => LX_TERMINAL
+  513      <ASC_DES_phrase>
+  514      <ASC_DES_phrases>
+  515      <AT_END_phrase>              => ILS_LIST
+  516      <AT_END_phrase_opt>          => LX_TERMINAL(EMPTY) or ILS_LIST
+  517      <AT_opt>                     => LX_TERMINAL
+  518      <BEFORE_AFTER>               => LX_TERMINAL
+  519      <BEGINNING_ENDING_ALL>       => LX_TERMINAL
+  520      <BEGINNING_ENDING_opt>       => LX_TERMINAL
+  521      <BY_opt>                     => LX_TERMINAL
+  522      <CALL_using_item>
+  523      <CALL_using_list>
+  524      <CLOSE_file_list>
+  525      <CLOSE_options_opt>
+  526      <COLLATING_opt>              => LX_TERMINAL
+  527      <CONTROL_swap_div>
+  528      <COUNT_in_phrase_opt>
+  529      <CURRENCY_opt>               => LX_TERMINAL
+  530      <CURRENT_opt>                => LX_TERMINAL
+  531      <DATA_opt>                   => LX_TERMINAL
+  532      <DELIMITER_in_phrase_opt>
+  533      <DISABLE_type>
+  534      <DISPLAY_options>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    17   
+  535      <DIVIDE_body>                => DIVIDE_STMT
+  536      <DIVIDE_no_round>            => DIVIDE_STMT
+  537      <DML_accept>
+  538      <DML_connect>
+  539      <DML_disconnect>
+  540      <DML_erase>
+  541      <DML_find>
+  542      <DML_finish>
+  543      <DML_get>
+  544      <DML_modify>
+  545      <DML_ready>
+  546      <DML_record_selection_expr>
+  547      <DML_set>
+  548      <DML_statement>
+  549      <DML_store>
+  550      <DML_use>
+  551      <EOP_phrase>
+  552      <EVAL_expression>
+  553      <EVAL_expression_list>
+  554      <EVAL_when_item>
+  555      <EVAL_when_list>
+  556      <EXAMINE_type>
+  557      <EXCEPTION_ERROR>            => LX_TERMINAL
+  558      <FILE_VOLUME>                => LX_TERMINAL
+  559      <FIRST_NEXT>                 => LX_TERMINAL
+  560      <FOR_opt>                    => LX_TERMINAL
+  561      <GLOBAL_opt>                 => LX_TERMINAL
+  562      <IDENTIFICATION_swap_div>
+  563      <INCLUDING_ONLY>             => LX_TERMINAL
+  564      <INITIAL_opt>                => LX_TERMINAL
+  565      <INPUT_OUTPUT_EXTEND>        => LX_TERMINAL
+  566      <INPUT_OUTPUT_opt>           => LX_TERMINAL
+  567      <INSPECT_1>                  => LX_LIST of <identifier> & <INSP_1_for_list>
+  568      <INSP_1_all_lead>            => LX_LIST of LX_LIST of <ident_alpha_list_no_ALL>
+  569                                                          & <INSP_1_before_after_opt>
+  570      <INSP_1_before_after_opt>    => LX_TERMINAL (empty) or LX_LIST of LX_LIST (1 or 2)
+  571      <INSP_1_for_list>            => LX_LIST of LX_LIST of LX_TERMINAL (CHARACTERS, ALL, or LEADING)
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    18   
+  572                                                          & <INSP_1_before_after_opt>
+  573                                                         or <INSP_1_all_lead>
+  574                                                          & [<identifier>]
+  575      <INSP_2_first>               => LX_LIST of LX_LIST of <ident_alpha_lit_no_ALL>
+  576                                                          & <ident_alpha_lit_no_ALL>
+  577                                                          & <INSP_1_before_after_opt>
+  578      <INSP_2_replace>             => LX_LIST of LX_LIST of LX_TERMINAL (CHARACTERS)
+  579                                                          & <ident_alpha_lit_no_ALL>
+  580                                                          & <INSP_1_before_after_opt>
+  581                                                         or LX_TERMINAL (ALL, ...)
+  582                                                          & <INSP_2_first>
+  583      <INSP_after>                 => LX_LIST of LX_TERMINAL & <ident_alpha_list_no_all>
+  584                                                 (AFTER)
+  585      <INSP_before>                => LX_LIST of LX_TERMINAL & <ident_alpha_list_no_all>
+  586                                                 (BEFORE)
+  587      <INVALID_clause>             => ILS_LIST
+  588      <IN_opt>                     => LX_TERMINAL
+  589      <IS_opt>                     => LX_TERMINAL
+  590      <KEY_opt>                    => LX_TERMINAL
+  591      <LINE_LINES_opt>             => LX_TERMINAL
+  592      <LINE_opt>                   => LX_TERMINAL
+  593      <MEMBERSHIP_opt>             => LX_TERMINAL
+  594      <MESSAGE_SEGMENT>            => LX_TERMINAL
+  595      <MESSAGE_opt>                => LX_TERMINAL
+  596      <MULTIPLY_body>              => MULTIPLY_STMT
+  597      <NEXT_SENTENCE>              => LX_TERMINAL(NEXT)
+  598      <NEXT_opt>                   => LX_TERMINAL
+  599      <NOT_condition>
+  600      <NO_DATA_clause>             => ILS_LIST
+  601      <OF_opt>                     => LX_TERMINAL
+  602      <OF_or_IN>                   => LX_TERMINAL
+  603      <ON_EXCEPTION_phrase>        => ILS_LIST
+  604      <ON_opt>                     => LX_TERMINAL
+  605      <OPEN_body>
+  606      <OPEN_file_name_rew_list>
+  607      <OPEN_no_rew_opt>
+  608      <OPEN_type>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    19   
+  609      <ORDER_opt>                  => LX_TERMINAL
+  610      <OR_opt>                     => LX_TERMINAL
+  611      <PERFORM_2>                  => LX_TERMINAL or LX_ETT_ITEM
+  612      <PERFORM_3>                  => LX_LIST(2) of LX_TERMINAL(BEFORE,AFTER) & <condition>
+  613      <PERFORM_4>                  => LX_LIST(2) of LX_TERMINAL(BEFORE, AFTER) & <VARYING_body>
+  614      <PERFORM_proc_phrase>        => LX_LIST of <procedure_name>
+  615      <PROCEED_TO_opt>             => LX_TERMINAL (PROCEED, empty)
+  616      <PROCESSING_opt>             => LX_TERMINAL
+  617      <READ_key_phrase_opt>
+  618      <RECORD_opt>                 => LX_TERMINAL
+  619      <REEL_UNIT_FILE_opt>         => LX_TERMINAL
+  620      <REFERENCES_opt>             => LX_TERMINAL
+  621      <RETRIEVAL_UPDATE_LOAD>      => LX_TERMINAL
+  622      <SEARCH_EQUAL>
+  623      <SEARCH_WHEN_1>
+  624      <SEARCH_WHEN_2>
+  625      <SEARCH_condition_2>
+  626      <SEND_advancing_type>
+  627      <SEND_rep_line_opt>
+  628      <SEND_with_phrase>
+  629      <SET_body>
+  630      <SET_body_3>
+  631      <SET_body_item_3>
+  632      <SORT_MERGE_output_GIVING>
+  633      <SORT_input>
+  634      <STANDARD_opt>               => LX_TERMINAL
+  635      <START_key_opt>
+  636      <START_rel_op>
+  637      <STRING_delimiter>           => LX_ETT_ITEM or LX_TERMINAL
+  638      <STRING_list>                => LX_LIST of LX_LIST of 2 nodes
+  639                                          1) <ident_alpha_list_no_ALL_list>
+  640                                          2) <STRING_delimiter>
+  641      <SUBTRACT_body>              => SUBTRACT_STMT
+  642      <SYSTEM_GS>
+  643      <TERMINAL_opt>               => LX_TERMINAL
+  644      <THAN_opt>                   => LX_TERMINAL
+  645      <THEN_opt>                   => LX_TERMINAL
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    20   
+  646      <TO_opt>                     => LX_TERMINAL
+  647      <UNSTRING_delim_list>
+  648      <UNSTRING_delimited_phrase_opt>
+  649      <UNSTRING_ident_list>
+  650      <UNSTRING_ident_lit_phrase>
+  651      <UNSTRING_tally_phrase_opt>
+  652      <USE_debugging_list>
+  653      <USE_debugging_list_opt>
+  654      <USE_debugging_type>
+  655      <USE_procedure_type>
+  656      <USE_statement>
+  657      <VARYING_SEARCH_phrase_opt>
+  658      <VARYING_body>               => <VARYING_item>
+  659      <VARYING_item>               => LX_LIST(4)
+  660                                         1) LX_LIST OF LX_ETT_ITEM (identifier)
+  661                                         2) LX_LIST of LX_ETT_ITEM or LX_TERMINAL (from)
+  662                                         3) LX_LIST of LX_ETT_ITEM or LX_TERMINAL (by)
+  663                                         4) LX_LIST of <condition>
+  664      <WHEN_CONDITION_1>
+  665      <WHEN_CONDITION_2>
+  666      <WHEN_selection_item>
+  667      <WHEN_selection_list>
+  668      <WITH_opt>                   => LX_TERMINAL
+  669      <WITH_ptr_ident_opt>
+  670      <all_references_opt>
+  671      <alpha_constant>             => LX_TERMINAL
+  672      <alpha_constant_no_ALL>      => LX_TERMINAL
+  673      <alpha_constant_no_ALL_no_zero> => LX_TERMINAL
+  674      <alpha_constant_no_zero>     => LX_TERMINAL
+  675      <alpha_or_arith>             => LX_TERMINAL or BINARY_OP or UNARY_OP or LX_ETT_ITEM
+  676      <alphabet_name>              => LX_TERMINAL
+  677      <alphabet_name_common>       => LX_TERMINAL
+  678      <arith_expr>                 => LX_TERMINAL or BINARY_OP or UNARY_OP or LX_ETT_ITEM
+  679      <basic_mnemonic_name>        => LX_TERMINAL
+  680      <basic_mnemonic_name_list>
+  681      <basic_rel_op>               => BINARY_OP
+  682      <before_after_advancing_opt>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    21   
+  683      <cd_name>
+  684      <class_sign>                 => LX_TERMINAL
+  685      <collating_sequence>
+  686      <collating_sequence_opt>
+  687      <condition>
+  688      <conditional_ADD>            => O1COM.ILS_LIST
+  689      <conditional_CALL>           => O1COM.ILS_LIST
+  690      <conditional_COMPUTE>        => O1COM.ILS_LIST
+  691      <conditional_DELETE>         => O1COM.ILS_LIST
+  692      <conditional_DIVIDE>         => O1COM.ILS_LIST
+  693      <conditional_EVALUATE>       => O1COM.ILS_LIST
+  694      <conditional_IF>             => O1COM.ILS_LIST
+  695      <conditional_MULTIPLY>       => O1COM.ILS_LIST
+  696      <conditional_READ>           => O1COM.ILS_LIST
+  697      <conditional_RECEIVE>        => O1COM.ILS_LIST
+  698      <conditional_RETURN>         => O1COM.ILS_LIST
+  699      <conditional_REWRITE>        => O1COM.ILS_LIST
+  700      <conditional_SEARCH>         => O1COM.ILS_LIST
+  701      <conditional_START>          => O1COM.ILS_LIST
+  702      <conditional_STRING>         => O1COM.ILS_LIST
+  703      <conditional_SUBTRACT>       => O1COM.ILS_LIST
+  704      <conditional_UNSTRING>       => O1COM.ILS_LIST
+  705      <conditional_WRITE>          => O1COM.ILS_LIST
+  706      <conditional_stmt>           => O1COM.ILS_LIST
+  707      <control_div>
+  708      <control_div_opt>
+  709      <data_name>                  => LX_TERMINAL
+  710      <data_name_list>             => LX_LIST OF LX_TERMINAL
+  711      <data_name_list_opt>         => LX_TERMINAL (EMPTY) or LX_LIST OF LX_TERMINAL
+  712      <data_name_opt>              => LX_TERMINAL
+  713      <declaratives_opt>
+  714      <delimited_ADD>              => O1COM.ILS_LIST
+  715      <delimited_CALL>             => O1COM.ILS_LIST
+  716      <delimited_COMPUTE>          => O1COM.ILS_LIST
+  717      <delimited_DELETE>           => O1COM.ILS_LIST
+  718      <delimited_DIVIDE>           => O1COM.ILS_LIST
+  719      <delimited_EVALUATE>         => O1COM.ILS_LIST
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    22   
+  720      <delimited_IF>               => O1COM.ILS_LIST
+  721      <delimited_MULTIPLY>         => O1COM.ILS_LIST
+  722      <delimited_PERFORM>          => O1COM.ILS_LIST
+  723      <delimited_READ>             => O1COM.ILS_LIST
+  724      <delimited_RECEIVE>          => O1COM.ILS_LIST
+  725      <delimited_RETURN>           => O1COM.ILS_LIST
+  726      <delimited_REWRITE>          => O1COM.ILS_LIST
+  727      <delimited_SEARCH>           => O1COM.ILS_LIST
+  728      <delimited_START>            => O1COM.ILS_LIST
+  729      <delimited_STRING>           => O1COM.ILS_LIST
+  730      <delimited_SUBTRACT>         => O1COM.ILS_LIST
+  731      <delimited_UNSTRING>         => O1COM.ILS_LIST
+  732      <delimited_WRITE>            => O1COM.ILS_LIST
+  733      <delimited_stmt>             => O1COM.ILS_LIST
+  734      <end_program>
+  735      <end_program_list>
+  736      <factor>                     => LX_TERMINAL or LX_ETT_ITEM or BINARY_OP or UNARY_OP
+  737      <file_name>
+  738      <file_name_list>
+  739      <find_type>
+  740      <from_ident_phrase_opt>
+  741      <ident_alpha_lit_no_ALL>     => LX_TERMINAL or LX_ETT_ITEM
+  742      <ident_alpha_lit_no_ALL_list>    => LX_LIST of <ident_alpha_lit_no_all>
+  743      <ident_div>
+  744      <ident_ident-round>          => LX_ETT_ITEM
+  745      <ident_ident-round_list>     => LX_LIST OF LX_ETT_ITEM
+  746      <ident_lit>                  => LX_TERMINA or LX_ETT_ITEM
+  747      <ident_lit_list_no_ALL>      => LX_LIST of (LX_TERMINAL or LX_ETT_ITEM)
+  748      <ident_lit_no_ALL>           => LX_TERMINAL or LX_ETT_ITEM
+  749      <ident_no_refmod>            => LX_ETT_ITEM
+  750      <ident_ident-round_no_refmod> => LX_ETT_ITEM
+  751      <ident_num-lit>              => LX_TERMINAL or LX_ETT_ITEM
+  752      <ident_num-lit_list>         => LX_LIST of (LX_TERMINAL or LX_ETT_ITEM)
+  753      <ident_num-lit_opt>          => LX_TERMINAL (maybe EMPTY) or LX_ETT_ITEM
+  754      <identifier>                 => LX_ETT_ITEM
+  755      <identifier_list>            => LX_LIST of <identifier>
+  756      <identifier_list_opt>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    23   
+  757      <identifier_opt>
+  758      <imp_cond_stmts>
+  759      <imperative_ACCEPT>          => O1COM.ILS_LIST
+  760      <imperative_ADD>             => ADD_STMT
+  761      <imperative_ALTER>           => O1COM.ILS_LIST
+  762      <imperative_CALL>
+  763      <imperative_CANCEL>
+  764      <imperative_CLOSE>
+  765      <imperative_COMPUTE>         => COMPUTE_STMT
+  766      <imperative_CONTINUE>        => O1COM.ILS_LIST
+  767      <imperative_DELETE>
+  768      <imperative_DISABLE>
+  769      <imperative_DISPLAY>         => O1COM.ILS_LIST
+  770      <imperative_DIVIDE>          => DIVIDE_STMT
+  771      <imperative_ENABLE>
+  772      <imperative_ENTRY>
+  773      <imperative_EXAMINE>
+  774      <imperative_EXIT_PROGRAM>
+  775      <imperative_GENERATE>
+  776      <imperative_GO_TO>           => O1COM.ILS_LIST
+  777      <imperative_INITIALIZE>
+  778      <imperative_INITIATE>
+  779      <imperative_INSPECT>         => INSPECT_1_STMT or INSPECT_2_STMT or
+  780                                      INSPECT_3_STMT or INSPECT_4_STMT
+  781      <imperative_MERGE>
+  782      <imperative_MOVE>            => O1COM.ILS_LIST
+  783      <imperative_MULTIPLY>        => MULTIPLY_STMT
+  784      <imperative_OPEN>
+  785      <imperative_PERFORM>         => O1COM.ILS_LIST
+  786      <imperative_PURGE>
+  787      <imperative_READ>
+  788      <imperative_READ_LABEL>
+  789      <imperative_RECEIVE>
+  790      <imperative_RELEASE>
+  791      <imperative_RETURN>
+  792      <imperative_REWRITE>
+  793      <imperative_SEND>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    24   
+  794      <imperative_SET>
+  795      <imperative_SORT>
+  796      <imperative_START>
+  797      <imperative_STOP>            => O1COM.ILS_LIST
+  798      <imperative_STRING>
+  799      <imperative_SUBTRACT>        => SUBTRACT_STMT
+  800      <imperative_SUPPRESS>
+  801      <imperative_TERMINATE>
+  802      <imperative_UNSTRING>
+  803      <imperative_WRITE>
+  804      <imperative_WRITE_LABEL>
+  805      <imperative_stmt>            => O1COM.ILS_LIST
+  806      <imperative_stmts>           => ILS_LIST
+  807      <init_data_types>
+  808      <integer>                    => LX_TERMINAL
+  809      <internal_program>
+  810      <into_ident_phrase_opt>
+  811      <less_than_rel_op>           => BINARY_OP
+  812      <literal>                    => LX_TERMINAL
+  813      <literal_list>               => LX_LIST OF LX_TERMINAL
+  814      <literal_no_ALL>             => LX_TERMINAL
+  815      <mnemonic_name>              => LX_TERMINAL
+  816      <overflow_phrase>            => ILS_LIST
+  817      <paragraph>                  => ILS_LIST
+  818      <paragraph_def>              => LX_TERMINAL
+  819      <paragraph_header>           => ILS_LIST
+  820      <paragraph_ref>              => LX_TERMINAL
+  821      <paragraphs>                 => ILS_LIST
+  822      <privacy_on_words>
+  823      <privacy_phrase>
+  824      <privacy_phrase_list>
+  825      <privacy_word>               => LX_TERMINAL
+  826      <privacy_word_list>
+  827      <proc_div>
+  828      <proc_section>
+  829      <procedure_div_subset>
+  830      <procedure_div_using>
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    25   
+  831      <procedure_name>             => LX_TERMINAL(ST$ points to PARA)
+  832      <procedure_name_list>        => LX_LIST of <procedure_name>
+  833      <procedure_name_or_blank>    => LX_TERMINAL
+  834      <program_name>
+  835      <program_procedure_division>
+  836      <pwr>                        => LX_TERMINAL or LX_ETT_ITEM or BINARY_OP or UNARY_OP
+  837      <qualified_id>               => LX_LIST OF LX_TERMINAL
+  838      <qualified_id_list>          => LX_LIST OF <qualified_id>
+  839      <reference_modification>     => LX_LIST of 1 or 2 <arith_expr>
+  840      <relation_condition>         => BINARY_OP
+  841      <relational_operator>        => BINARY_OP
+  842      <report_name>
+  843      <report_name_list>
+  844      <retaining_clause>
+  845      <retaining_type>             => LX_TERMINAL
+  846      <retaining_type_list>
+  847      <section_header>             => ILS_LIST
+  848      <section_name>
+  849      <section_use_header>
+  850      <sections_paragraphs_opt>    => ILS_LIST or LX_TERMINAL(empty)
+  851      <sentences>                  => ILS_LIST
+  852      <sign_class_condition>       => UNARY_OP
+  853      <size_error_phrase>          => ILS_LIST
+  854      <subscript_list>             => LX_LIST of <arith_expr>
+  855      <subscripts>                 => LX_LIST of <arith_expr>
+  856      <term>                       => LX_TERMINAL or LX_ETT_ITEM or BINARY_OP or UNARY_OP
+  857      <thru_sect_opt>
+  858      <unary>                      => LX_TERMINAL or LX_ETT_ITEM or BINARY_OP or UNARY_OP
+  859      <with_conversion_opt>
+  860      <with_dup_phrase_opt>
+  861      <with_test_opt>              => LX_TERMINAL (BEFORE,AFTER)
+  862      */
+  863
+  864
+  865
+  866      %EQU ADD_TO = 0;
+  867      %EQU ADD_GIVING = 1;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    26   
+  868      %EQU ADD_CORRESPONDING = 2;
+  869
+  870      DCL 1 ADD_STMT BASED ALIGNED, /* ADD STATEMENT */
+  871          2 ID     UBIN HALF UNAL,
+  872          2 *      UBIN HALF UNAL,
+  873          2 KEY_WORD$ PTR,
+  874          2 SENDING$  PTR ,
+  875          2 RECEIVING$ PTR,
+  876          2 TYPE   SBIN WORD,
+  877          2 *      SBIN WORD,
+  878          2 *      SBIN WORD,
+  879          2 *      SBIN WORD;
+  880
+  881
+  882      /* Unary operators  for UNARY_OP */
+  883
+  884      %EQU OP_NOT                    = 0;
+  885      %EQU OP_UNARY_MINUS            = 1;
+  886      %EQU OP_PAREN                  = 2;
+  887      %EQU OP_OWNER                  = 3;
+  888      %EQU OP_MEMBER                 = 4;
+  889      %EQU OP_TENANT                 = 5;
+  890      %EQU OP_NUMERIC                = 6;
+  891      %EQU OP_ALPHABETIC             = 7;
+  892      %EQU OP_ALPHABETIC_LOWER       = 8;
+  893      %EQU OP_ALPHABETIC_UPPER       = 9;
+  894      %EQU OP_POSITIVE               = 10;
+  895      %EQU OP_NEGATIVE               = 11;
+  896      %EQU OP_ZERO                   = 12;
+  897      %EQU OP_EMPTY                  = 13;
+  898
+  899      /* Binary operators for BINARY OP */
+  900
+  901      %EQU OP_AND                    = 14;
+  902      %EQU OP_OR                     = 15;
+  903      %EQU OP_PLUS                   = 16;
+  904      %EQU OP_BINARY_MINUS           = 17;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    27   
+  905      %EQU OP_STAR                   = 18;
+  906      %EQU OP_SLASH                  = 19;
+  907      %EQU OP_STAR_STAR              = 20;
+  908      %EQU OP_THRU                   = 21;
+  909      %EQU OP_LESS_THAN              = 22;
+  910      %EQU OP_EQUAL                  = 23;
+  911      %EQU OP_GREATER_THAN           = 24;
+  912      %EQU OP_NOT_EQUAL              = 25;
+  913      %EQU OP_LESS_THAN_OR_EQUAL     = 26;
+  914      %EQU OP_GREATER_THAN_OR_EQUAL  = 27;
+  915      %EQU OP_MINIMUM                = 28;
+  916      %EQU OP_INDEX                  = 29;
+  917
+  918         /* Unary op */
+  919
+  920      %EQU OP_SWITCH_IS_ON           = 30;
+  921      %EQU OP_SWITCH_IS_OFF          = 31;
+  922      %EQU OP_SET_SWITCH_ON          = 32;
+  923      %EQU OP_SET_SWITCH_OFF         = 33;
+  924
+  925      /* More binary ops */
+  926      %EQU OP_USER_CLASS             = 34;
+  927
+  928
+  929      %MACRO SET_OF_UNARY_ARITH;
+  930
+  931           %OP_PAREN,
+  932           %OP_UNARY_MINUS
+  933
+  934      %MEND;
+  935
+  936
+  937      %MACRO SET_OF_RELATIONAL_OPS;
+  938
+  939          %OP_USER_CLASS,
+  940          %OP_AND,
+  941          %OP_OR,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    28   
+  942          %OP_EQUAL,
+  943          %OP_LESS_THAN,
+  944          %OP_GREATER_THAN,
+  945          %OP_NOT_EQUAL,
+  946          %OP_LESS_THAN_OR_EQUAL,
+  947          %OP_GREATER_THAN_OR_EQUAL
+  948
+  949      %MEND;
+  950
+  951
+  952
+  953      %MACRO SET_OF_BINARY_ARITH;
+  954
+  955           %OP_PLUS,
+  956           %OP_BINARY_MINUS,
+  957           %OP_STAR,
+  958           %OP_SLASH,
+  959           %OP_STAR_STAR
+  960
+  961      %MEND;
+  962
+  963      DCL 1 BINARY_OP BASED ALIGNED,
+  964            2 ID         UBIN HALF UNAL,
+  965            2 B          UNAL,
+  966              3 ERROR     BOOLEAN,
+  967              3 *         BIT(5) UNAL,
+  968              3 HIGH_LEV  BOOLEAN,   /* Expression uses high-level feature */
+  969              3 *         BIT(11) UNAL,
+  970            2 LOP$       PTR,
+  971            2 ROP$       PTR,
+  972            2 OP         UBIN WORD,
+  973            2 *          UBIN WORD,
+  974            2 LINE       UBIN WORD,
+  975            2 COLUMN     UBIN WORD,
+  976            2 LINK       PTR;
+  977
+  978
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    29   
+  979      DCL 1 CALL_STMT BASED ALIGNED,
+  980          2 ID          UBIN HALF UNAL,
+  981          2 *           UBIN HALF UNAL,
+  982          2 KEY_WORD$   PTR,
+  983          2 PROC_NAME$  PTR,
+  984          2 ARG_LIST$   PTR,
+  985          2 *           PTR,
+  986          2 *           PTR,
+  987          2 *           PTR,
+  988          2 *           PTR;
+  989
+  990
+  991
+  992
+  993      DCL 1 COMPUTE_STMT BASED ALIGNED, /* COMPUTE STATEMENT */
+  994          2 ID     UBIN HALF UNAL,
+  995          2 *      UBIN HALF UNAL,
+  996          2 KEY_WORD$   PTR,
+  997          2 EXPR$       PTR,
+  998          2 IDENT_LIST$ PTR,
+  999          2 *           PTR,
+ 1000          2 *           PTR,
+ 1001          2 *           PTR,
+ 1002          2 *           PTR;
+ 1003
+ 1004
+ 1005      DCL 1 DEFERED_QUAL_ID  BASED  ALIGNED, /* Defered qualified id's */
+ 1006            2 ID             UBIN HALF UNAL,
+ 1007            2 B              UNAL,
+ 1008              3 ERROR        BOOLEAN,
+ 1009              3 *            BIT(17) UNAL,
+ 1010            2 QUAL_ID_LIST$  PTR, /* Ptr to <QUALIFIED_ID> */
+ 1011            2 ASSOC_VAR_ST$  PTR, /* Ptr to associated variable ST */
+ 1012            2 ILL$           PTR, /* points to associated ILL item */
+ 1013            2 *              PTR, /* Not presently used */
+ 1014            2 LINE           UBIN WORD,
+ 1015            2 COLUMN         UBIN WORD,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    30   
+ 1016            2 LINK           PTR;
+ 1017
+ 1018
+ 1019      DCL 1 DELETE_STMT BASED ALIGNED,   /* Delete statement */
+ 1020            2 ID            UBIN HALF UNAL,
+ 1021            2 *             UBIN HALF UNAL,
+ 1022            2 KEY_WORD$     PTR,
+ 1023            2 FILE_NAME$    PTR,
+ 1024            2 *             PTR,
+ 1025            2 *             PTR,
+ 1026            2 *             PTR,
+ 1027            2 *             PTR,
+ 1028            2 *             PTR;
+ 1029
+ 1030
+ 1031
+ 1032      DCL 1 DIVIDE_STMT BASED ALIGNED, /* DIVIDE STATEMENT */
+ 1033            2 ID     UBIN HALF UNAL,
+ 1034            2 *      UBIN HALF UNAL,
+ 1035            2 KEY_WORD$ PTR,
+ 1036            2 DIVISOR$   PTR,
+ 1037            2 QUOTIENT_LIST$ PTR,
+ 1038            2 DIVIDEND_LIST$ PTR,
+ 1039            2 REMAINDER$ PTR,
+ 1040            2 * PTR,
+ 1041            2 * PTR;
+ 1042
+ 1043      %MACRO EMPTY_LX_LIST;
+ 1044      DCL 1 EMPTY_LX_LIST CONSTANT,
+ 1045            2 ID    UBIN HALF HALIGNED INIT (%LX_LIST),
+ 1046            2 *     BIT (18) INIT (FALSE),
+ 1047            2 TAIL$ PTR INIT (ADDR (NIL)),
+ 1048            2 COUNT SBIN INIT (0),
+ 1049            2 *     SBIN INIT (0),
+ 1050            2 HEAD$ PTR INIT (ADDR (NIL)),
+ 1051            2 *     BIT (72) ALIGNED INIT (FALSE),
+ 1052            2 LINK  PTR INIT (ADDR (NIL));
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    31   
+ 1053      %MEND;
+ 1054
+ 1055      /* Types of EXAMINE formats */
+ 1056      %EQU EXAMINE_TALLYING         = 0;
+ 1057      %EQU EXAMINE_TALLYING_REPLACING = 1;
+ 1058      %EQU EXAMINE_REPLACING          = 2;
+ 1059
+ 1060
+ 1061      /* Types of expressions for EVALUATE */
+ 1062
+ 1063      %EQU EXPR_TYPE_ANY = 0;
+ 1064      %EQU EXPR_TYPE_TRUE = 1;
+ 1065      %EQU EXPR_TYPE_FALSE = 2;
+ 1066      %EQU EXPR_TYPE_COND = 3;
+ 1067      %EQU EXPR_TYPE_EXPR = 4;
+ 1068
+ 1069      %EQU IMP_ILS_LIST  = 0; /* Imperative statement(s) only */
+ 1070      %EQU COND_ILS_LIST = 1; /* Flag conditional statement for level checking */
+ 1071
+ 1072      DCL 1 ILS_LIST BASED ALIGNED,
+ 1073            2 ID           UBIN HALF UNAL,
+ 1074            2 CODE         UBIN HALF UNAL,
+ 1075            2 HEAD$        PTR,
+ 1076            2 TAIL$        PTR,
+ 1077            2 *  PTR,
+ 1078            2 *  PTR,
+ 1079            2 *            PTR,
+ 1080            2 *            PTR,
+ 1081            2 LINK         PTR;
+ 1082
+ 1083
+ 1084
+ 1085
+ 1086
+ 1087      %EQU INSPECT_1 = 1029 ; /* '2001'O */
+ 1088      %EQU INSPECT_2 = 1030 ; /* '2002'O */
+ 1089      %EQU INSPECT_4 = 1032 ; /* '2004'O */
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    32   
+ 1090
+ 1091      DCL 1  INSPECT_1_STMT          BASED ALIGNED, /*INSPECT Format 1 */
+ 1092           2 ID                      UBIN HALF UNAL,
+ 1093           2 HIGH_LEV                BIT(1),   /* High-level feature used */
+ 1094           2 *                       BIT(17),
+ 1095           2 KEY_WORD$               PTR,
+ 1096           2 ID_1$                   PTR,
+ 1097           2 INSPECT_1$              PTR,
+ 1098           2 *                       PTR,
+ 1099           2 LINE                    SBIN WORD,
+ 1100           2 COLUMN                  SBIN WORD,
+ 1101           2 *                       PTR ;
+ 1102
+ 1103      DCL 1  INSPECT_2_STMT          BASED ALIGNED, /*INSPECT Format 2 */
+ 1104           2 ID                      UBIN HALF UNAL,
+ 1105           2 HIGH_LEV                BIT(1),   /* High-level feature used */
+ 1106           2 *                       BIT(17),
+ 1107           2 KEY_WORD$               PTR,
+ 1108           2 ID_1$                   PTR,
+ 1109           2 INSP_2_REPLACE$         PTR,
+ 1110           2 *                       PTR,
+ 1111           2 LINE                    SBIN WORD,
+ 1112           2 COLUMN                  SBIN WORD,
+ 1113           2 *                       PTR ;
+ 1114
+ 1115      DCL 1  INSPECT_4_STMT          BASED ALIGNED, /*INSPECT Format 4 */
+ 1116           2 ID                      UBIN HALF UNAL,
+ 1117           2 *                       UBIN HALF UNAL,
+ 1118           2 KEY_WORD$               PTR,
+ 1119           2 ID_1$                   PTR,
+ 1120           2 ID_6$                   PTR,
+ 1121           2 ID_7$                   PTR,
+ 1122           2 LINE                    SBIN WORD,
+ 1123           2 COLUMN                  SBIN WORD,
+ 1124           2 INSP_1_BEFORE_AFTER_OPT$ PTR ;
+ 1125
+ 1126      DCL 1 LX_ETT_ITEM BASED ALIGNED,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    33   
+ 1127          2      ID      UBIN HALF UNAL,    /* identification number */
+ 1128          2      B       UNAL,
+ 1129            3      ERROR   BOOLEAN,
+ 1130            3      ROUND   BOOLEAN,
+ 1131            3      INTEGER BOOLEAN,
+ 1132            3      ALL     BOOLEAN,
+ 1133            3      NEGATE  BOOLEAN,
+ 1134            3      REFMOD  BOOLEAN,
+ 1135            3      HIGH_LEV BOOLEAN,   /* Expression uses high-level features */
+ 1136            3      *       BIT (11) ,
+ 1137          2      FLAGS REDEF B BIT(18) UNAL,
+ 1138
+ 1139          2      ETT$    PTR,               /* PTR TO ETT TREE */
+ 1140          2      BY_CONTENT_ILS_LIST$  PTR, /* Move Arg to Temp ILS  */
+ 1141          2      *       SBIN WORD,
+ 1142          2      TYPE    UBIN WORD,    /* TYPE (EG, %TYI, %TYA, ETC) */
+ 1143          2      LINE    UBIN WORD,    /* LINE# OF THIS OCCURRENCE    */
+ 1144          2      COLUMN  UBIN WORD,    /* COL # OF THIS OCCURRENCE    */
+ 1145          2      LINK    PTR;
+ 1146
+ 1147      DCL 1 LX_LARGE BASED ALIGNED,
+ 1148            2 ID      UBIN HALF UNAL,
+ 1149            2 *       BIT(18) UNAL,
+ 1150            2 LARGE_ITEM$ PTR,
+ 1151            2 *       SBIN WORD,
+ 1152            2 *       SBIN WORD,
+ 1153            2 *       SBIN WORD,
+ 1154            2 *       SBIN WORD,
+ 1155            2 *       SBIN WORD,
+ 1156            2 LINK    PTR;
+ 1157
+ 1158      DCL 1 LX_LIST ALIGNED BASED , /* List descriptor */
+ 1159          2 ID      UBIN HALF UNAL,
+ 1160          2 B       UNAL,
+ 1161            3 ERROR   BOOLEAN ,
+ 1162            3 *       BIT (5),
+ 1163            3 HIGH_LEV BOOLEAN,   /* Expression uses high-level features */
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    34   
+ 1164            3 *       BIT (11),
+ 1165
+ 1166          2 TAIL$   PTR ,             /* Pointer to tail item in list */
+ 1167          2 COUNT   SBIN WORD,        /* Number of ident items in list */
+ 1168          2 *       SBIN WORD,
+ 1169          2 HEAD$   PTR ,            /* Pointer to head of the list */
+ 1170          2 *       UBIN WORD ,
+ 1171          2 *       UBIN WORD ,
+ 1172          2 LINK    PTR ;             /* Pointer to next item in list */
+ 1173
+ 1174      /* LX_REC_DECL field equates */
+ 1175
+ 1176      %EQU REC_DECL_LEVEL_NO = 0;
+ 1177      %EQU REC_DECL_DATA_NAME = 1;
+ 1178      %EQU REC_DECL_USAGE = 2;
+ 1179      %EQU REC_DECL_PIC_CLAUSE = 3;
+ 1180      %EQU REC_DECL_REDEFINES = 4;
+ 1181      %EQU REC_DECL_RENAMES = 5;
+ 1182      %EQU REC_DECL_OCCURS = 6;
+ 1183      %EQU REC_DECL_VALUE = 7;
+ 1184      %EQU REC_DECL_SIGN = 8;
+ 1185      %EQU REC_DECL_BLANK = 9;
+ 1186      %EQU REC_DECL_GLOBAL = 10;
+ 1187      %EQU REC_DECL_SYNC = 11;
+ 1188      %EQU REC_DECL_EXTERNAL = 12;
+ 1189      %EQU REC_DECL_JUSTIFIED = 13;
+ 1190      %EQU REC_DECL_INDEXED = 14;
+ 1191      %EQU REC_DECL_KEY = 15;
+ 1192      %EQU REC_DECL_MAX_FIELD = 15;  /* Update this when adding fields */
+ 1193
+ 1194      DCL 1 LX_REC_DECL BASED ALIGNED,  /* Record declaration info */
+ 1195            2 ID             UBIN HALF UNAL,
+ 1196            2 *              BIT(18) UNAL,
+ 1197            2 P,
+ 1198              3 LEVEL_NO$    PTR,  /* <level_no> */
+ 1199              3 DATA_NAME$   PTR,  /* <data_name> */
+ 1200              3 USAGE$       PTR,  /* <usage_clause> */
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    35   
+ 1201              3 PIC_CLAUSE$  PTR,  /* picture_clause */
+ 1202              3 REDEFINES$   PTR,  /* <redefines_clause> */
+ 1203              3 RENAMES$     PTR,  /* <renames_clause> */
+ 1204              3 OCCURS$      PTR,  /* LX_LIST (1 or 2 nodes)
+ 1205                                       node 1) LX_LIST of <integer> (1 or 2)
+ 1206                                       node 2) <qualified_id>
+ 1207                                   */
+ 1208              3 VALUE$       PTR,  /* <literal_thru_list> */
+ 1209              3 SIGN$        PTR,  /* <sign_clause */
+ 1210              3 BLANK$       PTR,  /* <blank_clause */
+ 1211              3 GLOBAL$      PTR,  /* <global_clause> */
+ 1212              3 SYNC$        PTR,  /* <sync_clause> */
+ 1213              3 EXTERNAL$    PTR,  /* <external_clause> */
+ 1214              3 JUSTIFIED$   PTR,  /* <justified_clause> */
+ 1215              3 INDEXED$     PTR,  /* <OCCURS_INDEX_clause> */
+ 1216              3 KEY$         PTR,  /* LX_LIST of <OCCURS_KEY_clause> */
+ 1217            2 P_PTRS (0:%REC_DECL_MAX_FIELD) REDEF P PTR,
+ 1218
+ 1219            2 CLAUSE_COUNT(0:%REC_DECL_MAX_FIELD) SBIN WORD,
+ 1220            2 CURRENT_CLAUSE_COUNT SBIN WORD;
+ 1221
+ 1222
+ 1223
+ 1224      DCL 1 LX_TERMINAL BASED ALIGNED,  /* terminal symbol obtained from parser */
+ 1225            %LA_STK_INFO;
+ 1226            2 LINK     PTR;
+ 1227
+ 1228
+ 1229
+ 1230
+ 1231      DCL 1 MULTIPLY_STMT BASED ALIGNED, /* MULTIPLY STATEMENT */
+ 1232          2 ID     UBIN HALF UNAL,
+ 1233          2 *      UBIN HALF UNAL,
+ 1234          2 KEY_WORD$      PTR,
+ 1235          2 SENDING$       PTR ,
+ 1236          2 BY$            PTR,
+ 1237          2 GIVING$        PTR,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    36   
+ 1238          2 *              PTR,
+ 1239          2 *              PTR,
+ 1240          2 *      SBIN WORD;
+ 1241
+ 1242
+ 1243      %EQU READ_AT_END_CLAUSE = 0;
+ 1244      %EQU READ_INVALID_CLAUSE = 1;
+ 1245      %EQU READ_NO_EXCEPTION_CLAUSE = 2;
+ 1246
+ 1247      DCL 1 READ_STMT BASED ALIGNED,  /* Read statement */
+ 1248            2 ID         UBIN HALF UNAL,
+ 1249            2 *          UBIN HALF UNAL,
+ 1250            2 KEY_WORD$  PTR,
+ 1251            2 FILE_NAME$ PTR,
+ 1252            2 NEXT$      PTR,
+ 1253            2 INTO_IDENT$ PTR,
+ 1254            2 KEY_ID$ PTR,
+ 1255            2 *          PTR,
+ 1256            2 *          PTR;
+ 1257
+ 1258
+ 1259      DCL 1 REWRITE_STMT BASED ALIGNED,  /* Rewrite statement */
+ 1260            2 ID         UBIN HALF UNAL,
+ 1261            2 *          UBIN HALF UNAL,
+ 1262            2 KEY_WORD$  PTR,
+ 1263            2 IDENT$     PTR,
+ 1264            2 FROM_IDENT$ PTR,
+ 1265            2 *          PTR,
+ 1266            2 *          PTR,
+ 1267            2 *          PTR,
+ 1268            2 *          PTR;
+ 1269
+ 1270      /* USE_PRIVACY statement types  */
+ 1271
+ 1272      %EQU PRIVACY_RECORD  = 1;
+ 1273      %EQU PRIVACY_SET     = 2;
+ 1274      %EQU PRIVACY_LIST    = 3;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    37   
+ 1275
+ 1276      /* DB_EXCEPTION statement types */
+ 1277
+ 1278      %EQU DB_EXCEPTION_ALL    = 0;
+ 1279      %EQU DB_EXCEPTION_OTHER  = 1;
+ 1280      %EQU DB_EXCEPTION_INDICATOR =2;
+ 1281      %EQU DB_EXCEPTION_END  = 3;
+ 1282
+ 1283
+ 1284      /* FIND statement types  */
+ 1285
+ 1286      %EQU FIND_DIRECT        = 1;
+ 1287      %EQU FIND_CALC          = 2;
+ 1288      %EQU FIND_DUPLICATE_WITHIN  = 3;
+ 1289      %EQU FIND_IDENT_WITHIN  = 4;
+ 1290      %EQU FIND_RELATIVE_OCCURENCE= 5;
+ 1291      %EQU FIND_OWNER         = 6;
+ 1292      %EQU FIND_WITHIN_USING  = 7;
+ 1293      %EQU FIND_FIRST_NEXT_USING  = 8;
+ 1294      %EQU FIND_USING         = 9;
+ 1295      %EQU FIND_CURRENT      = 10;
+ 1296
+ 1297      /*  USE statement types  */
+ 1298
+ 1299      %EQU USE_EXCEPTION = 0;
+ 1300      %EQU USE_DB_EXCEPTION = 1;
+ 1301      %EQU USE_SAVE_X0 = 1;
+ 1302      %EQU USE_PRIVACY = 2;
+ 1303      %EQU USE_BEFORE_REPORTING = 3;
+ 1304      %EQU USE_BEFORE_LABEL = 4;
+ 1305      %EQU USE_AFTER_LABEL = 5;
+ 1306
+ 1307      /* SET statement types */
+ 1308
+ 1309      %EQU SET_TO        = 0;
+ 1310      %EQU SET_UP_BY     = 1;
+ 1311      %EQU SET_DOWN_BY   = 2;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    38   
+ 1312      %EQU SET_TO_TRUE   = 3;
+ 1313      %EQU SET_ON        = 4;
+ 1314      %EQU SET_OFF       = 5;
+ 1315      %EQU SET_SWITCH    = 6;
+ 1316      %EQU SET_TO_SWITCH = 7;
+ 1317
+ 1318      DCL 1 START_STMT BASED ALIGNED,
+ 1319            2 ID              UBIN HALF UNAL,
+ 1320            2 *               UBIN HALF UNAL,
+ 1321            2 KEY_WORD$       PTR,
+ 1322            2 FILE_NAME$      PTR,
+ 1323            2 KEY$            PTR,
+ 1324            2 *               PTR,
+ 1325            2 *               PTR,
+ 1326            2 *               PTR,
+ 1327            2 *               PTR;
+ 1328
+ 1329
+ 1330      DCL 1 STRING_STMT BASED ALIGNED,
+ 1331            2 ID           UBIN HALF UNAL,
+ 1332            2 *            UBIN HALF UNAL,
+ 1333            2 KEY_WORD$    PTR,
+ 1334            2 STRING_LIST$ PTR,
+ 1335            2 INTO$        PTR,
+ 1336            2 POINTER$     PTR,
+ 1337            2 *            SBIN WORD,
+ 1338            2 *            SBIN WORD;
+ 1339
+ 1340
+ 1341      %EQU SUBTRACT_FROM = 0;
+ 1342      %EQU SUBTRACT_GIVING = 1;
+ 1343      %EQU SUBTRACT_CORRESPONDING = 2;
+ 1344
+ 1345      DCL 1 SUBTRACT_STMT BASED ALIGNED, /* SUBTRACT STATEMENT */
+ 1346            2 ID     UBIN HALF UNAL,
+ 1347            2 *      UBIN HALF UNAL,
+ 1348            2 KEY_WORD$ PTR,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    39   
+ 1349            2 SENDING$  PTR ,
+ 1350            2 FROM$   PTR,
+ 1351            2 RECEIVING$ PTR,
+ 1352            2 TYPE   SBIN WORD,
+ 1353            2 *      SBIN WORD,
+ 1354            2 *      SBIN WORD;
+ 1355
+ 1356
+ 1357
+ 1358
+ 1359      DCL 1 UNARY_OP BASED ALIGNED,
+ 1360            2 ID         UBIN HALF UNAL,
+ 1361            2 B          UNAL,
+ 1362              3 ERROR     BOOLEAN,
+ 1363              3 *         BIT(5) UNAL,
+ 1364              3 HIGH_LEV  BOOLEAN,   /* Expression uses high-level feature */
+ 1365              3 *         BIT(11) UNAL,
+ 1366            2 LOP$       PTR,
+ 1367            2 *          PTR,
+ 1368            2 OP         UBIN WORD,
+ 1369            2 *          UBIN WORD,
+ 1370            2 LINE       UBIN WORD,
+ 1371            2 COLUMN     UBIN WORD,
+ 1372            2 LINK       PTR;
+ 1373
+ 1374
+ 1375      DCL 1 UNSTRING_STMT BASED ALIGNED, /* Unstring statement */
+ 1376            2 ID           UBIN HALF UNAL,
+ 1377            2 *            UBIN HALF UNAL,
+ 1378            2 KEY_WORD$    PTR,
+ 1379            2 IDENT$       PTR,
+ 1380            2 DELIM_LIST$  PTR,
+ 1381            2 INTO_LIST$   PTR,
+ 1382            2 POINTER$     PTR,
+ 1383            2 TALLYING$    PTR,
+ 1384            2 *          PTR;
+ 1385
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    40   
+ 1386
+ 1387      %EQU WRITE_EOP_CLAUSE = 0;
+ 1388      %EQU WRITE_INVALID_CLAUSE = 1;
+ 1389      %EQU WRITE_NO_EXCEPTION_CLAUSE = 2;
+ 1390
+ 1391      DCL 1 WRITE_STMT BASED ALIGNED,  /* Write statement */
+ 1392            2 ID            UBIN HALF UNAL,
+ 1393            2 *             UBIN HALF UNAL,
+ 1394            2 KEY_WORD$     PTR,
+ 1395            2 IDENT$        PTR,
+ 1396            2 FROM_IDENT$   PTR,
+ 1397            2 LINES$        PTR,
+ 1398            2 *             PTR,
+ 1399            2 *             PTR,
+ 1400            2 *             PTR;
+ 1401
+ 1402       DCL 1 LX_REPORT_REC     BASED  ALIGNED,
+ 1403             2 ID                     UBIN  HALF  UNAL,
+ 1404             2 *                      BIT(18) UNAL,
+ 1405             2 D,
+ 1406               3 REPORT_TYPE          UBIN WORD,  /* %REPORT_HEADING, %... */
+ 1407               3 LINE_TYPE            UBIN WORD,  /* %REPORT_LINE_INT, %.. */
+ 1408               3 NEXT_GROUP_TYPE      UBIN WORD,  /* %NEXT_GROUP_INT, %... */
+ 1409             2 P,
+ 1410               3 LEVEL_NO$            PTR,
+ 1411               3 DATA_NAME$           PTR,
+ 1412               3 USAGE$               PTR,
+ 1413               3 PICTURE$             PTR,
+ 1414               3 VALUE$               PTR,
+ 1415               3 SIGN$                PTR,
+ 1416               3 BLANK$               PTR,
+ 1417               3 TYPE$                PTR,
+ 1418               3 JUSTIFIED$           PTR,
+ 1419               3 NEXT_GROUP$          PTR,
+ 1420               3 LINE_NUMBER$         PTR,
+ 1421               3 COLUMN_NUMBER$       PTR,
+ 1422               3 GROUP_INDICATE$      PTR,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    41   
+ 1423               3 SOURCE$              PTR,
+ 1424               3 SUM$                 PTR,
+ 1425             2 P_PTRS  (0:%REPORT_REC_MAX_FIELD)  REDEF  P  PTR,
+ 1426             2 CLAUSE_COUNT           UBIN  WORD,
+ 1427             2 NEXT_GROUP_NO#         SBIN WORD,
+ 1428             2 COLUMN_NO#             SBIN WORD,
+ 1429             2 LINE_NO#               SBIN WORD,
+ 1430             2 LEVEL_NUMBER           UBIN  WORD;
+ 1431
+ 1432       DCL 1 DEFERED_ID_TREE          BASED   ALIGNED,
+ 1433             2 ID                     UBIN  HALF  UNAL,
+ 1434             2 *                      UBIN  HALF  UNAL,
+ 1435             2 QUAL_ID$               PTR,
+ 1436             2 SUB$                   PTR,
+ 1437             2 REF$                   PTR,
+ 1438             2 ACTION_NO#             UBIN WORD,
+ 1439             2 LINE                   SBIN WORD,
+ 1440             2 LINK                   PTR;
+ 1441
+ 1442       DCL 1 DEFERED_IDENTIFIER        BASED  ALIGNED,
+ 1443             2 ID                      UBIN HALF UNAL,
+ 1444             2 B                       UNAL,
+ 1445               3 ERROR                 BOOLEAN,
+ 1446               3 *                     BIT(17)  UNAL,
+ 1447             2 DEFERED_ID$            PTR,
+ 1448             2 ASSOC_VAR_LTS$          PTR,
+ 1449             2 ASSOC_REPORT_LTS$       PTR,
+ 1450             2 *                       PTR,
+ 1451             2 LINE                    UBIN WORD,
+ 1452             2 COLUMN                  UBIN WORD,
+ 1453             2 LINK                    PTR;
+ 1454
+ 1455
+ 1456       DCL 1 DEFERED_SUM_CLAUSE_LIST   BASED  ALIGNED,
+ 1457             2 ID                      UBIN HALF UNAL,
+ 1458             2 B                       UNAL,
+ 1459               3 ERROR                 BOOLEAN,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    42   
+ 1460               3 *                     BIT(17)  UNAL,
+ 1461             2 SUM_CLAUSE_LIST$        PTR,
+ 1462             2 ASSOC_VAR_LTS$          PTR,
+ 1463             2 ASSOC_REPORT_LTS$       PTR,
+ 1464             2 ASSOC_01_LTS$           PTR,
+ 1465             2 LINE                    UBIN WORD,
+ 1466             2 COLUMN                  UBIN WORD,
+ 1467             2 LINK                    PTR;
+ 1468
+ 1469
+ 1470       DCL 1 DEFERED_SUM_CLAUSE        BASED  ALIGNED,
+ 1471             2 ID                      UBIN HALF UNAL,
+ 1472             2 B                       UNAL,
+ 1473               3 ERROR                 BOOLEAN,
+ 1474               3 RESET_ID              BOOLEAN,
+ 1475               3 RESET_FINAL           BOOLEAN,
+ 1476               3 *                     BIT(15)  UNAL,
+ 1477             2 DEFERED_ID$            PTR,
+ 1478             2 *                       PTR,
+ 1479             2 SUM_UPON$               PTR,
+ 1480             2 SUM_RESET$              PTR,
+ 1481             2 LINE                    UBIN WORD,
+ 1482             2 COLUMN                  UBIN WORD,
+ 1483             2 LINK                    PTR;
+ 1484
+ 1485       DCL 1 LX_CD_INPUT         BASED ALIGNED,
+ 1486             2 ID                UBIN HALF UNAL,
+ 1487             2 B                 UNAL,
+ 1488               3 INITIAL         BOOLEAN,
+ 1489               3 *               BIT(17) UNAL,
+ 1490             2 CD_NAME$          PTR,
+ 1491             2 BLOCK$            PTR,
+ 1492             2 P,
+ 1493               3 QUEUE$          PTR,
+ 1494               3 SUB_QUEUE_1$    PTR,
+ 1495               3 SUB_QUEUE_2$    PTR,
+ 1496               3 SUB_QUEUE_3$    PTR,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    43   
+ 1497               3 MESSAGE_DATE$   PTR,
+ 1498               3 MESSAGE_TIME$   PTR,
+ 1499               3 SYMBOLIC_SOURCE$ PTR,
+ 1500               3 TEXT_LENGTH$    PTR,
+ 1501               3 END_KEY$        PTR,
+ 1502               3 STATUS_KEY$     PTR,
+ 1503               3 MESSAGE_COUNT$  PTR,
+ 1504             2 INPUT_FIELDS$  (0:%(CD_INPUT_OPTION - 1)) REDEF P PTR;
+ 1505
+ 1506       DCL 1 LX_CD_OUTPUT        BASED ALIGNED,
+ 1507             2 ID                UBIN HALF UNAL,
+ 1508             2 B                 UNAL,
+ 1509               3 ERROR           BOOLEAN,
+ 1510               3 *               BIT(17) UNAL,
+ 1511             2 CD_NAME$          PTR,
+ 1512             2 BLOCK$            PTR,
+ 1513             2 P,
+ 1514               3 DESTINATION_COUNT$  PTR,
+ 1515               3 TEXT_LENGTH$    PTR,
+ 1516               3 STATUS_KEY$     PTR,
+ 1517               3 DESTINATION_TABLE$ PTR,
+ 1518               3 ERROR_KEY$      PTR,
+ 1519               3 SYMBOLIC_DESTINATION$ PTR,
+ 1520               3 OCCURS$         PTR,
+ 1521               3 INDEX_LIST$     PTR,
+ 1522             2 OUTPUT_FIELDS$  (0:%(CD_OUTPUT_OPTION + 1)) REDEF P PTR;
+ 1523
+ 1524       DCL 1 LX_CD_I_O           BASED ALIGNED,
+ 1525             2 ID                UBIN HALF UNAL,
+ 1526             2 B                 UNAL,
+ 1527               3 INITIAL         BOOLEAN,
+ 1528               3 *               BIT(17) UNAL,
+ 1529             2 CD_NAME$          PTR,
+ 1530             2 BLOCK$            PTR,
+ 1531             2 P,
+ 1532               3 MESSAGE_DATE$   PTR,
+ 1533               3 MESSAGE_TIME$   PTR,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    44   
+ 1534               3 TERMINAL$       PTR,
+ 1535               3 TEXT_LENGTH$    PTR,
+ 1536               3 END_KEY$        PTR,
+ 1537               3 STATUS_KEY$     PTR,
+ 1538             2 I_O_FIELDS$ (0:%(CD_I_O_OPTION - 1)) REDEF P PTR;
+ 1539
+ 1540      %EJECT;
+
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    45   
+ 1541
+ 1542      %MACRO NEW_LX_REC_DECL(@POINTER=);
+ 1543        DO;
+ 1544          %NEW(@POINTER=@POINTER,
+ 1545               @TEMPLATE=LX_REC_DECL);
+ 1546          @POINTER -> LX_REC_DECL.ID = %LX_REC_DECL;
+ 1547          @POINTER -> LX_REC_DECL.CURRENT_CLAUSE_COUNT = 0;
+ 1548          DO I = 0 TO %REC_DECL_MAX_FIELD;
+ 1549            @POINTER -> LX_REC_DECL.P_PTRS(I) = ADDR(NIL);
+ 1550            @POINTER -> LX_REC_DECL.CLAUSE_COUNT(I) = 0;
+ 1551          END;
+ 1552        END;
+ 1553      %MEND;
+ 1554
+ 1555       %MACRO  NEW_LX_REPORT_REC (@POINTER = );
+ 1556         DO;
+ 1557           %NEW (@POINTER = @POINTER,
+ 1558                 @TEMPLATE = LX_REPORT_REC);
+ 1559           @POINTER -> LX_REPORT_REC.ID = %LX_REPORT_REC;
+ 1560           @POINTER -> LX_REPORT_REC.CLAUSE_COUNT = 0;
+ 1561           @POINTER -> LX_REPORT_REC.D.REPORT_TYPE = %NO_REPORT_TYPE;
+ 1562           @POINTER -> LX_REPORT_REC.D.LINE_TYPE = %NO_REPORT_TYPE;
+ 1563           @POINTER -> LX_REPORT_REC.D.NEXT_GROUP_TYPE = %NO_REPORT_TYPE;
+ 1564           @POINTER -> LX_REPORT_REC.NEXT_GROUP_NO# = 0;
+ 1565           @POINTER -> LX_REPORT_REC.LINE_NO# = 0;
+ 1566           @POINTER -> LX_REPORT_REC.COLUMN_NO# = 0;
+ 1567           DO I = 0 TO %REPORT_REC_MAX_FIELD;
+ 1568             @POINTER -> LX_REPORT_REC.P_PTRS(I) = ADDR(NIL);
+ 1569           END;
+ 1570         END;
+ 1571       %MEND;
+ 1572
+ 1573       %MACRO INIT_DEFERED_ID_TREE (@POINTER = ,
+ 1574                                    @QUAL_ID$ = "ADDR(NIL)",
+ 1575                                    @LINK    = "ADDR(NIL)",
+ 1576                                    @SUB$    = "ADDR(NIL)",
+ 1577                                    @REF$    = "ADDR(NIL)",
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    46   
+ 1578                                    @ACTION_NO# = SEMANTIC_ACTION,
+ 1579                                    @LINE    = 0);
+ 1580         DO;
+ 1581
+ 1582           @POINTER -> DEFERED_ID_TREE.ID = %DEFERED_ID_TREE;
+ 1583           @POINTER -> DEFERED_ID_TREE.QUAL_ID$ = @QUAL_ID$;
+ 1584           @POINTER -> DEFERED_ID_TREE.SUB$ = @SUB$;
+ 1585           @POINTER -> DEFERED_ID_TREE.REF$ = @REF$;
+ 1586           @POINTER -> DEFERED_ID_TREE.LINK = @LINK;
+ 1587           @POINTER -> DEFERED_ID_TREE.LINE = @LINE;
+ 1588           @POINTER -> DEFERED_ID_TREE.ACTION_NO# = @ACTION_NO#;
+ 1589         END;
+ 1590       %MEND;
+ 1591
+ 1592       %MACRO INIT_DEFERED_IDENTIFIER (@POINTER      =,
+ 1593                                       @DEFERED_ID$ = "ADDR(NIL)",
+ 1594                                       @ASSOC_VAR_LTS$ = "ADDR(NIL)",
+ 1595                                       @ASSOC_REPORT_LTS$ = "ADDR(NIL)",
+ 1596                                       @ERROR         = '0'B,
+ 1597                                       @LINE          = COMCOM.CURRENT.LINE,
+ 1598                                       @COLUMN        = COMCOM.CURRENT.COLUMN,
+ 1599                                       @LINK          = "ADDR(NIL)");
+ 1600         DO;
+ 1601           @POINTER -> DEFERED_IDENTIFIER.ID = %DEFERED_IDENTIFIER;
+ 1602           @POINTER -> DEFERED_IDENTIFIER.DEFERED_ID$ = @DEFERED_ID$;
+ 1603           @POINTER -> DEFERED_IDENTIFIER.ASSOC_VAR_LTS$ = @ASSOC_VAR_LTS$;
+ 1604           @POINTER -> DEFERED_IDENTIFIER.ASSOC_REPORT_LTS$ = @ASSOC_REPORT_LTS$;
+ 1605           @POINTER -> DEFERED_IDENTIFIER.LINE = @LINE;
+ 1606           @POINTER -> DEFERED_IDENTIFIER.COLUMN = @COLUMN;
+ 1607           @POINTER -> DEFERED_IDENTIFIER.LINK = @LINK;
+ 1608           @POINTER -> DEFERED_IDENTIFIER.B = '0'B;
+ 1609           @POINTER -> DEFERED_IDENTIFIER.B.ERROR = @ERROR;
+ 1610         END;
+ 1611       %MEND;
+ 1612
+ 1613       %MACRO INIT_DEFERED_SUM_CLAUSE_LIST (@POINTER      =,
+ 1614                                            @SUM_CLAUSE_LIST$ = "ADDR(NIL)",
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    47   
+ 1615                                            @ASSOC_VAR_LTS$ = "ADDR(NIL)",
+ 1616                                            @ASSOC_REPORT_LTS$ = "ADDR(NIL)",
+ 1617                                            @ASSOC_01_LTS$ = "ADDR(NIL)",
+ 1618                                            @ERROR         = '0'B,
+ 1619                                            @LINE          = COMCOM.CURRENT.LINE,
+ 1620                                            @COLUMN       = COMCOM.CURRENT.COLUMN,
+ 1621                                            @LINK          = "ADDR(NIL)");
+ 1622         DO;
+ 1623           @POINTER -> DEFERED_SUM_CLAUSE_LIST.ID = %DEFERED_SUM_CLAUSE_LIST;
+ 1624           @POINTER -> DEFERED_SUM_CLAUSE_LIST.SUM_CLAUSE_LIST$ = @SUM_CLAUSE_LIST$;
+ 1625           @POINTER -> DEFERED_SUM_CLAUSE_LIST.ASSOC_VAR_LTS$ = @ASSOC_VAR_LTS$;
+ 1626           @POINTER -> DEFERED_SUM_CLAUSE_LIST.ASSOC_REPORT_LTS$ = @ASSOC_REPORT_LTS$;
+ 1627           @POINTER -> DEFERED_SUM_CLAUSE_LIST.ASSOC_01_LTS$ = @ASSOC_01_LTS$;
+ 1628           @POINTER -> DEFERED_SUM_CLAUSE_LIST.B = '0'B;
+ 1629           @POINTER -> DEFERED_SUM_CLAUSE_LIST.B.ERROR = @ERROR;
+ 1630           @POINTER -> DEFERED_SUM_CLAUSE_LIST.LINE = @LINE;
+ 1631           @POINTER -> DEFERED_SUM_CLAUSE_LIST.COLUMN = @COLUMN;
+ 1632           @POINTER -> DEFERED_SUM_CLAUSE_LIST.LINK = @LINK;
+ 1633         END;
+ 1634       %MEND;
+ 1635
+ 1636
+ 1637       %MACRO INIT_DEFERED_SUM_CLAUSE      (@POINTER      =,
+ 1638                                            @DEFERED_ID$ = "ADDR(NIL)",
+ 1639                                            @SUM_UPON$ = "ADDR(NIL)",
+ 1640                                            @SUM_RESET$ = "ADDR(NIL)",
+ 1641                                            @ERROR         = '0'B,
+ 1642                                            @RESET_ID      = '0'B,
+ 1643                                            @RESET_FINAL   = '0'B,
+ 1644                                            @LINE          = COMCOM.CURRENT.LINE,
+ 1645                                            @COLUMN        = COMCOM.CURRENT.COLUMN,
+ 1646                                            @LINK          = "ADDR(NIL)");
+ 1647         DO;
+ 1648           @POINTER -> DEFERED_SUM_CLAUSE.ID = %DEFERED_SUM_CLAUSE;
+ 1649           @POINTER -> DEFERED_SUM_CLAUSE.DEFERED_ID$ = @DEFERED_ID$;
+ 1650           @POINTER -> DEFERED_SUM_CLAUSE.SUM_UPON$ = @SUM_UPON$;
+ 1651           @POINTER -> DEFERED_SUM_CLAUSE.SUM_RESET$ = @SUM_RESET$;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    48   
+ 1652           @POINTER -> DEFERED_SUM_CLAUSE.B = '0'B;
+ 1653           @POINTER -> DEFERED_SUM_CLAUSE.B.ERROR = @ERROR;
+ 1654           @POINTER -> DEFERED_SUM_CLAUSE.B.RESET_ID = @RESET_ID;
+ 1655           @POINTER -> DEFERED_SUM_CLAUSE.B.RESET_FINAL = @RESET_FINAL;
+ 1656           @POINTER -> DEFERED_SUM_CLAUSE.LINE = @LINE;
+ 1657           @POINTER -> DEFERED_SUM_CLAUSE.COLUMN = @COLUMN;
+ 1658           @POINTER -> DEFERED_SUM_CLAUSE.LINK = @LINK;
+ 1659         END;
+ 1660       %MEND;
+ 1661
+ 1662
+ 1663       %MACRO NEW_LX_CD_INPUT  (@POINTER = );
+ 1664         DO;
+ 1665           %NEW(@POINTER = @POINTER,
+ 1666                @TEMPLATE = LX_CD_INPUT );
+ 1667
+ 1668           @POINTER -> LX_CD_INPUT.CD_NAME$ = ADDR(NIL);
+ 1669           @POINTER -> LX_CD_INPUT.BLOCK$   = ADDR(NIL);
+ 1670           @POINTER -> LX_CD_INPUT.ID       = %LX_CD_INPUT;
+ 1671           @POINTER -> LX_CD_INPUT.B        = '0'B;
+ 1672           DO I = 0 TO %CD_INPUT_OPTION - 1;
+ 1673             @POINTER -> LX_CD_INPUT.INPUT_FIELDS$(I) = ADDR(NIL);
+ 1674           END;
+ 1675         END;
+ 1676       %MEND;
+ 1677
+ 1678       %MACRO NEW_LX_CD_OUTPUT (@POINTER = );
+ 1679         DO;
+ 1680           %NEW(@POINTER = @POINTER,
+ 1681                @TEMPLATE = LX_CD_OUTPUT);
+ 1682
+ 1683           @POINTER -> LX_CD_OUTPUT.CD_NAME$ = ADDR(NIL);
+ 1684           @POINTER -> LX_CD_OUTPUT.BLOCK$   = ADDR(NIL);
+ 1685           @POINTER -> LX_CD_OUTPUT.ID       = %LX_CD_OUTPUT;
+ 1686           @POINTER -> LX_CD_OUTPUT.B        = '0'B;
+ 1687           DO I = 0 TO %CD_OUTPUT_OPTION + 1;
+ 1688             @POINTER -> LX_CD_OUTPUT.OUTPUT_FIELDS$(I) = ADDR(NIL);
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    49   
+ 1689           END;
+ 1690         END;
+ 1691       %MEND;
+ 1692
+ 1693
+ 1694       %MACRO NEW_LX_CD_I_O (@POINTER = );
+ 1695         DO;
+ 1696           %NEW(@POINTER = @POINTER,
+ 1697                @TEMPLATE = LX_CD_I_O);
+ 1698
+ 1699           @POINTER -> LX_CD_I_O.CD_NAME$ = ADDR(NIL);
+ 1700           @POINTER -> LX_CD_I_O.BLOCK$   = ADDR(NIL);
+ 1701           @POINTER -> LX_CD_I_O.ID       = %LX_CD_I_O;
+ 1702           @POINTER -> LX_CD_I_O.B        = '0'B;
+ 1703           DO I = 0 TO %CD_I_O_OPTION - 1;
+ 1704             @POINTER -> LX_CD_I_O.I_O_FIELDS$(I) = ADDR(NIL);
+ 1705           END;
+ 1706         END;
+ 1707       %MEND;
+ 1708
+ 1709
+ 1710
+ 1711      %MACRO INIT_ADD_STMT ( @POINTER = );
+ 1712        DO;
+ 1713          @POINTER -> ADD_STMT.ID = %ADD_STMT;
+ 1714          @POINTER -> ADD_STMT.KEY_WORD$ = ADDR(NIL);
+ 1715          @POINTER -> ADD_STMT.SENDING$ = ADDR(NIL);
+ 1716          @POINTER -> ADD_STMT.RECEIVING$ = ADDR(NIL);
+ 1717          @POINTER -> ADD_STMT.TYPE = %ADD_TO;
+ 1718        END;
+ 1719      %MEND;
+ 1720
+ 1721
+ 1722      %MACRO INIT_CALL_STMT ( @POINTER = );
+ 1723        DO;
+ 1724          @POINTER -> CALL_STMT.ID = %CALL_STMT;
+ 1725          @POINTER -> CALL_STMT.KEY_WORD$ = ADDR(NIL);
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    50   
+ 1726          @POINTER -> CALL_STMT.PROC_NAME$ = ADDR(NIL);
+ 1727          @POINTER -> CALL_STMT.ARG_LIST$ = ADDR(NIL);
+ 1728        END;
+ 1729      %MEND;
+ 1730
+ 1731
+ 1732      %MACRO INIT_DEFERED_QUAL_ID (@POINTER =,
+ 1733                                   @QUAL_ID_LIST$ = "ADDR(NIL)",
+ 1734                                   @ASSOC_VAR_ST$ = "ADDR(NIL)",
+ 1735                                   @ILL$          = "ADDR(NIL)",
+ 1736                                   @BERROR        = '0'B,
+ 1737                                   @LINE          = COMCOM.CURRENT.LINE,
+ 1738                                   @COLUMN        = COMCOM.CURRENT.COLUMN,
+ 1739                                   @LINK          = "ADDR(NIL)");
+ 1740
+ 1741         DO;
+ 1742           @POINTER -> DEFERED_QUAL_ID.ID            = %DEFERED_QUAL_ID;
+ 1743           @POINTER -> DEFERED_QUAL_ID.QUAL_ID_LIST$ = @QUAL_ID_LIST$;
+ 1744           @POINTER -> DEFERED_QUAL_ID.ASSOC_VAR_ST$ = @ASSOC_VAR_ST$;
+ 1745           @POINTER -> DEFERED_QUAL_ID.ILL$          = @ILL$;
+ 1746           @POINTER -> DEFERED_QUAL_ID.B             = '0'B;
+ 1747           @POINTER -> DEFERED_QUAL_ID.B.ERROR       = @BERROR;
+ 1748           @POINTER -> DEFERED_QUAL_ID.LINE          = @LINE;
+ 1749           @POINTER -> DEFERED_QUAL_ID.COLUMN        = @COLUMN;
+ 1750           @POINTER -> DEFERED_QUAL_ID.LINK          = @LINK;
+ 1751         END;
+ 1752
+ 1753      %MEND;
+ 1754
+ 1755
+ 1756      %MACRO INIT_DELETE_STMT (@POINTER = );
+ 1757        DO;
+ 1758          @POINTER -> DELETE_STMT.ID = %DELETE_STMT;
+ 1759          @POINTER -> DELETE_STMT.KEY_WORD$ = ADDR(NIL);
+ 1760          @POINTER -> DELETE_STMT.FILE_NAME$ = ADDR(NIL);
+ 1761        END;
+ 1762      %MEND;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    51   
+ 1763
+ 1764
+ 1765      %MACRO INIT_LX_LARGE (@POINTER=);
+ 1766        DO;
+ 1767          @POINTER -> LX_LARGE.ID = %LX_LARGE;
+ 1768          @POINTER -> LX_LARGE.LARGE_ITEM$ = ADDR(NIL);
+ 1769          @POINTER -> LX_LARGE.LINK = ADDR(NIL);
+ 1770        END;
+ 1771      %MEND;
+ 1772
+ 1773
+ 1774      %MACRO INIT_LX_LIST (@POINTER=,
+ 1775                           @TAIL$ = "ADDR(NIL)",
+ 1776                           @HEAD$ = "ADDR(NIL)",
+ 1777                           @LINK  = "ADDR(NIL)",
+ 1778                           @COUNT = 0,
+ 1779                           @TYPE = 0);
+ 1780        DO;
+ 1781          @POINTER -> LX_LIST.ID = %LX_LIST;
+ 1782          @POINTER -> LX_LIST.B  = '0'B;
+ 1783          @POINTER -> LX_LIST.TAIL$ = @TAIL$;
+ 1784          @POINTER -> LX_LIST.HEAD$ = @HEAD$;
+ 1785          @POINTER -> LX_LIST.LINK  = @LINK;
+ 1786          @POINTER -> LX_LIST.COUNT = @COUNT;
+ 1787        END;
+ 1788      %MEND;
+ 1789
+ 1790
+ 1791
+ 1792
+ 1793      %MACRO INIT_LX_ETT_ITEM ( @POINTER = ,
+ 1794                                @TYPE    = %TYT ,
+ 1795                                @LINK    = "ADDR(NIL)",
+ 1796                                @ETT$    = "ADDR(NIL)" ,
+ 1797                                @BY_CONTENT_ILS_LIST$ = "ADDR(NIL)",
+ 1798                                @ROUND   = ,
+ 1799                                @REFMOD  = ,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    52   
+ 1800                                @ALL     = ,
+ 1801                                @LINE    = COMCOM.CURRENT.LINE,
+ 1802                                @COLUMN  = COMCOM.CURRENT.COLUMN);
+ 1803        DO;
+ 1804          @POINTER -> LX_ETT_ITEM.ID   = %LX_ETT_ITEM;
+ 1805          @POINTER -> LX_ETT_ITEM.B    = '0'B;
+ 1806          @POINTER -> LX_ETT_ITEM.TYPE = @TYPE;
+ 1807          @POINTER -> LX_ETT_ITEM.LINK = @LINK;
+ 1808          @POINTER -> LX_ETT_ITEM.ETT$ = @ETT$;
+ 1809          @POINTER -> LX_ETT_ITEM.BY_CONTENT_ILS_LIST$ =
+ 1810                                 @BY_CONTENT_ILS_LIST$ ;
+ 1811          @POINTER -> LX_ETT_ITEM.LINE = @LINE;
+ 1812          @POINTER -> LX_ETT_ITEM.COLUMN = @COLUMN;
+ 1813           %IF TEXTCHAR(@ROUND) ~= '';
+ 1814             @POINTER -> LX_ETT_ITEM.B.ROUND = @ROUND;
+ 1815           %ENDIF;
+ 1816
+ 1817           %IF TEXTCHAR(@ALL) ~= '';
+ 1818             @POINTER -> LX_ETT_ITEM.B.ALL = @ALL;
+ 1819           %ENDIF;
+ 1820
+ 1821           %IF TEXTCHAR(@REFMOD) ~= '';
+ 1822             @POINTER -> LX_ETT_ITEM.B.REFMOD = @REFMOD;
+ 1823           %ENDIF;
+ 1824        END;
+ 1825      %MEND;
+ 1826
+ 1827
+ 1828
+ 1829      %MACRO INIT_LX_TERMINAL ( @POINTER = ,
+ 1830                                @TYPE    = %TYT ,
+ 1831                                @BERROR  = ,
+ 1832                                @LINK    = "ADDR(NIL)",
+ 1833                                @LA_ITEM = ,
+ 1834                                @ST$     = "ADDR(NIL)" ,
+ 1835                                @SYMBOL  = %RSV_WRD_ZEROES,
+ 1836                                @DNT$    = "ADDR(NIL)" ,
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    53   
+ 1837                                @LINE    = COMCOM.CURRENT.LINE,
+ 1838                                @COLUMN  = COMCOM.CURRENT.COLUMN);
+ 1839        DO;
+ 1840          @POINTER -> LX_TERMINAL.ID     = %LX_TERMINAL;
+ 1841          @POINTER -> LX_TERMINAL.B      = '0'B;
+ 1842          %IF (TEXTCHAR(@BERROR) ~= '');
+ 1843             @POINTER -> LX_TERMINAL.B.ERROR = @BERROR;
+ 1844          %ENDIF;
+ 1845          @POINTER -> LX_TERMINAL.TYPE   = @TYPE;
+ 1846          %IF (TEXTCHAR(@LA_ITEM) = '');
+ 1847            @POINTER -> LX_TERMINAL.LINK   = @LINK;
+ 1848          %ENDIF;
+ 1849          @POINTER -> LX_TERMINAL.ST$    = @ST$ ;
+ 1850          @POINTER -> LX_TERMINAL.SYMBOL = @SYMBOL;
+ 1851          @POINTER -> LX_TERMINAL.DNT$   = @DNT$;
+ 1852          @POINTER -> LX_TERMINAL.LINE   = @LINE;
+ 1853          @POINTER -> LX_TERMINAL.COLUMN = @COLUMN;
+ 1854        END;
+ 1855      %MEND;
+ 1856
+ 1857
+ 1858
+ 1859      %MACRO INIT_BINARY_OP (@POINTER = "ADDR(TEMP_LX_NODE)",
+ 1860                             @BERR    = ,
+ 1861                             @HIGH_LEV =,
+ 1862                             @LINE    = "COMCOM.CURRENT.LINE",
+ 1863                             @COLUMN  = "COMCOM.CURRENT.COLUMN",
+ 1864                             @ROP$    = "ADDR(NIL)",
+ 1865                             @LOP$    = "ADDR(NIL)",
+ 1866                             @OP      = %OP_PLUS,
+ 1867                             @LINK    = "ADDR(NIL)");
+ 1868        DO;
+ 1869          @POINTER -> BINARY_OP.ID      = %BINARY_OP;
+ 1870          @POINTER -> BINARY_OP.B       = '0'B;
+ 1871          %IF (TEXTCHAR(@BERR) ~= '');
+ 1872            @POINTER -> BINARY_OP.B.ERROR = @BERR;
+ 1873          %ENDIF;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    54   
+ 1874          %IF (TEXTCHAR(@HIGH_LEV) ~= '');
+ 1875            @POINTER -> BINARY_OP.B.HIGH_LEV = @HIGH_LEV;
+ 1876          %ENDIF;
+ 1877          @POINTER -> BINARY_OP.LINE    = @LINE;
+ 1878          @POINTER -> BINARY_OP.COLUMN  = @COLUMN;
+ 1879          @POINTER -> BINARY_OP.ROP$    = @ROP$;
+ 1880          @POINTER -> BINARY_OP.LOP$    = @LOP$;
+ 1881          @POINTER -> BINARY_OP.OP      = @OP;
+ 1882          @POINTER -> BINARY_OP.LINK    = @LINK;
+ 1883        END;
+ 1884      %MEND;
+ 1885
+ 1886
+ 1887      %MACRO INIT_MULTIPLY_STMT ( @POINTER = );
+ 1888        DO;
+ 1889          @POINTER -> MULTIPLY_STMT.ID = %MULTIPLY_STMT;
+ 1890          @POINTER -> MULTIPLY_STMT.KEY_WORD$ = ADDR(NIL);
+ 1891          @POINTER -> MULTIPLY_STMT.SENDING$ = ADDR(NIL);
+ 1892          @POINTER -> MULTIPLY_STMT.BY$      = ADDR(NIL);
+ 1893          @POINTER -> MULTIPLY_STMT.GIVING$  = ADDR(NIL);
+ 1894        END;
+ 1895      %MEND;
+ 1896
+ 1897
+ 1898      %MACRO INIT_READ_STMT (@POINTER = );
+ 1899        DO;
+ 1900          @POINTER -> READ_STMT.ID = %READ_STMT;
+ 1901          @POINTER -> READ_STMT.KEY_WORD$ = ADDR(NIL);
+ 1902          @POINTER -> READ_STMT.FILE_NAME$ = ADDR(NIL);
+ 1903          @POINTER -> READ_STMT.NEXT$ = ADDR(NIL);
+ 1904          @POINTER -> READ_STMT.INTO_IDENT$ = ADDR(NIL);
+ 1905          @POINTER -> READ_STMT.KEY_ID$ = ADDR(NIL);
+ 1906        END;
+ 1907      %MEND;
+ 1908
+ 1909
+ 1910      %MACRO INIT_REWRITE_STMT (@POINTER = );
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    55   
+ 1911        DO;
+ 1912          @POINTER -> REWRITE_STMT.ID = %REWRITE_STMT;
+ 1913          @POINTER -> REWRITE_STMT.KEY_WORD$ = ADDR(NIL);
+ 1914          @POINTER -> REWRITE_STMT.IDENT$ = ADDR(NIL);
+ 1915          @POINTER -> REWRITE_STMT.FROM_IDENT$ = ADDR(NIL);
+ 1916        END;
+ 1917      %MEND;
+ 1918
+ 1919
+ 1920      %MACRO INIT_START_STMT (@POINTER = );
+ 1921        DO;
+ 1922          @POINTER -> START_STMT.ID = %START_STMT;
+ 1923          @POINTER -> START_STMT.KEY_WORD$ = ADDR(NIL);
+ 1924          @POINTER -> START_STMT.FILE_NAME$ = ADDR(NIL);
+ 1925          @POINTER -> START_STMT.KEY$ = ADDR(NIL);
+ 1926        END;
+ 1927      %MEND;
+ 1928
+ 1929
+ 1930      %MACRO INIT_STRING_STMT (@POINTER = );
+ 1931        DO;
+ 1932          @POINTER -> STRING_STMT.ID = %STRING_STMT;
+ 1933          @POINTER -> STRING_STMT.KEY_WORD$ = ADDR(NIL);
+ 1934          @POINTER -> STRING_STMT.STRING_LIST$ = ADDR(NIL);
+ 1935          @POINTER -> STRING_STMT.INTO$ = ADDR(NIL);
+ 1936          @POINTER -> STRING_STMT.POINTER$ = ADDR(NIL);
+ 1937        END;
+ 1938      %MEND;
+ 1939
+ 1940      %MACRO INIT_SUBTRACT_STMT ( @POINTER = );
+ 1941        DO;
+ 1942          @POINTER -> SUBTRACT_STMT.ID = %SUBTRACT_STMT;
+ 1943          @POINTER -> SUBTRACT_STMT.KEY_WORD$ = ADDR(NIL);
+ 1944          @POINTER -> SUBTRACT_STMT.SENDING$ = ADDR(NIL);
+ 1945          @POINTER -> SUBTRACT_STMT.FROM$ = ADDR(NIL);
+ 1946          @POINTER -> SUBTRACT_STMT.RECEIVING$ = ADDR(NIL);
+ 1947          @POINTER -> SUBTRACT_STMT.TYPE = %SUBTRACT_FROM;
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    56   
+ 1948        END;
+ 1949      %MEND;
+ 1950
+ 1951
+ 1952
+ 1953      %MACRO INIT_UNARY_OP (@POINTER = "ADDR(TEMP_LX_NODE)",
+ 1954                             @BERR   = ,
+ 1955    *                        @HIGH_LEV = ,
+ 1956                             @LINE   = "COMCOM.CURRENT.LINE",
+ 1957                             @COLUMN = "COMCOM.CURRENT.COLUMN",
+ 1958                             @LOP$   = "ADDR(NIL)",
+ 1959                             @OP     = %OP_UNARY_MINUS,
+ 1960                             @LINK   = "ADDR(NIL)");
+ 1961        DO;
+ 1962          @POINTER -> UNARY_OP.ID       = %UNARY_OP;
+ 1963          @POINTER -> UNARY_OP.B        = '0'B;
+ 1964          %IF (TEXTCHAR(@BERR) ~= '');
+ 1965            @POINTER -> UNARY_OP.B.ERROR  = @BERR;
+ 1966    *     %ENDIF;
+ 1967    *     %IF (TEXTCHAR(@HIGH_LEV) ~= '');
+ 1968    *       @POINTER -> UNARY_OP.B.HIGH_LEV = TRUE;
+ 1969          %ENDIF;
+ 1970          @POINTER -> UNARY_OP.LINE     = @LINE;
+ 1971          @POINTER -> UNARY_OP.COLUMN   = @COLUMN;
+ 1972          @POINTER -> UNARY_OP.LOP$     = @LOP$;
+ 1973          @POINTER -> UNARY_OP.OP       = @OP;
+ 1974          @POINTER -> UNARY_OP.LINK     = @LINK;
+ 1975        END;
+ 1976      %MEND;
+ 1977
+ 1978
+ 1979
+ 1980      %MACRO INIT_UNSTRING_STMT (@POINTER = );
+ 1981        DO;
+ 1982          @POINTER -> UNSTRING_STMT.ID   = %UNSTRING_STMT;
+ 1983          @POINTER -> UNSTRING_STMT.KEY_WORD$ = ADDR(NIL);
+ 1984          @POINTER -> UNSTRING_STMT.IDENT$ = ADDR(NIL);
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    57   
+ 1985          @POINTER -> UNSTRING_STMT.DELIM_LIST$ = ADDR(NIL);
+ 1986          @POINTER -> UNSTRING_STMT.INTO_LIST$ = ADDR(NIL);
+ 1987          @POINTER -> UNSTRING_STMT.POINTER$ = ADDR(NIL);
+ 1988          @POINTER -> UNSTRING_STMT.TALLYING$ = ADDR(NIL);
+ 1989        END;
+ 1990      %MEND;
+ 1991
+ 1992
+ 1993
+ 1994
+ 1995      %MACRO INIT_ILS_LIST (@POINTER =);
+ 1996        DO;
+ 1997          @POINTER -> ILS_LIST.ID            = %ILS_LIST;
+ 1998          @POINTER -> ILS_LIST.HEAD$         = ADDR(NIL);
+ 1999          @POINTER -> ILS_LIST.TAIL$         = ADDR(NIL);
+ 2000          @POINTER -> ILS_LIST.LINK          = ADDR(NIL);
+ 2001        END;
+ 2002      %MEND;
+ 2003
+ 2004
+ 2005      %MACRO INIT_COMPUTE_STMT (@POINTER =,
+ 2006                                @EXPR$ = "ADDR(NIL)",
+ 2007                                @IDENT_LIST$ = "ADDR(NIL)",
+ 2008                                @KEY_WORD$ = "ADDR(NIL)");
+ 2009        DO;
+ 2010          @POINTER -> COMPUTE_STMT.ID = %COMPUTE_STMT;
+ 2011          @POINTER -> COMPUTE_STMT.EXPR$ = @EXPR$;
+ 2012          @POINTER -> COMPUTE_STMT.IDENT_LIST$ = @IDENT_LIST$;
+ 2013          @POINTER -> COMPUTE_STMT.KEY_WORD$ = @KEY_WORD$;
+ 2014        END;
+ 2015      %MEND;
+ 2016
+ 2017      %MACRO INIT_DIVIDE_STMT ( @POINTER =,
+ 2018                                @KEY_WORD$ = "ADDR(NIL)",
+ 2019                                @DIVISOR$ = "ADDR(NIL)",
+ 2020                                @QUOTIENT_LIST$ = "ADDR(NIL)",
+ 2021                                @DIVIDEND_LIST$ = "ADDR(NIL)",
+09:21 AUG 09 '97 Z8E_STACKS.:Z8A6SI/Z8E_STACKS.:Z8A6TUI                    58   
+ 2022                                @REMAINDER$ = "ADDR(NIL)");
+ 2023        DO;
+ 2024          @POINTER -> DIVIDE_STMT.ID = %DIVIDE_STMT;
+ 2025          @POINTER -> DIVIDE_STMT.KEY_WORD$ = @KEY_WORD$;
+ 2026          @POINTER -> DIVIDE_STMT.DIVISOR$ = @DIVISOR$;
+ 2027          @POINTER -> DIVIDE_STMT.QUOTIENT_LIST$ = @QUOTIENT_LIST$;
+ 2028          @POINTER -> DIVIDE_STMT.DIVIDEND_LIST$ = @DIVIDEND_LIST$;
+ 2029          @POINTER -> DIVIDE_STMT.REMAINDER$ = @REMAINDER$;
+ 2030        END;
+ 2031      %MEND;
+ 2032
+ 2033
+ 2034      %MACRO INIT_WRITE_STMT (@POINTER =);
+ 2035        DO;
+ 2036          @POINTER -> WRITE_STMT.ID = %WRITE_STMT;
+ 2037          @POINTER -> WRITE_STMT.KEY_WORD$ = ADDR(NIL);
+ 2038          @POINTER -> WRITE_STMT.IDENT$    = ADDR(NIL);
+ 2039          @POINTER -> WRITE_STMT.FROM_IDENT$ = ADDR(NIL);
+ 2040          @POINTER -> WRITE_STMT.LINES$    = ADDR(NIL);
+ 2041        END;
+ 2042      %MEND;
+ 2043
+ 2044
+ 2045
+ 2046      %INCLUDE Z8A_LEX_SYMB;
+ 2047
+

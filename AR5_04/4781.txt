@@ -1,0 +1,213 @@
+/*M* YFA$BATCH - BATCH ONE JOB FOR FUMBLE */
+/*T***********************************************************/
+/*T*                                                         */
+/*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+/*T*                                                         */
+/*T***********************************************************/
+/*X* CCC,DMR,PLM=5,IND=5,CSU=3,EXM=0,ECU=3,MOC,DCI=5,CRT=5 */
+/*P* NAME: YFA$BATCH
+     DESCRIPTION: BATCH IS CALLED BY YFA$FUMBLE TO BUILD A !BATCH
+          IMAGE TO PASS TO IBEX VIA M$YC.  THE NAME OF THE LISTFILE
+          RECORD TO BATCH IS PASSED IN NAME.  IF THE X OPTION WAS
+          SPECIFIED (ONLY ONE RECORD TO BATCH), THE LISTFILE
+          IS READ SEQUEN, IF ITS NOT KEYED.  IF THE X OPTION WAS
+          NOT SPECIFIED, YFA$FUMBLE WILL HAVE ALREADY CREATED A KEYED
+          LISTFILE (IF IT WAS NOT ALREADY KEYED).  IN THIS CASE, BATCH
+          READS THE LISTFILE KEYED.  AFTER THE LISTFILE RECORD IS
+          IN HAND, THE VARIOUS FIELDS ARE BROKEN DOWN, AND THE !BATCH
+          IMAGE BUILT.  THE LISTFILE RECORD IS COMPARED AGAINST THE
+          SELECT LIST (IF PRESENT).  IF THE RECORD MATCHES A SELECT NAME,
+          THE !BATCH IMAGE IS SENT TO IBEX.
+ 
+          AFTER THE M$YC CALL, Q_COUNT IS INCREMENTED AND COMPARED WITH
+          MAXQ.  IF MAXQ IS REACHED, YFA$BATCH CALLS M$EXIT.  AS SOON
+          AS IBEX PASSES THE SYSID OF THE BATCHED JOB IN THE RESULTS
+          FIELD, WE CAN KEEP MAXQ JOBS IN THE QUEUE, NOW WE JUST
+          EXIT.
+                             */
+YFA$BATCH: PROC(NAME);
+                                        /**/
+DCL Q_COUNT UBIN STATIC INIT(0);
+DCL ERRCODE BIT(36) STATIC;
+DCL SIZE UBIN;
+DCL RUSTART   UBIN;
+DCL B$JIT$ PTR SYMREF;
+%INCLUDE B$JIT;
+DCL RULEN   UBIN;
+DCL RUEND UBIN;
+DCL JCLSTART UBIN;
+DCL JCLLEN UBIN;
+DCL SUBSTART UBIN;
+DCL SUBLEN UBIN;
+DCL I UBIN;
+DCL IN_NAME CHAR(31);
+DCL INPUT$ PTR;
+DCL NAME CHAR(31);
+DCL 1 SYSIDBFR STATIC,
+      2 SYSID CHAR(6),
+      2 * CHAR(0) INIT('    "'),
+      2 NAME CHAR(31);
+%INCLUDE CP_6;
+%INCLUDE FUMBLE_DATA_R;
+%FPT_WRITE (FPTN=WRITELO, STCLASS=SYMREF);
+%FPT_READ (FPTN=READLISTSEQ,
+          STCLASS=STATIC,
+          DCB=F$LIST,
+          BUF=YF_INBUF);
+%FPT_READ (FPTN=READLISTKEYED,
+          STCLASS=STATIC,
+          DCB=F$STARLIST,
+          KEYS=YES,
+          KEY=YF_KEY,
+          BUF=YF_INBUF);
+%FPT_YC (FPTN=FPT_YC,
+          STCLASS=STATIC,
+          CMD=YF_OUTBUF);
+%FPT_ERRMSG (FPTN=FPT_ERRMSG, STCLASS=STATIC,
+          OUTDCB1=M$LO,
+          BUF=YF_OUTBUF);
+%FPT_WRITE (FPTN=WRITESYSID,
+          DCB=F$SYSID,
+          BUF=SYSIDBFR,
+          KEY=SYSIDKEY);
+DCL F$LIST DCB;
+DCL F$STARLIST DCB;
+DCL M$LO DCB;
+DCL F$SYSID DCB;
+DCL CHARN CHAR(SIZE) BASED;
+%INCLUDE B_ERRORS_C;
+%B$TCB (STCLASS="BASED(B$TCB$)");
+%B$ALT;
+DCL B$TCB$ PTR SYMREF;
+                                        /**/
+     INPUT$ = ADDR(YF_INBUF);
+     IF YF_X_F
+     THEN DO;                           /* Search listfile sequen. */
+          IN_NAME = '#';
+          DO WHILE (IN_NAME ~= NAME);
+               YF_INBUF = ' ';
+               CALL M$READ(READLISTSEQ) ALTRET(READ_ALT);
+               CALL INDEX1(SIZE, ',', YF_INBUF) ALTRET(BAD_LIST_REC);
+               IF SIZE > 59 THEN GOTO BAD_LIST_REC;
+               IN_NAME = ADDR(YF_INBUF)->CHARN;
+             END;
+        END;
+     ELSE DO;                           /* Read it keyed */
+          YF_INBUF = ' ';
+          YF_KEY.TEXT = NAME;
+          CALL M$READ(READLISTKEYED) ALTRET(READ_ALT);
+        END;
+/* Break down list record */
+     CALL INDEX1(SIZE, ',', YF_INBUF) ALTRET(BAD_LIST_REC);
+     JCLSTART = SIZE+1;
+     CALL INDEX1(SIZE, ',', YF_INBUF, JCLSTART) ALTRET(BAD_LIST_REC);
+     JCLLEN = SIZE-JCLSTART;
+     RUSTART = SIZE+1;
+     CALL INDEX1(SIZE, ';', YF_INBUF, RUSTART)
+     WHENRETURN DO;
+          RULEN = SIZE - RUSTART;
+          SUBSTART = SIZE+1;
+          CALL INDEX1(SIZE, ';', YF_INBUF, SUBSTART) ALTRET(BAD_LIST_REC);
+          SUBLEN = SIZE - SUBSTART;
+        END;
+     WHENALTRETURN DO;
+          SUBSTART = 0;                 /* No sub found (no ;) */
+          SUBLEN = 0;
+          CALL INDEX1(SIZE, ' ', YF_INBUF) ALTRET (BAD_LIST_REC);
+          RULEN = SIZE - RUSTART;
+        END;
+/* If a selection list was specified, make sure this one is in it */
+     IF YF_SEL_F
+     THEN DO;
+          IF RULEN = 0 THEN RETURN;     /* Nope, nil doesn't match */
+          RUEND = RUSTART+RULEN+1;
+          DO WHILE (RUSTART ~= RUEND);
+               CALL INDEX1(SIZE, ',', YF_INBUF, RUSTART);
+               IF SIZE > RUEND THEN SIZE = RULEN;
+               ELSE SIZE = SIZE - RUSTART;
+               DO I = 0 TO YF_SEL_NUM - 1;
+                    IF PINCRC(INPUT$, RUSTART)->CHARN = YF_SEL(I)
+                    THEN GOTO OK;
+                  END;
+               RUSTART = RUSTART+SIZE+1;
+               RULEN = RULEN - SIZE - 1;
+             END;                       /* Do while */
+          RETURN;                       /* Not found */
+        END;
+OK:
+/* Build batch image */
+     IF YF_JCLACCT_F
+     THEN DO;
+          CALL INDEX1(SIZE, '.', YF_INBUF, JCLSTART);
+          IF SIZE < JCLSTART+JCLLEN THEN JCLLEN = SIZE - JCLSTART;
+        END;
+     CALL CONCAT(YF_OUTBUF, 'BATCH ',
+       SUBSTR(YF_INBUF, JCLSTART, JCLLEN),
+       SUBSTR(YF_JCLACCT, 0, YF_JCLACCT_LEN));
+     CALL INDEX2(SIZE, '  ', YF_OUTBUF);
+     IF YF_SUB_F AND SUBLEN > 0 THEN CALL INSERT(YF_OUTBUF, SIZE,,
+            ' ',
+            SUBSTR(YF_INBUF, SUBSTART, SUBLEN),
+            ',',
+            SUBSTR(YF_SUB, 0, YF_SUB_LEN),
+            ',X=',
+            NAME);
+     ELSE IF SUBLEN > 0 OR YF_SUB_F THEN CALL INSERT(YF_OUTBUF, SIZE,,
+                 ' ',
+                 SUBSTR(YF_SUB, 0, YF_SUB_LEN),
+                 SUBSTR(YF_INBUF, SUBSTART, SUBLEN),
+                 ',X=',
+                 NAME);
+          ELSE CALL INSERT(YF_OUTBUF, SIZE,,
+                 ' X=',
+                 NAME);
+     IF NOT (YF_SILENT)
+     THEN
+          CALL M$WRITE(WRITELO);
+     IF NOT YF_T_F THEN DO;
+SCANDOWN: DO I = LENGTHC(YF_OUTBUF) - 1 DOWNTO 1 BY -1;
+               IF SUBSTR (YF_OUTBUF, I, 1) ~= ' '
+               THEN EXIT SCANDOWN;
+             END;
+          FPT_YC.CMD_ = VECTOR (SUBSTR(YF_OUTBUF, 0, I + 1));
+          CALL M$YC(FPT_YC) ALTRET(YC_ALT);
+          IF YF_SYSID_F AND B$JIT.LBJID~=YF_LBJID THEN DO;
+               YF_LBJID=B$JIT.LBJID;
+               CALL BINCHAR(SYSIDBFR.SYSID,YF_LBJID);
+               SYSIDBFR.NAME=NAME;
+               CALL M$WRITE (WRITESYSID) ALTRET(SYSID_ERR);
+               SYSIDKEY.VAL=SYSIDKEY.VAL+1000;
+             END;
+        END;
+     Q_COUNT = Q_COUNT+1;
+/*N* DO THIS TILL AFTER QUAIL */
+     IF Q_COUNT >= YF_MAXQ THEN CALL M$EXIT;
+     RETURN;
+YC_ALT:
+     FPT_ERRMSG.CODE_ = VECTOR(B$TCB.ALT$->B$ALT.ERR);
+     CALL M$ERRMSG(FPT_ERRMSG);
+     RETURN;
+BAD_LIST_REC:
+     CALL CONCAT (YF_OUTBUF, 'Bad listfule record:', YF_INBUF);
+     CALL M$WRITE(WRITELO);
+     RETURN;
+SYSID_ERR:
+     FPT_ERRMSG.CODE_ = VECTOR(ERRCODE);
+     FPT_ERRMSG.V.DCB# = B$TCB.ALT$->B$ALT.DCB#;
+     ERRCODE = B$TCB.ALT$->B$ALT.ERR;
+     CALL CONCAT (YF_OUTBUF, 'Error writing SYSID file');
+     CALL M$WRITE(WRITELO);
+     CALL M$ERRMSG(FPT_ERRMSG);
+     RETURN;
+READ_ALT:
+     IF B$TCB.ALT$->B$ALT.ERR.CODE = %E$EOF OR B$TCB.ALT$->B$ALT.ERR.CODE = %E$NOKEY
+     THEN DO;
+          IF SUBSTR (NAME, 0, 1) ~= '.'
+          THEN DO;
+               CALL CONCAT(YF_OUTBUF, 'No listfile record for: ', NAME);
+               CALL M$WRITE(WRITELO);
+             END;
+          RETURN;
+        END;
+     ELSE CALL M$MERC;
+END YFA$BATCH;

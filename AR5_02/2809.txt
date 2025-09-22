@@ -1,0 +1,1249 @@
+
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:1    
+        1        1        /*T***********************************************************/
+        2        2        /*T*                                                         */
+        3        3        /*T* Copyright (c) Bull HN Information Systems Inc., 1989    */
+        4        4        /*T*                                                         */
+        5        5        /*T***********************************************************/
+        6        6        XBI$SCAN: PROC (format, P_argument_block$, P_argument_block_size, F, S, result);
+        7        7           /*I*  NAME: XBI$SCAN
+        8        8                 PURPOSE: fscanf, scanf and sscanf call this routine to do the actual
+        9        9                    work.
+       10       10           */
+       11       11
+       12       12           %INCLUDE xb_stdio_i6;
+       13      255           %INCLUDE xb_errors_i6;
+       14      326           %INCLUDE B$TABLES_C;
+       15      434
+       16      435    1      DCL format                 CHAR (format_len);
+       17      436    1      DCL P_argument_block$      PTR;
+       18      437    1      DCL P_argument_block_size  UBIN;
+       19      438           %File_Header (Name=F, Stclass=" ");
+       20      550    1      DCL S                      CHAR (16384);
+       21      551    1      DCL result                 SBIN;
+       22      552
+       23      553           /* variables associated with our input buffer */
+       24      554    1      DCL inbuf                  CHAR (ars) BASED (inbuf$);
+       25      555    1      DCL inbuf$                 PTR;
+       26      556    1      DCL ars                    UBIN; /* number of chars in buffer */
+       27      557    1      DCL nextch                 UBIN; /* index of next char in buffer */
+       28      558    1      DCL firstch                UBIN; /* index when chars_scanned was last updated */
+       29      559    1      DCL chars_scanned          UBIN; /* number of chars scanned */
+       30      560
+       31      561    1      DCL argument_block$        PTR;
+       32      562    1      DCL argument_block_size    UBIN;
+       33      563    1      DCL argument_words_used    UBIN;
+       34      564    1      DCL assignment_suppression BIT (1);
+       35      565    1      DCL assignments            UBIN;
+       36      566    1      DCL digits                 UBIN;
+       37      567    1      DCL format_index           UBIN;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:2    
+       38      568    1      DCL format_len             UBIN;
+       39      569    1      DCL format_next_char       UBIN;
+       40      570    1      DCL large_size             BIT (1);
+       41      571           %B$SR_NON_DEC (NAME=XBI$non_digit_table);
+       42      575    1      DCL XBI$non_octal_digit_table (0:511) UBIN BYTE UNAL SYMREF READONLY;
+       43      576    1      DCL XBI$non_hex_digit_table (0:511) UBIN BYTE UNAL SYMREF READONLY;
+       44      577    1      DCL XBI$non_whitespace_table (0:511) UBIN BYTE UNAL SYMREF READONLY;
+       45      578    1      DCL XBI$whitespace_table (0:511) UBIN BYTE UNAL SYMREF READONLY;
+       46      579           %EQU other_tv = 0;
+       47      580           %EQU null_tv = 1;
+       48      581           %EQU white_tv = 2;
+       49      582           %EQU percent_tv = 3;
+       50      583    1      DCL null_percent_whitespace_table (0:511) UBIN BYTE UNAL CONSTANT INIT
+       51      584    1         (%null_tv,
+       52      585    1          %other_tv*8,
+       53      586    1          %white_tv*5,
+       54      587    1          %other_tv*18,
+       55      588    1          %white_tv,
+       56      589    1          %other_tv*4,
+       57      590    1          %percent_tv,
+       58      591    1          %other_tv*474);
+       59      592    1      DCL small_size             BIT (1);
+       60      593    1      DCL table_value            UBIN;
+       61      594    1      DCL tempch                 UBIN;
+       62      595    1      DCL void_tv                UBIN;
+       63      596    1      DCL width                  UBIN;
+       64      597    1      DCL width_specified        BIT (1);
+       65      598    1      DCL skipped_white_err      BIT (1)  ALIGNED;
+       66      599
+       67      600
+       68      601    1      DCL XBI_SET_ERRNO          ENTRY (1);
+       69      602    1      DCL XBI_SET_STREAM_ERRNO   ENTRY (2);
+       70      603    1      DCL XBI$STRTOL             ENTRY (4);
+       71      604    1      DCL XBI$STRTOUL            ENTRY (4);
+       72      605    1      DCL XB_IO_ERROR            ENTRY;
+       73      606    1      DCL XBI$STRLEN             ENTRY (2);
+       74      607
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:3    
+       75      608    1      set_errno: PROC (error);
+       76      609    2         DCL error         UBIN;
+       77      610
+       78      611    2         IF ADDR(F) ~= ADDR(NIL) THEN
+       79      612    2            CALL XBI_SET_STREAM_ERRNO (F, error);
+       80      613    2         ELSE
+       81      614    2            CALL XBI_SET_ERRNO (error);
+       82      615    2      END set_errno;
+       83      616
+       84      617    1      update_chars_scanned: PROC;
+       85      618
+       86      619              /* to simplify the code, we don't update chars_scanned as we scan
+       87      620                 the line.  This proc is called at those points where we must update
+       88      621                 chars_scanned.
+       89      622              */
+       90      623
+       91      624    2         chars_scanned = chars_scanned + (nextch - firstch);
+       92      625    2         firstch = nextch;
+       93      626    2      END update_chars_scanned;
+       94      627
+       95      628
+       96      629    1      setup_inbuf: PROC ALTRET;
+       97      630
+       98      631    2         DCL XBI$COMPLETE_OPEN            ENTRY (1) ALTRET;
+       99      632    2         DCL XBI$STRLEN                   ENTRY (2);
+      100      633
+      101      634    2         chars_scanned = 0;
+      102      635    3         IF ADDR(F) = ADDR(NIL) THEN DO;
+      103      636    3            CALL XBI$STRLEN (s, ars);
+      104      637    3            inbuf$ = ADDR(s);
+      105      638    3            nextch = 0;
+      106      639    3         END; ELSE DO;
+      107      640    4              IF (F.auxio$ ~= ADDR(NIL)) THEN DO;
+      108      641    4                 CALL XBI_SET_STREAM_ERRNO (F, ERR$AUXIO_FILE_POINTER);
+      109      642    4                 CALL XB_IO_ERROR;
+      110      643    4              END;
+      111      644
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:4    
+      112      645    3            IF F.is_partly_open THEN CALL XBI$COMPLETE_OPEN (F) ALTRET (error_return);
+      113      646    3            inbuf$ = F.buffer$;
+      114      647    3            ars = F.ars;
+      115      648    3            nextch = F.character_position;
+      116      649    3         END;
+      117      650    2         firstch = nextch;
+      118      651    2         RETURN;
+      119      652
+      120      653    2      error_return:
+      121      654    2         nextch = 0;
+      122      655    2         firstch = 0;
+      123      656    2         ALTRETURN;
+      124      657    2      END setup_inbuf;
+      125      658
+      126      659
+      127      660    1      fill_inbuf: PROC ALTRET;
+      128      661              /* This proc tries to get more characters to scan if we run out of
+      129      662                 chars in inbuf.
+      130      663              */
+      131      664
+      132      665    2         DCL XBI$READ_NEXT_RECORD   ENTRY (1) ALTRET;
+      133      666
+      134      667    2         CALL update_chars_scanned;
+      135      668    3         IF ADDR(F) = ADDR(NIL) THEN DO;
+      136      669    3            CALL set_errno (ERR$NO_CHARS_TO_SCAN);
+      137      670    3            ALTRETURN;
+      138      671    3         END; ELSE DO;
+      139      672    4            DO UNTIL ars > 0;
+      140      673    5               IF F.is_eof THEN DO;
+      141      674    5                  CALL XBI_SET_STREAM_ERRNO (F, ERR$NO_CHARS_TO_SCAN);
+      142      675    5                  ALTRETURN;
+      143      676    5               END;
+      144      677    4               CALL XBI$READ_NEXT_RECORD (F)
+      145      678    5                  WHENALTRETURN DO;
+      146      679    5                     ALTRETURN;
+      147      680    5                  END;
+      148      681    4               ars = F.ars;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:5    
+      149      682    4            END;
+      150      683        /*   Check to see if at EOF of file but the record still has not
+      151      684             been written to the file.  If this is the case these variables
+      152      685             should not be reset */
+      153      686
+      154      687    4            IF (~F.is_eof) OR (ars = 0) then DO;
+      155      688    4               nextch = 0;
+      156      689    4               firstch = 0;
+      157      690    4            END;
+      158      691    3         END;
+      159      692    2      END fill_inbuf;
+      160      693
+      161      694
+      162      695    1      finish_using_inbuf: PROC;
+      163      696    2         CALL update_chars_scanned;
+      164      697    2         IF ADDR(F) ~= ADDR(NIL) THEN F.character_position = nextch;
+      165      698    2      END finish_using_inbuf;
+      166      699
+      167      700
+      168      701    1      put_word_argument: PROC (value) ALTRET;
+      169      702    2         DCL p$                     PTR;
+      170      703    2         DCL value                  BIT(36) ALIGNED;
+      171      704    2         DCL based_bit36            BIT(36) ALIGNED BASED;
+      172      705    2         DCL based_ptr              PTR BASED;
+      173      706
+      174      707    3         IF argument_words_used >= argument_block_size THEN DO;
+      175      708    3            CALL set_errno (ERR$NO_SUCH_ARGUMENT);
+      176      709    3            ALTRETURN;
+      177      710    3         END;
+      178      711    2         p$ = argument_block$ -> based_ptr;
+      179      712    2         p$ -> based_bit36 = value;
+      180      713    2         argument_block$ = PINCRW (argument_block$, 1);
+      181      714    2         argument_words_used = argument_words_used + 1;
+      182      715    2         assignments = assignments + 1;
+      183      716    2      END put_word_argument;
+      184      717
+      185      718    1      put_double_argument: PROC (value) ALTRET;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:6    
+      186      719    2         DCL p$                     PTR;
+      187      720    2         DCL value                  BIT(72) DALIGNED;
+      188      721    2         DCL based_bit72 BIT(72) DALIGNED BASED;
+      189      722    2         DCL based_ptr              PTR BASED;
+      190      723
+      191      724
+      192      725    3         IF argument_words_used >= argument_block_size THEN DO;
+      193      726    3            CALL set_errno (ERR$NO_SUCH_ARGUMENT);
+      194      727    3            ALTRETURN;
+      195      728    3         END;
+      196      729    2         p$ = argument_block$ -> based_ptr;
+      197      730    2         p$ -> based_bit72 = value;
+      198      731    2         argument_block$ = PINCRW (argument_block$, 1);
+      199      732    2         argument_words_used = argument_words_used + 1;
+      200      733    2         assignments = assignments + 1;
+      201      734    2      END put_double_argument;
+      202      735
+      203      736
+      204      737    1      get_argument_pointer: PROC (p$) ALTRET;
+      205      738    2         DCL p$                     PTR;
+      206      739    2         DCL based_ptr              PTR BASED;
+      207      740
+      208      741    3         IF argument_words_used >= argument_block_size THEN DO;
+      209      742    3            CALL set_errno (ERR$NO_SUCH_ARGUMENT);
+      210      743    3            ALTRETURN;
+      211      744    3         END;
+      212      745    2         p$ = argument_block$ -> based_ptr;
+      213      746    2         argument_block$ = PINCRW (argument_block$, 1);
+      214      747    2         argument_words_used = argument_words_used + 1;
+      215      748    2         assignments = assignments + 1;
+      216      749    2      END get_argument_pointer;
+      217      750
+      218      751
+      219      752    1      skip_whitespace_chars: PROC ALTRET;
+      220      753
+      221      754    2         IF nextch >= ars THEN CALL fill_inbuf ALTRET (error_return);
+      222      755    2      search_again:
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:7    
+      223      756    2         CALL SEARCH (nextch, void_tv, XBI$non_whitespace_table, inbuf, nextch)
+      224      757    3            WHENALTRETURN DO;
+      225      758    3               CALL fill_inbuf ALTRET (error_return);
+      226      759    3               GOTO search_again;
+      227      760    3            END;
+      228      761    2         RETURN;
+      229      762
+      230      763    2      error_return:
+      231      764    2         IF (ADDR(F) ~= ADDR(NIL) AND F.is_eof) THEN
+      232      765    2            skipped_white_err = '1'B;
+      233      766    2         ALTRETURN;
+      234      767    2      END skip_whitespace_chars;
+      235      768
+      236      769
+      237      770    1      parse_integer: PROC (P_base) ALTRET;
+      238      771    2         DCL P_base           UBIN;
+      239      772
+      240      773    2         DCL base             UBIN;
+      241      774    2         DCL chars_to_move    UBIN;
+      242      775    2         DCL i                UBIN;
+      243      776    2         DCL long             SBIN;
+      244      777    2         DCL minimum_length   SBIN;
+      245      778    2         DCL temp_ptr         PTR;
+      246      779              %SET temp_str_size   = 20;
+      247      780    2         DCL temp_str         CHAR (%temp_str_size);
+      248      781    2         DCL temp_next_char   UBIN;
+      249      782
+      250      783    2         base = P_base;
+      251      784    2         IF ~width_specified THEN width = %temp_str_size - 1;
+      252      785    2         CALL skip_whitespace_chars ALTRET (error_return);
+      253      786    3         DO CASE (ASCBIN (SUBSTR (inbuf, nextch)));
+      254      787    3            CASE (%ASCBIN ('+'), %ASCBIN ('-'));
+      255      788    3               SUBSTR (temp_str, 0, 1) = SUBSTR (inbuf, nextch, 1);
+      256      789    3               temp_next_char = 1;
+      257      790    3               nextch = nextch + 1;
+      258      791    4               IF nextch >= ars THEN DO;
+      259      792    4                  CALL fill_inbuf ALTRET (error_return);
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:8    
+      260      793    4                  IF (F.is_eof) then
+      261      794    4                     GOTO error_return;
+      262      795    4               END;
+      263      796    3               minimum_length = 2;
+      264      797    3            CASE (ELSE);
+      265      798    3               temp_next_char = 0;
+      266      799    3               minimum_length = 1;
+      267      800    3         END;
+      268      801
+      269      802              /* optional 0x or 0X specification */
+      270      803    3         IF SUBSTR (inbuf, nextch, 1) = '0' THEN DO;
+      271      804    3            SUBSTR (temp_str, temp_next_char, 1) = '0';
+      272      805    3            temp_next_char = temp_next_char + 1;
+      273      806    3            nextch = nextch + 1;
+      274      807    4            IF (nextch >= ars) AND ((ADDR(F) ~= ADDR(NIL)) OR ((width_specified) AND (
+               807                     width > 1))) THEN DO;
+      275      808    4               CALL fill_inbuf ALTRET (error_return);
+      276      809    4               IF (F.is_eof) THEN
+      277      810    4                  GOTO error_return;
+      278      811    4            END;
+      279      812    3            IF (base = 0 OR base = 16) AND
+      280      813    3               (SUBSTR (inbuf, nextch, 1) = 'x' OR
+      281      814    3               SUBSTR (inbuf, nextch, 1) = 'X')
+      282      815    4            THEN DO;
+      283      816    4               IF base = 0 THEN base = 16;
+      284      817    4               SUBSTR (temp_str, temp_next_char, 1) = 'x';
+      285      818    4               temp_next_char = temp_next_char + 1;
+      286      819    4               nextch = nextch + 1;
+      287      820    5               IF nextch >= ars THEN DO;
+      288      821    5                  CALL fill_inbuf ALTRET (error_return);
+      289      822    5                  IF (F.is_eof) THEN
+      290      823    5                     GOTO error_return;
+      291      824    5               END;
+      292      825    4            END;
+      293      826    3            IF base = 0 THEN base = 8;
+      294      827    3         END;
+      295      828    2         IF base = 0 THEN base = 10;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:9    
+      296      829
+      297      830    2      search_again:
+      298      831    3         DO CASE (base);
+      299      832    3            CASE (10);
+      300      833    3               CALL SEARCH (i, void_tv, XBI$non_digit_table, inbuf, nextch);
+      301      834    3            CASE (8);
+      302      835    3               CALL SEARCH (i, void_tv, XBI$non_octal_digit_table, inbuf, nextch);
+      303      836    3            CASE (16);
+      304      837    3               CALL SEARCH (i, void_tv, XBI$non_hex_digit_table, inbuf, nextch);
+      305      838    3            CASE (ELSE);
+      306      839    3               CALL set_errno (ERR$ASSERTION_FAILURE);
+      307      840    3               CALL XB_IO_ERROR;
+      308      841    3         END;
+      309      842    2         chars_to_move = MINIMUM (i-nextch, width-temp_next_char);
+      310      843    2         SUBSTR (temp_str, temp_next_char, chars_to_move) =
+      311      844    2            SUBSTR (inbuf, nextch, chars_to_move);
+      312      845    2         temp_next_char = temp_next_char + chars_to_move;
+      313      846    2         nextch = nextch + chars_to_move;
+      314      847    2         IF (i = ars) AND (temp_next_char < width) AND
+      315      848    3            ((ADDR (F) ~= ADDR (NIL)) OR (width_specified)) THEN DO;
+      316      849    3            CALL fill_inbuf ALTRET (error_return);
+      317      850    3            IF (~F.is_eof) THEN
+      318      851    3              GOTO search_again;
+      319      852    3         END;
+      320      853    3         IF temp_next_char < minimum_length THEN DO;
+      321      854    3            CALL set_errno (ERR$SCAN_MISMATCH);
+      322      855    3            ALTRETURN;
+      323      856    3         END;
+      324      857    2         SUBSTR (temp_str, temp_next_char, 1) = BINASC (0);
+      325      858    2         CALL XBI$STRTOL (temp_str, temp_ptr, base, long);
+      326      859    2         IF ~assignment_suppression THEN CALL put_word_argument (long) ALTRET (
+               859                  error_return);
+      327      860    2         RETURN;
+      328      861
+      329      862    2      error_return:
+      330      863    2         ALTRETURN;
+      331      864    2      END parse_integer;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:10   
+      332      865
+      333      866
+      334      867    1      parse_unsigned_integer: PROC ALTRET;
+      335      868    2         DCL chars_to_move    UBIN;
+      336      869    2         DCL i                UBIN;
+      337      870    2         DCL unsigned_long    UBIN;
+      338      871    2         DCL temp_ptr         PTR;
+      339      872              %SET temp_str_size   = 20;
+      340      873    2         DCL temp_str         CHAR (%temp_str_size);
+      341      874    2         DCL temp_next_char   UBIN;
+      342      875
+      343      876    2         IF ~width_specified THEN width = %temp_str_size - 1;
+      344      877    2         CALL skip_whitespace_chars ALTRET (error_return);
+      345      878    2         temp_next_char = 0;
+      346      879
+      347      880    2      search_again:
+      348      881    2         CALL SEARCH (i, void_tv, XBI$non_digit_table, inbuf, nextch);
+      349      882    2         chars_to_move = MINIMUM (i-nextch, width-temp_next_char);
+      350      883    2         SUBSTR (temp_str, temp_next_char, chars_to_move) =
+      351      884    2            SUBSTR (inbuf, nextch, chars_to_move);
+      352      885    2         temp_next_char = temp_next_char + chars_to_move;
+      353      886    2         nextch = nextch + chars_to_move;
+      354      887    2         IF (i = ars) AND (temp_next_char < width) AND
+      355      888    3            ((ADDR (F) ~= ADDR (NIL)) OR (width_specified)) THEN DO;
+      356      889    3            CALL fill_inbuf ALTRET (error_return);
+      357      890    3            IF (~F.is_eof) THEN
+      358      891    3               GOTO search_again;
+      359      892    3         END;
+      360      893    3         IF temp_next_char = 0 THEN DO;
+      361      894    3            CALL set_errno (ERR$SCAN_MISMATCH);
+      362      895    3            ALTRETURN;
+      363      896    3         END;
+      364      897    2         SUBSTR (temp_str, temp_next_char, 1) = BINASC (0);
+      365      898    2         CALL XBI$STRTOUL (temp_str, temp_ptr, 10, unsigned_long);
+      366      899    2         IF ~assignment_suppression THEN CALL put_word_argument (unsigned_long) ALTRET
+               899                  (error_return);
+      367      900    2         RETURN;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:11   
+      368      901
+      369      902    2      error_return:
+      370      903    2         ALTRETURN;
+      371      904    2      END parse_unsigned_integer;
+      372      905
+      373      906    1      parse_real: PROC ALTRET;
+      374      907    2         DCL result              BIT (72) DALIGNED;
+      375      908
+      376      909              %EQU string_size     = 200;
+      377      910    2         DCL chunk_length        SBIN;
+      378      911    2         DCL start_index         SBIN;
+      379      912    2         DCL state               SBIN;
+      380      913    2         DCL type                SBIN;
+      381      914    2         DCL overflow_error      BIT (1);
+      382      915    2         DCL 1 string,
+      383      916    2               2 length          SBIN,
+      384      917    2               2 text            CHAR (%string_size);
+      385      918
+      386      919              %EQU error_state     = -2;
+      387      920              %EQU finish_state    = -1;
+      388      921    2         DCL transition_table (0 : 39) SBIN WORD CONSTANT INIT (
+      389      922    2               /*  0: */   10,   15,            %error_state,  5,             %
+               922                        error_state,
+      390      923    2               /*  5: */   10,   15,            %error_state,  %error_state,  %
+               923                        error_state,
+      391      924    2               /* 10: */   10,   20,            25,            %finish_state, %
+               924                        finish_state,
+      392      925    2               /* 15: */   20,   %error_state,  %error_state,  %error_state,  %
+               925                        error_state,
+      393      926    2               /* 20: */   20,   %finish_state, 25,            %finish_state, %
+               926                        finish_state,
+      394      927    2               /* 25: */   35,   %error_state,  %error_state,  30,            %
+               927                        error_state,
+      395      928    2               /* 30: */   35,   %error_state,  %error_state,  %error_state,  %
+               928                        error_state,
+      396      929    2               /* 35: */   35,   %finish_state, %finish_state, %finish_state, %
+               929                        finish_state);
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:12   
+      397      930
+      398      931
+      399      932                 /* these values correspond to the characters in 'characters' */
+      400      933    2         DCL character_class (0 : 16)  SBIN WORD CONSTANT INIT
+      401      934    2               (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 2, 3, 3, 4);
+      402      935
+      403      936    2         DCL characters CHAR (15) CONSTANT INIT
+      404      937    2               ('0123456789.Ee+-');
+      405      938
+      406      939    2         DCL XBI$STRING_TO_REAL         ENTRY (3);
+      407      940
+      408      941    2         IF ~width_specified THEN width = %string_size;
+      409      942    2         width = minimum (width, %string_size);
+      410      943    2         CALL skip_whitespace_chars ALTRET (error_return);
+      411      944    2         start_index = nextch;
+      412      945    2         state = 0;
+      413      946    2         string.length = 0;
+      414      947    3         DO WHILE '1'B;
+      415      948    4            DO WHILE nextch < ars;
+      416      949    4               CALL INDEX1 (type, SUBSTR(inbuf, nextch, 1), characters);
+      417      950    4               state = transition_table(state + character_class(type));
+      418      951    4               chunk_length = nextch - start_index;
+      419      952    4               IF (chunk_length + string.length) >= width OR
+      420      953    4                  state = %finish_state
+      421      954    5               THEN DO;
+      422      955    6                  IF chunk_length + string.length > %string_size THEN DO;
+      423      956    6                     CALL set_errno (ERR$BAD_OR_MISSING_REAL_NUMBER);
+      424      957    6                     GOTO error_return;
+      425      958    6                  END;
+      426      959    5                  CALL INSERT (string.text, string.length, chunk_length,
+      427      960    5                               SUBSTR(inbuf, start_index, chunk_length));
+      428      961    5                  string.length = string.length + chunk_length;
+      429      962    5                  GOTO found_end;
+      430      963    5               END;
+      431      964    5               IF state = %error_state THEN DO;
+      432      965    5                  CALL set_errno (ERR$BAD_OR_MISSING_REAL_NUMBER);
+      433      966    5                  GOTO error_return;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:13   
+      434      967    5               END;
+      435      968    4               nextch = nextch + 1;
+      436      969    4            END; /* while */
+      437      970    3            chunk_length = nextch - start_index;
+      438      971    4            IF chunk_length + string.length > %string_size THEN DO;
+      439      972    4               CALL set_errno (ERR$BAD_OR_MISSING_REAL_NUMBER);
+      440      973    4               GOTO error_return;
+      441      974    4            END;
+      442      975    3            CALL INSERT (string.text, string.length, chunk_length,
+      443      976    3                         SUBSTR(inbuf, start_index, chunk_length));
+      444      977    3            string.length = string.length + chunk_length;
+      445      978    4            IF ((ADDR (F) ~= ADDR (NIL)) OR (width_specified)) THEN DO;
+      446      979    4               CALL fill_inbuf ALTRET (error_return);
+      447      980    4               IF (F.is_eof) THEN
+      448      981    4                  GOTO found_end;
+      449      982    4            END;
+      450      983    3            ELSE
+      451      984    3               GOTO found_end;
+      452      985    3            start_index = nextch;
+      453      986    3         END; /* while */
+      454      987
+      455      988    2      found_end:
+      456      989    2         CALL XBI$STRING_TO_REAL (string, result, overflow_error);
+      457      990    2         IF overflow_error THEN
+      458      991    2            CALL set_errno (ERR$RANGE_ERROR);
+      459      992    2         IF ~assignment_suppression THEN
+      460      993    2            IF (large_size) THEN
+      461      994    2               CALL put_double_argument (result) ALTRET (error_return);
+      462      995    2            ELSE
+      463      996    2               CALL put_word_argument (result) ALTRET (error_return);
+      464      997    2         RETURN;
+      465      998
+      466      999    2      error_return:
+      467     1000    2         ALTRETURN;
+      468     1001    2      END parse_real;
+      469     1002
+      470     1003    1      parse_c: PROC ALTRET;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:14   
+      471     1004    2         DCL c$                     PTR;
+      472     1005    2         DCL c_array                CHAR (width) BASED (c$);
+      473     1006    2         DCL start                  UBIN;
+      474     1007    2         DCL chars_to_move          UBIN;
+      475     1008
+      476     1009    2         IF ~width_specified THEN width = 1;
+      477     1010    2         IF ~assignment_suppression THEN
+      478     1011    2            CALL get_argument_pointer (c$) ALTRET (error_return);
+      479     1012    2         start = 0;
+      480     1013    3         DO WHILE start < width;
+      481     1014    3            chars_to_move = MINIMUM (width - start, ars - nextch);
+      482     1015    4            IF ~assignment_suppression THEN DO;
+      483     1016    4               SUBSTR (c_array, start, chars_to_move) =
+      484     1017    4                  SUBSTR (inbuf, nextch, chars_to_move);
+      485     1018    4            END;
+      486     1019    3            nextch = nextch + chars_to_move;
+      487     1020    3            IF (nextch >= ars) AND ((ADDR(F) ~= ADDR (NIL)) OR (width_specified)) THEN
+      488     1021    3               CALL fill_inbuf ALTRET (error_return);
+      489     1022    3            start = start + chars_to_move;
+      490     1023    3         END;
+      491     1024    2         RETURN;
+      492     1025
+      493     1026    2      error_return:
+      494     1027    2         assignments = assignments - 1;
+      495     1028    2         ALTRETURN;
+      496     1029    2      END parse_c;
+      497     1030
+      498     1031
+      499     1032    1      parse_s: PROC ALTRET;
+      500     1033    2         DCL chars_to_move                UBIN;
+      501     1034    2         DCL i                            UBIN;
+      502     1035    2         DCL s                            CHAR (1) BASED (s$);
+      503     1036    2         DCL s$                           PTR;
+      504     1037    2         DCL start                        UBIN;
+      505     1038    2         DCL void_tv                      UBIN;
+      506     1039
+      507     1040    2         IF ~width_specified THEN width = 262143;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:15   
+      508     1041    2         IF ~assignment_suppression THEN
+      509     1042    2            CALL get_argument_pointer (s$) ALTRET (error_return);
+      510     1043    2         CALL skip_whitespace_chars ALTRET (error_return);
+      511     1044    2         start= 0;
+      512     1045
+      513     1046    2      search_again:
+      514     1047    2         CALL SEARCH (i, void_tv, XBI$whitespace_table, inbuf, nextch);
+      515     1048    2         chars_to_move = MINIMUM (i-nextch, width-start);
+      516     1049    2         IF ~assignment_suppression THEN
+      517     1050    2            SUBSTR (s, start, chars_to_move) =
+      518     1051    2               SUBSTR (inbuf, nextch, chars_to_move);
+      519     1052    2         start = start + chars_to_move;
+      520     1053    2         nextch = nextch + chars_to_move;
+      521     1054    2         IF (i = ars) AND (start < width) AND
+      522     1055    3            ((ADDR (F) ~= ADDR (NIL)) OR (width_specified)) THEN DO;
+      523     1056    3            CALL fill_inbuf ALTRET (error_return);
+      524     1057    3            IF (~F.is_eof) THEN
+      525     1058    3               GOTO search_again;
+      526     1059    3         END;
+      527     1060    2         IF ~assignment_suppression THEN
+      528     1061    2            SUBSTR (s, start, 1) = BINASC (0);
+      529     1062    2         RETURN;
+      530     1063
+      531     1064    2      error_return:
+      532     1065    2         assignments = assignments - 1;
+      533     1066    2         ALTRETURN;
+      534     1067    2      END parse_s;
+      535     1068
+      536     1069
+      537     1070    1      parse_scanset: PROC ALTRET;
+      538     1071    2         DCL i                            UBIN;
+      539     1072    2         DCL s                            CHAR (1) BASED (s$);
+      540     1073    2         DCL s$                           PTR;
+      541     1074    2         DCL scan_for                     BIT(1);
+      542     1075    2         DCL scanset_size                 UBIN;
+      543     1076    2         DCL scanset_start                UBIN;
+      544     1077    2         DCL start                        UBIN;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:16   
+      545     1078
+      546     1079    2         IF ~width_specified THEN width = 262143;
+      547     1080    2         IF ~assignment_suppression THEN
+      548     1081    2            CALL get_argument_pointer (s$) ALTRET (error_return);
+      549     1082    2         format_next_char = format_next_char + 1; /* skip '[' */
+      550     1083    3         DO SELECT (ASCBIN (SUBSTR (format, format_next_char, 1)));
+      551     1084    3            SELECT (%ASCBIN ('^'));
+      552     1085    3               scan_for = '0'B;
+      553     1086    3               format_next_char = format_next_char + 1;
+      554     1087    3               scanset_start = format_next_char;
+      555     1088    3               IF SUBSTR (format, format_next_char, 1) = ']' THEN
+      556     1089    3                  format_next_char = format_next_char + 1;
+      557     1090    3            SELECT (%ASCBIN (']'));
+      558     1091    3               scan_for = '1'B;
+      559     1092    3               scanset_start = format_next_char;
+      560     1093    3               format_next_char = format_next_char + 1;
+      561     1094    3            SELECT (ELSE);
+      562     1095    3               scan_for = '1'B;
+      563     1096    3               scanset_start = format_next_char;
+      564     1097    3         END;
+      565     1098    2         CALL INDEX (i, ']', format, format_next_char)
+      566     1099    3            WHENALTRETURN DO;
+      567     1100    3               CALL set_errno (ERR$FORMAT_STRING_TOO_LONG);
+      568     1101    3               ALTRETURN;
+      569     1102    3            END;
+      570     1103    2         scanset_size = i - scanset_start;
+      571     1104    2         format_next_char = scanset_start + scanset_size;
+      572     1105    3         IF (nextch >= ars) AND ((ADDR(F) ~= ADDR (NIL)) OR (width_specified)) THEN DO;
+      573     1106    3            CALL fill_inbuf ALTRET (error_return);
+      574     1107    3            IF (F.is_eof) THEN
+      575     1108    3               GOTO error_return;
+      576     1109    3         END;
+      577     1110    2         start = 0;
+      578     1111    2         IF scan_for THEN
+      579     1112    2      loop_for:
+      580     1113    3            DO WHILE start < width;
+      581     1114    3               CALL INDEX (i, SUBSTR (inbuf, nextch, 1), SUBSTR (format,
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:17   
+      582     1115    3                     scanset_start, scanset_size))
+      583     1116    4                  WHENRETURN DO;
+      584     1117    4                     IF ~assignment_suppression THEN
+      585     1118    4                        SUBSTR (s, start, 1) = SUBSTR (inbuf, nextch, 1);
+      586     1119    4                     start = start + 1;
+      587     1120    4                     nextch = nextch + 1;
+      588     1121    5                     IF (nextch >= ars) AND ((ADDR(F) ~= ADDR (NIL)) OR (
+              1121                              width_specified)) THEN DO;
+      589     1122    5                        CALL fill_inbuf ALTRET (error_return);
+      590     1123    5                        IF (F.is_eof) THEN
+      591     1124    5                           EXIT loop_for;
+      592     1125    5                     END;
+      593     1126    4                  END;
+      594     1127    4                  WHENALTRETURN DO;
+      595     1128    4                     EXIT loop_for;
+      596     1129    4                  END;
+      597     1130    3            END loop_for;
+      598     1131    2         ELSE
+      599     1132    2      loop_not_for:
+      600     1133    3            DO WHILE start < width;
+      601     1134    3               CALL INDEX (i, SUBSTR (inbuf, nextch, 1), SUBSTR (format,
+      602     1135    3                     scanset_start, scanset_size))
+      603     1136    4                  WHENRETURN DO;
+      604     1137    4                     EXIT loop_not_for;
+      605     1138    4                  END;
+      606     1139    4                  WHENALTRETURN DO;
+      607     1140    4                     IF ~assignment_suppression THEN
+      608     1141    4                        SUBSTR (s, start, 1) = SUBSTR (inbuf, nextch, 1);
+      609     1142    4                     start = start + 1;
+      610     1143    4                     nextch = nextch + 1;
+      611     1144    5                     IF (nextch >= ars) AND ((ADDR(F) ~= ADDR (NIL)) OR (
+              1144                              width_specified)) THEN DO;
+      612     1145    5                        CALL fill_inbuf ALTRET (error_return);
+      613     1146    5                        IF (F.is_eof) THEN
+      614     1147    5                           EXIT loop_not_for;
+      615     1148    5                     END;
+      616     1149    4                  END;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:18   
+      617     1150    3            END loop_not_for;
+      618     1151    2         IF ~assignment_suppression THEN SUBSTR (s, start, 1) = BINASC (0);
+      619     1152    2         RETURN;
+      620     1153
+      621     1154    2      error_return:
+      622     1155    2         assignments = assignments - 1;
+      623     1156    2         ALTRETURN;
+      624     1157    2      END parse_scanset;
+      625     1158
+      626     1159
+      627     1160        /* main body */
+      628     1161
+      629     1162    1      argument_block$ = P_argument_block$;
+      630     1163    1      argument_block_size = P_argument_block_size;
+      631     1164    1      argument_words_used = 0;
+      632     1165    1      assignments = 0;
+      633     1166    1      format_next_char = 0;
+      634     1167    1      skipped_white_err = '0'B;
+      635     1168    1      CALL XBI$STRLEN (format, format_len);
+      636     1169    1      format_len = format_len + 1;
+      637     1170    1      CALL setup_inbuf  ALTRET (error_return);
+      638     1171
+      639     1172    2      DO WHILE '1'B;
+      640     1173    2         CALL SEARCH (format_index, table_value, null_percent_whitespace_table,
+      641     1174    2                      format, format_next_char) ALTRET (format_string_too_long);
+      642     1175    3         DO WHILE format_next_char < format_index;
+      643     1176                 /* make sure there is an input character. */
+      644     1177    4            IF nextch >= ars THEN DO;
+      645     1178    4               CALL fill_inbuf ALTRET (error_return);
+      646     1179    4               IF (F.is_eof) then
+      647     1180    4                  GOTO error_return;
+      648     1181    4            END;
+      649     1182    3            IF SUBSTR (format, format_next_char, 1) ~= SUBSTR (inbuf, nextch, 1)
+      650     1183    4            THEN DO;
+      651     1184    4               CALL set_errno (ERR$SCAN_MISMATCH);
+      652     1185    4               GOTO error_return;
+      653     1186    4            END;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:19   
+      654     1187    3            nextch = nextch + 1;
+      655     1188    3            format_next_char = format_next_char + 1;
+      656     1189    3         END;
+      657     1190
+      658     1191    3         DO CASE (table_value);
+      659     1192    3         CASE (%null_tv);
+      660     1193                 /* we found a null; the entire format has been processed */
+      661     1194    3            CALL finish_using_inbuf;
+      662     1195    3            result = assignments;
+      663     1196    3            RETURN;
+      664     1197
+      665     1198    3         CASE (%white_tv);
+      666     1199
+      667     1200                 /* skip whitespace chars in format string */
+      668     1201
+      669     1202    3            CALL SEARCH (format_next_char, void_tv, XBI$non_whitespace_table,
+      670     1203    3               format, format_next_char + 1) ALTRET (format_string_too_long);
+      671     1204
+      672     1205                 /* there has to be at least one whitespace char in the input string
+      673     1206                    to match.
+      674     1207                 */
+      675     1208
+      676     1209    4            IF nextch >= ars THEN DO;
+      677     1210    4               CALL fill_inbuf ALTRET (error_return);
+      678     1211    4               IF (F.is_eof) then
+      679     1212    4                  GOTO error_return;
+      680     1213    4            END;
+      681     1214    3            CALL SEARCH (tempch, void_tv, XBI$non_whitespace_table, inbuf,
+      682     1215    3                         nextch)
+      683     1216    4               WHENRETURN DO;
+      684     1217                       /* make sure at least one whitespace char was found */
+      685     1218    5                  IF tempch = nextch THEN DO;
+      686     1219    5                     CALL set_errno (ERR$SCAN_MISMATCH);
+      687     1220    5                     GOTO error_return;
+      688     1221    4                  END; ELSE
+      689     1222    4                     nextch = tempch;
+      690     1223    4               END;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:20   
+      691     1224    4               WHENALTRETURN DO;
+      692     1225    4                  nextch = tempch;
+      693     1226    4                  CALL skip_whitespace_chars ALTRET (error_return);
+      694     1227    4               END;
+      695     1228
+      696     1229
+      697     1230    3         CASE (%percent_tv);
+      698     1231                 /* we found a % which denotes a conversion specification */
+      699     1232
+      700     1233    3            format_next_char = format_next_char + 1; /* skip the % */
+      701     1234
+      702     1235    3            assignment_suppression = '0'B;
+      703     1236    3            small_size = '0'B;
+      704     1237    3            large_size = '0'B;
+      705     1238
+      706     1239    4            IF SUBSTR (format, format_next_char, 1) = '*' THEN DO;
+      707     1240    4               assignment_suppression = '1'B;
+      708     1241    4               format_next_char = format_next_char + 1;
+      709     1242    4            END;
+      710     1243
+      711     1244                 /* optional maximum field width */
+      712     1245
+      713     1246    3            CALL SEARCH (format_index, void_tv, XBI$non_digit_table, format,
+      714     1247    3                         format_next_char) ALTRET (format_string_too_long);
+      715     1248    3            digits = format_index - format_next_char;
+      716     1249    4            IF digits > 0 THEN DO;
+      717     1250    4               width_specified = '1'B;
+      718     1251    5               IF digits > 6 THEN DO;
+      719     1252    5                  CALL set_errno (ERR$WIDTH_OR_PRECISION_TB);
+      720     1253    5                  GOTO error_return;
+      721     1254    5               END;
+      722     1255    4               CALL CHARBIN (width, SUBSTR (format, format_next_char, digits));
+      723     1256    4               format_next_char = format_next_char + digits;
+      724     1257    5               IF width = 0 THEN DO;
+      725     1258    5                  CALL set_errno (ERR$WIDTH_CANT_BE_ZERO);
+      726     1259    5                  GOTO error_return;
+      727     1260    5               END;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:21   
+      728     1261    3            END; ELSE
+      729     1262    3               width_specified = '0'B;
+      730     1263
+      731     1264                 /* optional type modifier */
+      732     1265
+      733     1266    4            DO CASE (ASCBIN (SUBSTR (format, format_next_char, 1)));
+      734     1267    4               CASE (%ASCBIN ('h'));
+      735     1268    4                  small_size = '1'B;
+      736     1269    4                  format_next_char = format_next_char + 1;
+      737     1270    4               CASE (%ASCBIN ('l'), %ASCBIN ('L'));
+      738     1271    4                  large_size = '1'B;
+      739     1272    4                  format_next_char = format_next_char + 1;
+      740     1273    4            END;
+      741     1274
+      742     1275                 /* compulsory type of conversion */
+      743     1276
+      744     1277    4            DO CASE (ASCBIN (SUBSTR (format, format_next_char, 1)));
+      745     1278    4               CASE (%ASCBIN ('d'));
+      746     1279    4                  CALL parse_integer (10) ALTRET (error_return);
+      747     1280    4               CASE (%ASCBIN ('i'));
+      748     1281    4                  CALL parse_integer (0) ALTRET (error_return);
+      749     1282    4               CASE (%ASCBIN ('o'), %ASCBIN ('p'));
+      750     1283    4                  CALL parse_integer (8) ALTRET (error_return);
+      751     1284    4               CASE (%ASCBIN ('x'), %ASCBIN ('X'));
+      752     1285    4                  CALL parse_integer (16) ALTRET (error_return);
+      753     1286    4               CASE (%ASCBIN ('u'));
+      754     1287    4                  CALL parse_unsigned_integer ALTRET (error_return);
+      755     1288    4               CASE (%ASCBIN ('e'), %ASCBIN ('f'), %ASCBIN ('g'),
+      756     1289    4                     %ASCBIN ('E'), %ASCBIN ('G'));
+      757     1290    4                  CALL parse_real ALTRET (error_return);
+      758     1291    4               CASE (%ASCBIN ('n'));
+      759     1292    4                  CALL update_chars_scanned;
+      760     1293    5                  IF ~assignment_suppression THEN DO;
+      761     1294    5                     CALL put_word_argument (chars_scanned) ALTRET (error_return);
+      762     1295                          /* for some unknown reason, the C standard doesn't consider
+      763     1296                             this to be an assignment.
+      764     1297                          */
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:22   
+      765     1298    5                     assignments = assignments - 1;
+      766     1299    5                  END;
+      767     1300    4               CASE (%ASCBIN ('c'));
+      768     1301    4                  CALL parse_c ALTRET (error_return);
+      769     1302    4               CASE (%ASCBIN ('s'));
+      770     1303    4                  CALL parse_s ALTRET (error_return);
+      771     1304    4               CASE (%ASCBIN ('['));
+      772     1305    4                  CALL parse_scanset ALTRET (error_return);
+      773     1306    4               CASE (%ASCBIN ('%'));
+      774     1307    5                  IF nextch >= ars THEN DO;
+      775     1308    5                     CALL fill_inbuf ALTRET (error_return);
+      776     1309    5                     IF (F.is_eof) then
+      777     1310    5                        GOTO error_return;
+      778     1311    5                  END;
+      779     1312    5                  IF SUBSTR (inbuf, nextch, 1) ~= '%' THEN DO;
+      780     1313    5                     CALL set_errno (ERR$SCAN_MISMATCH);
+      781     1314    5                     GOTO error_return;
+      782     1315    5                  END;
+      783     1316    4                  nextch = nextch + 1;
+      784     1317    4               CASE (ELSE);
+      785     1318    4                  CALL set_errno (ERR$UNKNOWN_FORMAT_CONV);
+      786     1319    4                  GOTO error_return;
+      787     1320    4            END; /* case */
+      788     1321    3            format_next_char = format_next_char + 1;
+      789     1322    3         END; /* case */
+      790     1323    2      END; /* infinite while loop */
+      791     1324
+      792     1325    1   format_string_too_long:
+      793     1326    1      CALL set_errno (ERR$FORMAT_STRING_TOO_LONG);
+      794     1327
+      795     1328    1   error_return:
+      796     1329    1      CALL finish_using_inbuf;
+      797     1330    1      IF ((chars_scanned = 0) AND ((ADDR(F) ~= ADDR(NIL)) AND F.is_eof)) OR
+      798     1331    1         ((assignments = 0) AND (skipped_white_err)) THEN
+      799     1332    1         result = %EOF;
+      800     1333    1      ELSE
+      801     1334    1         result = assignments;
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:23   
+      802     1335    1      RETURN;
+      803     1336
+      804     1337    1   END XBI$SCAN;
+
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:24   
+--  Include file information  --
+
+   B$TABLES_C.:LIB_E04  cannot be made into a system file and is referenced.
+   xb_errors_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+   xb_stdio_i6.:XBC3TOU  cannot be made into a system file and is referenced.
+      No diagnostics issued in procedure XBI$SCAN.
+
+   Procedure XBI$SCAN requires 1603 words for executable code.
+   Procedure XBI$SCAN requires 102 words of local(AUTO) storage.
+
+    No errors detected in file xbi_io_scan:6.:XBC3TSI    .
+
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:25   
+          *** CROSS REFERENCE LISTING ***
+**     DENOTES     IDENTIFIER DEFINITION
+<<                 IDENTIFIER'S VALUE SET
+>>                 IDENTIFIER'S VALUE USED
+<>                 IDENTIFIER SET AND/OR USED
+--                 IDENTIFIER REFERENCED
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:26   
+          MINI XREF LISTING
+
+ARGUMENT_BLOCK$
+       561**DCL       711>>ASSIGN    713<<ASSIGN    713>>ASSIGN    729>>ASSIGN    731<<ASSIGN    731>>ASSIGN
+       745>>ASSIGN    746<<ASSIGN    746>>ASSIGN   1162<<ASSIGN
+ARGUMENT_BLOCK_SIZE
+       562**DCL       707>>IF        725>>IF        741>>IF       1163<<ASSIGN
+ARGUMENT_WORDS_USED
+       563**DCL       707>>IF        714<<ASSIGN    714>>ASSIGN    725>>IF        732<<ASSIGN    732>>ASSIGN
+       741>>IF        747<<ASSIGN    747>>ASSIGN   1164<<ASSIGN
+ARS
+       556**DCL       554--IMP-SIZ   636<>CALL      647<<ASSIGN    672>>DOUNTIL   681<<ASSIGN    687>>IF
+       754>>IF        756>>CALLBLT   786>>DOCASE    788>>ASSIGN    791>>IF        803>>IF        807>>IF
+       812>>IF        812>>IF        820>>IF        833>>CALLBLT   835>>CALLBLT   837>>CALLBLT   843>>ASSIGN
+       847>>IF        881>>CALLBLT   883>>ASSIGN    887>>IF        948>>DOWHILE   949>>CALLBLT   959>>CALLBLT
+       975>>CALLBLT  1014>>ASSIGN   1016>>ASSIGN   1020>>IF       1047>>CALLBLT  1050>>ASSIGN   1054>>IF
+      1105>>IF       1114>>CALLBLT  1118>>ASSIGN   1121>>IF       1134>>CALLBLT  1141>>ASSIGN   1144>>IF
+      1177>>IF       1182>>IF       1209>>IF       1214>>CALLBLT  1307>>IF       1312>>IF
+ASSIGNMENTS
+       565**DCL       715<<ASSIGN    715>>ASSIGN    733<<ASSIGN    733>>ASSIGN    748<<ASSIGN    748>>ASSIGN
+      1027<<ASSIGN   1027>>ASSIGN   1065<<ASSIGN   1065>>ASSIGN   1155<<ASSIGN   1155>>ASSIGN   1165<<ASSIGN
+      1195>>ASSIGN   1298<<ASSIGN   1298>>ASSIGN   1330>>IF       1334>>ASSIGN
+ASSIGNMENT_SUPPRESSION
+       564**DCL       859>>IF        899>>IF        992>>IF       1010>>IF       1015>>IF       1041>>IF
+      1049>>IF       1060>>IF       1080>>IF       1117>>IF       1140>>IF       1151>>IF       1235<<ASSIGN
+      1240<<ASSIGN   1293>>IF
+B$SR_NON_DEC$
+       572**DCL       573--IMP-PTR   833>>CALLBLT   881>>CALLBLT  1246>>CALLBLT
+BASE IN PROCEDURE PARSE_INTEGER
+       773**DCL       783<<ASSIGN    812>>IF        812>>IF        816>>IF        816<<ASSIGN    826>>IF
+       826<<ASSIGN    828>>IF        828<<ASSIGN    831>>DOCASE    858<>CALL
+BASED_BIT36 IN PROCEDURE PUT_WORD_ARGUMENT
+       704**DCL       712<<ASSIGN
+BASED_BIT72 IN PROCEDURE PUT_DOUBLE_ARGUMENT
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:27   
+       721**DCL       730<<ASSIGN
+BASED_PTR IN PROCEDURE GET_ARGUMENT_POINTER
+       739**DCL       745>>ASSIGN
+BASED_PTR IN PROCEDURE PUT_DOUBLE_ARGUMENT
+       722**DCL       729>>ASSIGN
+BASED_PTR IN PROCEDURE PUT_WORD_ARGUMENT
+       705**DCL       711>>ASSIGN
+C$ IN PROCEDURE PARSE_C
+      1004**DCL      1005--IMP-PTR  1011<>CALL     1016>>ASSIGN
+CHARACTERS IN PROCEDURE PARSE_REAL
+       936**DCL       949>>CALLBLT
+CHARACTER_CLASS IN PROCEDURE PARSE_REAL
+       933**DCL       950>>ASSIGN
+CHARS_SCANNED
+       559**DCL       624<<ASSIGN    624>>ASSIGN    634<<ASSIGN   1294<>CALL     1330>>IF
+CHARS_TO_MOVE IN PROCEDURE PARSE_C
+      1007**DCL      1014<<ASSIGN   1016>>ASSIGN   1016>>ASSIGN   1019>>ASSIGN   1022>>ASSIGN
+CHARS_TO_MOVE IN PROCEDURE PARSE_INTEGER
+       774**DCL       842<<ASSIGN    843>>ASSIGN    843>>ASSIGN    845>>ASSIGN    846>>ASSIGN
+CHARS_TO_MOVE IN PROCEDURE PARSE_S
+      1033**DCL      1048<<ASSIGN   1050>>ASSIGN   1050>>ASSIGN   1052>>ASSIGN   1053>>ASSIGN
+CHARS_TO_MOVE IN PROCEDURE PARSE_UNSIGNED_INTEGER
+       868**DCL       882<<ASSIGN    883>>ASSIGN    883>>ASSIGN    885>>ASSIGN    886>>ASSIGN
+CHUNK_LENGTH IN PROCEDURE PARSE_REAL
+       910**DCL       951<<ASSIGN    952>>IF        955>>IF        959>>CALLBLT   959>>CALLBLT   961>>ASSIGN
+       970<<ASSIGN    971>>IF        975>>CALLBLT   975>>CALLBLT   977>>ASSIGN
+C_ARRAY IN PROCEDURE PARSE_C
+      1005**DCL      1016<<ASSIGN
+DIGITS
+       566**DCL      1248<<ASSIGN   1249>>IF       1251>>IF       1255>>CALLBLT  1256>>ASSIGN
+ERROR IN PROCEDURE SET_ERRNO
+       609**DCL       608--PROC      612<>CALL      614<>CALL
+ERROR_RETURN
+      1329**LABEL    1170--CALLALT  1178--CALLALT  1180--GOTO     1185--GOTO     1210--CALLALT  1212--GOTO
+      1220--GOTO     1226--CALLALT  1253--GOTO     1259--GOTO     1279--CALLALT  1281--CALLALT  1283--CALLALT
+      1285--CALLALT  1287--CALLALT  1290--CALLALT  1294--CALLALT  1301--CALLALT  1303--CALLALT  1305--CALLALT
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:28   
+      1308--CALLALT  1310--GOTO     1314--GOTO     1319--GOTO
+ERROR_RETURN IN PROCEDURE PARSE_C
+      1027**LABEL    1011--CALLALT  1021--CALLALT
+ERROR_RETURN IN PROCEDURE PARSE_INTEGER
+       863**LABEL     785--CALLALT   792--CALLALT   794--GOTO      808--CALLALT   810--GOTO      821--CALLALT
+       823--GOTO      849--CALLALT   859--CALLALT
+ERROR_RETURN IN PROCEDURE PARSE_REAL
+      1000**LABEL     943--CALLALT   957--GOTO      966--GOTO      973--GOTO      979--CALLALT   994--CALLALT
+       996--CALLALT
+ERROR_RETURN IN PROCEDURE PARSE_S
+      1065**LABEL    1042--CALLALT  1043--CALLALT  1056--CALLALT
+ERROR_RETURN IN PROCEDURE PARSE_SCANSET
+      1155**LABEL    1081--CALLALT  1106--CALLALT  1108--GOTO     1122--CALLALT  1145--CALLALT
+ERROR_RETURN IN PROCEDURE PARSE_UNSIGNED_INTEGER
+       903**LABEL     877--CALLALT   889--CALLALT   899--CALLALT
+ERROR_RETURN IN PROCEDURE SETUP_INBUF
+       654**LABEL     645--CALLALT
+ERROR_RETURN IN PROCEDURE SKIP_WHITESPACE_CHARS
+       764**LABEL     754--CALLALT   758--CALLALT
+F
+       439**DCL         6--PROC      611--IF        612<>CALL      635--IF        641<>CALL      645<>CALL
+       668--IF        674<>CALL      677<>CALL      697--IF        764--IF        807--IF        847--IF
+       887--IF        978--IF       1020--IF       1054--IF       1105--IF       1121--IF       1144--IF
+      1330--IF
+F.ARS
+       461**DCL       647>>ASSIGN    681>>ASSIGN
+F.AUXIO$
+       471**DCL       640>>IF
+F.BUFFER$
+       463**DCL       646>>ASSIGN
+F.CHARACTER_POSITION
+       459**DCL       648>>ASSIGN    697<<ASSIGN
+F.FPT_READ.V.DVBYTE.REREAD#
+       501**DCL       502--REDEF
+F.FPT_READ.V.INDX#
+       494**DCL       495--REDEF
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:29   
+F.FPT_WRITE.V.DVBYTE.VFC#
+       539**DCL       540--REDEF
+F.IS_EOF
+       441**DCL       673>>IF        687>>IF        764>>IF        793>>IF        809>>IF        822>>IF
+       850>>IF        890>>IF        980>>IF       1057>>IF       1107>>IF       1123>>IF       1146>>IF
+      1179>>IF       1211>>IF       1309>>IF       1330>>IF
+F.IS_PARTLY_OPEN
+       451**DCL       645>>IF
+FILL_INBUF
+       660**PROC      754--CALL      758--CALL      792--CALL      808--CALL      821--CALL      849--CALL
+       889--CALL      979--CALL     1021--CALL     1056--CALL     1106--CALL     1122--CALL     1145--CALL
+      1178--CALL     1210--CALL     1308--CALL
+FINISH_USING_INBUF
+       695**PROC     1194--CALL     1329--CALL
+FIRSTCH
+       558**DCL       624>>ASSIGN    625<<ASSIGN    650<<ASSIGN    655<<ASSIGN    689<<ASSIGN
+FORMAT
+       435**DCL         6--PROC     1083>>DOSELCT  1088>>IF       1098>>CALLBLT  1114>>CALLBLT  1134>>CALLBLT
+      1168<>CALL     1173>>CALLBLT  1182>>IF       1202>>CALLBLT  1239>>IF       1246>>CALLBLT  1255>>CALLBLT
+      1266>>DOCASE   1277>>DOCASE
+FORMAT_INDEX
+       567**DCL      1173<<CALLBLT  1175>>DOWHILE  1246<<CALLBLT  1248>>ASSIGN
+FORMAT_LEN
+       568**DCL       435--IMP-SIZ  1083>>DOSELCT  1088>>IF       1098>>CALLBLT  1114>>CALLBLT  1134>>CALLBLT
+      1168>>CALL     1168<>CALL     1169<<ASSIGN   1169>>ASSIGN   1173>>CALLBLT  1182>>IF       1202>>CALLBLT
+      1239>>IF       1246>>CALLBLT  1255>>CALLBLT  1266>>DOCASE   1277>>DOCASE
+FORMAT_NEXT_CHAR
+       569**DCL      1082<<ASSIGN   1082>>ASSIGN   1083>>DOSELCT  1086<<ASSIGN   1086>>ASSIGN   1087>>ASSIGN
+      1088>>IF       1089<<ASSIGN   1089>>ASSIGN   1092>>ASSIGN   1093<<ASSIGN   1093>>ASSIGN   1096>>ASSIGN
+      1098>>CALLBLT  1104<<ASSIGN   1166<<ASSIGN   1173>>CALLBLT  1175>>DOWHILE  1182>>IF       1188<<ASSIGN
+      1188>>ASSIGN   1202<<CALLBLT  1202>>CALLBLT  1233<<ASSIGN   1233>>ASSIGN   1239>>IF       1241<<ASSIGN
+      1241>>ASSIGN   1246>>CALLBLT  1248>>ASSIGN   1255>>CALLBLT  1256<<ASSIGN   1256>>ASSIGN   1266>>DOCASE
+      1269<<ASSIGN   1269>>ASSIGN   1272<<ASSIGN   1272>>ASSIGN   1277>>DOCASE   1321<<ASSIGN   1321>>ASSIGN
+FORMAT_STRING_TOO_LONG
+      1326**LABEL    1173--CALLALT  1202--CALLALT  1246--CALLALT
+FOUND_END IN PROCEDURE PARSE_REAL
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:30   
+       989**LABEL     962--GOTO      981--GOTO      984--GOTO
+GET_ARGUMENT_POINTER
+       737**PROC     1011--CALL     1042--CALL     1081--CALL
+I IN PROCEDURE PARSE_INTEGER
+       775**DCL       833<<CALLBLT   835<<CALLBLT   837<<CALLBLT   842>>ASSIGN    847>>IF
+I IN PROCEDURE PARSE_S
+      1034**DCL      1047<<CALLBLT  1048>>ASSIGN   1054>>IF
+I IN PROCEDURE PARSE_SCANSET
+      1071**DCL      1098<<CALLBLT  1103>>ASSIGN   1114<<CALLBLT  1134<<CALLBLT
+I IN PROCEDURE PARSE_UNSIGNED_INTEGER
+       869**DCL       881<<CALLBLT   882>>ASSIGN    887>>IF
+INBUF
+       554**DCL       756>>CALLBLT   786>>DOCASE    788>>ASSIGN    803>>IF        812>>IF        812>>IF
+       833>>CALLBLT   835>>CALLBLT   837>>CALLBLT   843>>ASSIGN    881>>CALLBLT   883>>ASSIGN    949>>CALLBLT
+       959>>CALLBLT   975>>CALLBLT  1016>>ASSIGN   1047>>CALLBLT  1050>>ASSIGN   1114>>CALLBLT  1118>>ASSIGN
+      1134>>CALLBLT  1141>>ASSIGN   1182>>IF       1214>>CALLBLT  1312>>IF
+INBUF$
+       555**DCL       554--IMP-PTR   637<<ASSIGN    646<<ASSIGN    756>>CALLBLT   786>>DOCASE    788>>ASSIGN
+       803>>IF        812>>IF        812>>IF        833>>CALLBLT   835>>CALLBLT   837>>CALLBLT   843>>ASSIGN
+       881>>CALLBLT   883>>ASSIGN    949>>CALLBLT   959>>CALLBLT   975>>CALLBLT  1016>>ASSIGN   1047>>CALLBLT
+      1050>>ASSIGN   1114>>CALLBLT  1118>>ASSIGN   1134>>CALLBLT  1141>>ASSIGN   1182>>IF       1214>>CALLBLT
+      1312>>IF
+LARGE_SIZE
+       570**DCL       993>>IF       1237<<ASSIGN   1271<<ASSIGN
+LONG IN PROCEDURE PARSE_INTEGER
+       776**DCL       858<>CALL      859<>CALL
+LOOP_FOR IN PROCEDURE PARSE_SCANSET
+      1113**LABEL    1124--EXIT     1128--EXIT
+LOOP_NOT_FOR IN PROCEDURE PARSE_SCANSET
+      1133**LABEL    1137--EXIT     1147--EXIT
+MINIMUM_LENGTH IN PROCEDURE PARSE_INTEGER
+       777**DCL       796<<ASSIGN    799<<ASSIGN    853>>IF
+NEXTCH
+       557**DCL       624>>ASSIGN    625>>ASSIGN    638<<ASSIGN    648<<ASSIGN    650>>ASSIGN    654<<ASSIGN
+       688<<ASSIGN    697>>ASSIGN    754>>IF        756<<CALLBLT   756>>CALLBLT   786>>DOCASE    788>>ASSIGN
+       790<<ASSIGN    790>>ASSIGN    791>>IF        803>>IF        806<<ASSIGN    806>>ASSIGN    807>>IF
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:31   
+       812>>IF        812>>IF        819<<ASSIGN    819>>ASSIGN    820>>IF        833>>CALLBLT   835>>CALLBLT
+       837>>CALLBLT   842>>ASSIGN    843>>ASSIGN    846<<ASSIGN    846>>ASSIGN    881>>CALLBLT   882>>ASSIGN
+       883>>ASSIGN    886<<ASSIGN    886>>ASSIGN    944>>ASSIGN    948>>DOWHILE   949>>CALLBLT   951>>ASSIGN
+       968<<ASSIGN    968>>ASSIGN    970>>ASSIGN    985>>ASSIGN   1014>>ASSIGN   1016>>ASSIGN   1019<<ASSIGN
+      1019>>ASSIGN   1020>>IF       1047>>CALLBLT  1048>>ASSIGN   1050>>ASSIGN   1053<<ASSIGN   1053>>ASSIGN
+      1105>>IF       1114>>CALLBLT  1118>>ASSIGN   1120<<ASSIGN   1120>>ASSIGN   1121>>IF       1134>>CALLBLT
+      1141>>ASSIGN   1143<<ASSIGN   1143>>ASSIGN   1144>>IF       1177>>IF       1182>>IF       1187<<ASSIGN
+      1187>>ASSIGN   1209>>IF       1214>>CALLBLT  1218>>IF       1222<<ASSIGN   1225<<ASSIGN   1307>>IF
+      1312>>IF       1316<<ASSIGN   1316>>ASSIGN
+NULL_PERCENT_WHITESPACE_TABLE
+       583**DCL      1173>>CALLBLT
+OVERFLOW_ERROR IN PROCEDURE PARSE_REAL
+       914**DCL       989<>CALL      990>>IF
+P$ IN PROCEDURE GET_ARGUMENT_POINTER
+       738**DCL       737--PROC      745<<ASSIGN
+P$ IN PROCEDURE PUT_DOUBLE_ARGUMENT
+       719**DCL       729<<ASSIGN    730>>ASSIGN
+P$ IN PROCEDURE PUT_WORD_ARGUMENT
+       702**DCL       711<<ASSIGN    712>>ASSIGN
+PARSE_C
+      1003**PROC     1301--CALL
+PARSE_INTEGER
+       770**PROC     1279--CALL     1281--CALL     1283--CALL     1285--CALL
+PARSE_REAL
+       906**PROC     1290--CALL
+PARSE_S
+      1032**PROC     1303--CALL
+PARSE_SCANSET
+      1070**PROC     1305--CALL
+PARSE_UNSIGNED_INTEGER
+       867**PROC     1287--CALL
+PUT_DOUBLE_ARGUMENT
+       718**PROC      994--CALL
+PUT_WORD_ARGUMENT
+       701**PROC      859--CALL      899--CALL      996--CALL     1294--CALL
+P_ARGUMENT_BLOCK$
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:32   
+       436**DCL         6--PROC     1162>>ASSIGN
+P_ARGUMENT_BLOCK_SIZE
+       437**DCL         6--PROC     1163>>ASSIGN
+P_BASE IN PROCEDURE PARSE_INTEGER
+       771**DCL       770--PROC      783>>ASSIGN
+RESULT
+       551**DCL         6--PROC     1195<<ASSIGN   1332<<ASSIGN   1334<<ASSIGN
+RESULT IN PROCEDURE PARSE_REAL
+       907**DCL       989<>CALL      994<>CALL      996<>CALL
+S
+       550**DCL         6--PROC      636<>CALL      637--ASSIGN
+S IN PROCEDURE PARSE_S
+      1035**DCL      1050<<ASSIGN   1061<<ASSIGN
+S IN PROCEDURE PARSE_SCANSET
+      1072**DCL      1118<<ASSIGN   1141<<ASSIGN   1151<<ASSIGN
+S$ IN PROCEDURE PARSE_S
+      1036**DCL      1035--IMP-PTR  1042<>CALL     1050>>ASSIGN   1061>>ASSIGN
+S$ IN PROCEDURE PARSE_SCANSET
+      1073**DCL      1072--IMP-PTR  1081<>CALL     1118>>ASSIGN   1141>>ASSIGN   1151>>ASSIGN
+SCANSET_SIZE IN PROCEDURE PARSE_SCANSET
+      1075**DCL      1103<<ASSIGN   1104>>ASSIGN   1114>>CALLBLT  1134>>CALLBLT
+SCANSET_START IN PROCEDURE PARSE_SCANSET
+      1076**DCL      1087<<ASSIGN   1092<<ASSIGN   1096<<ASSIGN   1103>>ASSIGN   1104>>ASSIGN   1114>>CALLBLT
+      1134>>CALLBLT
+SCAN_FOR IN PROCEDURE PARSE_SCANSET
+      1074**DCL      1085<<ASSIGN   1091<<ASSIGN   1095<<ASSIGN   1111>>IF
+SEARCH_AGAIN IN PROCEDURE PARSE_INTEGER
+       831**LABEL     851--GOTO
+SEARCH_AGAIN IN PROCEDURE PARSE_S
+      1047**LABEL    1058--GOTO
+SEARCH_AGAIN IN PROCEDURE PARSE_UNSIGNED_INTEGER
+       881**LABEL     891--GOTO
+SEARCH_AGAIN IN PROCEDURE SKIP_WHITESPACE_CHARS
+       756**LABEL     759--GOTO
+SETUP_INBUF
+       629**PROC     1170--CALL
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:33   
+SET_ERRNO
+       608**PROC      669--CALL      708--CALL      726--CALL      742--CALL      839--CALL      854--CALL
+       894--CALL      956--CALL      965--CALL      972--CALL      991--CALL     1100--CALL     1184--CALL
+      1219--CALL     1252--CALL     1258--CALL     1313--CALL     1318--CALL     1326--CALL
+SKIPPED_WHITE_ERR
+       598**DCL       765<<ASSIGN   1167<<ASSIGN   1330>>IF
+SKIP_WHITESPACE_CHARS
+       752**PROC      785--CALL      877--CALL      943--CALL     1043--CALL     1226--CALL
+SMALL_SIZE
+       592**DCL      1236<<ASSIGN   1268<<ASSIGN
+START IN PROCEDURE PARSE_C
+      1006**DCL      1012<<ASSIGN   1013>>DOWHILE  1014>>ASSIGN   1016>>ASSIGN   1022<<ASSIGN   1022>>ASSIGN
+START IN PROCEDURE PARSE_S
+      1037**DCL      1044<<ASSIGN   1048>>ASSIGN   1050>>ASSIGN   1052<<ASSIGN   1052>>ASSIGN   1054>>IF
+      1061>>ASSIGN
+START IN PROCEDURE PARSE_SCANSET
+      1077**DCL      1110<<ASSIGN   1113>>DOWHILE  1118>>ASSIGN   1119<<ASSIGN   1119>>ASSIGN   1133>>DOWHILE
+      1141>>ASSIGN   1142<<ASSIGN   1142>>ASSIGN   1151>>ASSIGN
+START_INDEX IN PROCEDURE PARSE_REAL
+       911**DCL       944<<ASSIGN    951>>ASSIGN    959>>CALLBLT   970>>ASSIGN    975>>CALLBLT   985<<ASSIGN
+STATE IN PROCEDURE PARSE_REAL
+       912**DCL       945<<ASSIGN    950<<ASSIGN    950>>ASSIGN    952>>IF        964>>IF
+STRING IN PROCEDURE PARSE_REAL
+       915**DCL       989<>CALL
+STRING.LENGTH IN PROCEDURE PARSE_REAL
+       916**DCL       946<<ASSIGN    952>>IF        955>>IF        959>>CALLBLT   961<<ASSIGN    961>>ASSIGN
+       971>>IF        975>>CALLBLT   977<<ASSIGN    977>>ASSIGN
+STRING.TEXT IN PROCEDURE PARSE_REAL
+       917**DCL       959<<CALLBLT   975<<CALLBLT
+TABLE_VALUE
+       593**DCL      1173<<CALLBLT  1191>>DOCASE
+TEMPCH
+       594**DCL      1214<<CALLBLT  1218>>IF       1222>>ASSIGN   1225>>ASSIGN
+TEMP_NEXT_CHAR IN PROCEDURE PARSE_INTEGER
+       781**DCL       789<<ASSIGN    798<<ASSIGN    804>>ASSIGN    805<<ASSIGN    805>>ASSIGN    817>>ASSIGN
+       818<<ASSIGN    818>>ASSIGN    842>>ASSIGN    843>>ASSIGN    845<<ASSIGN    845>>ASSIGN    847>>IF
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:34   
+       853>>IF        857>>ASSIGN
+TEMP_NEXT_CHAR IN PROCEDURE PARSE_UNSIGNED_INTEGER
+       874**DCL       878<<ASSIGN    882>>ASSIGN    883>>ASSIGN    885<<ASSIGN    885>>ASSIGN    887>>IF
+       893>>IF        897>>ASSIGN
+TEMP_PTR IN PROCEDURE PARSE_INTEGER
+       778**DCL       858<>CALL
+TEMP_PTR IN PROCEDURE PARSE_UNSIGNED_INTEGER
+       871**DCL       898<>CALL
+TEMP_STR IN PROCEDURE PARSE_INTEGER
+       780**DCL       788<<ASSIGN    804<<ASSIGN    817<<ASSIGN    843<<ASSIGN    857<<ASSIGN    858<>CALL
+TEMP_STR IN PROCEDURE PARSE_UNSIGNED_INTEGER
+       873**DCL       883<<ASSIGN    897<<ASSIGN    898<>CALL
+TRANSITION_TABLE IN PROCEDURE PARSE_REAL
+       921**DCL       950>>ASSIGN
+TYPE IN PROCEDURE PARSE_REAL
+       913**DCL       949<<CALLBLT   950>>ASSIGN
+UNSIGNED_LONG IN PROCEDURE PARSE_UNSIGNED_INTEGER
+       870**DCL       898<>CALL      899<>CALL
+UPDATE_CHARS_SCANNED
+       617**PROC      667--CALL      696--CALL     1292--CALL
+VALUE IN PROCEDURE PUT_DOUBLE_ARGUMENT
+       720**DCL       718--PROC      730>>ASSIGN
+VALUE IN PROCEDURE PUT_WORD_ARGUMENT
+       703**DCL       701--PROC      712>>ASSIGN
+VOID_TV
+       595**DCL       756<<CALLBLT   833<<CALLBLT   835<<CALLBLT   837<<CALLBLT   881<<CALLBLT  1202<<CALLBLT
+      1214<<CALLBLT  1246<<CALLBLT
+VOID_TV IN PROCEDURE PARSE_S
+      1038**DCL      1047<<CALLBLT
+WIDTH
+       596**DCL       784<<ASSIGN    807>>IF        842>>ASSIGN    847>>IF        876<<ASSIGN    882>>ASSIGN
+       887>>IF        941<<ASSIGN    942<<ASSIGN    942>>ASSIGN    952>>IF       1005--IMP-SIZ  1009<<ASSIGN
+      1013>>DOWHILE  1014>>ASSIGN   1016>>ASSIGN   1040<<ASSIGN   1048>>ASSIGN   1054>>IF       1079<<ASSIGN
+      1113>>DOWHILE  1133>>DOWHILE  1255<<CALLBLT  1257>>IF
+WIDTH_SPECIFIED
+       597**DCL       784>>IF        807>>IF        847>>IF        876>>IF        887>>IF        941>>IF
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:35   
+       978>>IF       1009>>IF       1020>>IF       1040>>IF       1054>>IF       1079>>IF       1105>>IF
+      1121>>IF       1144>>IF       1250<<ASSIGN   1262<<ASSIGN
+XB$ERR$ASSERTION_FAILURE
+       300**DCL       839<>CALL
+XB$ERR$AUXIO_FILE_POINTER
+       322**DCL       641<>CALL
+XB$ERR$BAD_OR_MISSING_REAL_NUM
+       296**DCL       956<>CALL      965<>CALL      972<>CALL
+XB$ERR$FORMAT_STRING_TOO_LONG
+       305**DCL      1100<>CALL     1326<>CALL
+XB$ERR$NO_CHARS_TO_SCAN
+       313**DCL       669<>CALL      674<>CALL
+XB$ERR$NO_SUCH_ARGUMENT
+       302**DCL       708<>CALL      726<>CALL      742<>CALL
+XB$ERR$RANGE_ERROR
+       308**DCL       991<>CALL
+XB$ERR$SCAN_MISMATCH
+       314**DCL       854<>CALL      894<>CALL     1184<>CALL     1219<>CALL     1313<>CALL
+XB$ERR$UNKNOWN_FORMAT_CONV
+       304**DCL      1318<>CALL
+XB$ERR$WIDTH_CANT_BE_ZERO
+       315**DCL      1258<>CALL
+XB$ERR$WIDTH_OR_PRECISION_TB
+       303**DCL      1252<>CALL
+XBI$COMPLETE_OPEN IN PROCEDURE SETUP_INBUF
+       631**DCL-ENT   645--CALL
+XBI$NON_DIGIT_TABLE
+       573**DCL       833>>CALLBLT   881>>CALLBLT  1246>>CALLBLT
+XBI$NON_HEX_DIGIT_TABLE
+       576**DCL       837>>CALLBLT
+XBI$NON_OCTAL_DIGIT_TABLE
+       575**DCL       835>>CALLBLT
+XBI$NON_WHITESPACE_TABLE
+       577**DCL       756>>CALLBLT  1202>>CALLBLT  1214>>CALLBLT
+XBI$READ_NEXT_RECORD IN PROCEDURE FILL_INBUF
+       665**DCL-ENT   677--CALL
+PL6.E3A0      #001=XBI$SCAN File=xbi_io_scan:6.:XBC3TSI                          FRI 01/06/95 11:27 Page:36   
+XBI$STRING_TO_REAL IN PROCEDURE PARSE_REAL
+       939**DCL-ENT   989--CALL
+XBI$STRLEN
+       606**DCL-ENT  1168--CALL
+XBI$STRLEN IN PROCEDURE SETUP_INBUF
+       632**DCL-ENT   636--CALL
+XBI$STRTOL
+       603**DCL-ENT   858--CALL
+XBI$STRTOUL
+       604**DCL-ENT   898--CALL
+XBI$WHITESPACE_TABLE
+       578**DCL      1047>>CALLBLT
+XBI_SET_ERRNO
+       601**DCL-ENT   614--CALL
+XBI_SET_STREAM_ERRNO
+       602**DCL-ENT   612--CALL      641--CALL      674--CALL
+XB_IO_ERROR
+       605**DCL-ENT   642--CALL      840--CALL
